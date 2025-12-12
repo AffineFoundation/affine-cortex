@@ -164,9 +164,9 @@ class ScoringCacheManager:
         await self._full_refresh_both()
     
     async def _full_refresh_both(self) -> None:
-        """Execute full refresh for both scoring and sampling ranges with optimized single query."""
+        """Execute full refresh for both scoring and sampling ranges with separate queries."""
         start_time = time.time()
-        logger.info("Full refresh started (optimized single query)")
+        logger.info("Full refresh started (separate queries for scoring and sampling)")
         
         from affine.database.dao.system_config import SystemConfigDAO
         from affine.database.dao.miners import MinersDAO
@@ -200,10 +200,9 @@ class ScoringCacheManager:
             for m in valid_miners
         ]
         
-        # Build ranges for scoring, sampling, and merged query
+        # Build ranges for scoring and sampling separately
         env_ranges_scoring = {}
         env_ranges_sampling = {}
-        env_ranges_merged = {}
         
         for env in all_envs:
             scoring_range = env_ranges_dict[env]['scoring_range']
@@ -212,42 +211,35 @@ class ScoringCacheManager:
             scoring_start, scoring_end = scoring_range
             sampling_start, sampling_end = sampling_range
             
-            env_ranges_scoring[env] = (scoring_start, scoring_end)
-            env_ranges_sampling[env] = (sampling_start, sampling_end)
-            
-            # Compute merged range [min(starts), max(ends))
-            # Skip if both ranges are empty
-            if scoring_start >= scoring_end and sampling_start >= sampling_end:
-                continue
-            
-            # Calculate union of the two ranges
-            valid_starts = [s for s, e in [(scoring_start, scoring_end), (sampling_start, sampling_end)] if s < e]
-            valid_ends = [e for s, e in [(scoring_start, scoring_end), (sampling_start, sampling_end)] if s < e]
-            
-            if valid_starts and valid_ends:
-                merged_start = min(valid_starts)
-                merged_end = max(valid_ends)
-                env_ranges_merged[env] = (merged_start, merged_end)
+            # Only add non-empty ranges
+            if scoring_start < scoring_end:
+                env_ranges_scoring[env] = (scoring_start, scoring_end)
+            if sampling_start < sampling_end:
+                env_ranges_sampling[env] = (sampling_start, sampling_end)
         
-        # Single batch query with merged ranges
-        samples_data_merged = await sample_dao.get_scoring_samples_batch(
+        # Execute two separate queries to avoid superset range inefficiency
+        samples_data_scoring = await sample_dao.get_scoring_samples_batch(
             miners=miners_list,
-            env_ranges=env_ranges_merged
+            env_ranges=env_ranges_scoring
+        )
+        samples_data_sampling = await sample_dao.get_scoring_samples_batch(
+            miners=miners_list,
+            env_ranges=env_ranges_sampling
         )
         
-        # Assemble results for both types by filtering merged data
+        # Assemble results using their respective query data
         self._data_scoring = self._assemble_result(
-            valid_miners, all_envs, env_ranges_scoring, samples_data_merged
+            valid_miners, all_envs, env_ranges_scoring, samples_data_scoring
         )
         self._data_sampling = self._assemble_result(
-            valid_miners, all_envs, env_ranges_sampling, samples_data_merged
+            valid_miners, all_envs, env_ranges_sampling, samples_data_sampling
         )
         
         # Log statistics
         elapsed = time.time() - start_time
         combo_count = len(valid_miners) * len(all_envs)
         logger.info(
-            f"Full refresh completed (optimized): {len(valid_miners)} miners, "
+            f"Full refresh completed: {len(valid_miners)} miners, "
             f"{len(all_envs)} environments, "
             f"{combo_count} miner×env combinations, "
             f"scoring={len(self._data_scoring)} entries, "

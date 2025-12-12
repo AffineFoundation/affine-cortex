@@ -88,14 +88,18 @@ class TaskGeneratorService:
                 'env_ranges': {}
             }
     
-    async def get_sampling_range(self, env: str) -> tuple:
-        """Get sampling range for an environment from SystemConfig.
+    async def get_task_id_set(self, env: str) -> Set[int]:
+        """Get the complete set of task IDs needed for both sampling and scoring.
+        
+        This method combines both sampling_range and scoring_range to ensure all tasks
+        needed for both operations are generated. The two ranges may be completely
+        disjoint (e.g., sampling=[100,200), scoring=[300,400)).
         
         Args:
             env: Environment name
             
         Returns:
-            Tuple of (start_id, end_id)
+            Set of task IDs covering both sampling and scoring ranges
             
         Raises:
             ValueError: If environment not found in SystemConfig
@@ -108,10 +112,22 @@ class TaskGeneratorService:
         env_ranges = self._config_cache.get('env_ranges', {})
         if env in env_ranges:
             sampling_range = env_ranges[env].get('sampling_range', [0, 0])
-            if len(sampling_range) == 2:
-                start, end = sampling_range
-                logger.debug(f"Using SystemConfig range for {env}: [{start}, {end})")
-                return (start, end)
+            scoring_range = env_ranges[env].get('scoring_range', [0, 0])
+            
+            if len(sampling_range) == 2 and len(scoring_range) == 2:
+                # Create sets for both ranges
+                sampling_ids = set(range(sampling_range[0], sampling_range[1]))
+                scoring_ids = set(range(scoring_range[0], scoring_range[1]))
+                
+                # Union of both sets
+                all_task_ids = sampling_ids | scoring_ids
+                
+                logger.debug(
+                    f"Task IDs for {env}: sampling=[{sampling_range[0]}, {sampling_range[1]}) ({len(sampling_ids)} tasks), "
+                    f"scoring=[{scoring_range[0]}, {scoring_range[1]}) ({len(scoring_ids)} tasks), "
+                    f"total={len(all_task_ids)} tasks"
+                )
+                return all_task_ids
         
         # Environment not configured
         raise ValueError(
@@ -136,11 +152,8 @@ class TaskGeneratorService:
         Returns:
             Number of tasks created
         """
-        # Get sampling range from config
-        start_id, end_id = await self.get_sampling_range(env)
-        
-        # Get expected task_ids (all task_ids in sampling range)
-        expected_task_ids = set(range(start_id, end_id))
+        # Get expected task_ids (union of sampling and scoring ranges)
+        expected_task_ids = await self.get_task_id_set(env)
         
         # Get completed task_ids from sample results
         completed_task_ids = await self.sample_results_dao.get_completed_task_ids(
@@ -402,7 +415,8 @@ class TaskGeneratorService:
         status = {}
         
         for env in envs:
-            start_id, end_id = await self.get_sampling_range(env)
+            # Get expected task_ids (union of sampling and scoring ranges)
+            expected_task_ids = await self.get_task_id_set(env)
             
             # Get completed task_ids
             completed_task_ids = await self.sample_results_dao.get_completed_task_ids(
@@ -412,10 +426,9 @@ class TaskGeneratorService:
             )
             
             # Calculate completion status
-            expected_task_ids = set(range(start_id, end_id))
             missing_task_ids = expected_task_ids - completed_task_ids
             is_complete = len(missing_task_ids) == 0
-            total_count = end_id - start_id
+            total_count = len(expected_task_ids)
             
             status[env] = {
                 'is_complete': is_complete,
