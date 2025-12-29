@@ -68,14 +68,12 @@ class ExecutorWorker:
             from affine.core.environments import SDKEnvironment
 
             # Create SDK environment instance (reads mode from affinetes_hosts.json)
-            sdk_env = SDKEnvironment(self.env)
-            
-            # Reuse the SDK's environment instance
-            # This ensures consistent behavior between SDK and Executor
-            self.env_executor = sdk_env._env
+            # Store the entire SDKEnvironment, not just the underlying _env
+            # This ensures we get Result objects instead of raw dicts
+            self.env_executor = SDKEnvironment(self.env)
             
             # Log the mode being used
-            _, execution_mode = sdk_env._get_hosts_and_mode()
+            _, execution_mode = self.env_executor._get_hosts_and_mode()
             safe_log(
                 f"[{self.env}] Environment initialized using {execution_mode} mode "
                 f"(via SDKEnvironment)",
@@ -209,10 +207,19 @@ class ExecutorWorker:
                     f"miner={miner_hotkey[:12]}..."
                 )
             
-            base_url = f"https://{chute_slug}.chutes.ai/v1"
+            # Create a minimal miner object for evaluate()
+            class MinimalMiner:
+                def __init__(self, model, slug, hotkey):
+                    self.model = model
+                    self.slug = chute_slug.replace('.chutes.ai', '').replace('https://', '')
+                    self.hotkey = hotkey
+                    self.revision = ""
+            
+            miner = MinimalMiner(model, chute_slug, miner_hotkey)
+            
+            # Call SDKEnvironment.evaluate() which returns a Result object
             result = await self.env_executor.evaluate(
-                model=model,
-                base_url=base_url,
+                miner=miner,
                 task_id=task_id,
             )
             
