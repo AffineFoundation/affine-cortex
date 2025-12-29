@@ -35,6 +35,7 @@ from affine.core.environments import (
     ABD_V2_factory as ABD_V2,
     CDE_factory as CDE,
     LGC_factory as LGC,
+    GAME_factory as GAME,
     SWE_PRO_factory as SWEPRO,
     list_available_environments,
 )

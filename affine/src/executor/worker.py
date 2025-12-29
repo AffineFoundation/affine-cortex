@@ -56,14 +56,32 @@ class ExecutorWorker:
         self.executor_tasks = []
 
     async def _init_env_executor(self):
-        """Initialize environment executor in subprocess."""
+        """Initialize environment executor in subprocess.
+        
+        Reuses SDKEnvironment's _load_environment logic for consistency.
+        The executor mode is determined by affinetes_hosts.json configuration.
+        """
         if self.env_executor is not None:
             return
 
         try:
-            from affine.core.environments import create_environment
-            self.env_executor = create_environment(self.env)
-            safe_log(f"[{self.env}] Environment initialized in subprocess", "INFO")
+            from affine.core.environments import SDKEnvironment
+
+            # Create SDK environment instance (reads mode from affinetes_hosts.json)
+            sdk_env = SDKEnvironment(self.env)
+            
+            # Reuse the SDK's environment instance
+            # This ensures consistent behavior between SDK and Executor
+            self.env_executor = sdk_env._env
+            
+            # Log the mode being used
+            _, execution_mode = sdk_env._get_hosts_and_mode()
+            safe_log(
+                f"[{self.env}] Environment initialized using {execution_mode} mode "
+                f"(via SDKEnvironment)",
+                "INFO"
+            )
+            
         except Exception as e:
             safe_log(f"[{self.env}] Failed to initialize environment: {e}", "ERROR")
             raise

@@ -37,6 +37,9 @@ class EnvConfig:
         "timeout": 600,
     })
     proxy_timeout: int = 600
+    
+    # Basilica mode configuration (optional)
+    cpu_limit: Optional[str] = None  # e.g., "4000m" for basilica mode
 
 
 # ========================= Environment Configurations =========================
@@ -88,12 +91,14 @@ _ENV_CONFIGS_CANONICAL = {
     "game": EnvConfig(
         name="game",
         docker_image="affinefoundation/game:openspiel",
-        env_vars={"UVICORN_WORKERS": "40"},
+        env_vars={"UVICORN_WORKERS": "50"},
         eval_params={
             "temperature": 0.0,
-            "timeout": 1800,
+            "timeout": 7200,
         },
-        proxy_timeout=2000,
+        proxy_timeout=7400,
+        cpu_limit="2000m",  # Basilica mode CPU limit
+        mem_limit="8Gi",   # Basilica mode memory limit
     ),
     
     # SWE-bench Pro environment (requires DOOD)
@@ -158,11 +163,19 @@ for alias, canonical in _ENV_ALIASES.items():
 class SDKEnvironment:
     """Unified SDK environment implementation"""
     
-    def __init__(self, env_name: str):
+    def __init__(self, env_name: str, mode: Optional[str] = None):
+        """Initialize SDK environment
+        
+        Args:
+            env_name: Environment name
+            mode: Execution mode override ('docker' or 'basilica').
+                  If not specified, will use mode from affinetes_hosts.json or default to docker.
+        """
         if env_name not in ENV_CONFIGS:
             raise ValueError(f"Unknown environment: {env_name}")
         
         self.config = ENV_CONFIGS[env_name]
+        self._mode_override = mode
         self._env = self._load_environment()
         self._env_lock = asyncio.Lock()
     
@@ -194,7 +207,20 @@ class SDKEnvironment:
         return env_vars
     
     def _load_hosts_config(self) -> Dict[str, Any]:
-        """Load hosts configuration from file"""
+        """Load hosts configuration from file
+        
+        Format:
+        {
+            "env_name": {
+                "hosts": ["host1", "host2"],
+                "mode": "docker" | "basilica"  # optional, defaults to docker
+            },
+            "default": {
+                "hosts": ["localhost"],
+                "mode": "docker"
+            }
+        }
+        """
         # Check for config file in multiple locations
         config_paths = [
             Path(os.getenv("AFFINETES_HOSTS_CONFIG", "")),
@@ -215,25 +241,40 @@ class SDKEnvironment:
         
         return {}
     
-    def _get_hosts_for_env(self) -> Optional[List[str]]:
-        """Get hosts for this environment from config file or env var"""
+    def _get_hosts_and_mode(self) -> tuple[List[str], str]:
+        """Get hosts and execution mode for this environment
+        
+        Returns:
+            (hosts, mode): hosts list and execution mode ('docker' or 'basilica')
+        """
         # Try config file first
         config = self._load_hosts_config()
         
         if config:
-            # Check for environment-specific hosts
+            # Check for environment-specific config
             if self.env_name in config:
-                hosts = config[self.env_name]
-                if isinstance(hosts, list) and hosts:
-                    logger.debug(f"Using config file hosts for {self.env_name}: {hosts}")
-                    return hosts
+                env_config = config[self.env_name]
+                if isinstance(env_config, dict):
+                    hosts = env_config.get("hosts", ["localhost"])
+                    mode = env_config.get("mode", "docker")
+                    logger.debug(f"Using config for {self.env_name}: hosts={hosts}, mode={mode}")
+                    return hosts, mode
+                elif isinstance(env_config, list):
+                    # Backward compatibility: ["host1", "host2"]
+                    logger.debug(f"Using config hosts for {self.env_name}: {env_config}")
+                    return env_config, "docker"
             
-            # Fall back to default hosts in config
+            # Fall back to default config
             if "default" in config:
-                hosts = config["default"]
-                if isinstance(hosts, list) and hosts:
-                    logger.debug(f"Using default config hosts for {self.env_name}: {hosts}")
-                    return hosts
+                default_config = config["default"]
+                if isinstance(default_config, dict):
+                    hosts = default_config.get("hosts", ["localhost"])
+                    mode = default_config.get("mode", "docker")
+                    logger.debug(f"Using default config for {self.env_name}: hosts={hosts}, mode={mode}")
+                    return hosts, mode
+                elif isinstance(default_config, list):
+                    logger.debug(f"Using default hosts for {self.env_name}: {default_config}")
+                    return default_config, "docker"
         
         # Fall back to environment variable (for backward compatibility)
         hosts_env = os.getenv("AFFINETES_HOSTS", "").strip()
@@ -241,12 +282,19 @@ class SDKEnvironment:
             hosts = [h.strip() for h in hosts_env.split(",") if h.strip()]
             if hosts:
                 logger.debug(f"Using env var hosts for {self.env_name}: {hosts}")
-                return hosts
+                return hosts, "docker"
         
-        return ["localhost"]
+        return ["localhost"], "docker"
     
     def _load_environment(self) -> Any:
-        """Load or get cached environment instance"""
+        """Load or get cached environment instance
+        
+        Mode selection priority:
+        1. mode parameter passed to __init__
+        2. mode from affinetes_hosts.json
+        3. AFFINETES_MODE environment variable
+        4. default to 'docker'
+        """
         with _ENV_LOCK:
             if self.env_name in _ENV_CACHE:
                 cached = _ENV_CACHE[self.env_name]
@@ -255,33 +303,62 @@ class SDKEnvironment:
                     return cached
                 del _ENV_CACHE[self.env_name]
             
-            # Get hosts for this environment
-            hosts = self._get_hosts_for_env()
+            # Determine execution mode
+            hosts, config_mode = self._get_hosts_and_mode()
+            
+            # Priority: parameter > config > env var > default
+            if self._mode_override:
+                mode = self._mode_override
+                logger.info(f"Using mode from parameter: {mode}")
+            elif config_mode:
+                mode = config_mode
+                logger.info(f"Using mode from config: {mode}")
+            else:
+                mode = os.getenv("AFFINETES_MODE", "docker")
+                logger.info(f"Using mode from env/default: {mode}")
+            
+            # Validate mode
+            if mode not in ["docker", "basilica"]:
+                raise ValueError(f"Invalid mode: {mode}. Must be 'docker' or 'basilica'")
             
             # Load environment
-            logger.info(f"Loading environment: {self.env_name} (image={self.docker_image}, hosts={hosts or 'local'}, mem_limit={self.config.mem_limit})")
+            logger.info(f"Loading environment: {self.env_name} (image={self.docker_image}, mode={mode}, hosts={hosts or 'local'}, mem_limit={self.config.mem_limit})")
             
-            # Build load_env kwargs
+            # Build load_env kwargs based on mode
             load_kwargs = {
                 "image": self.docker_image,
-                "mode": "docker",
-                "replicas": len(hosts),
+                "mode": mode,
                 "env_vars": self._get_env_vars(),
-                "hosts": hosts,
-                "container_name": self.env_name.replace(":", "-"),
                 "mem_limit": self.config.mem_limit,
                 "pull": True,
-                "force_recreate": True,
             }
             
-            # Add volumes if configured
+            if mode == "docker":
+                # Docker mode specific parameters
+                load_kwargs.update({
+                    "replicas": len(hosts),
+                    "hosts": hosts,
+                    "container_name": self.env_name.replace(":", "-"),
+                    "force_recreate": True,
+                })
+            elif mode == "basilica":
+                # Basilica mode specific parameters
+                ttl_buffer = self.config.proxy_timeout
+                cpu_limit = self.config.cpu_limit or "2000m"
+                
+                load_kwargs.update({
+                    "cpu_limit": cpu_limit,
+                    "ttl_buffer": ttl_buffer,
+                })
+            
+            # Add volumes if configured (both modes)
             if self.config.volumes:
                 load_kwargs["volumes"] = self.config.volumes
             
             env = af_env.load_env(**load_kwargs)
             
             _ENV_CACHE[self.env_name] = env
-            logger.debug(f"Cached environment: {self.env_name}")
+            logger.debug(f"Cached environment: {self.env_name} (mode={mode})")
             return env
     
     def _generate_seed(self, task_id: int) -> int:
@@ -371,9 +448,14 @@ class SDKEnvironment:
 
 # ========================= Factory Functions =========================
 
-def create_environment(env_name: str) -> SDKEnvironment:
-    """Create environment by name"""
-    return SDKEnvironment(env_name)
+def create_environment(env_name: str, mode: Optional[str] = None) -> SDKEnvironment:
+    """Create environment by name
+    
+    Args:
+        env_name: Environment name
+        mode: Execution mode ('docker' or 'basilica'). If not specified, uses config/default.
+    """
+    return SDKEnvironment(env_name, mode=mode)
 
 
 def list_available_environments() -> Dict[str, List[str]]:
@@ -408,15 +490,15 @@ def cleanup_all_environments():
 # ========================= Backward Compatibility Aliases =========================
 
 # Factory functions for backward compatibility
-SAT_factory = lambda: create_environment("sat")
-ABD_factory = lambda: create_environment("abd")  # Points to abd-v2
-DED_factory = lambda: create_environment("ded")  # Points to ded-v2
-DED_V2_factory = lambda: create_environment("ded-v2")
-ABD_V2_factory = lambda: create_environment("abd-v2")
-CDE_factory = lambda: create_environment("cde")
-LGC_factory = lambda: create_environment("lgc")
-GAME_factory = lambda: create_environment("game")
-SWE_PRO_factory = lambda: create_environment("swe-pro")
+SAT_factory = lambda mode=None: create_environment("sat", mode=mode)
+ABD_factory = lambda mode=None: create_environment("abd", mode=mode)  # Points to abd-v2
+DED_factory = lambda mode=None: create_environment("ded", mode=mode)  # Points to ded-v2
+DED_V2_factory = lambda mode=None: create_environment("ded-v2", mode=mode)
+ABD_V2_factory = lambda mode=None: create_environment("abd-v2", mode=mode)
+CDE_factory = lambda mode=None: create_environment("cde", mode=mode)
+LGC_factory = lambda mode=None: create_environment("lgc", mode=mode)
+GAME_factory = lambda mode=None: create_environment("game", mode=mode)
+SWE_PRO_factory = lambda mode=None: create_environment("swe-pro", mode=mode)
 
 # Legacy class aliases
 SAT = SAT_factory
