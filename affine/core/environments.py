@@ -85,7 +85,17 @@ _ENV_CONFIGS_CANONICAL = {
         env_vars={"UVICORN_WORKERS": "15"},
         eval_params={
             "temperature": 0.0,
-            "timeout": 600,
+            "timeout": 1200,
+        },
+    ),
+    "lgc-v2": EnvConfig(
+        name="lgc-v2",
+        mem_limit="20g",
+        docker_image="affinefoundation/lgc:pi-v2",
+        env_vars={"UVICORN_WORKERS": "15"},
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 1200,
         },
     ),
     "game": EnvConfig(
@@ -141,6 +151,7 @@ _ENV_ALIASES = {
     # PrimeIntellect aliases (uppercase versions)
     "CDE": "cde",
     "LGC": "lgc",
+    "LGC-V2": "lgc-v2",
     "GAME": "game",
     
     # SWE-bench aliases
@@ -502,6 +513,7 @@ DED_V2_factory = lambda mode=None: create_environment("ded-v2", mode=mode)
 ABD_V2_factory = lambda mode=None: create_environment("abd-v2", mode=mode)
 CDE_factory = lambda mode=None: create_environment("cde", mode=mode)
 LGC_factory = lambda mode=None: create_environment("lgc", mode=mode)
+LGC_V2_factory = lambda mode=None: create_environment("lgc-v2", mode=mode)
 GAME_factory = lambda mode=None: create_environment("game", mode=mode)
 SWE_PRO_factory = lambda mode=None: create_environment("swe-pro", mode=mode)
 
@@ -513,6 +525,7 @@ DED_V2 = DED_V2_factory
 ABD_V2 = ABD_V2_factory
 CDE = CDE_factory
 LGC = LGC_factory
+LGC_V2 = LGC_V2_factory
 GAME = GAME_factory
 
 # SWE-bench factories
