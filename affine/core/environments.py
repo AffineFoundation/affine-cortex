@@ -97,8 +97,8 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 7200,
         },
         proxy_timeout=7400,
-        cpu_limit="2000m",  # Basilica mode CPU limit
-        mem_limit="8Gi",   # Basilica mode memory limit
+        cpu_limit="2000m",
+        mem_limit="8g",
     ),
     
     # SWE-bench Pro environment (requires DOOD)
@@ -323,13 +323,18 @@ class SDKEnvironment:
             
             # Load environment
             logger.info(f"Loading environment: {self.env_name} (image={self.docker_image}, mode={mode}, hosts={hosts or 'local'}, mem_limit={self.config.mem_limit})")
-            
+
+            mem_limit = self.config.mem_limit
+            if mode == "basilica" and mem_limit.endswith("g"):
+                # Convert Docker format to Kubernetes format: 8g -> 8Gi
+                mem_limit = mem_limit.replace("g", "Gi")
+
             # Build load_env kwargs based on mode
             load_kwargs = {
                 "image": self.docker_image,
                 "mode": mode,
                 "env_vars": self._get_env_vars(),
-                "mem_limit": self.config.mem_limit,
+                "mem_limit": mem_limit,
                 "pull": True,
             }
             
