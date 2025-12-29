@@ -152,6 +152,7 @@ _ENV_ALIASES = {
     "CDE": "cde",
     "LGC": "lgc",
     "LGC-V2": "lgc-v2",
+    "LGC-v2": "lgc-v2",
     "GAME": "game",
     
     # SWE-bench aliases
