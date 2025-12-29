@@ -213,10 +213,11 @@ class TaskPoolManager:
             # Populate UUID cache with (pk, sk, assigned_at)
             async with self._cache_lock:
                 for task in assigned_tasks:
+                    assigned_at = task.get('assigned_at') or 0
                     self._uuid_cache[task['task_uuid']] = (
                         task['pk'],
                         task['sk'],
-                        task.get('assigned_at', 0)
+                        assigned_at
                     )
             
             elapsed = time.time() - start_time
@@ -272,7 +273,8 @@ class TaskPoolManager:
         timeout_tasks = []
         async with self._cache_lock:
             for task_uuid, (pk, sk, assigned_at) in list(self._uuid_cache.items()):
-                if assigned_at < timeout_threshold:
+                # Skip if assigned_at is None or 0 (invalid timestamp)
+                if assigned_at and assigned_at < timeout_threshold:
                     timeout_tasks.append((task_uuid, pk, sk))
         
         if not timeout_tasks:
@@ -446,7 +448,8 @@ class TaskPoolManager:
         
         # Cache location
         async with self._cache_lock:
-            self._uuid_cache[task_uuid] = (task['pk'], task['sk'], task.get('assigned_at', 0))
+            assigned_at = task.get('assigned_at') or 0
+            self._uuid_cache[task_uuid] = (task['pk'], task['sk'], assigned_at)
         
         return (task['pk'], task['sk'])
     
@@ -534,10 +537,11 @@ class TaskPoolManager:
             for result in assigned_results:
                 # Cache UUID location with assigned_at
                 async with self._cache_lock:
+                    assigned_at = result.get('assigned_at') or int(time.time())
                     self._uuid_cache[result['task_uuid']] = (
                         result['pk'],
                         result['sk'],
-                        result.get('assigned_at', int(time.time()))
+                        assigned_at
                     )
                 
                 # Enrich task with miner data from cache

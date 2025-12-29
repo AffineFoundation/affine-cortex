@@ -64,7 +64,7 @@
     "GAME": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.5,
+      "min_completeness": 0.7,
       "sampling_config": {
         "dataset_range": [[0, 400000000]],
         "sampling_count": 200,
