@@ -67,9 +67,6 @@ class ExecutorWorker:
         try:
             from affine.core.environments import SDKEnvironment
 
-            # Create SDK environment instance (reads mode from affinetes_hosts.json)
-            # Store the entire SDKEnvironment, not just the underlying _env
-            # This ensures we get Result objects instead of raw dicts
             self.env_executor = SDKEnvironment(self.env)
             
             # Log the mode being used
