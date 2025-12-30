@@ -17,9 +17,16 @@ from affine.core.models import (
 )
 
 # --------------------------------------------------------------------------- #
-#                   Miners (imported from miners module)                      #
+#                   Miners (lazy import to avoid CLI interference)            #
 # --------------------------------------------------------------------------- #
-from affine.core.miners import miners
+def miners(*args, **kwargs):
+    """Query miner information from blockchain.
+    
+    Lazy import wrapper to avoid bittensor CLI interference.
+    See affine.core.miners.miners for full documentation.
+    """
+    from affine.core.miners import miners as _miners
+    return _miners(*args, **kwargs)
 
 
 # --------------------------------------------------------------------------- #

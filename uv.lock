@@ -85,7 +85,7 @@ requires-dist = [
 [[package]]
 name = "affinetes"
 version = "0.1.0"
-source = { git = "https://github.com/AffineFoundation/affinetes.git#2ed51199f67c60c31820e69b409b28d1b62b8d36" }
+source = { git = "https://github.com/AffineFoundation/affinetes.git#22d6780a80dc141c35dda4d79ec0a007d485dd3a" }
 dependencies = [
     { name = "aiohttp" },
     { name = "docker" },

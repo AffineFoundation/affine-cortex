@@ -2,26 +2,34 @@
 """
 Affine Eval CLI Command
 
-Unified evaluation command supporting multiple modes:
+Unified evaluation command supporting multiple model source modes:
 1. --uid: Evaluate a registered miner by UID (fetches chute info from metagraph)
 2. --chute-slug: Evaluate via Chutes slug directly
 3. --chute-id: Evaluate via Chutes deployment ID (fetches slug via API)
 4. --base-url: Evaluate any model via custom base_url (local or remote)
 
-Only one of these options can be specified at a time.
+Only one of these model source options can be specified at a time.
+
+Execution modes (independent from model source):
+- Default: Docker mode - uses local persistent Docker containers
+- --basilica: Basilica mode - creates temporary cloud pods per evaluation
 
 Examples:
-    # Mode 1: By miner UID
-    af eval --env affine:ded-v2 --uid 7 --samples 10
+    # Mode 1: By miner UID (default Docker execution)
+    af eval --env affine:ded-v2 --uid 7 --samples 1
 
-    # Mode 2: By Chutes slug
-    af eval --env affine:ded-v2 --chute-slug my-model-abc123 --model deepseek-ai/DeepSeek-V3 --samples 5
+    # Mode 2: By Chutes slug (default Docker execution)
+    af eval --env affine:ded-v2 --chute-slug my-model-abc123 --model deepseek-ai/DeepSeek-V3 --samples 1
 
-    # Mode 3: By Chutes ID
-    af eval --env affine:ded-v2 --chute-id abc-123-def --model deepseek-ai/DeepSeek-V3 --samples 5
+    # Mode 3: By Chutes ID (default Docker execution)
+    af eval --env affine:ded-v2 --chute-id abc-123-def --model deepseek-ai/DeepSeek-V3 --samples 1
 
-    # Mode 4: By base URL (local inference server)
-    af eval --env affine:ded-v2 --base-url http://localhost:8000/v1 --model my-model --samples 5 --network-host
+    # Mode 4: By base URL with local inference server (requires --network-host)
+    af eval --env affine:ded-v2 --base-url http://localhost:8000/v1 --model my-model --samples 1 --network-host
+    
+    # Using Basilica cloud execution (requires BASILICA_API_TOKEN)
+    export BASILICA_API_TOKEN='your-token'
+    af eval --env GAME --uid 7 --task-id 502284834 --basilica
 """
 
 import asyncio
@@ -30,6 +38,8 @@ import os
 import sys
 import time
 import random
+from datetime import datetime
+from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
 import click
@@ -115,13 +125,19 @@ def get_available_environments() -> List[str]:
 @click.option(
     "--output", "-o",
     default=None,
-    help="Output file path for JSON results"
+    help="Output file path for JSON results (default: eval/results_yyyy_mm_dd_hh_mm_ss.json)"
 )
 @click.option(
     "--list-envs",
     is_flag=True,
     default=False,
     help="List all available environments and exit"
+)
+@click.option(
+    "--basilica",
+    is_flag=True,
+    default=False,
+    help="Use Basilica cloud execution (creates temporary pods, requires BASILICA_API_TOKEN). Default: Docker mode with persistent containers."
 )
 def eval_cmd(
     env: str,
@@ -138,10 +154,11 @@ def eval_cmd(
     network_host: bool,
     output: Optional[str],
     list_envs: bool,
+    basilica: bool,
 ):
     """Evaluate models on Affine environments.
     
-    Supports four mutually exclusive modes (only one can be specified):
+    MODEL SOURCE MODES (mutually exclusive, choose one):
     
     \b
     1. --uid        : Miner UID (fetches model/chute from metagraph)
@@ -151,12 +168,41 @@ def eval_cmd(
     
     For modes 2-4, --model is required to specify the model name.
     
-    For local inference servers, use --network-host to enable container access to localhost.
+    EXECUTION MODES (independent):
+    
+    \b
+    - Default       : Docker mode (persistent local containers)
+    - --basilica    : Basilica mode (temporary cloud pods, needs BASILICA_API_TOKEN)
+    
+    SPECIAL OPTIONS:
+    
+    \b
+    - --network-host: Required for --base-url with localhost servers
+    - --list-envs   : Show all available environments
     
     \b
     Examples:
-        af eval --env affine:ded-v2 --uid 7 --samples 10
-        af eval --env affine:ded-v2 --base-url http://localhost:8000/v1 --model my-model --network-host
+        # Evaluate miner UID 7 with 10 random samples
+        af eval --env GAME --uid 7 --samples 10
+        
+        # Evaluate specific task ID
+        af eval --env GAME --uid 7 --task-id 502284834
+        
+        # Evaluate task ID range (one sample per task)
+        af eval --env GAME --uid 7 --task-id-range 100 110
+        
+        # Evaluate using Chutes slug
+        af eval --env GAME --chute-slug my-model-abc123 --model deepseek-ai/DeepSeek-V3 --samples 5
+        
+        # Evaluate local model server (requires --network-host)
+        af eval --env GAME --base-url http://localhost:8000/v1 --model my-model --network-host
+        
+        # Evaluate using Basilica cloud execution
+        export BASILICA_API_TOKEN='your-token'
+        af eval --env GAME --uid 7 --task-id 502284834 --basilica
+        
+        # List available environments
+        af eval --list-envs
     """
     # Handle --list-envs
     if list_envs:
@@ -220,6 +266,7 @@ def eval_cmd(
         seed=seed,
         network_host=network_host,
         output=output,
+        basilica=basilica,
     ))
 
 
@@ -290,6 +337,7 @@ async def _run_evaluation(
     seed: Optional[int],
     network_host: bool,
     output: Optional[str],
+    basilica: bool,
 ):
     """Run the evaluation asynchronously."""
     load_dotenv()
@@ -325,6 +373,7 @@ async def _run_evaluation(
     click.echo(f"  Environment: {env}")
     click.echo(f"  Model: {resolved_model}")
     click.echo(f"  Base URL: {resolved_url}")
+    click.echo(f"  Execution Mode: {'Basilica (temporary pods)' if basilica else 'Docker (persistent containers)'}")
     if task_id is not None:
         click.echo(f"  Task ID: {task_id}")
     if task_id_range is not None:
@@ -340,7 +389,7 @@ async def _run_evaluation(
     try:
         # Create environment instance
         click.echo(f"\nLoading {env} environment...")
-        env_instance = _create_environment(env, network_host)
+        env_instance = _create_environment(env, network_host, basilica)
         click.echo("✓ Environment loaded")
         
         # Run evaluation based on mode
@@ -393,14 +442,22 @@ async def _run_evaluation(
         if seed is not None:
             summary["seed"] = seed
         
-        # Save to file if specified
-        if output:
-            try:
-                with open(output, "w", encoding="utf-8") as f:
-                    json.dump(summary, f, indent=2, ensure_ascii=False)
-                click.echo(f"\n✓ Results saved to: {output}")
-            except Exception as e:
-                click.echo(f"\n✗ Failed to save results: {e}")
+        # Generate default output path if not specified
+        if output is None:
+            timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+            output = f"eval/results_{timestamp}.json"
+        
+        # Save to file
+        try:
+            # Ensure parent directory exists
+            output_path = Path(output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(output_path, "w", encoding="utf-8") as f:
+                json.dump(summary, f, indent=2, ensure_ascii=False)
+            click.echo(f"\n✓ Results saved to: {output}")
+        except Exception as e:
+            click.echo(f"\n✗ Failed to save results: {e}")
         
         # Print summary
         click.echo("\n" + "=" * 60)
@@ -436,9 +493,9 @@ async def _run_evaluation(
         sys.exit(1)
 
 
-def _create_environment(env_name: str, network_host: bool = False):
-    """Create environment instance with optional network_host mode."""
-    from affine.core.environments import ENV_CONFIGS
+def _create_environment(env_name: str, network_host: bool = False, basilica: bool = False):
+    """Create environment instance with optional network_host and basilica mode."""
+    from affine.core.environments import ENV_CONFIGS, convert_memory_format
     from affine.core.setup import logger
     import affinetes as af_env
     
@@ -457,28 +514,52 @@ def _create_environment(env_name: str, network_host: bool = False):
     
     env_vars.update(config.env_vars)
     
+    # Choose execution mode
+    mode = "basilica" if basilica else "docker"
+    
+    # Convert memory format for the selected mode
+    mem_limit = convert_memory_format(config.mem_limit, mode)
+    
     load_kwargs = {
         "image": config.docker_image,
-        "mode": "docker",
-        "replicas": 1,
+        "mode": mode,
         "env_vars": env_vars,
-        "hosts": ["localhost"],
-        "container_name": config.name.replace(":", "-") + "-eval",
-        "mem_limit": config.mem_limit,
-        "pull": True,
-        "force_recreate": True,
+        "mem_limit": mem_limit,
     }
     
-    # Add volumes if configured
-    if config.volumes:
-        load_kwargs["volumes"] = config.volumes
+    # Mode-specific parameters
+    if mode == "docker":
+        load_kwargs.update({
+            "replicas": 1,
+            "hosts": ["localhost"],
+            "container_name": config.name.replace(":", "-") + "-eval",
+            "pull": True,
+            "force_recreate": True,
+        })
+        
+        # Add volumes if configured
+        if config.volumes:
+            load_kwargs["volumes"] = config.volumes
+        
+        # Add network_mode for host network access
+        if network_host:
+            load_kwargs["network_mode"] = "host"
+            logger.info(f"Using host network mode for {env_name}")
     
-    # Add network_mode for host network access
-    if network_host:
-        load_kwargs["network_mode"] = "host"
-        logger.info(f"Using host network mode for {env_name}")
+    elif mode == "basilica":
+        # Basilica mode uses cpu_limit and requires BASILICA_API_TOKEN
+        if not os.getenv("BASILICA_API_TOKEN"):
+            raise ValueError(
+                "BASILICA_API_TOKEN environment variable is required for --basilica mode. "
+                "Set it with: export BASILICA_API_TOKEN='your-token'"
+            )
+        
+        if hasattr(config, 'cpu_limit') and config.cpu_limit:
+            load_kwargs["cpu_limit"] = config.cpu_limit
+        
+        logger.info(f"Using Basilica mode for {env_name} (temporary pods)")
     
-    logger.info(f"Loading environment: {env_name} (image={config.docker_image}, network_host={network_host})")
+    logger.info(f"Loading environment: {env_name} (mode={mode}, image={config.docker_image})")
     
     env = af_env.load_env(**load_kwargs)
     return _EnvironmentWrapper(env, config)

@@ -21,6 +21,38 @@ _ENV_CACHE: Dict[str, Any] = {}
 _ENV_LOCK = Lock()
 
 
+# ========================= Utility Functions =========================
+
+def convert_memory_format(mem_limit: str, mode: str) -> str:
+    """Convert memory format between Docker and Kubernetes formats.
+    
+    Docker format: 10g, 8g, 512m
+    Kubernetes format: 10Gi, 8Gi, 512Mi
+    
+    Args:
+        mem_limit: Memory limit string
+        mode: Execution mode ('docker' or 'basilica')
+        
+    Returns:
+        Converted memory limit string
+        
+    Examples:
+        >>> convert_memory_format("10g", "docker")
+        "10g"
+        >>> convert_memory_format("10g", "basilica")
+        "10Gi"
+        >>> convert_memory_format("512m", "basilica")
+        "512Mi"
+    """
+    if mode == "basilica":
+        # Convert Docker format to Kubernetes format
+        if mem_limit.endswith("g"):
+            return mem_limit.replace("g", "Gi")
+        elif mem_limit.endswith("m"):
+            return mem_limit.replace("m", "Mi")
+    return mem_limit
+
+
 # ========================= Configuration =========================
 
 @dataclass
@@ -336,10 +368,8 @@ class SDKEnvironment:
             # Load environment
             logger.info(f"Loading environment: {self.env_name} (image={self.docker_image}, mode={mode}, hosts={hosts or 'local'}, mem_limit={self.config.mem_limit})")
 
-            mem_limit = self.config.mem_limit
-            if mode == "basilica" and mem_limit.endswith("g"):
-                # Convert Docker format to Kubernetes format: 8g -> 8Gi
-                mem_limit = mem_limit.replace("g", "Gi")
+            # Convert memory format for the selected mode
+            mem_limit = convert_memory_format(self.config.mem_limit, mode)
 
             # Build load_env kwargs based on mode
             load_kwargs = {

@@ -4,7 +4,6 @@ import time
 import textwrap
 from typing import Any, Dict, Optional
 from pydantic import BaseModel, Field
-import bittensor as bt
 
 __version__ = "0.0.0"
 
@@ -90,6 +89,7 @@ class SampleSubmission(BaseModel):
             True if signature is valid
         """
         try:
+            import bittensor as bt
             keypair = bt.Keypair(ss58_address=hotkey)
             sign_data = self.get_sign_data()
             signature_bytes = bytes.fromhex(self.signature)
