@@ -119,6 +119,7 @@ _ENV_CONFIGS_CANONICAL = {
             "temperature": 0.0,
             "timeout": 1200,
         },
+        proxy_timeout=1300,
     ),
     "lgc-v2": EnvConfig(
         name="lgc-v2",
@@ -129,6 +130,7 @@ _ENV_CONFIGS_CANONICAL = {
             "temperature": 0.0,
             "timeout": 1200,
         },
+        proxy_timeout=1300,
     ),
     "game": EnvConfig(
         name="game",
