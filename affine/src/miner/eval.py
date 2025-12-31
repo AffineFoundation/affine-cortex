@@ -139,6 +139,18 @@ def get_available_environments() -> List[str]:
     default=False,
     help="Use Basilica cloud execution (creates temporary pods, requires BASILICA_API_TOKEN). Default: Docker mode with persistent containers."
 )
+@click.option(
+    "--delay",
+    type=float,
+    default=0.0,
+    help="Delay in seconds between evaluations to avoid rate limiting (default: 0.0)"
+)
+@click.option(
+    "--max-retries",
+    type=int,
+    default=3,
+    help="Maximum retries on timeout/rate-limit errors (default: 3)"
+)
 def eval_cmd(
     env: str,
     uid: Optional[int],
@@ -155,6 +167,8 @@ def eval_cmd(
     output: Optional[str],
     list_envs: bool,
     basilica: bool,
+    delay: float,
+    max_retries: int,
 ):
     """Evaluate models on Affine environments.
     
@@ -267,6 +281,8 @@ def eval_cmd(
         network_host=network_host,
         output=output,
         basilica=basilica,
+        delay=delay,
+        max_retries=max_retries,
     ))
 
 
@@ -338,6 +354,8 @@ async def _run_evaluation(
     network_host: bool,
     output: Optional[str],
     basilica: bool,
+    delay: float,
+    max_retries: int,
 ):
     """Run the evaluation asynchronously."""
     load_dotenv()
@@ -402,6 +420,8 @@ async def _run_evaluation(
                 task_id_start=task_id_range[0],
                 task_id_end=task_id_range[1],
                 temperature=temperature,
+                delay=delay,
+                max_retries=max_retries,
             )
         else:
             # Single/multi-sample mode
@@ -413,6 +433,8 @@ async def _run_evaluation(
                 task_id=task_id,
                 seed=seed,
                 temperature=temperature,
+                delay=delay,
+                max_retries=max_retries,
             )
         
         # Calculate summary
@@ -585,6 +607,61 @@ class _EnvironmentWrapper:
         return result
 
 
+def _is_retryable_error(error: Exception) -> bool:
+    """Check if an error is retryable (timeout/rate-limit related)."""
+    error_str = str(error).lower()
+    return any(keyword in error_str for keyword in [
+        "504", "timeout", "rate", "limit", "429", "too many", "upstream"
+    ])
+
+
+async def _evaluate_with_retry(
+    env_instance: _EnvironmentWrapper,
+    eval_kwargs: Dict[str, Any],
+    max_retries: int,
+    sample_num: int,
+    total_samples: int,
+) -> Dict[str, Any]:
+    """Evaluate with retry logic for rate-limit/timeout errors."""
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            start_time = time.monotonic()
+            result = await env_instance.evaluate(**eval_kwargs)
+            latency = time.monotonic() - start_time
+
+            # Convert result to dict
+            if hasattr(result, "model_dump"):
+                result_dict = result.model_dump()
+            elif hasattr(result, "dict"):
+                result_dict = result.dict()
+            elif isinstance(result, dict):
+                result_dict = result
+            else:
+                result_dict = {"raw": str(result)}
+
+            result_dict["latency_seconds"] = latency
+            result_dict["task_id"] = eval_kwargs.get("task_id")
+            result_dict["success"] = True
+
+            if attempt > 0:
+                click.echo(f" (succeeded on retry {attempt})", nl=False)
+
+            return result_dict
+
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries and _is_retryable_error(e):
+                backoff = min(30, (2 ** attempt) * 5)  # 5s, 10s, 20s, max 30s
+                click.echo(f"\n  Retry {attempt + 1}/{max_retries} in {backoff}s (error: {type(e).__name__})", nl=False)
+                await asyncio.sleep(backoff)
+            else:
+                raise
+
+    raise last_error
+
+
 async def _evaluate_samples(
     env_instance: _EnvironmentWrapper,
     model: str,
@@ -593,48 +670,46 @@ async def _evaluate_samples(
     task_id: Optional[int],
     seed: Optional[int],
     temperature: float,
+    delay: float,
+    max_retries: int,
 ) -> List[Dict[str, Any]]:
-    """Evaluate multiple samples."""
+    """Evaluate multiple samples with delay and retry support."""
     results = []
-    
-    click.echo(f"\nStarting evaluation ({samples} sample(s))...")
-    
+
+    delay_msg = f", delay={delay}s" if delay > 0 else ""
+    click.echo(f"\nStarting evaluation ({samples} sample(s){delay_msg})...")
+
     for i in range(samples):
         click.echo(f"\rProgress: {i+1}/{samples}", nl=False)
-        
+
         eval_kwargs = {
             "model": model,
             "base_url": base_url,
             "temperature": temperature,
         }
-        
+
         # Set task_id (generate random if not specified)
         if task_id is not None:
             eval_kwargs["task_id"] = task_id
         else:
             eval_kwargs["task_id"] = random.randint(0, 10000)
-        
+
         if seed is not None:
             eval_kwargs["seed"] = seed
-        
-        start_time = time.monotonic()
-        result = await env_instance.evaluate(**eval_kwargs)
-        latency = time.monotonic() - start_time
-        
-        # Convert result to dict
-        if hasattr(result, "model_dump"):
-            result_dict = result.model_dump()
-        elif hasattr(result, "dict"):
-            result_dict = result.dict()
-        elif isinstance(result, dict):
-            result_dict = result
-        else:
-            result_dict = {"raw": str(result)}
-        
-        result_dict["latency_seconds"] = latency
-        result_dict["task_id"] = eval_kwargs["task_id"]
+
+        result_dict = await _evaluate_with_retry(
+            env_instance=env_instance,
+            eval_kwargs=eval_kwargs,
+            max_retries=max_retries,
+            sample_num=i + 1,
+            total_samples=samples,
+        )
         results.append(result_dict)
-    
+
+        # Apply delay between evaluations (except after last one)
+        if delay > 0 and i < samples - 1:
+            await asyncio.sleep(delay)
+
     click.echo()  # New line after progress
     return results
 
@@ -646,41 +721,39 @@ async def _evaluate_range(
     task_id_start: int,
     task_id_end: int,
     temperature: float,
+    delay: float,
+    max_retries: int,
 ) -> List[Dict[str, Any]]:
-    """Evaluate across a range of task IDs (one sample per task)."""
+    """Evaluate across a range of task IDs with delay and retry support."""
     results = []
-    
+
     task_count = task_id_end - task_id_start + 1
-    click.echo(f"\nStarting evaluation ({task_count} tasks)...")
-    
+    delay_msg = f", delay={delay}s" if delay > 0 else ""
+    click.echo(f"\nStarting evaluation ({task_count} tasks{delay_msg})...")
+
     for idx, task_id in enumerate(range(task_id_start, task_id_end + 1)):
         click.echo(f"\rProgress: {idx+1}/{task_count} (Task {task_id})", nl=False)
-        
+
         eval_kwargs = {
             "model": model,
             "base_url": base_url,
             "temperature": temperature,
             "task_id": task_id,
         }
-        
-        start_time = time.monotonic()
-        result = await env_instance.evaluate(**eval_kwargs)
-        latency = time.monotonic() - start_time
-        
-        # Convert result to dict
-        if hasattr(result, "model_dump"):
-            result_dict = result.model_dump()
-        elif hasattr(result, "dict"):
-            result_dict = result.dict()
-        elif isinstance(result, dict):
-            result_dict = result
-        else:
-            result_dict = {"raw": str(result)}
-        
-        result_dict["latency_seconds"] = latency
-        result_dict["task_id"] = task_id
+
+        result_dict = await _evaluate_with_retry(
+            env_instance=env_instance,
+            eval_kwargs=eval_kwargs,
+            max_retries=max_retries,
+            sample_num=idx + 1,
+            total_samples=task_count,
+        )
         results.append(result_dict)
-    
+
+        # Apply delay between evaluations (except after last one)
+        if delay > 0 and idx < task_count - 1:
+            await asyncio.sleep(delay)
+
     click.echo()  # New line after progress
     return results
 
