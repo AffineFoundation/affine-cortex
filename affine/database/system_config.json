@@ -2,8 +2,8 @@
   "validator_burn_percentage": 0.0,
   "environments": {
     "affine:ded-v2": {
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
       "min_completeness": 0.9,
       "sampling_config": {
         "dataset_range": [[0, 23302]],
@@ -25,9 +25,21 @@
         "rotation_interval": 3600
       }
     },
-    "CDE": {
+    "PRINT": {
       "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
+      "enabled_for_scoring": false,
+      "min_completeness": 0.9,
+      "sampling_config": {
+        "dataset_range": [[0, 23302]],
+        "sampling_count": 200,
+        "rotation_enabled": false,
+        "rotation_count": 5,
+        "rotation_interval": 3600
+      }
+    },
+    "CDE": {
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
       "min_completeness": 0.9,
       "sampling_config": {
         "dataset_range": [[0, 8580]],
@@ -38,26 +50,26 @@
       }
     },
     "LGC": {
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
       "min_completeness": 0.9,
       "sampling_config": {
         "dataset_range": [[0, 1080979]],
         "sampling_count": 800,
         "rotation_enabled": true,
-        "rotation_count": 10,
+        "rotation_count": 0,
         "rotation_interval": 3600
       }
     },
     "LGC-v2": {
       "enabled_for_sampling": true,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
+      "enabled_for_scoring": true,
+      "min_completeness": 0.5,
       "sampling_config": {
-        "dataset_range": [[0, 199999999]],
-        "sampling_count": 500,
-        "rotation_enabled": false,
-        "rotation_count": 0,
+        "dataset_range": [[0, 399999999]],
+        "sampling_count": 700,
+        "rotation_enabled": true,
+        "rotation_count": 10,
         "rotation_interval": 3600
       }
     },
@@ -78,8 +90,8 @@
       "enabled_for_scoring": true,
       "min_completeness": 0.8,
       "sampling_config": {
-        "dataset_range": [[0, 500000000]],
-        "sampling_count": 230,
+        "dataset_range": [[0, 600000000]],
+        "sampling_count": 250,
         "rotation_enabled": true,
         "rotation_count": 1,
         "rotation_interval": 3600

@@ -165,6 +165,15 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=2000,
     ),
+    "print": EnvConfig(
+        name="print",
+        docker_image="affinefoundation/cde:print",
+        env_vars={"UVICORN_WORKERS": "15"},
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 600,
+        },
+    ),
 }
 
 # Alias mappings (multiple names can map to the same canonical config)
@@ -191,6 +200,9 @@ _ENV_ALIASES = {
     
     # SWE-bench aliases
     "SWE-PRO": "swe-pro",
+    
+    # Print aliases
+    "PRINT": "print",
 }
 
 # Build final ENV_CONFIGS with aliases
@@ -549,6 +561,7 @@ LGC_factory = lambda mode=None: create_environment("lgc", mode=mode)
 LGC_V2_factory = lambda mode=None: create_environment("lgc-v2", mode=mode)
 GAME_factory = lambda mode=None: create_environment("game", mode=mode)
 SWE_PRO_factory = lambda mode=None: create_environment("swe-pro", mode=mode)
+PRINT_factory = lambda mode=None: create_environment("print", mode=mode)
 
 # Legacy class aliases
 SAT = SAT_factory
@@ -560,6 +573,7 @@ CDE = CDE_factory
 LGC = LGC_factory
 LGC_V2 = LGC_V2_factory
 GAME = GAME_factory
+PRINT = PRINT_factory
 
 # SWE-bench factories
 SWE_PRO = SWE_PRO_factory
