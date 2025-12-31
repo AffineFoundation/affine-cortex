@@ -188,7 +188,41 @@ async def get_sample_by_uid(
         )
 
 
-# Conditionally register get-pool endpoint based on SERVICES_ENABLED
+@router.get("/scoring", dependencies=[Depends(rate_limit_scoring)])
+async def get_scoring_data(
+    range_type: str = Query(
+        "scoring",
+        regex="^(scoring|sampling)$",
+        description="Range type: 'scoring' for scoring_range or 'sampling' for sampling_range"
+    )
+):
+    """
+    Get scoring data for all valid miners.
+    
+    Query Parameters:
+    - range_type: Type of range to use ('scoring' or 'sampling', default: 'scoring')
+    
+    Uses proactive cache with background refresh.
+    - Startup: Cache prewarmed
+    - Runtime: Background refresh every 20 minutes
+    - Access: Always returns hot cache (< 100ms)
+    """
+    from affine.api.services.scoring_cache import get_cached_data
+    
+    try:
+        return await get_cached_data(range_type=range_type)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get scoring data: {str(e)}"
+        )
+
+
+# ============================================================================
+# Internal Service Endpoints (SERVICES_ENABLED only)
+# ============================================================================
+
+# Conditionally register internal endpoints based on SERVICES_ENABLED
 if config.SERVICES_ENABLED:
     @router.get("/pool/uid/{uid}/{env}", dependencies=[Depends(rate_limit_read)])
     async def get_task_pool(
@@ -313,33 +347,3 @@ if config.SERVICES_ENABLED:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Failed to retrieve task pool: {str(e)}"
             )
-
-
-@router.get("/scoring", dependencies=[Depends(rate_limit_scoring)])
-async def get_scoring_data(
-    range_type: str = Query(
-        "scoring",
-        regex="^(scoring|sampling)$",
-        description="Range type: 'scoring' for scoring_range or 'sampling' for sampling_range"
-    )
-):
-    """
-    Get scoring data for all valid miners.
-    
-    Query Parameters:
-    - range_type: Type of range to use ('scoring' or 'sampling', default: 'scoring')
-    
-    Uses proactive cache with background refresh.
-    - Startup: Cache prewarmed
-    - Runtime: Background refresh every 20 minutes
-    - Access: Always returns hot cache (< 100ms)
-    """
-    from affine.api.services.scoring_cache import get_cached_data
-    
-    try:
-        return await get_cached_data(range_type=range_type)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get scoring data: {str(e)}"
-        )
