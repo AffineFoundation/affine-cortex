@@ -188,7 +188,7 @@ async def get_sample_by_uid(
         )
 
 
-# Only enable get-pool endpoint for internal services (SERVICES_ENABLED=true)
+# Conditionally register get-pool endpoint based on SERVICES_ENABLED
 if config.SERVICES_ENABLED:
     @router.get("/pool/uid/{uid}/{env}", dependencies=[Depends(rate_limit_read)])
     async def get_task_pool(
