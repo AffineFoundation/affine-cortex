@@ -81,8 +81,8 @@ class SubtensorWrapper:
                     if self._subtensor:
                         try:
                             await self._subtensor.close()
-                        except:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"Error closing subtensor during reconnection: {e}")
                         self._subtensor = None
 
                     self._subtensor = await self._create_connection()
