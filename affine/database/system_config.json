@@ -27,13 +27,13 @@
     },
     "PRINT": {
       "enabled_for_sampling": true,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
+      "enabled_for_scoring": true,
+      "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 23302]],
-        "sampling_count": 200,
-        "rotation_enabled": false,
-        "rotation_count": 5,
+        "sampling_count": 240,
+        "rotation_enabled": true,
+        "rotation_count": 3,
         "rotation_interval": 3600
       }
     },
@@ -64,10 +64,10 @@
     "LGC-v2": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.5,
+      "min_completeness": 0.7,
       "sampling_config": {
         "dataset_range": [[0, 399999999]],
-        "sampling_count": 700,
+        "sampling_count": 500,
         "rotation_enabled": true,
         "rotation_count": 10,
         "rotation_interval": 3600
