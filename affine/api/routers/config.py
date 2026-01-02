@@ -59,11 +59,17 @@ async def get_config(key: str):
         raise HTTPException(status_code=404, detail=f"Config '{key}' not found")
 
     # Filter out sampling_list from environments config
-    if key == "environments" and config.get("value"):
+    if key == "environments" and config.get("param_value"):
         filtered_envs = {}
-        for env_name, env_config in config["value"].items():
+        for env_name, env_config in config["param_value"].items():
             filtered_config = {k: v for k, v in env_config.items() if k != "sampling_list"}
+            # Also filter sampling_list from nested sampling_config
+            if "sampling_config" in filtered_config and isinstance(filtered_config["sampling_config"], dict):
+                filtered_config["sampling_config"] = {
+                    k: v for k, v in filtered_config["sampling_config"].items()
+                    if k != "sampling_list"
+                }
             filtered_envs[env_name] = filtered_config
-        config["value"] = filtered_envs
+        config["param_value"] = filtered_envs
 
     return config
