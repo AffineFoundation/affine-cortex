@@ -27,6 +27,7 @@ from affine.database.dao.sample_results import SampleResultsDAO
 from affine.utils.subtensor import get_subtensor
 
 from affine.core.setup import logger
+from affine.core.environments import ENV_CONFIGS
 
 
 T = TypeVar('T')
@@ -147,9 +148,9 @@ class TaskPoolManager:
             name="block_number"
         )
         
-        # UUID location cache: task_uuid -> (pk, sk, assigned_at)
-        # assigned_at is used for timeout detection without DB query
-        self._uuid_cache: Dict[str, Tuple[str, str, int]] = {}
+        # UUID location cache: task_uuid -> (pk, sk, assigned_at, env)
+        # assigned_at and env are used for timeout detection without DB query
+        self._uuid_cache: Dict[str, Tuple[str, str, int, str]] = {}
         self._cache_lock = asyncio.Lock()
         
         # Warmup flag
@@ -210,14 +211,16 @@ class TaskPoolManager:
             # Preload all assigned tasks into UUID cache via DAO
             assigned_tasks = await self.dao.get_all_assigned_tasks()
             
-            # Populate UUID cache with (pk, sk, assigned_at)
+            # Populate UUID cache with (pk, sk, assigned_at, env)
             async with self._cache_lock:
                 for task in assigned_tasks:
                     assigned_at = task.get('assigned_at') or 0
+                    env = task.get('env', '')
                     self._uuid_cache[task['task_uuid']] = (
                         task['pk'],
                         task['sk'],
-                        assigned_at
+                        assigned_at,
+                        env
                     )
             
             elapsed = time.time() - start_time
@@ -254,27 +257,36 @@ class TaskPoolManager:
             lambda: self.dao.get_pool_stats(env)
         )
     
-    async def reset_timeout_tasks(self, timeout_seconds: int = 600) -> int:
+    async def reset_timeout_tasks(self) -> int:
         """Reset timeout assigned tasks using in-memory cache.
         
         Uses UUID cache to detect timeout tasks without DB scan.
-        This is much more efficient than scanning the entire task_pool table.
+        Each task's timeout is determined by its environment's eval_params.timeout config.
         
-        Args:
-            timeout_seconds: Timeout threshold in seconds
-            
         Returns:
             Number of tasks reset
         """
         current_time = int(time.time())
-        timeout_threshold = current_time - timeout_seconds
         
         # Find timeout tasks from cache
         timeout_tasks = []
         async with self._cache_lock:
-            for task_uuid, (pk, sk, assigned_at) in list(self._uuid_cache.items()):
+            for task_uuid, (pk, sk, assigned_at, env) in list(self._uuid_cache.items()):
                 # Skip if assigned_at is None or 0 (invalid timestamp)
-                if assigned_at and assigned_at < timeout_threshold:
+                if not assigned_at:
+                    continue
+                
+                # Get timeout from environment config
+                env_config = ENV_CONFIGS.get(env)
+                if not env_config:
+                    logger.warning(f"Unknown environment {env} for task {task_uuid}, skipping")
+                    continue
+                
+                timeout_seconds = env_config.eval_params['timeout']
+                
+                # Check if task has timed out
+                timeout_threshold = current_time - timeout_seconds
+                if assigned_at < timeout_threshold:
                     timeout_tasks.append((task_uuid, pk, sk))
         
         if not timeout_tasks:
@@ -372,15 +384,17 @@ class TaskPoolManager:
             return
         
         async def cleanup_loop():
-            """Background loop for timeout task cleanup."""
-            cleanup_interval = int(os.getenv('TASK_TIMEOUT_CLEANUP_INTERVAL', '300'))  # 5 minutes
-            task_timeout = int(os.getenv('TASK_TIMEOUT', '1800'))  # 10 minutes
+            """Background loop for timeout task cleanup.
             
-            logger.info(f"Timeout cleanup loop started (interval={cleanup_interval}s, timeout={task_timeout}s)")
+            Each task's timeout is determined by its environment's eval_params.timeout config.
+            """
+            cleanup_interval = int(os.getenv('TASK_TIMEOUT_CLEANUP_INTERVAL', '300'))  # 5 minutes
+            
+            logger.info(f"Timeout cleanup loop started (interval={cleanup_interval}s, per-env timeout)")
             
             while True:
                 try:
-                    await self.reset_timeout_tasks(timeout_seconds=task_timeout)
+                    await self.reset_timeout_tasks()
                     await asyncio.sleep(cleanup_interval)
                 except asyncio.CancelledError:
                     logger.info("Timeout cleanup loop cancelled")
@@ -449,7 +463,8 @@ class TaskPoolManager:
         # Cache location
         async with self._cache_lock:
             assigned_at = task.get('assigned_at') or 0
-            self._uuid_cache[task_uuid] = (task['pk'], task['sk'], assigned_at)
+            env = task.get('env', '')
+            self._uuid_cache[task_uuid] = (task['pk'], task['sk'], assigned_at, env)
         
         return (task['pk'], task['sk'])
     
@@ -535,13 +550,15 @@ class TaskPoolManager:
             
             assigned_tasks = []
             for result in assigned_results:
-                # Cache UUID location with assigned_at
+                # Cache UUID location with assigned_at and env
                 async with self._cache_lock:
                     assigned_at = result.get('assigned_at') or int(time.time())
+                    env = result.get('env', '')
                     self._uuid_cache[result['task_uuid']] = (
                         result['pk'],
                         result['sk'],
-                        assigned_at
+                        assigned_at,
+                        env
                     )
                 
                 # Enrich task with miner data from cache
