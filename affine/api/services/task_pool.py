@@ -553,12 +553,12 @@ class TaskPoolManager:
                 # Cache UUID location with assigned_at and env
                 async with self._cache_lock:
                     assigned_at = result.get('assigned_at') or int(time.time())
-                    env = result.get('env', '')
+                    task_env = result.get('env', '')
                     self._uuid_cache[result['task_uuid']] = (
                         result['pk'],
                         result['sk'],
                         assigned_at,
-                        env
+                        task_env
                     )
                 
                 # Enrich task with miner data from cache
