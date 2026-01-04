@@ -146,43 +146,68 @@ def geometric_mean(values: List[float]) -> float:
 
 def calculate_required_score(
     prior_score: float,
-    error_rate_reduction: float = 0.2,
+    prior_sample_count: int,
+    z_score: float = 1.5,
     min_improvement: float = 0.02,
-    max_improvement: float = 0.1
+    max_improvement: float = 0.10
 ) -> float:
-    """Calculate required score to beat prior.
-    
-    The threshold is calculated as: prior_score + improvement_delta
-    where improvement_delta is determined by:
-    1. Error rate reduction: (1 - prior_score) × error_rate_reduction
-    2. Minimum improvement: min_improvement
-    3. Maximum improvement cap: max_improvement
-    
-    Final formula: prior_score + min(max(err_delta, min_improvement), max_improvement)
-    
+    """Calculate required score threshold using statistical confidence intervals.
+
+    Uses standard error (SE) to adjust threshold based on sample size:
+    - More samples → smaller SE → smaller gap → easier to beat
+    - Fewer samples → larger SE → larger gap → harder to beat
+
+    Formula:
+        SE = sqrt(p * (1-p) / n)
+        gap = z * SE
+        gap = max(gap, min_improvement)  # floor
+        gap = min(gap, max_improvement)  # ceiling
+        threshold = prior_score + gap
+
     Args:
         prior_score: Score of the earlier miner (0.0 to 1.0)
-        error_rate_reduction: Required error rate reduction ratio (default: 0.2 for 20%)
-        min_improvement: Minimum absolute improvement required (default: 0.02)
-        max_improvement: Maximum improvement cap (default: 0.1 for 10%)
-        
+        prior_sample_count: Number of samples for prior score
+        z_score: Z-score for confidence level (default: 1.5 ≈ 87% confidence)
+        min_improvement: Minimum gap to prevent noise (default: 0.02 = 2%)
+        max_improvement: Maximum gap cap (default: 0.10 = 10%)
+
     Returns:
-        Required score to dominate the prior miner
-        
+        Required score threshold to beat the prior miner
+
     Examples:
-        prior=0.09, err_red=0.2, min_imp=0.02, max_imp=0.1
-        -> err_delta = (1-0.09)*0.2 = 0.182
-        -> improvement = min(max(0.182, 0.02), 0.1) = 0.1
-        -> threshold = 0.09 + 0.1 = 0.19 (19%)
+        prior=0.5, n=100, z=1.5:
+        -> se = sqrt(0.5*0.5/100) = 0.05
+        -> gap = 1.5 * 0.05 = 0.075 (7.5%)
+        -> threshold = 0.5 + 0.075 = 0.575
+
+        prior=0.5, n=500, z=1.5:
+        -> se = sqrt(0.5*0.5/500) ≈ 0.0224
+        -> gap = 1.5 * 0.0224 ≈ 0.0336 (3.36%)
+        -> threshold = 0.5 + 0.0336 = 0.5336
+
+        prior=0.5, n=50, z=1.5:
+        -> se = sqrt(0.5*0.5/50) ≈ 0.0707
+        -> gap = 1.5 * 0.0707 ≈ 0.106 → capped to 0.10
+        -> threshold = 0.5 + 0.10 = 0.60
     """
-    # Calculate error rate reduction delta
-    error_delta = (1.0 - prior_score) * error_rate_reduction
-    
-    # Choose improvement: max of error_delta and min_improvement, capped by max_improvement
-    improvement = min(max(error_delta, min_improvement), max_improvement)
-    
-    # Final threshold, capped at 1.0
-    return min(prior_score + improvement, 1.0)
+    # Handle edge case: no samples
+    if prior_sample_count <= 0:
+        # Use maximum gap for zero samples (least confident)
+        gap = max_improvement
+    else:
+        # Calculate standard error
+        p = prior_score
+        se = math.sqrt(p * (1.0 - p) / prior_sample_count)
+
+        # Calculate gap from standard error
+        gap = z_score * se
+
+        # Apply bounds: gap must be in [min_improvement, max_improvement]
+        gap = max(gap, min_improvement)
+        gap = min(gap, max_improvement)
+
+    # Calculate final threshold, capped at 1.0
+    return min(prior_score + gap, 1.0)
 
 
 def normalize_weights(weights: Dict[int, float]) -> Dict[int, float]:

@@ -32,12 +32,11 @@ class Stage2ParetoFilter:
     
     def __init__(self, config: ScorerConfig = ScorerConfig):
         """Initialize Stage 2 Pareto filter.
-        
+
         Args:
             config: Scorer configuration (defaults to global config)
         """
         self.config = config
-        self.error_rate_reduction = config.ERROR_RATE_REDUCTION
         self.score_precision = config.SCORE_PRECISION
     
     def filter(
