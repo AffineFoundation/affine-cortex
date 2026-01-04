@@ -98,6 +98,16 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 600,
         },
     ),
+    "affine:arc-gen": EnvConfig(
+        name="affine:arc-gen",
+        docker_image="affinefoundation/arc-gen:v1",
+        env_vars={"UVICORN_WORKERS": "10"},
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 600,
+            "num_train": 3,
+        },
+    ),
     
     # PrimeIntellect environments (no task_type)
     "cde": EnvConfig(
@@ -187,6 +197,12 @@ _ENV_ALIASES = {
     "affine:ded": "affine:ded-v2",
     "ded": "affine:ded-v2",
     "ded-v2": "affine:ded-v2",
+
+    # ARC-GEN aliases
+    "arc-gen": "affine:arc-gen",
+    "arc_gen": "affine:arc-gen",
+    "ARC-GEN": "affine:arc-gen",
+    "ARC_GEN": "affine:arc-gen",
     
     # SAT aliases
     "sat": "affine:sat",
@@ -562,6 +578,7 @@ LGC_V2_factory = lambda mode=None: create_environment("lgc-v2", mode=mode)
 GAME_factory = lambda mode=None: create_environment("game", mode=mode)
 SWE_PRO_factory = lambda mode=None: create_environment("swe-pro", mode=mode)
 PRINT_factory = lambda mode=None: create_environment("print", mode=mode)
+ARC_GEN_factory = lambda mode=None: create_environment("arc-gen", mode=mode)
 
 # Legacy class aliases
 SAT = SAT_factory
@@ -574,6 +591,7 @@ LGC = LGC_factory
 LGC_V2 = LGC_V2_factory
 GAME = GAME_factory
 PRINT = PRINT_factory
+ARC_GEN = ARC_GEN_factory
 
 # SWE-bench factories
 SWE_PRO = SWE_PRO_factory
