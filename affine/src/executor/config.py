@@ -6,6 +6,7 @@ Executor configuration for different environments
 ENV_MAX_CONCURRENT = {
     "LGC": 90,
     "GAME": 180,
+    "LGC-v2": 120,
 }
 
 # Default max concurrent tasks if environment not found in config

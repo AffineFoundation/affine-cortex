@@ -125,12 +125,12 @@ _ENV_CONFIGS_CANONICAL = {
         name="lgc-v2",
         mem_limit="20g",
         docker_image="affinefoundation/lgc:pi-v2",
-        env_vars={"UVICORN_WORKERS": "15"},
+        env_vars={"UVICORN_WORKERS": "30"},
         eval_params={
             "temperature": 0.0,
-            "timeout": 1200,
+            "timeout": 300,
         },
-        proxy_timeout=1300,
+        proxy_timeout=320,
     ),
     "game": EnvConfig(
         name="game",
