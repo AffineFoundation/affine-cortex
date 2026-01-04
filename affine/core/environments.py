@@ -98,6 +98,20 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 600,
         },
     ),
+    "affine:codex-synth": EnvConfig(
+        name="affine:codex-synth",
+        docker_image="affinefoundation/affine-codex-synth:latest",
+        env_vars={
+            "UVICORN_WORKERS": "1",
+            "BUG_INJECT_MODEL": "deepseek-ai/DeepSeek-V3",
+            "BUG_INJECT_BASE_URL": "https://llm.chutes.ai/v1",
+        },
+        mem_limit="16g",
+        eval_params={
+            "timeout": 1200,
+        },
+        proxy_timeout=1500,
+    ),
     
     # PrimeIntellect environments (no task_type)
     "cde": EnvConfig(
@@ -190,6 +204,11 @@ _ENV_ALIASES = {
     
     # SAT aliases
     "sat": "affine:sat",
+
+    # Codex synth aliases
+    "codex-synth": "affine:codex-synth",
+    "codex": "affine:codex-synth",
+    "bug-synth": "affine:codex-synth",
     
     # PrimeIntellect aliases (uppercase versions)
     "CDE": "cde",
@@ -562,6 +581,7 @@ LGC_V2_factory = lambda mode=None: create_environment("lgc-v2", mode=mode)
 GAME_factory = lambda mode=None: create_environment("game", mode=mode)
 SWE_PRO_factory = lambda mode=None: create_environment("swe-pro", mode=mode)
 PRINT_factory = lambda mode=None: create_environment("print", mode=mode)
+CODEX_SYNTH_factory = lambda mode=None: create_environment("affine:codex-synth", mode=mode)
 
 # Legacy class aliases
 SAT = SAT_factory
@@ -574,6 +594,7 @@ LGC = LGC_factory
 LGC_V2 = LGC_V2_factory
 GAME = GAME_factory
 PRINT = PRINT_factory
+CODEX_SYNTH = CODEX_SYNTH_factory
 
 # SWE-bench factories
 SWE_PRO = SWE_PRO_factory
