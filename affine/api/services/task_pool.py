@@ -514,7 +514,7 @@ class TaskPoolManager:
                 if isinstance(result, Exception):
                     continue
                 if isinstance(result, list) and result:
-                    candidate_tasks.append(result[0])  # Take first task
+                    candidate_tasks.append(result[-1])  # Take last task
             
             # Take first batch_size tasks and assign in parallel
             tasks_to_assign = candidate_tasks[:batch_size]
