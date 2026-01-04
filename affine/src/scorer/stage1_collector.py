@@ -174,11 +174,12 @@ class Stage1Collector:
                 
                 # Validate completeness
                 is_valid = completeness >= env_min_completeness
-                
-                # Calculate required score threshold
+
+                # Calculate required score threshold (sample-size aware)
                 threshold = calculate_required_score(
                     avg_score,
-                    self.config.ERROR_RATE_REDUCTION,
+                    completed_count,
+                    self.config.Z_SCORE,
                     self.config.MIN_IMPROVEMENT,
                     self.config.MAX_IMPROVEMENT
                 )

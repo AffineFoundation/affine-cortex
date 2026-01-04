@@ -12,41 +12,50 @@ class ScorerConfig:
     """Configuration for the four-stage scoring algorithm."""
     
     # Stage 2: Pareto Frontier Anti-Plagiarism
-    ERROR_RATE_REDUCTION: float = 0.2  # 20% error rate reduction threshold
+    Z_SCORE: float = 1.5
     """
-    Error rate reduction threshold for Pareto dominance.
-    
-    Formula: required_score = 0.2 + 0.8 * prior_score
-    
-    Examples:
-    - prior_score=0.5 → error_rate=0.5 → required=0.6 (need 20% error reduction)
-    - prior_score=0.9 → error_rate=0.1 → required=0.92 (need 20% error reduction)
+    Z-score for statistical confidence interval in threshold calculation.
+
+    Uses standard error (SE) based approach to adjust threshold by sample size:
+    - SE = sqrt(p * (1-p) / n)
+    - gap = z * SE
+
+    Z-score values:
+    - 1.0: ~68% confidence (more aggressive, smaller gaps)
+    - 1.5: ~87% confidence (balanced, recommended)
+    - 1.96: 95% confidence (more conservative, larger gaps)
+
+    Higher sample counts → smaller SE → smaller gap → easier to beat.
+    Lower sample counts → larger SE → larger gap → harder to beat.
+
+    Recommended value: 1.5
     """
-    
+
     MIN_IMPROVEMENT: float = 0.02
     """
     Minimum improvement required for later miner to beat earlier miner.
-    
-    Later miner must achieve: score_later > score_earlier + MIN_IMPROVEMENT
-    This prevents random fluctuations in high-score regions from allowing
-    plagiarism to beat originals.
-    
-    Example: If prior=0.9979 and MIN_IMPROVEMENT=0.02,
-    later miner needs 0.9979 + 0.02 = 1.0179 (capped by MAX_IMPROVEMENT).
-    
-    Recommended value: 0.02
+
+    Ensures that even with very large sample sizes (small SE), there's still
+    a minimum gap to prevent noise and random fluctuations from allowing
+    copies to beat originals.
+
+    Example: If SE-based gap = 0.01 but MIN_IMPROVEMENT = 0.02,
+    the actual gap used will be 0.02.
+
+    Recommended value: 0.02 (2%)
     """
-    
-    MAX_IMPROVEMENT: float = 0.1
+
+    MAX_IMPROVEMENT: float = 0.10
     """
     Maximum improvement threshold cap.
-    
-    Caps the required score threshold to prevent unreasonably high values.
-    The final threshold is clamped to: prior_score + MAX_IMPROVEMENT
-    
-    This ensures that even with low prior scores, the threshold remains reasonable.
-    
-    Recommended value: 0.1 (allows maximum 10% improvement)
+
+    Caps the required score gap to prevent unreasonably high thresholds
+    when sample size is very small (large SE).
+
+    Example: If SE-based gap = 0.25 but MAX_IMPROVEMENT = 0.10,
+    the actual gap used will be capped at 0.10.
+
+    Recommended value: 0.10 (10%)
     """
     
     SCORE_PRECISION: int = 3
@@ -98,7 +107,7 @@ class ScorerConfig:
     def to_dict(cls) -> Dict[str, Any]:
         """Export configuration as dictionary for storage in snapshots."""
         return {
-            'error_rate_reduction': cls.ERROR_RATE_REDUCTION,
+            'z_score': cls.Z_SCORE,
             'min_improvement': cls.MIN_IMPROVEMENT,
             'max_improvement': cls.MAX_IMPROVEMENT,
             'score_precision': cls.SCORE_PRECISION,
@@ -113,7 +122,7 @@ class ScorerConfig:
     @classmethod
     def validate(cls):
         """Validate configuration parameters."""
-        assert 0.0 <= cls.ERROR_RATE_REDUCTION <= 1.0, "ERROR_RATE_REDUCTION must be in [0, 1]"
+        assert cls.Z_SCORE > 0.0, "Z_SCORE must be positive"
         assert cls.MIN_IMPROVEMENT >= 0.0, "MIN_IMPROVEMENT must be non-negative"
         assert cls.MAX_IMPROVEMENT >= cls.MIN_IMPROVEMENT, "MAX_IMPROVEMENT must be >= MIN_IMPROVEMENT"
         assert cls.SCORE_PRECISION >= 0, "SCORE_PRECISION must be non-negative"
