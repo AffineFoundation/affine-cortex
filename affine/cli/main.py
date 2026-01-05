@@ -74,7 +74,9 @@ def api():
     """Start API server."""
     from affine.api.server import app, config
     import uvicorn
-    
+
+    setup_logging(verbosity=1, component="api")
+
     uvicorn.run(
         "affine.api.server:app",
         host=config.HOST,
