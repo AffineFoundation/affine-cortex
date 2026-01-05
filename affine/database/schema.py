@@ -58,6 +58,11 @@ SAMPLE_RESULTS_SCHEMA = {
     "BillingMode": "PAY_PER_REQUEST",
 }
 
+# TTL settings for sample_results (30 days retention)
+SAMPLE_RESULTS_TTL = {
+    "AttributeName": "ttl",
+}
+
 
 # Task Pool Table
 #

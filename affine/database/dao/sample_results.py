@@ -103,6 +103,9 @@ class SampleResultsDAO(BaseDAO):
         extra_json = json.dumps(extra, separators=(',', ':'))
         extra_compressed = self.compress_data(extra_json)
         
+        # Calculate TTL: 30 days from now (in seconds)
+        ttl_seconds = int(time.time()) + (30 * 86400)
+        
         item = {
             'pk': self._make_pk(miner_hotkey, model_revision, env),
             'sk': self._make_sk(str(task_id_int)),
@@ -119,6 +122,7 @@ class SampleResultsDAO(BaseDAO):
             'validator_hotkey': validator_hotkey,
             'block_number': block_number,
             'signature': signature,
+            'ttl': ttl_seconds,  # TTL: auto-delete after 30 days
         }
         
         return await self.put(item)

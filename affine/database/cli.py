@@ -656,6 +656,8 @@ async def cmd_update_miners():
     """
     from affine.database.dao.sample_results import SampleResultsDAO
     from affine.database.dao.miner_stats import MinerStatsDAO
+    from affine.database.tables import table_exists, create_table
+    from affine.database.schema import MINER_STATS_SCHEMA, get_table_name
     from datetime import datetime
     
     print("Initializing miner_stats from sample_results...")
@@ -665,6 +667,13 @@ async def cmd_update_miners():
     await init_client()
     
     try:
+        # Check if miner_stats table exists
+        miner_stats_table = get_table_name("miner_stats")
+        if not await table_exists(miner_stats_table):
+            print(f"Table '{miner_stats_table}' does not exist. Creating it...")
+            await create_table(MINER_STATS_SCHEMA)
+            print(f"✓ Table '{miner_stats_table}' created successfully\n")
+    
         sample_dao = SampleResultsDAO()
         miner_dao = MinerStatsDAO()
         
@@ -757,24 +766,24 @@ async def cmd_update_miners():
                         sk = miner_dao._make_sk(revision)
                         
                         update_parts = []
+                        expr_names = {}
                         expr_values = {}
                         
                         if 'first_seen_at' in updates:
                             update_parts.append('#first_seen = :first_seen')
+                            expr_names['#first_seen'] = 'first_seen_at'
                             expr_values[':first_seen'] = {'N': str(updates['first_seen_at'])}
                         
                         if 'last_updated_at' in updates:
                             update_parts.append('#last_updated = :last_updated')
+                            expr_names['#last_updated'] = 'last_updated_at'
                             expr_values[':last_updated'] = {'N': str(updates['last_updated_at'])}
                         
                         await client.update_item(
                             TableName=miner_dao.table_name,
                             Key={'pk': {'S': pk}, 'sk': {'S': sk}},
                             UpdateExpression=f"SET {', '.join(update_parts)}",
-                            ExpressionAttributeNames={
-                                '#first_seen': 'first_seen_at',
-                                '#last_updated': 'last_updated_at'
-                            },
+                            ExpressionAttributeNames=expr_names,
                             ExpressionAttributeValues=expr_values
                         )
                         miners_updated += 1

@@ -8,6 +8,7 @@ services:
     mem_limit: "4g"
     volumes:
       - /var/log/affine/api:/var/log/affine/api
+      - /var/lib/affine/sampling_stats:/var/lib/affine/sampling_stats
     ports:
       - "8000:8000"
     environment:

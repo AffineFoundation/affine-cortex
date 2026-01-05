@@ -1,47 +1,31 @@
 """
 Sampling Statistics Collector
 
-Collects and aggregates sampling statistics in memory with sliding windows,
-then syncs to DynamoDB periodically.
+Collects and aggregates sampling statistics using local file-based persistence
+with 5-minute granularity, then syncs to DynamoDB periodically.
 """
 
 import time
 import asyncio
-from collections import defaultdict, deque
-from typing import Dict, Any, Optional, Tuple
-from dataclasses import dataclass
+from typing import Dict, Any, Optional
 from affine.core.setup import logger
-
-
-@dataclass
-class SampleEvent:
-    """Single sampling event"""
-    timestamp: int          # Unix timestamp (seconds)
-    success: bool           # Whether the sample succeeded
-    error_type: Optional[str]  # Error type: 'rate_limit', 'other', None
+from affine.api.services.local_stats_store import LocalStatsStore
 
 
 class SamplingStatsCollector:
-    """Sampling statistics collector with in-memory sliding windows"""
+    """Sampling statistics collector with local file-based persistence"""
     
-    def __init__(self, sync_interval: int = 300, cleanup_interval: int = 3600, max_idle_time: int = 86400):
+    def __init__(self, sync_interval: int = 300, cleanup_interval: int = 3600):
         """
         Args:
             sync_interval: Sync interval to database (seconds), default 5 minutes
-            cleanup_interval: Cleanup interval for idle miners (seconds), default 1 hour
-            max_idle_time: Maximum idle time before cleaning up miner events (seconds), default 24 hours
+            cleanup_interval: Cleanup interval for old files (seconds), default 1 hour
         """
         self.sync_interval = sync_interval
         self.cleanup_interval = cleanup_interval
-        self.max_idle_time = max_idle_time
         
-        # Data structure: {(hotkey, revision, env): deque[SampleEvent]}
-        self._events: Dict[Tuple[str, str, str], deque] = defaultdict(
-            lambda: deque(maxlen=10000)
-        )
-        
-        # Track last activity time for each miner to enable cleanup
-        self._last_activity: Dict[Tuple[str, str, str], int] = {}
+        # Local statistics store (5-minute granularity)
+        self._local_store = LocalStatsStore()
         
         # Sync task
         self._sync_task: Optional[asyncio.Task] = None
@@ -72,108 +56,61 @@ class SamplingStatsCollector:
             else:
                 error_type = "other"
         
-        event = SampleEvent(
-            timestamp=int(time.time()),
-            success=success,
-            error_type=error_type
-        )
-        
-        key = (hotkey, revision, env)
-        self._events[key].append(event)
-        self._last_activity[key] = int(time.time())
-    
-    def _compute_window_stats(
-        self,
-        events: deque,
-        window_seconds: int
-    ) -> Dict[str, Any]:
-        """Compute sliding window statistics
-        
-        Args:
-            events: Event queue
-            window_seconds: Window size (seconds)
-            
-        Returns:
-            Statistics dictionary
-        """
-        current_time = int(time.time())
-        cutoff_time = current_time - window_seconds
-        
-        samples = 0
-        success = 0
-        rate_limit_errors = 0
-        other_errors = 0
-        
-        for event in events:
-            if event.timestamp >= cutoff_time:
-                samples += 1
-                if event.success:
-                    success += 1
-                elif event.error_type == "rate_limit":
-                    rate_limit_errors += 1
-                elif event.error_type == "other":
-                    other_errors += 1
-        
-        success_rate = success / samples if samples > 0 else 0.0
-        samples_per_min = (samples / window_seconds) * 60 if window_seconds > 0 else 0.0
-        
-        return {
-            "samples": samples,
-            "success": success,
-            "rate_limit_errors": rate_limit_errors,
-            "other_errors": other_errors,
-            "success_rate": success_rate,
-            "samples_per_min": samples_per_min
-        }
+        # Record to local store (accumulates in current 5-minute window)
+        self._local_store.record_sample(hotkey, revision, env, success, error_type)
     
     async def compute_all_stats(self) -> Dict[str, Dict[str, Any]]:
-        """Compute statistics for all miners
+        """Compute statistics for all miners from local files
         
         Returns:
             Dict mapping "hotkey#revision" to env_stats
         """
+        # Flush current window before computing
+        self._local_store.flush()
+        
         windows = {
-            "last_15min": 15 * 60,
-            "last_1hour": 60 * 60,
-            "last_6hours": 6 * 60 * 60,
-            "last_24hours": 24 * 60 * 60
+            "last_15min": 0.25,   # hours
+            "last_1hour": 1,
+            "last_6hours": 6,
+            "last_24hours": 24
         }
         
         all_stats = {}
         
-        for (hotkey, revision, env), events in self._events.items():
-            # Compute statistics for each time window
-            window_stats = {}
-            for window_name, window_seconds in windows.items():
-                window_stats[window_name] = self._compute_window_stats(events, window_seconds)
+        # Load and aggregate statistics for each time window
+        for window_name, hours in windows.items():
+            window_stats = self._local_store.load_aggregated_stats(hours=hours)
             
-            key = f"{hotkey}#{revision}"
-            if key not in all_stats:
-                all_stats[key] = {"envs": {}}
-            
-            all_stats[key]["envs"][env] = window_stats
+            for miner_key, stats in window_stats.items():
+                # Parse miner key: "hotkey#revision#env"
+                parts = miner_key.split("#", 2)
+                if len(parts) != 3:
+                    continue
+                
+                hotkey, revision, env = parts
+                key = f"{hotkey}#{revision}"
+                
+                if key not in all_stats:
+                    all_stats[key] = {"envs": {}}
+                
+                if env not in all_stats[key]["envs"]:
+                    all_stats[key]["envs"][env] = {}
+                
+                # Calculate derived metrics
+                samples = stats["samples"]
+                success_rate = stats["success"] / samples if samples > 0 else 0.0
+                samples_per_min = (samples / (hours * 60)) if hours > 0 else 0.0
+                
+                all_stats[key]["envs"][env][window_name] = {
+                    "samples": samples,
+                    "success": stats["success"],
+                    "rate_limit_errors": stats["rate_limit_errors"],
+                    "other_errors": stats["other_errors"],
+                    "success_rate": success_rate,
+                    "samples_per_min": samples_per_min
+                }
         
         return all_stats
-    
-    def _cleanup_idle_miners(self):
-        """Cleanup event queues for idle miners to prevent memory leak.
-        
-        Removes miners that haven't had any activity for max_idle_time seconds.
-        """
-        current_time = int(time.time())
-        cutoff_time = current_time - self.max_idle_time
-        
-        keys_to_remove = [
-            key for key, last_active in self._last_activity.items()
-            if last_active < cutoff_time
-        ]
-        
-        for key in keys_to_remove:
-            self._events.pop(key, None)
-            self._last_activity.pop(key, None)
-        
-        if keys_to_remove:
-            logger.info(f"Cleaned up {len(keys_to_remove)} idle miner event queues")
     
     async def start_sync_loop(self):
         """Start background sync loop"""
@@ -184,15 +121,17 @@ class SamplingStatsCollector:
         self._running = True
         self._sync_task = asyncio.create_task(self._sync_loop())
         logger.info(
-            f"SamplingStatsCollector sync loop started "
-            f"(sync_interval={self.sync_interval}s, cleanup_interval={self.cleanup_interval}s, "
-            f"max_idle_time={self.max_idle_time}s)"
+            f"SamplingStatsCollector started "
+            f"(sync_interval={self.sync_interval}s, cleanup_interval={self.cleanup_interval}s)"
         )
     
     async def _sync_loop(self):
         """Background sync loop with periodic cleanup and retry logic"""
         from affine.database.dao.miner_stats import MinerStatsDAO
+        from affine.database.dao.miners import MinersDAO
+        
         dao = MinerStatsDAO()
+        miners_dao = MinersDAO()
         
         last_cleanup_time = int(time.time())
         consecutive_failures = 0
@@ -202,8 +141,12 @@ class SamplingStatsCollector:
             try:
                 await asyncio.sleep(self.sync_interval)
                 
-                # Compute statistics
+                # Compute statistics from local files
                 all_stats = await self.compute_all_stats()
+                
+                # Get all miners info for batch update
+                all_miners = await miners_dao.get_all_miners()
+                miners_dict = {f"{m['hotkey']}#{m['revision']}": m for m in all_miners}
                 
                 # Batch sync to database with individual error handling
                 sync_success = 0
@@ -212,7 +155,22 @@ class SamplingStatsCollector:
                 for miner_key, stats in all_stats.items():
                     try:
                         hotkey, revision = miner_key.split("#", 1)
+                        
+                        # Update sampling stats
                         await dao.update_sampling_stats(hotkey, revision, stats["envs"])
+                        
+                        # Update miner basic info (model, rank, weight) if miner exists
+                        miner_info = miners_dict.get(miner_key)
+                        if miner_info:
+                            await dao.update_miner_info(
+                                hotkey=hotkey,
+                                revision=revision,
+                                model=miner_info.get('model', ''),
+                                rank=miner_info.get('rank'),
+                                weight=miner_info.get('weight'),
+                                is_online=miner_info.get('is_valid', False)
+                            )
+                        
                         sync_success += 1
                     except Exception as e:
                         sync_failures += 1
@@ -227,7 +185,7 @@ class SamplingStatsCollector:
                         f"Synced stats for {sync_success}/{len(all_stats)} miners to database"
                         + (f" ({sync_failures} failures)" if sync_failures > 0 else "")
                     )
-                    consecutive_failures = 0  # Reset on partial success
+                    consecutive_failures = 0
                 elif sync_failures > 0:
                     consecutive_failures += 1
                     logger.warning(
@@ -235,10 +193,10 @@ class SamplingStatsCollector:
                         f"(consecutive failures: {consecutive_failures}/{max_consecutive_failures})"
                     )
                 
-                # Periodic cleanup of idle miners
+                # Periodic cleanup of old files
                 current_time = int(time.time())
                 if current_time - last_cleanup_time >= self.cleanup_interval:
-                    self._cleanup_idle_miners()
+                    self._local_store.cleanup_old_files(keep_hours=25)
                     last_cleanup_time = current_time
                 
             except asyncio.CancelledError:
@@ -254,21 +212,29 @@ class SamplingStatsCollector:
                 
                 # If too many consecutive failures, increase sleep time
                 if consecutive_failures >= max_consecutive_failures:
-                    backoff_time = min(self.sync_interval * 2, 600)  # Max 10 minutes
+                    backoff_time = min(self.sync_interval * 2, 600)
                     logger.warning(
                         f"Too many consecutive failures, backing off for {backoff_time}s"
                     )
                     await asyncio.sleep(backoff_time)
     
     async def stop(self):
-        """Stop sync loop"""
+        """Stop sync loop and flush remaining data"""
         self._running = False
+        
+        # Flush current window before stopping
+        try:
+            self._local_store.flush()
+        except Exception as e:
+            logger.error(f"Failed to flush stats on stop: {e}")
+        
         if self._sync_task:
             self._sync_task.cancel()
             try:
                 await self._sync_task
             except asyncio.CancelledError:
                 pass
+        
         logger.info("SamplingStatsCollector stopped")
 
 

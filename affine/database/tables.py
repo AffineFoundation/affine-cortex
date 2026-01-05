@@ -85,7 +85,7 @@ async def init_tables():
     Creates all tables defined in schemas if they don't exist.
     """
     from affine.database.schema import (
-        SAMPLE_RESULTS_SCHEMA,
+        SAMPLE_RESULTS_SCHEMA, SAMPLE_RESULTS_TTL,
         TASK_QUEUE_SCHEMA,
         EXECUTION_LOGS_SCHEMA, EXECUTION_LOGS_TTL,
         SCORES_SCHEMA, SCORES_TTL,
@@ -99,7 +99,7 @@ async def init_tables():
     
     # Create tables with TTL configuration
     await asyncio.gather(
-        create_table(SAMPLE_RESULTS_SCHEMA),
+        create_table(SAMPLE_RESULTS_SCHEMA, ttl_attribute=SAMPLE_RESULTS_TTL["AttributeName"]),
         create_table(TASK_QUEUE_SCHEMA),
         create_table(EXECUTION_LOGS_SCHEMA, ttl_attribute=EXECUTION_LOGS_TTL["AttributeName"]),
         create_table(SCORES_SCHEMA, ttl_attribute=SCORES_TTL["AttributeName"]),
