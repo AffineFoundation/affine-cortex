@@ -20,6 +20,7 @@ from affine.api.dependencies import (
 from affine.api.config import config
 from affine.core.models import SampleSubmission
 from affine.api.services.task_pool import TaskPoolManager
+from affine.api.services.sampling_stats import get_stats_collector
 
 from affine.core.setup import logger
 
@@ -152,6 +153,16 @@ if config.SERVICES_ENABLED:
         async def _background_submit():
             """Background task to process submission asynchronously."""
             try:
+                # Get task metadata BEFORE complete_task to avoid race condition
+                # (complete_task may delete the task from pool)
+                task_location = await task_pool._get_task_location(sample_sub.task_uuid)
+                task_metadata = None
+                
+                if task_location:
+                    pk, sk = task_location
+                    task_metadata = await task_pool.dao.get(pk, sk)
+                
+                # Complete the task (success or failure)
                 # For zero-score errors, treat as successful sample with score=0
                 if should_record_zero_score:
                     await task_pool.complete_task(
@@ -183,6 +194,24 @@ if config.SERVICES_ENABLED:
                         error_code="EXECUTION_ERROR",
                         submission_signature=sample_sub.signature
                     )
+                
+                # Record sampling statistics if task metadata was retrieved successfully
+                # Note: task_metadata is cached before complete_task to avoid deletion race
+                if task_metadata:
+                    stats_collector = get_stats_collector()
+                    stats_collector.record_sample(
+                        hotkey=task_metadata['miner_hotkey'],
+                        revision=task_metadata['model_revision'],
+                        env=task_metadata['env'],
+                        success=is_success or should_record_zero_score,
+                        error_message=error_message if not should_record_zero_score else None
+                    )
+                else:
+                    logger.warning(
+                        f"Task metadata not found for {sample_sub.task_uuid[:8]}..., "
+                        f"skipping sampling stats recording"
+                    )
+                
                 logger.debug(
                     f"Background submit completed: task_uuid={sample_sub.task_uuid[:8]}... "
                     f"score={sample_sub.score:.4f}"

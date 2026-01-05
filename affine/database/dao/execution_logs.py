@@ -92,7 +92,7 @@ class ExecutionLogsDAO(BaseDAO):
             'error_code': error_code,
             'execution_time_ms': execution_time_ms,
             'timestamp': timestamp,
-            'ttl': self.get_ttl(30),  # 30 days (increased from 7)
+            'ttl': self.get_ttl(3),
         }
         
         return await self.put(item)

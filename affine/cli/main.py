@@ -352,6 +352,16 @@ cli.add_command(db)
 
 
 # ============================================================================
+# Miner Stats Management Commands
+# ============================================================================
+
+# Import and register miner_stats commands
+from affine.cli.miner_stats import miner_stats
+miner_stats.hidden = not SHOW_ADMIN_COMMANDS
+cli.add_command(miner_stats)
+
+
+# ============================================================================
 # Docker Deployment Commands
 # ============================================================================
 

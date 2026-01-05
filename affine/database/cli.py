@@ -18,7 +18,6 @@ from affine.database.dao import (
     ExecutionLogsDAO,
     ScoresDAO,
     SystemConfigDAO,
-    DataRetentionDAO,
 )
 
 
@@ -595,6 +594,167 @@ async def cmd_delete_samples_empty_conversation():
         await close_client()
 
 
+async def cmd_cleanup_inactive_miners(days: int):
+    """Cleanup long-inactive miners.
+    
+    Finds miners that haven't been updated for the specified number of days
+    and have never had any weight (best_weight == 0).
+    """
+    from affine.database.dao.miner_stats import MinerStatsDAO
+    from datetime import datetime
+    
+    await init_client()
+    
+    try:
+        dao = MinerStatsDAO()
+        
+        # Get inactive miners (dry-run)
+        inactive_miners = await dao.cleanup_inactive_miners(
+            inactive_days=days,
+            dry_run=True
+        )
+        
+        if not inactive_miners:
+            print("No inactive miners found.")
+            return
+        
+        # Display results
+        print(f"\nFound {len(inactive_miners)} inactive miners (>{days} days, zero weight):\n")
+        
+        for i, miner in enumerate(inactive_miners[:10], 1):
+            last_updated = datetime.fromtimestamp(miner['last_updated_at'])
+            print(
+                f"{i}. {miner['hotkey'][:16]}...#{miner['revision'][:8]}... "
+                f"(last_updated: {last_updated.strftime('%Y-%m-%d')}, "
+                f"weight: {miner['best_weight']})"
+            )
+        
+        if len(inactive_miners) > 10:
+            print(f"... and {len(inactive_miners) - 10} more")
+        
+        # Confirm deletion
+        confirm = input(f"\nWARNING: Delete {len(inactive_miners)} miners? Type 'yes' to confirm: ")
+        
+        if confirm.lower() == 'yes':
+            await dao.cleanup_inactive_miners(inactive_days=days, dry_run=False)
+            print(f"✓ Cleanup completed: {len(inactive_miners)} miners deleted")
+        else:
+            print("Cleanup cancelled")
+    
+    finally:
+        await close_client()
+
+
+async def cmd_update_miners():
+    """Initialize miner_stats table from existing sample_results data.
+    
+    Scans sample_results table and creates miner_stats records for all
+    unique (hotkey, revision) combinations found.
+    """
+    from affine.database.dao.sample_results import SampleResultsDAO
+    from affine.database.dao.miner_stats import MinerStatsDAO
+    
+    print("Initializing miner_stats from sample_results...")
+    await init_client()
+    
+    try:
+        sample_dao = SampleResultsDAO()
+        miner_dao = MinerStatsDAO()
+        
+        # Get all unique (hotkey, revision, model) combinations from samples
+        print("Scanning sample_results table...")
+        
+        from affine.database.client import get_client
+        client = get_client()
+        
+        # Use scan to get all samples
+        params = {'TableName': sample_dao.table_name}
+        
+        miners_map = {}  # {(hotkey, revision): {model, first_seen, last_seen}}
+        total_samples = 0
+        
+        while True:
+            response = await client.scan(**params)
+            items = response.get('Items', [])
+            
+            for item in items:
+                sample = sample_dao._deserialize(item)
+                hotkey = sample.get('miner_hotkey')
+                revision = sample.get('model_revision')
+                model = sample.get('model', '')
+                timestamp = sample.get('timestamp', 0)
+                
+                if not hotkey or not revision:
+                    continue
+                
+                key = (hotkey, revision)
+                if key not in miners_map:
+                    miners_map[key] = {
+                        'model': model,
+                        'first_seen': timestamp,
+                        'last_seen': timestamp
+                    }
+                else:
+                    # Update timestamps
+                    miners_map[key]['first_seen'] = min(miners_map[key]['first_seen'], timestamp)
+                    miners_map[key]['last_seen'] = max(miners_map[key]['last_seen'], timestamp)
+                
+                total_samples += 1
+            
+            last_key = response.get('LastEvaluatedKey')
+            if not last_key:
+                break
+            
+            params['ExclusiveStartKey'] = last_key
+            
+            # Progress update
+            if total_samples % 1000 == 0:
+                print(f"  Processed {total_samples} samples, found {len(miners_map)} unique miners...")
+        
+        print(f"\n✓ Scanned {total_samples} samples")
+        print(f"✓ Found {len(miners_map)} unique (hotkey, revision) combinations\n")
+        
+        # Create miner_stats records
+        print("Creating miner_stats records...")
+        created = 0
+        skipped = 0
+        
+        for (hotkey, revision), info in miners_map.items():
+            # Check if record already exists
+            existing = await miner_dao.get_miner_stats(hotkey, revision)
+            
+            if existing:
+                skipped += 1
+                continue
+            
+            # Create new record
+            await miner_dao.update_miner_info(
+                hotkey=hotkey,
+                revision=revision,
+                model=info['model'],
+                rank=None,
+                weight=None,
+                is_online=False
+            )
+            created += 1
+            
+            if created % 100 == 0:
+                print(f"  Created {created} records...")
+        
+        print(f"\n✓ Initialization complete:")
+        print(f"  - Created: {created} new miner records")
+        print(f"  - Skipped: {skipped} existing records")
+        print(f"  - Total miners: {len(miners_map)}")
+    
+    except Exception as e:
+        print(f"\n✗ Failed to initialize miner_stats: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+    finally:
+        await close_client()
+
+
 @click.group()
 def db():
     """Database management commands."""
@@ -734,6 +894,38 @@ def delete_samples_empty_conversation():
         af db delete-samples-empty-conversation
     """
     asyncio.run(cmd_delete_samples_empty_conversation())
+
+
+@db.command("cleanup-inactive-miners")
+@click.option('--days', default=30, help='Inactive days threshold')
+def cleanup_inactive_miners(days: int):
+    """Cleanup long-inactive miners from miner_stats table.
+    
+    Finds miners that haven't been updated for the specified number of days
+    and have never had any weight (best_weight == 0), then prompts for deletion.
+    
+    Examples:
+        af db cleanup-inactive-miners --days 30
+        af db cleanup-inactive-miners --days 90
+    """
+    asyncio.run(cmd_cleanup_inactive_miners(days))
+
+
+@db.command("update-miners")
+def update_miners():
+    """Initialize miner_stats table from existing sample_results data.
+    
+    Scans sample_results table and creates miner_stats records for all
+    unique (hotkey, revision) combinations found. Skips existing records.
+    
+    This is useful for:
+    - Initial setup after adding miner_stats table
+    - Backfilling historical miner metadata
+    
+    Example:
+        af db update-miners
+    """
+    asyncio.run(cmd_update_miners())
 
 
 def main():

@@ -76,10 +76,32 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize scoring cache: {e}")
         # Non-fatal: continue startup, cache will compute on first request
     
+    # Initialize sampling statistics collector
+    stats_collector = None
+    if config.SERVICES_ENABLED:
+        try:
+            from affine.api.services.sampling_stats import get_stats_collector
+            
+            stats_collector = get_stats_collector()
+            await stats_collector.start_sync_loop()
+            logger.info("SamplingStatsCollector initialized with background sync")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize SamplingStatsCollector: {e}")
+            # Non-fatal: continue startup, stats will not be collected
+    
     yield
     
     # Shutdown
     logger.info("Shutting down Affine API server...")
+    
+    # Stop sampling stats collector
+    if stats_collector:
+        try:
+            await stats_collector.stop()
+            logger.info("SamplingStatsCollector stopped")
+        except Exception as e:
+            logger.error(f"Error stopping SamplingStatsCollector: {e}")
     
     # Stop scoring cache refresh task
     if scoring_refresh_task:

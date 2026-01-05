@@ -182,21 +182,6 @@ SYSTEM_CONFIG_SCHEMA = {
 }
 
 
-# Data Retention Policy Table
-DATA_RETENTION_SCHEMA = {
-    "TableName": get_table_name("data_retention_policy"),
-    "KeySchema": [
-        {"AttributeName": "pk", "KeyType": "HASH"},
-        {"AttributeName": "sk", "KeyType": "RANGE"},
-    ],
-    "AttributeDefinitions": [
-        {"AttributeName": "pk", "AttributeType": "S"},
-        {"AttributeName": "sk", "AttributeType": "S"},
-    ],
-    "BillingMode": "PAY_PER_REQUEST",
-}
-
-
 # Miners Table
 # Schema design:
 # - PK: UID#{uid} - unique primary key, each UID has only one record
@@ -273,6 +258,35 @@ SCORE_SNAPSHOTS_TTL = {
 }
 
 
+# Miner Stats Table
+# Schema design:
+# - PK: HOTKEY#{hotkey} - partition by hotkey
+# - SK: REV#{revision} - each revision is a separate record
+#
+# Query patterns:
+# 1. Get miner stats: Direct query by hotkey + revision
+# 2. Get all revisions for a hotkey: Query by PK prefix
+# 3. Get all historical miners: Full table scan
+# 4. Cleanup inactive miners: Full table scan with filter
+#
+# Design rationale:
+# - Permanent storage of all miner metadata (not just current 256)
+# - Real-time sampling statistics via sliding windows
+# - No GSI needed (cleanup uses full scan, which is efficient for small tables)
+MINER_STATS_SCHEMA = {
+    "TableName": get_table_name("miner_stats"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},   # HOTKEY#{hotkey}
+        {"AttributeName": "sk", "KeyType": "RANGE"},  # REV#{revision}
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+
 # All table schemas
 ALL_SCHEMAS = [
     SAMPLE_RESULTS_SCHEMA,
@@ -280,7 +294,7 @@ ALL_SCHEMAS = [
     EXECUTION_LOGS_SCHEMA,
     SCORES_SCHEMA,
     SYSTEM_CONFIG_SCHEMA,
-    DATA_RETENTION_SCHEMA,
     MINERS_SCHEMA,
     SCORE_SNAPSHOTS_SCHEMA,
+    MINER_STATS_SCHEMA,
 ]
