@@ -308,8 +308,8 @@ class TaskPoolDAO(BaseDAO):
     ) -> List[Dict[str, Any]]:
         """Batch assign multiple tasks to an executor.
         
-        Uses BatchWriteItem for efficient bulk operations (25 items per batch).
-        Each task requires 2 operations: delete old + put new = optimal batching.
+        Uses BatchWriteItem for efficient bulk operations.
+        Each task requires 2 operations (delete + put), batched at 25 operations per request.
         
         Args:
             tasks: List of task dicts
@@ -879,27 +879,27 @@ class TaskPoolDAO(BaseDAO):
         
         return stats
     
-    async def get_all_assigned_tasks(self) -> List[Dict[str, Any]]:
-        """Get all assigned tasks across all environments for cache warmup.
+    async def reset_all_assigned_to_pending(self) -> int:
+        """Reset all assigned tasks to pending status on startup.
         
-        Uses FilterExpression to scan only assigned tasks.
-        This is a one-time startup operation, Scan is acceptable.
+        Called on API server restart to handle lost executor tasks.
+        Uses Scan to find all assigned tasks, then batch resets them.
         
         Returns:
-            List of assigned tasks with pk, sk, task_uuid fields
+            Number of tasks reset
         """
         from affine.database.client import get_client
         client = get_client()
         
+        # Scan all assigned tasks
         params = {
             'TableName': self.table_name,
             'FilterExpression': '#status = :status',
             'ExpressionAttributeNames': {'#status': 'status'},
-            'ExpressionAttributeValues': {':status': {'S': 'assigned'}},
-            'ProjectionExpression': 'pk, sk, task_uuid, assigned_at'
+            'ExpressionAttributeValues': {':status': {'S': 'assigned'}}
         }
         
-        all_tasks = []
+        all_assigned_tasks = []
         last_key = None
         
         while True:
@@ -910,13 +910,78 @@ class TaskPoolDAO(BaseDAO):
             items = response.get('Items', [])
             
             for item in items:
-                all_tasks.append(self._deserialize(item))
+                all_assigned_tasks.append(self._deserialize(item))
             
             last_key = response.get('LastEvaluatedKey')
             if not last_key:
                 break
         
-        return all_tasks
+        if not all_assigned_tasks:
+            logger.info("No assigned tasks to reset on startup")
+            return 0
+        
+        logger.info(f"Found {len(all_assigned_tasks)} assigned tasks to reset on startup")
+        
+        # Reset each task: delete old assigned record + create new pending record
+        # Each task needs 2 operations (delete + put), so batch_size = 12 to stay under 25 limit
+        reset_count = 0
+        batch_size = 12  # 12 tasks × 2 ops = 24 requests (< 25 DynamoDB limit)
+        
+        for i in range(0, len(all_assigned_tasks), batch_size):
+            batch = all_assigned_tasks[i:i + batch_size]
+            
+            # Build batch requests (delete + put for each task)
+            requests = []
+            for task in batch:
+                # Delete old assigned record
+                requests.append({
+                    'DeleteRequest': {
+                        'Key': {
+                            'pk': {'S': task['pk']},
+                            'sk': {'S': task['sk']}
+                        }
+                    }
+                })
+                
+                # Create new pending record
+                new_status = 'pending'
+                new_sk = self._make_sk(task['env'], new_status, task['task_id'])
+                new_gsi1_pk = self._make_gsi1_pk(task['env'], new_status)
+                new_gsi1_sk = self._make_gsi1_sk(
+                    task['miner_hotkey'],
+                    task['model_revision'],
+                    task['task_id']
+                )
+                
+                new_task = {
+                    **task,
+                    'sk': new_sk,
+                    'status': new_status,
+                    'assigned_to': None,
+                    'assigned_at': None,
+                    'gsi1_pk': new_gsi1_pk,
+                    'gsi1_sk': new_gsi1_sk,
+                }
+                
+                requests.append({
+                    'PutRequest': {
+                        'Item': self._serialize(new_task)
+                    }
+                })
+            
+            # Execute batch
+            try:
+                await client.batch_write_item(
+                    RequestItems={
+                        self.table_name: requests
+                    }
+                )
+                reset_count += len(batch)
+            except Exception as e:
+                logger.error(f"Batch reset failed for batch {i//batch_size}: {e}")
+        
+        logger.info(f"Reset {reset_count} assigned tasks to pending on startup")
+        return reset_count
     
     async def get_all_paused_tasks(self) -> List[Dict[str, Any]]:
         """Get all paused tasks across all environments.

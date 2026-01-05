@@ -191,13 +191,17 @@ class TaskPoolManager:
         
         return await self._block_cache.get(fetch_block)
     
-    async def warmup_caches(self):
-        """Warmup caches on startup by preloading assigned tasks into UUID cache.
+    async def reset_assigned_on_startup(self):
+        """Reset all assigned tasks to pending on API server startup.
         
-        Strategy:
-        - Load all assigned tasks via DAO
-        - Populate UUID cache with (uuid -> (pk, sk)) mappings
-        - This eliminates DB queries during submit for already-assigned tasks
+        Rationale:
+        - When API server restarts, all executor processes are restarted/lost
+        - Any tasks in 'assigned' status are orphaned (no executor running them)
+        - We reset them to 'pending' so they can be reassigned to new executors
+        
+        This is different from timeout cleanup:
+        - Startup reset: unconditional, all assigned -> pending (no timeout check)
+        - Timeout cleanup: runtime check, only reset tasks that exceeded timeout
         
         This is called automatically during server startup if warmup=True.
         """
@@ -205,35 +209,23 @@ class TaskPoolManager:
             return
         
         try:
-            logger.info("TaskPoolManager cache warmup started...")
+            logger.info("TaskPoolManager startup reset: resetting all assigned tasks to pending...")
             start_time = time.time()
             
-            # Preload all assigned tasks into UUID cache via DAO
-            assigned_tasks = await self.dao.get_all_assigned_tasks()
-            
-            # Populate UUID cache with (pk, sk, assigned_at, env)
-            async with self._cache_lock:
-                for task in assigned_tasks:
-                    assigned_at = task.get('assigned_at') or 0
-                    env = task.get('env', '')
-                    self._uuid_cache[task['task_uuid']] = (
-                        task['pk'],
-                        task['sk'],
-                        assigned_at,
-                        env
-                    )
+            # Reset all assigned tasks to pending via DAO
+            reset_count = await self.dao.reset_all_assigned_to_pending()
             
             elapsed = time.time() - start_time
             logger.info(
-                f"TaskPoolManager cache warmup completed: "
-                f"preloaded {len(assigned_tasks)} assigned tasks in {elapsed:.2f}s"
+                f"TaskPoolManager startup reset completed: "
+                f"reset {reset_count} assigned tasks to pending in {elapsed:.2f}s"
             )
             
             self._warmup_done = True
             
         except Exception as e:
-            logger.error(f"TaskPoolManager cache warmup failed: {e}", exc_info=True)
-            # Non-fatal: continue startup, cache will populate lazily
+            logger.error(f"TaskPoolManager startup reset failed: {e}", exc_info=True)
+            # Non-fatal: continue startup, tasks may be orphaned but will timeout eventually
     
     async def get_pool_stats(self, env: str) -> Dict[str, int]:
         """Get pool statistics for an environment with caching.
@@ -258,10 +250,12 @@ class TaskPoolManager:
         )
     
     async def reset_timeout_tasks(self) -> int:
-        """Reset timeout assigned tasks using in-memory cache.
+        """Reset timeout assigned tasks during runtime (not on startup).
         
-        Uses UUID cache to detect timeout tasks without DB scan.
+        This is for long-running scenarios where executors may crash or hang.
         Each task's timeout is determined by its environment's eval_params.timeout config.
+        
+        Uses UUID cache for fast timeout detection without DB scan.
         
         Returns:
             Number of tasks reset
@@ -328,7 +322,11 @@ class TaskPoolManager:
                             ExpressionAttributeValues={':status': {'S': 'assigned'}}
                         )
                     except client.exceptions.ConditionalCheckFailedException:
-                        # Task already completed
+                        # Task status changed (completed/reset by another process)
+                        logger.debug(
+                            f"Task {task_uuid} status changed during reset "
+                            f"(race condition with complete_task or another reset)"
+                        )
                         async with self._cache_lock:
                             self._uuid_cache.pop(task_uuid, None)
                         return False
@@ -373,37 +371,45 @@ class TaskPoolManager:
         reset_count = sum(1 for r in results if r is True)
         
         if reset_count > 0:
-            logger.info(f"Reset {reset_count}/{len(timeout_tasks)} timeout assigned tasks")
+            logger.info(f"Runtime timeout cleanup: reset {reset_count}/{len(timeout_tasks)} timeout assigned tasks")
         
         return reset_count
     
     async def start_timeout_cleanup_loop(self):
-        """Start background timeout cleanup loop."""
+        """Start background timeout cleanup loop for runtime timeout detection.
+        
+        This runs continuously during API server operation to detect and reset
+        tasks that have exceeded their execution timeout.
+        
+        Note: This is different from startup reset (reset_assigned_on_startup):
+        - Startup: unconditional reset of all assigned tasks (executor processes lost)
+        - Runtime: conditional reset of only timed-out tasks (executor may be running)
+        """
         if self._timeout_cleanup_task is not None:
             logger.warning("Timeout cleanup loop already started")
             return
         
         async def cleanup_loop():
-            """Background loop for timeout task cleanup.
+            """Background loop for runtime timeout task cleanup.
             
             Each task's timeout is determined by its environment's eval_params.timeout config.
             """
             cleanup_interval = int(os.getenv('TASK_TIMEOUT_CLEANUP_INTERVAL', '300'))  # 5 minutes
             
-            logger.info(f"Timeout cleanup loop started (interval={cleanup_interval}s, per-env timeout)")
+            logger.info(f"Runtime timeout cleanup loop started (interval={cleanup_interval}s, per-env timeout)")
             
             while True:
                 try:
                     await self.reset_timeout_tasks()
                     await asyncio.sleep(cleanup_interval)
                 except asyncio.CancelledError:
-                    logger.info("Timeout cleanup loop cancelled")
+                    logger.info("Runtime timeout cleanup loop cancelled")
                     break
                 except Exception as e:
-                    logger.error(f"Timeout cleanup error: {e}", exc_info=True)
+                    logger.error(f"Runtime timeout cleanup error: {e}", exc_info=True)
         
         self._timeout_cleanup_task = asyncio.create_task(cleanup_loop())
-        logger.info("Timeout cleanup background task started")
+        logger.info("Runtime timeout cleanup background task started")
     
     def _select_miners_weighted(
         self,

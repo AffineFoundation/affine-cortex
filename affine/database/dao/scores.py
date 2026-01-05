@@ -103,7 +103,7 @@ class ScoresDAO(BaseDAO):
         
         # Conditional TTL: only set TTL for miners with zero weight
         if overall_score == 0:
-            item['ttl'] = self.get_ttl(30)  # 30 days for inactive miners
+            item['ttl'] = self.get_ttl(7)  # 30 days for inactive miners
         # Miners with non-zero weight: no TTL (permanent storage)
         
         return await self.put(item)
