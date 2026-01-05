@@ -228,13 +228,16 @@ class MinersMonitor:
         block: int,
     ) -> MinerInfo:
         """Validate a single miner
-        
+
         Validation steps:
-        1. Fetch and verify chute is hot
-        2. Verify model name matches between commit and chute
-        3. Verify revision matches between commit and chute
-        4. Fetch HuggingFace model info and verify revision
-        
+        1. Fetch chute info
+        2. Validate chute_slug is not empty
+        3. Check chute is hot
+        4. Verify model name matches chute
+        5. Verify model name contains "Affine" or "affine" (except uid 0)
+        6. Verify revision matches chute
+        7. Fetch HuggingFace model info and verify revision
+
         Args:
             uid: Miner UID
             hotkey: Miner hotkey
@@ -242,7 +245,7 @@ class MinersMonitor:
             revision: Git commit hash from commit
             chute_id: Chute deployment ID
             block: Block when miner committed
-            
+
         Returns:
             MinerInfo with validation result and cached model_hash/hf_revision
         """
@@ -285,15 +288,22 @@ class MinersMonitor:
                 info.is_valid = False
                 info.invalid_reason = f"model_mismatch:chute={chute_model}"
                 return info
-        
-        # Step 5: Verify revision matches chute
+
+        # Step 5: Verify model name contains "Affine" or "affine" (except uid 0)
+        if uid != 0:
+            if "affine" not in model.lower():
+                info.is_valid = False
+                info.invalid_reason = "model_name_missing_affine"
+                return info
+
+        # Step 6: Verify revision matches chute
         chute_revision = chute.get("revision", "")
         if chute_revision and revision != chute_revision:
             info.is_valid = False
             info.invalid_reason = f"revision_mismatch:chute={chute_revision}"
             return info
         
-        # Step 6: Fetch HuggingFace model info and verify revision
+        # Step 7: Fetch HuggingFace model info and verify revision
         model_info = await self._get_model_info(model, revision)
         if not model_info:
             info.is_valid = False
