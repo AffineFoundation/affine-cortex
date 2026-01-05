@@ -359,6 +359,52 @@ async def get_miner_command(uid: int):
         data = await client.get(endpoint)
         if data:
             print(json.dumps(data, indent=2, ensure_ascii=False))
+            
+            # Fetch and display sampling stats via API
+            stats_endpoint = f"/miners/uid/{uid}/stats"
+            stats_data = await client.get(stats_endpoint)
+            
+            if stats_data and stats_data.get('sampling_stats'):
+                print("\n" + "="*80)
+                print("GLOBAL SAMPLING STATISTICS")
+                print("="*80)
+                
+                sampling_stats = stats_data['sampling_stats']
+                
+                for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
+                    if window in sampling_stats:
+                        wstats = sampling_stats[window]
+                        print(f"\n{window}:")
+                        print(f"  Samples: {wstats.get('samples', 0)}")
+                        print(f"  Success: {wstats.get('success', 0)}")
+                        print(f"  Success rate: {wstats.get('success_rate', 0.0):.2%}")
+                        print(f"  Samples/min: {wstats.get('samples_per_min', 0.0):.2f}")
+                        print(f"  Rate limit errors: {wstats.get('rate_limit_errors', 0)}")
+                        print(f"  Other errors: {wstats.get('other_errors', 0)}")
+                
+                # Display per-environment statistics
+                if stats_data.get('env_stats'):
+                    print("\n" + "="*80)
+                    print("PER-ENVIRONMENT STATISTICS")
+                    print("="*80)
+                    
+                    env_stats = stats_data['env_stats']
+                    for env_name, env_data in env_stats.items():
+                        print(f"\n[{env_name}]")
+                        for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
+                            if window in env_data:
+                                wstats = env_data[window]
+                                print(f"  {window}:")
+                                print(f"    Samples: {wstats.get('samples', 0)}")
+                                print(f"    Success: {wstats.get('success', 0)}")
+                                print(f"    Success rate: {wstats.get('success_rate', 0.0):.2%}")
+                                print(f"    Samples/min: {wstats.get('samples_per_min', 0.0):.2f}")
+                                print(f"    Rate limit errors: {wstats.get('rate_limit_errors', 0)}")
+                                print(f"    Other errors: {wstats.get('other_errors', 0)}")
+            else:
+                print("\n" + "="*80)
+                print("No sampling statistics available for this miner.")
+                print("="*80)
 
 
 

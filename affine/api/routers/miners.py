@@ -60,3 +60,68 @@ async def get_miner_by_uid(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve miner info: {str(e)}"
         )
+
+
+@router.get("/uid/{uid}/stats", dependencies=[Depends(rate_limit_read)])
+async def get_miner_stats_by_uid(
+    uid: int,
+):
+    """
+    Get miner sampling statistics by UID.
+    
+    Returns sampling statistics including:
+    - Global aggregated statistics across all environments
+    - Per-environment statistics
+    - Time windows: last_15min, last_1hour, last_6hours, last_24hours
+    """
+    try:
+        from affine.database.dao.miners import MinersDAO
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        
+        # First get miner info to get hotkey and revision
+        miners_dao = MinersDAO()
+        miner = await miners_dao.get_miner_by_uid(uid)
+        
+        if not miner:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Miner with UID {uid} not found"
+            )
+        
+        hotkey = miner.get('hotkey')
+        revision = miner.get('revision')
+        
+        if not hotkey or not revision:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Miner missing hotkey or revision"
+            )
+        
+        # Get sampling statistics
+        stats_dao = MinerStatsDAO()
+        stats = await stats_dao.get_miner_stats(hotkey, revision)
+        
+        if not stats:
+            return {
+                "uid": uid,
+                "hotkey": hotkey,
+                "revision": revision,
+                "sampling_stats": None,
+                "env_stats": None
+            }
+        
+        return {
+            "uid": uid,
+            "hotkey": hotkey,
+            "revision": revision,
+            "sampling_stats": stats.get('sampling_stats', {}),
+            "env_stats": stats.get('env_stats', {})
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve miner stats: {str(e)}"
+        )

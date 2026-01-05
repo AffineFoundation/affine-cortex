@@ -1034,6 +1034,132 @@ def update_miners():
     asyncio.run(cmd_update_miners())
 
 
+async def cmd_get_status():
+    """Get total sampling statistics for each environment.
+    
+    Aggregates sampling statistics across all miners for each environment.
+    """
+    print("Fetching environment sampling statistics...\n")
+    await init_client()
+    
+    try:
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        
+        dao = MinerStatsDAO()
+        all_miners = await dao.get_all_historical_miners()
+        
+        # Aggregate stats by environment
+        env_aggregates = {}
+        
+        for miner in all_miners:
+            env_stats = miner.get('env_stats', {})
+            
+            for env, stats in env_stats.items():
+                if env not in env_aggregates:
+                    env_aggregates[env] = {
+                        'last_15min': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'other_errors': 0},
+                        'last_1hour': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'other_errors': 0},
+                        'last_6hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'other_errors': 0},
+                        'last_24hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'other_errors': 0}
+                    }
+                
+                for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
+                    if window in stats:
+                        wstats = stats[window]
+                        env_aggregates[env][window]['samples'] += wstats.get('samples', 0)
+                        env_aggregates[env][window]['success'] += wstats.get('success', 0)
+                        env_aggregates[env][window]['rate_limit_errors'] += wstats.get('rate_limit_errors', 0)
+                        env_aggregates[env][window]['other_errors'] += wstats.get('other_errors', 0)
+        
+        # Print results
+        if not env_aggregates:
+            print("No sampling statistics found.")
+            return
+        
+        # Calculate global totals
+        global_totals = {
+            'last_15min': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'other_errors': 0},
+            'last_1hour': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'other_errors': 0},
+            'last_6hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'other_errors': 0},
+            'last_24hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'other_errors': 0}
+        }
+        
+        for env_stats in env_aggregates.values():
+            for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
+                global_totals[window]['samples'] += env_stats[window]['samples']
+                global_totals[window]['success'] += env_stats[window]['success']
+                global_totals[window]['rate_limit_errors'] += env_stats[window]['rate_limit_errors']
+                global_totals[window]['other_errors'] += env_stats[window]['other_errors']
+        
+        # Print global totals first
+        print("="*80)
+        print("GLOBAL SAMPLING STATISTICS (ALL ENVIRONMENTS)")
+        print("="*80)
+        
+        window_minutes = {
+            'last_15min': 15,
+            'last_1hour': 60,
+            'last_6hours': 360,
+            'last_24hours': 1440
+        }
+        
+        for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
+            wstats = global_totals[window]
+            samples = wstats['samples']
+            success = wstats['success']
+            success_rate = (success / samples * 100) if samples > 0 else 0
+            samples_per_min = samples / window_minutes[window] if samples > 0 else 0
+            
+            print(f"\n{window}:")
+            print(f"  Total samples: {samples}")
+            print(f"  Success: {success} ({success_rate:.1f}%)")
+            print(f"  Rate limit errors: {wstats['rate_limit_errors']}")
+            print(f"  Other errors: {wstats['other_errors']}")
+            print(f"  Samples/min: {samples_per_min:.2f}")
+        
+        # Print per-environment statistics
+        print("\n" + "="*80)
+        print("PER-ENVIRONMENT SAMPLING STATISTICS")
+        print("="*80)
+        
+        for env in sorted(env_aggregates.keys()):
+            print(f"\n{env}:")
+            print("-"*80)
+            
+            for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
+                wstats = env_aggregates[env][window]
+                samples = wstats['samples']
+                success = wstats['success']
+                success_rate = (success / samples * 100) if samples > 0 else 0
+                samples_per_min = samples / window_minutes[window] if samples > 0 else 0
+                
+                print(f"\n  {window}:")
+                print(f"    Total samples: {samples}")
+                print(f"    Success: {success} ({success_rate:.1f}%)")
+                print(f"    Rate limit errors: {wstats['rate_limit_errors']}")
+                print(f"    Other errors: {wstats['other_errors']}")
+                print(f"    Samples/min: {samples_per_min:.2f}")
+        
+        print("\n" + "="*80)
+    
+    finally:
+        await close_client()
+
+
+@db.command("get-status")
+def get_status():
+    """Get total sampling statistics for each environment.
+    
+    Aggregates and displays sampling statistics across all miners,
+    grouped by environment. Shows statistics for different time windows
+    (15min, 1hour, 6hours, 24hours).
+    
+    Example:
+        af db get-status
+    """
+    asyncio.run(cmd_get_status())
+
+
 def main():
     """Main CLI entry point."""
     db()
