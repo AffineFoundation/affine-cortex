@@ -646,36 +646,62 @@ async def cmd_cleanup_inactive_miners(days: int):
 
 
 async def cmd_update_miners():
-    """Initialize miner_stats table from existing sample_results data.
+    """Initialize/update miner_stats from sample_results using batch scan.
     
-    Scans sample_results table and creates miner_stats records for all
-    unique (hotkey, revision) combinations found.
+    Uses batch scanning to handle millions of samples efficiently:
+    - Scans in batches to avoid memory overflow
+    - Updates miner_stats incrementally per batch
+    - Only updates updatable fields (first_seen_at, last_updated_at)
+    - Skips immutable fields like best_rank (requires online data)
     """
     from affine.database.dao.sample_results import SampleResultsDAO
     from affine.database.dao.miner_stats import MinerStatsDAO
+    from datetime import datetime
     
     print("Initializing miner_stats from sample_results...")
+    print("Note: Only updates timestamps (first_seen_at, last_updated_at)")
+    print("      Historical best_rank is not updated (requires online data)\n")
+    
     await init_client()
     
     try:
         sample_dao = SampleResultsDAO()
         miner_dao = MinerStatsDAO()
         
-        # Get all unique (hotkey, revision, model) combinations from samples
-        print("Scanning sample_results table...")
-        
         from affine.database.client import get_client
         client = get_client()
         
-        # Use scan to get all samples
-        params = {'TableName': sample_dao.table_name}
-        
-        miners_map = {}  # {(hotkey, revision): {model, first_seen, last_seen}}
+        # Batch scan configuration
+        batch_size = 1000  # Process 1000 samples per batch
         total_samples = 0
+        total_batches = 0
+        miners_created = 0
+        miners_updated = 0
+        
+        # Track miners across batches to detect new ones
+        seen_miners = set()
+        
+        print("Scanning sample_results table in batches...")
+        
+        params = {
+            'TableName': sample_dao.table_name,
+            'Limit': batch_size,
+            'ProjectionExpression': 'miner_hotkey, model_revision, #model, #ts',
+            'ExpressionAttributeNames': {
+                '#model': 'model',
+                '#ts': 'timestamp'
+            }
+        }
         
         while True:
             response = await client.scan(**params)
             items = response.get('Items', [])
+            
+            if not items:
+                break
+            
+            # Process this batch
+            batch_miners = {}  # {(hotkey, revision): {model, first_seen, last_seen}}
             
             for item in items:
                 sample = sample_dao._deserialize(item)
@@ -688,63 +714,134 @@ async def cmd_update_miners():
                     continue
                 
                 key = (hotkey, revision)
-                if key not in miners_map:
-                    miners_map[key] = {
+                if key not in batch_miners:
+                    batch_miners[key] = {
                         'model': model,
                         'first_seen': timestamp,
                         'last_seen': timestamp
                     }
                 else:
-                    # Update timestamps
-                    miners_map[key]['first_seen'] = min(miners_map[key]['first_seen'], timestamp)
-                    miners_map[key]['last_seen'] = max(miners_map[key]['last_seen'], timestamp)
-                
-                total_samples += 1
+                    batch_miners[key]['first_seen'] = min(batch_miners[key]['first_seen'], timestamp)
+                    batch_miners[key]['last_seen'] = max(batch_miners[key]['last_seen'], timestamp)
             
+            # Update miner_stats for this batch
+            for (hotkey, revision), info in batch_miners.items():
+                existing = await miner_dao.get_miner_stats(hotkey, revision)
+                
+                if existing:
+                    # Update timestamps only (don't touch best_rank/best_weight)
+                    first_seen_ms = info['first_seen']
+                    last_seen_ms = info['last_seen']
+                    
+                    # Convert milliseconds to seconds
+                    first_seen_sec = first_seen_ms // 1000 if first_seen_ms > 1e10 else first_seen_ms
+                    last_seen_sec = last_seen_ms // 1000 if last_seen_ms > 1e10 else last_seen_ms
+                    
+                    # Update first_seen_at if this sample is older
+                    needs_update = False
+                    updates = {}
+                    
+                    current_first_seen = existing.get('first_seen_at', float('inf'))
+                    if first_seen_sec < current_first_seen:
+                        updates['first_seen_at'] = first_seen_sec
+                        needs_update = True
+                    
+                    current_last_updated = existing.get('last_updated_at', 0)
+                    if last_seen_sec > current_last_updated:
+                        updates['last_updated_at'] = last_seen_sec
+                        needs_update = True
+                    
+                    if needs_update:
+                        # Atomic update of timestamps only
+                        pk = miner_dao._make_pk(hotkey)
+                        sk = miner_dao._make_sk(revision)
+                        
+                        update_parts = []
+                        expr_values = {}
+                        
+                        if 'first_seen_at' in updates:
+                            update_parts.append('#first_seen = :first_seen')
+                            expr_values[':first_seen'] = {'N': str(updates['first_seen_at'])}
+                        
+                        if 'last_updated_at' in updates:
+                            update_parts.append('#last_updated = :last_updated')
+                            expr_values[':last_updated'] = {'N': str(updates['last_updated_at'])}
+                        
+                        await client.update_item(
+                            TableName=miner_dao.table_name,
+                            Key={'pk': {'S': pk}, 'sk': {'S': sk}},
+                            UpdateExpression=f"SET {', '.join(update_parts)}",
+                            ExpressionAttributeNames={
+                                '#first_seen': 'first_seen_at',
+                                '#last_updated': 'last_updated_at'
+                            },
+                            ExpressionAttributeValues=expr_values
+                        )
+                        miners_updated += 1
+                else:
+                    # Create new record
+                    first_seen_ms = info['first_seen']
+                    last_seen_ms = info['last_seen']
+                    
+                    # Convert milliseconds to seconds
+                    first_seen_sec = first_seen_ms // 1000 if first_seen_ms > 1e10 else first_seen_ms
+                    last_seen_sec = last_seen_ms // 1000 if last_seen_ms > 1e10 else last_seen_ms
+                    
+                    await miner_dao.update_miner_info(
+                        hotkey=hotkey,
+                        revision=revision,
+                        model=info['model'],
+                        rank=None,
+                        weight=None,
+                        is_online=False
+                    )
+                    
+                    # Update timestamps to historical values
+                    pk = miner_dao._make_pk(hotkey)
+                    sk = miner_dao._make_sk(revision)
+                    
+                    await client.update_item(
+                        TableName=miner_dao.table_name,
+                        Key={'pk': {'S': pk}, 'sk': {'S': sk}},
+                        UpdateExpression='SET #first_seen = :first_seen, #last_updated = :last_updated',
+                        ExpressionAttributeNames={
+                            '#first_seen': 'first_seen_at',
+                            '#last_updated': 'last_updated_at'
+                        },
+                        ExpressionAttributeValues={
+                            ':first_seen': {'N': str(first_seen_sec)},
+                            ':last_updated': {'N': str(last_seen_sec)}
+                        }
+                    )
+                    
+                    miners_created += 1
+                
+                seen_miners.add((hotkey, revision))
+            
+            total_samples += len(items)
+            total_batches += 1
+            
+            # Progress update
+            print(
+                f"  Batch {total_batches}: Processed {len(items)} samples "
+                f"(total: {total_samples}, unique miners: {len(seen_miners)}, "
+                f"created: {miners_created}, updated: {miners_updated})"
+            )
+            
+            # Check for next page
             last_key = response.get('LastEvaluatedKey')
             if not last_key:
                 break
             
             params['ExclusiveStartKey'] = last_key
-            
-            # Progress update
-            if total_samples % 1000 == 0:
-                print(f"  Processed {total_samples} samples, found {len(miners_map)} unique miners...")
-        
-        print(f"\n✓ Scanned {total_samples} samples")
-        print(f"✓ Found {len(miners_map)} unique (hotkey, revision) combinations\n")
-        
-        # Create miner_stats records
-        print("Creating miner_stats records...")
-        created = 0
-        skipped = 0
-        
-        for (hotkey, revision), info in miners_map.items():
-            # Check if record already exists
-            existing = await miner_dao.get_miner_stats(hotkey, revision)
-            
-            if existing:
-                skipped += 1
-                continue
-            
-            # Create new record
-            await miner_dao.update_miner_info(
-                hotkey=hotkey,
-                revision=revision,
-                model=info['model'],
-                rank=None,
-                weight=None,
-                is_online=False
-            )
-            created += 1
-            
-            if created % 100 == 0:
-                print(f"  Created {created} records...")
         
         print(f"\n✓ Initialization complete:")
-        print(f"  - Created: {created} new miner records")
-        print(f"  - Skipped: {skipped} existing records")
-        print(f"  - Total miners: {len(miners_map)}")
+        print(f"  - Total samples scanned: {total_samples}")
+        print(f"  - Total batches: {total_batches}")
+        print(f"  - Unique miners found: {len(seen_miners)}")
+        print(f"  - New records created: {miners_created}")
+        print(f"  - Existing records updated: {miners_updated}")
+        print(f"\nNote: Only timestamps were updated. Historical best_rank requires online miner data.")
     
     except Exception as e:
         print(f"\n✗ Failed to initialize miner_stats: {e}")

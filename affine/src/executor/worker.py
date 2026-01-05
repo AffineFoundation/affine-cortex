@@ -235,10 +235,8 @@ class ExecutorWorker:
                 signature="",
             )
             
-            sign_data = submission.get_sign_data()
-            signature_bytes = self.wallet.hotkey.sign(sign_data.encode())
-            submission.signature = signature_bytes.hex()
-            
+            submission.sign(self.wallet)
+
             has_error = extra.get("error")
             if has_error:
                 error_brief = str(has_error).replace('\n', ' ').replace('\r', ' ')[:300]
@@ -342,21 +340,42 @@ class ExecutorWorker:
                     )
                     
                     task_start_time = time.time()
+                    submission = None
+                    execution_error = None
+                    
                     try:
                         submission = await self._execute_task(task)
-                        await self._submit_result(task, submission)
-                        
                     except Exception as e:
+                        execution_error = e
                         execution_time = time.time() - task_start_time
-                        miner_uid = task.get('miner_uid')
-                        task_id = task.get('task_id', 'N/A')
                         
+                        # Create a failed submission with error details
                         error_brief = str(e).replace('\n', ' ').replace('\r', ' ')[:300]
-                        
                         safe_log(
-                            f"[FAILED] U{miner_uid:<4} │ {self.env:<20} │     FAILED │ "
-                            f"task_id={task_id:<6} │ {execution_time:6.3f}s │ {error_brief}",
+                            f"[FAILED] U{task.get('miner_uid'):<4} │ {self.env:<20} │     FAILED │ "
+                            f"task_id={task.get('task_id', 'N/A'):<6} │ {execution_time:6.3f}s │ {error_brief}",
                             "INFO"
+                        )
+                        
+                        # Construct a failed submission
+                        submission = SampleSubmission(
+                            task_uuid=task.get('task_uuid', ''),
+                            score=0.0,
+                            latency_ms=int(execution_time * 1000),
+                            extra={"error": str(e)},
+                            signature="",
+                        )
+                        
+                        submission.sign(self.wallet)
+                    
+                    # Always submit result if we have a submission
+                    try:
+                        if submission:
+                            await self._submit_result(task, submission)
+                    except Exception as submit_error:
+                        safe_log(
+                            f"[{self.env}] Failed to submit result for task {task.get('task_uuid', 'unknown')[:8]}...: {submit_error}",
+                            "ERROR"
                         )
                     finally:
                         self.task_queue.task_done()
