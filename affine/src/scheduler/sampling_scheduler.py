@@ -133,11 +133,12 @@ class PerMinerSamplingScheduler:
             # Update tracking
             self._last_valid_miners = current_valid_miners
             
-            # Get sampling environments
+            # Get sampling environments (only those with enabled_for_sampling=True)
             environments = await self.config_dao.get_param_value('environments', {})
             sampling_envs = [
                 env_name for env_name, env_config in environments.items()
-                if env_config.get('sampling_config')
+                if env_config.get('enabled_for_sampling', False)
+                and env_config.get('sampling_config')
             ]
             
             if not sampling_envs:
@@ -290,7 +291,8 @@ class PerMinerSamplingScheduler:
     ):
         """Handle sampling list changes (rotation or resize).
         
-        Removes tasks that are no longer in the sampling list.
+        Note: Task cleanup is handled by SamplingScheduler's rotation logic.
+        This method only logs the change for per-miner awareness.
         """
         old_set = set(old_list)
         new_set = set(new_list)
@@ -301,12 +303,9 @@ class PerMinerSamplingScheduler:
         if removed_ids or added_ids:
             logger.info(
                 f"Sampling list changed for {env}: "
-                f"removed={len(removed_ids)}, added={len(added_ids)}"
+                f"removed={len(removed_ids)}, added={len(added_ids)} "
+                f"(cleanup handled by SamplingScheduler)"
             )
-        
-        # Clean up removed tasks from pool
-        if removed_ids:
-            await self._cleanup_removed_tasks(env, list(removed_ids))
     
     def _select_tasks_to_create(
         self,
@@ -367,37 +366,6 @@ class PerMinerSamplingScheduler:
             f"U{miner.get('uid', -1)}({miner['hotkey'][:8]}...)"
         )
     
-    async def _cleanup_removed_tasks(self, env: str, removed_ids: List[int]):
-        """Cleanup removed task IDs from TaskPool (pending only)."""
-        if not removed_ids:
-            return
-        
-        valid_miners = await self.miners_dao.get_valid_miners()
-        
-        deleted_count = 0
-        for miner in valid_miners:
-            hotkey = miner['hotkey']
-            revision = miner['revision']
-            
-            for task_id in removed_ids:
-                pk = self.task_pool_dao._make_pk(hotkey, revision)
-                sk = self.task_pool_dao._make_sk(env, 'pending', task_id)
-                
-                try:
-                    deleted = await self.task_pool_dao.delete(pk, sk)
-                    if deleted:
-                        deleted_count += 1
-                except Exception as e:
-                    logger.debug(
-                        f"Failed to delete task {env}/{task_id} for miner "
-                        f"{hotkey[:8]}...: {e}"
-                    )
-        
-        if deleted_count > 0:
-            logger.info(
-                f"Cleaned up {deleted_count} pending tasks for {len(removed_ids)} "
-                f"removed task IDs in {env}"
-            )
     
     async def _cleanup_removed_miners(self, removed_miners: Set[tuple]):
         """Cleanup all tasks for miners that have been removed.

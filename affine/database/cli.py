@@ -1170,17 +1170,18 @@ async def cmd_get_pool():
     
     Shows how many tasks each miner has in the sampling pool for each environment,
     including pending, assigned, and paused tasks, plus sampling statistics.
+    Only displays environments where enabled_for_sampling=True.
     """
     print("Fetching task pool statistics...\n")
     await init_client()
     
     try:
-        from affine.core.environments import ENV_CONFIGS
         from affine.database.dao.miner_stats import MinerStatsDAO
         
         task_dao = TaskPoolDAO()
         miners_dao = MinersDAO()
         miner_stats_dao = MinerStatsDAO()
+        config_dao = SystemConfigDAO()
         
         # Get all miners for hotkey lookup
         all_miners = await miners_dao.get_all_miners()
@@ -1193,8 +1194,12 @@ async def cmd_get_pool():
             for m in all_miner_stats
         }
         
-        # Get active environments
-        active_envs = sorted([env for env in ENV_CONFIGS.keys()])
+        # Get enabled environments from system config
+        environments = await config_dao.get_param_value('environments', default={})
+        active_envs = sorted([
+            env_name for env_name, env_config in environments.items()
+            if env_config.get('enabled_for_sampling', False)
+        ])
         
         if not active_envs:
             print("No environments configured.")

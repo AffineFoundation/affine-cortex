@@ -11,14 +11,11 @@ import signal
 import click
 from affine.core.setup import setup_logging, logger
 from affine.database import init_client, close_client
-from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.task_pool import TaskPoolDAO
-from .task_generator import TaskGeneratorService
-from .scheduler import SchedulerService
 from .sampling_scheduler import SamplingScheduler, PerMinerSamplingScheduler
 
 
-async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int):
+async def run_service(cleanup_interval: int):
     """Run the task scheduler service."""
     logger.info("Starting Task Scheduler Service")
     
@@ -42,33 +39,10 @@ async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int)
         loop.add_signal_handler(sig, lambda s=sig: handle_shutdown(s))
     
     # Initialize schedulers
-    scheduler = None
     sampling_scheduler = None
     per_miner_scheduler = None
+    cleanup_task = None
     try:
-        # Create DAOs
-        sample_results_dao = SampleResultsDAO()
-        task_pool_dao = TaskPoolDAO()
-        
-        # Create TaskGeneratorService (legacy, for cleanup only)
-        task_generator = TaskGeneratorService(
-            sample_results_dao=sample_results_dao,
-            task_pool_dao=task_pool_dao
-        )
-        
-        # Create and start SchedulerService (legacy, for cleanup only)
-        scheduler = SchedulerService(
-            task_generator=task_generator,
-            task_generation_interval=task_interval,
-            cleanup_interval=cleanup_interval,
-            max_tasks_per_miner_env=max_tasks
-        )
-        
-        await scheduler.start()
-        logger.info(
-            f"Legacy SchedulerService started (cleanup_interval={cleanup_interval}s)"
-        )
-        
         # Create and start SamplingScheduler (rotation only)
         sampling_scheduler = SamplingScheduler()
         await sampling_scheduler.start()
@@ -82,6 +56,22 @@ async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int)
         await per_miner_scheduler.start()
         logger.info("PerMinerSamplingScheduler started for per-miner task generation")
         
+        # Start cleanup task for expired paused tasks
+        async def cleanup_loop():
+            """Background loop for cleanup operations."""
+            task_pool_dao = TaskPoolDAO()
+            logger.info(f"Cleanup loop started (interval={cleanup_interval}s)")
+            
+            while True:
+                try:
+                    await task_pool_dao.cleanup_expired_paused_tasks()
+                except Exception as e:
+                    logger.error(f"Cleanup loop error: {e}", exc_info=True)
+                
+                await asyncio.sleep(cleanup_interval)
+        
+        cleanup_task = asyncio.create_task(cleanup_loop())
+        
         # Wait for shutdown signal
         await shutdown_event.wait()
         
@@ -90,6 +80,14 @@ async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int)
         raise
     finally:
         # Cleanup
+        if cleanup_task:
+            cleanup_task.cancel()
+            try:
+                await cleanup_task
+            except asyncio.CancelledError:
+                pass
+            logger.info("Cleanup task stopped")
+        
         if per_miner_scheduler:
             try:
                 await per_miner_scheduler.stop()
@@ -103,13 +101,6 @@ async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int)
                 logger.info("SamplingScheduler stopped")
             except Exception as e:
                 logger.error(f"Error stopping SamplingScheduler: {e}")
-        
-        if scheduler:
-            try:
-                await scheduler.stop()
-                logger.info("Legacy SchedulerService stopped")
-            except Exception as e:
-                logger.error(f"Error stopping SchedulerService: {e}")
         
         try:
             await close_client()
@@ -131,24 +122,18 @@ def main(verbosity):
     """
     Affine Task Scheduler - Generate sampling tasks for miners.
     
-    This service periodically generates sampling tasks for all active miners
-    and performs cleanup of old tasks.
+    This service uses the new per-miner sampling scheduler architecture
+    with global concurrency control.
     """
     # Setup logging if verbosity specified
     if verbosity is not None:
         setup_logging(int(verbosity))
     
-    # Override with environment variables if present
-    task_interval = int(os.getenv("SCHEDULER_TASK_GENERATION_INTERVAL", "600"))
+    # Cleanup interval for expired paused tasks
     cleanup_interval = int(os.getenv("SCHEDULER_CLEANUP_INTERVAL", "300"))
-    max_tasks = int(os.getenv("SCHEDULER_MAX_TASKS_PER_MINER_ENV", "300"))
 
     # Run service
-    asyncio.run(run_service(
-        task_interval=task_interval,
-        cleanup_interval=cleanup_interval,
-        max_tasks=max_tasks
-    ))
+    asyncio.run(run_service(cleanup_interval=cleanup_interval))
 
 
 if __name__ == "__main__":
