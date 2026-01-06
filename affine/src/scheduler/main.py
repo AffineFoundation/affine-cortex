@@ -15,7 +15,7 @@ from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.task_pool import TaskPoolDAO
 from .task_generator import TaskGeneratorService
 from .scheduler import SchedulerService
-from .sampling_scheduler import SamplingScheduler
+from .sampling_scheduler import SamplingScheduler, PerMinerSamplingScheduler
 
 
 async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int):
@@ -41,21 +41,22 @@ async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int)
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: handle_shutdown(s))
     
-    # Initialize task generator and schedulers
+    # Initialize schedulers
     scheduler = None
     sampling_scheduler = None
+    per_miner_scheduler = None
     try:
         # Create DAOs
         sample_results_dao = SampleResultsDAO()
         task_pool_dao = TaskPoolDAO()
         
-        # Create TaskGeneratorService
+        # Create TaskGeneratorService (legacy, for cleanup only)
         task_generator = TaskGeneratorService(
             sample_results_dao=sample_results_dao,
             task_pool_dao=task_pool_dao
         )
         
-        # Create and start SchedulerService
+        # Create and start SchedulerService (legacy, for cleanup only)
         scheduler = SchedulerService(
             task_generator=task_generator,
             task_generation_interval=task_interval,
@@ -65,14 +66,21 @@ async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int)
         
         await scheduler.start()
         logger.info(
-            f"TaskScheduler started (task_interval={task_interval}s, "
-            f"cleanup_interval={cleanup_interval}s, max_tasks={max_tasks})"
+            f"Legacy SchedulerService started (cleanup_interval={cleanup_interval}s)"
         )
         
-        # Create and start SamplingScheduler
+        # Create and start SamplingScheduler (rotation only)
         sampling_scheduler = SamplingScheduler()
         await sampling_scheduler.start()
-        logger.info("SamplingScheduler started for dynamic task rotation")
+        logger.info("SamplingScheduler started for sampling list rotation")
+        
+        # Create and start PerMinerSamplingScheduler (new architecture)
+        per_miner_scheduler = PerMinerSamplingScheduler(
+            default_concurrency=5,
+            scheduling_interval=10
+        )
+        await per_miner_scheduler.start()
+        logger.info("PerMinerSamplingScheduler started for per-miner task generation")
         
         # Wait for shutdown signal
         await shutdown_event.wait()
@@ -82,6 +90,13 @@ async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int)
         raise
     finally:
         # Cleanup
+        if per_miner_scheduler:
+            try:
+                await per_miner_scheduler.stop()
+                logger.info("PerMinerSamplingScheduler stopped")
+            except Exception as e:
+                logger.error(f"Error stopping PerMinerSamplingScheduler: {e}")
+        
         if sampling_scheduler:
             try:
                 await sampling_scheduler.stop()
@@ -92,9 +107,9 @@ async def run_service(task_interval: int, cleanup_interval: int, max_tasks: int)
         if scheduler:
             try:
                 await scheduler.stop()
-                logger.info("TaskScheduler stopped")
+                logger.info("Legacy SchedulerService stopped")
             except Exception as e:
-                logger.error(f"Error stopping TaskScheduler: {e}")
+                logger.error(f"Error stopping SchedulerService: {e}")
         
         try:
             await close_client()
