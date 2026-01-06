@@ -41,36 +41,19 @@ async def run_service(cleanup_interval: int):
     # Initialize schedulers
     sampling_scheduler = None
     per_miner_scheduler = None
-    cleanup_task = None
     try:
         # Create and start SamplingScheduler (rotation only)
         sampling_scheduler = SamplingScheduler()
         await sampling_scheduler.start()
         logger.info("SamplingScheduler started for sampling list rotation")
         
-        # Create and start PerMinerSamplingScheduler (new architecture)
+        # Create and start PerMinerSamplingScheduler (task generation + all cleanup)
         per_miner_scheduler = PerMinerSamplingScheduler(
             default_concurrency=3,
             scheduling_interval=10
         )
         await per_miner_scheduler.start()
-        logger.info("PerMinerSamplingScheduler started for per-miner task generation")
-        
-        # Start cleanup task for expired paused tasks
-        async def cleanup_loop():
-            """Background loop for cleanup operations."""
-            task_pool_dao = TaskPoolDAO()
-            logger.info(f"Cleanup loop started (interval={cleanup_interval}s)")
-            
-            while True:
-                try:
-                    await task_pool_dao.cleanup_expired_paused_tasks()
-                except Exception as e:
-                    logger.error(f"Cleanup loop error: {e}", exc_info=True)
-                
-                await asyncio.sleep(cleanup_interval)
-        
-        cleanup_task = asyncio.create_task(cleanup_loop())
+        logger.info("PerMinerSamplingScheduler started (task generation + cleanup)")
         
         # Wait for shutdown signal
         await shutdown_event.wait()
@@ -80,14 +63,6 @@ async def run_service(cleanup_interval: int):
         raise
     finally:
         # Cleanup
-        if cleanup_task:
-            cleanup_task.cancel()
-            try:
-                await cleanup_task
-            except asyncio.CancelledError:
-                pass
-            logger.info("Cleanup task stopped")
-        
         if per_miner_scheduler:
             try:
                 await per_miner_scheduler.stop()

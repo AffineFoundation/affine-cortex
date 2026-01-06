@@ -439,13 +439,23 @@ class PerMinerSamplingScheduler:
             logger.info(f"Total cleanup: removed {total_deleted} tasks for {len(removed_miners)} miners")
     
     async def _cleanup_loop(self):
-        """Cleanup loop - runs every 5 minutes to remove invalid sampling tasks."""
+        """Cleanup loop - runs every 5 minutes for all cleanup tasks.
+        
+        Handles:
+        1. Invalid sampling tasks (env disabled or task_id not in sampling_list)
+        2. Expired paused tasks (TTL exceeded)
+        """
         # Wait 60s before first cleanup (let scheduler stabilize)
         await asyncio.sleep(60)
         
         while self._running:
             try:
+                # Cleanup invalid sampling tasks
                 await self._cleanup_invalid_sampling_tasks()
+                
+                # Cleanup expired paused tasks
+                await self.task_pool_dao.cleanup_expired_paused_tasks()
+                
                 await asyncio.sleep(300)  # Run every 5 minutes
             except asyncio.CancelledError:
                 logger.info("Cleanup loop cancelled")
