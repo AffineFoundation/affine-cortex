@@ -1034,7 +1034,7 @@ def update_miners():
     asyncio.run(cmd_update_miners())
 
 
-async def cmd_get_status():
+async def cmd_get_stats():
     """Get total sampling statistics for each environment.
     
     Aggregates sampling statistics across all miners for each environment.
@@ -1146,8 +1146,8 @@ async def cmd_get_status():
         await close_client()
 
 
-@db.command("get-status")
-def get_status():
+@db.command("get-stats")
+def get_stats():
     """Get total sampling statistics for each environment.
     
     Aggregates and displays sampling statistics across all miners,
@@ -1155,9 +1155,9 @@ def get_status():
     (15min, 1hour, 6hours, 24hours).
     
     Example:
-        af db get-status
+        af db get-stats
     """
-    asyncio.run(cmd_get_status())
+    asyncio.run(cmd_get_stats())
 
 
 def main():

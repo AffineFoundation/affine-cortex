@@ -247,9 +247,9 @@ class PerMinerSamplingScheduler:
         if not sampling_list:
             return []
         
-        # Detect sampling list changes
+        # Detect sampling list changes (compare lists directly to catch rotations)
         last_list = self._last_sampling_lists.get(env, [])
-        if set(sampling_list) != set(last_list):
+        if sampling_list != last_list:
             await self._handle_sampling_list_change(env, last_list, sampling_list)
             self._last_sampling_lists[env] = sampling_list
         
