@@ -182,15 +182,19 @@ class PerMinerSamplingScheduler:
         hotkey = miner['hotkey']
         revision = miner['revision']
         
-        # Get current pool count for this miner across all envs
+        # Get current active task count per env (exclude paused tasks)
+        env_active_counts: Dict[str, int] = {}
         total_pool_count = 0
+        
         for env in sampling_envs:
-            pending_task_ids = await self.task_pool_dao.get_pending_task_ids_for_miner(
+            active_task_ids = await self.task_pool_dao.get_pending_task_ids_for_miner(
                 miner_hotkey=hotkey,
                 model_revision=revision,
-                env=env
+                env=env,
+                include_paused=False
             )
-            total_pool_count += len(pending_task_ids)
+            env_active_counts[env] = len(active_task_ids)
+            total_pool_count += len(active_task_ids)
         
         # Check if pool is already at capacity
         if total_pool_count >= self.default_concurrency:
@@ -221,9 +225,10 @@ class PerMinerSamplingScheduler:
         if not env_missing_tasks:
             return
         
-        # Select tasks to create (randomly distributed across envs)
+        # Select tasks to create with env-aware strategy
         tasks_to_create = self._select_tasks_to_create(
             env_missing_tasks=env_missing_tasks,
+            env_active_counts=env_active_counts,
             slots_available=slots_available,
             miner=miner
         )
@@ -318,57 +323,60 @@ class PerMinerSamplingScheduler:
     def _select_tasks_to_create(
         self,
         env_missing_tasks: Dict[str, List[int]],
+        env_active_counts: Dict[str, int],
         slots_available: int,
         miner: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
         """Select tasks to create from missing tasks across environments.
         
-        Strategy: Guarantee-first + Random distribution
-        1. First, ensure each env gets at least 1 task (prevent starvation)
-        2. Then, randomly distribute remaining slots
+        Strategy: Fair round-robin allocation to prevent slot monopolization
         
-        This prevents slow envs from being starved while maintaining fairness.
+        Algorithm:
+        1. Sort envs by active_count (ascending) - prioritize underutilized envs
+        2. Round-robin distribute slots evenly across envs
+        3. Each env gets at most ceil(slots_available / num_envs) slots
+        
+        This ensures:
+        - No env monopolizes all slots (even slow-running envs)
+        - Envs with lower active_count are prioritized
+        - Slots distributed evenly (not weighted by missing task count)
         
         Returns:
             List of task specs with env and task_id
         """
-        if slots_available <= 0:
+        if slots_available <= 0 or not env_missing_tasks:
             return []
         
         selected = []
+        
+        # Sort envs by active_count (ascending) to prioritize underutilized envs
+        sorted_envs = sorted(
+            env_missing_tasks.keys(),
+            key=lambda e: env_active_counts.get(e, 0)
+        )
+        
+        # Round-robin: cycle through envs, take 1 task from each until slots exhausted
         remaining_slots = slots_available
-        remaining_env_tasks = dict(env_missing_tasks)  # Copy to avoid modifying original
+        env_index = 0
         
-        # Phase 1: Guarantee each env gets at least 1 task (if slots allow)
-        for env in list(remaining_env_tasks.keys()):
-            if remaining_slots <= 0:
-                break
+        while remaining_slots > 0 and sorted_envs:
+            # Get next env in round-robin order
+            env = sorted_envs[env_index % len(sorted_envs)]
             
-            task_ids = remaining_env_tasks[env]
-            if not task_ids:
-                continue
+            # Take 1 task from this env if available
+            if env_missing_tasks.get(env):
+                task_id = env_missing_tasks[env].pop(0)
+                selected.append({'env': env, 'task_id': task_id})
+                remaining_slots -= 1
+                
+                # Remove env from rotation if no more tasks
+                if not env_missing_tasks[env]:
+                    del env_missing_tasks[env]
+                    sorted_envs.remove(env)
+                    continue  # Don't increment index after removal
             
-            # Select first task from this env (prioritize tail tasks which are already sorted)
-            selected_task = {'env': env, 'task_id': task_ids[0]}
-            selected.append(selected_task)
-            remaining_slots -= 1
-            
-            # Remove selected task from candidates
-            remaining_env_tasks[env] = task_ids[1:]
-            if not remaining_env_tasks[env]:
-                del remaining_env_tasks[env]
-        
-        # Phase 2: Randomly distribute remaining slots
-        if remaining_slots > 0 and remaining_env_tasks:
-            # Flatten remaining candidates
-            remaining_candidates = []
-            for env, task_ids in remaining_env_tasks.items():
-                for task_id in task_ids:
-                    remaining_candidates.append({'env': env, 'task_id': task_id})
-            
-            # Randomly shuffle and select
-            random.shuffle(remaining_candidates)
-            selected.extend(remaining_candidates[:remaining_slots])
+            # Increment index to move to next env
+            env_index += 1
         
         if selected:
             env_distribution = {}
