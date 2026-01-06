@@ -52,6 +52,7 @@ class PerMinerSamplingScheduler:
         
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
     
     async def start(self):
         """Start per-miner sampling scheduler."""
@@ -65,6 +66,7 @@ class PerMinerSamplingScheduler:
         await self._initialize_sampling_lists()
         
         self._task = asyncio.create_task(self._scheduling_loop())
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
     
     async def stop(self):
         """Stop sampling scheduler."""
@@ -74,6 +76,12 @@ class PerMinerSamplingScheduler:
             self._task.cancel()
             try:
                 await self._task
+            except asyncio.CancelledError:
+                pass
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
             except asyncio.CancelledError:
                 pass
     
@@ -429,6 +437,139 @@ class PerMinerSamplingScheduler:
         
         if total_deleted > 0:
             logger.info(f"Total cleanup: removed {total_deleted} tasks for {len(removed_miners)} miners")
+    
+    async def _cleanup_loop(self):
+        """Cleanup loop - runs every 5 minutes to remove invalid sampling tasks."""
+        # Wait 60s before first cleanup (let scheduler stabilize)
+        await asyncio.sleep(60)
+        
+        while self._running:
+            try:
+                await self._cleanup_invalid_sampling_tasks()
+                await asyncio.sleep(300)  # Run every 5 minutes
+            except asyncio.CancelledError:
+                logger.info("Cleanup loop cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Cleanup loop error: {e}", exc_info=True)
+                await asyncio.sleep(60)
+    
+    async def _cleanup_invalid_sampling_tasks(self):
+        """Cleanup all invalid sampling tasks from task pool.
+        
+        Valid task criteria:
+        1. Environment has enabled_for_sampling=True
+        2. task_id is in the environment's sampling_list
+        
+        All other pending tasks are considered invalid and will be deleted.
+        """
+        logger.info("Starting cleanup of invalid sampling tasks")
+        
+        # Build valid task set
+        environments = await self.config_dao.get_param_value('environments', {})
+        valid_tasks = set()  # Set of (env, task_id) tuples
+        
+        for env_name, env_config in environments.items():
+            if not env_config.get('enabled_for_sampling', False):
+                continue
+            
+            sampling_config = env_config.get('sampling_config', {})
+            sampling_list = sampling_config.get('sampling_list', [])
+            
+            for task_id in sampling_list:
+                valid_tasks.add((env_name, task_id))
+        
+        if not valid_tasks:
+            logger.warning("No valid sampling tasks found in configuration")
+            return
+        
+        # Count enabled environments
+        enabled_env_count = sum(
+            1 for env_config in environments.values()
+            if env_config.get('enabled_for_sampling', False)
+        )
+        
+        logger.info(
+            f"Valid task set contains {len(valid_tasks)} tasks "
+            f"across {enabled_env_count} enabled environments"
+        )
+        
+        # Scan task pool and delete invalid tasks
+        from affine.database.client import get_client
+        client = get_client()
+        
+        # Get all valid miners
+        valid_miners = await self.miners_dao.get_valid_miners()
+        
+        total_scanned = 0
+        total_deleted = 0
+        
+        for miner in valid_miners:
+            hotkey = miner['hotkey']
+            revision = miner['revision']
+            
+            try:
+                pk = self.task_pool_dao._make_pk(hotkey, revision)
+                
+                # Query all pending tasks for this miner
+                query_params = {
+                    'TableName': self.task_pool_dao.table_name,
+                    'KeyConditionExpression': 'pk = :pk',
+                    'FilterExpression': '#status = :status',
+                    'ExpressionAttributeNames': {'#status': 'status'},
+                    'ExpressionAttributeValues': {
+                        ':pk': {'S': pk},
+                        ':status': {'S': 'pending'}
+                    }
+                }
+                
+                tasks_to_delete = []
+                last_key = None
+                
+                while True:
+                    if last_key:
+                        query_params['ExclusiveStartKey'] = last_key
+                    
+                    response = await client.query(**query_params)
+                    items = response.get('Items', [])
+                    
+                    for item in items:
+                        task = self.task_pool_dao._deserialize(item)
+                        total_scanned += 1
+                        
+                        env = task.get('env')
+                        task_id = task.get('task_id')
+                        
+                        # Check if this task is valid
+                        if (env, task_id) not in valid_tasks:
+                            tasks_to_delete.append(task)
+                    
+                    last_key = response.get('LastEvaluatedKey')
+                    if not last_key:
+                        break
+                
+                if tasks_to_delete:
+                    deleted = await self.task_pool_dao._batch_delete_tasks(tasks_to_delete)
+                    total_deleted += deleted
+                    
+                    # Log details for first few invalid tasks
+                    if deleted > 0:
+                        sample_tasks = tasks_to_delete[:3]
+                        logger.info(
+                            f"Deleted {deleted} invalid tasks for miner {hotkey[:8]}...#{revision[:8]}... "
+                            f"(examples: {[(t['env'], t['task_id']) for t in sample_tasks]})"
+                        )
+            
+            except Exception as e:
+                logger.error(
+                    f"Error cleaning up invalid tasks for miner {hotkey[:8]}...: {e}",
+                    exc_info=True
+                )
+        
+        logger.info(
+            f"Cleanup completed: scanned {total_scanned} pending tasks, "
+            f"deleted {total_deleted} invalid tasks"
+        )
 
 
 class SamplingScheduler:

@@ -1262,7 +1262,8 @@ async def cmd_get_pool():
                     stats_15m, stats_1h, stats_6h, stats_24h
                 ))
             
-            miner_totals.sort(key=lambda x: x[6], reverse=True)  # Sort by total
+            # Sort by UID (numeric) for consistency
+            miner_totals.sort(key=lambda x: (int(x[0]) if str(x[0]).isdigit() else 99999))
             
             # Print header
             print(
@@ -1305,22 +1306,13 @@ async def cmd_get_pool():
         print("=" * 180)
         
         for env in active_envs:
-            env_miner_keys = set()
-            for status_dict in env_stats[env].values():
-                for miner_key in status_dict.keys():
-                    parts = miner_key.split('#')
-                    if len(parts) >= 2:
-                        env_miner_keys.add((parts[0], parts[1]))
-            
-            if not env_miner_keys:
-                continue
-            
             print(f"\n{env}:")
             print("-" * 180)
             
+            # Use ALL valid miners for consistency (not just those with tasks in this env)
             # Aggregate counts for this environment
             env_totals = []
-            for hotkey, revision in env_miner_keys:
+            for hotkey, revision in all_miners_keys:
                 miner_key = f"{hotkey}#{revision}"
                 pending = env_stats[env]['pending'].get(miner_key, 0)
                 assigned = env_stats[env]['assigned'].get(miner_key, 0)
@@ -1340,7 +1332,8 @@ async def cmd_get_pool():
                     stats_15m, stats_1h, stats_6h, stats_24h
                 ))
             
-            env_totals.sort(key=lambda x: x[6], reverse=True)
+            # Sort by UID (numeric) for consistency
+            env_totals.sort(key=lambda x: (int(x[0]) if str(x[0]).isdigit() else 99999))
             
             print(
                 f"  {'UID':<5} {'Hotkey':<19} {'Rev':<11} "
