@@ -380,6 +380,7 @@ async def get_miner_command(uid: int):
                         print(f"  Success rate: {wstats.get('success_rate', 0.0):.2%}")
                         print(f"  Samples/min: {wstats.get('samples_per_min', 0.0):.2f}")
                         print(f"  Rate limit errors: {wstats.get('rate_limit_errors', 0)}")
+                        print(f"  Timeout errors: {wstats.get('timeout_errors', 0)}")
                         print(f"  Other errors: {wstats.get('other_errors', 0)}")
                 
                 # Display per-environment statistics
@@ -400,6 +401,7 @@ async def get_miner_command(uid: int):
                                 print(f"    Success rate: {wstats.get('success_rate', 0.0):.2%}")
                                 print(f"    Samples/min: {wstats.get('samples_per_min', 0.0):.2f}")
                                 print(f"    Rate limit errors: {wstats.get('rate_limit_errors', 0)}")
+                                print(f"    Timeout errors: {wstats.get('timeout_errors', 0)}")
                                 print(f"    Other errors: {wstats.get('other_errors', 0)}")
             else:
                 print("\n" + "="*80)

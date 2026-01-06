@@ -124,7 +124,8 @@ class MinerStatsDAO(BaseDAO):
                             "samples": 100,
                             "success": 95,
                             "rate_limit_errors": 3,
-                            "other_errors": 2,
+                            "timeout_errors": 1,
+                            "other_errors": 1,
                             "success_rate": 0.95,
                             "samples_per_min": 6.67
                         },
@@ -229,6 +230,7 @@ class MinerStatsDAO(BaseDAO):
                 'samples': 0,
                 'success': 0,
                 'rate_limit_errors': 0,
+                'timeout_errors': 0,
                 'other_errors': 0,
                 'samples_per_min_sum': 0.0,
                 'env_count': 0
@@ -244,6 +246,7 @@ class MinerStatsDAO(BaseDAO):
                     global_stats[window]['samples'] += wstats.get('samples', 0)
                     global_stats[window]['success'] += wstats.get('success', 0)
                     global_stats[window]['rate_limit_errors'] += wstats.get('rate_limit_errors', 0)
+                    global_stats[window]['timeout_errors'] += wstats.get('timeout_errors', 0)
                     global_stats[window]['other_errors'] += wstats.get('other_errors', 0)
                     global_stats[window]['samples_per_min_sum'] += wstats.get('samples_per_min', 0.0)
                     global_stats[window]['env_count'] += 1

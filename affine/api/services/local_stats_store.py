@@ -27,6 +27,7 @@ class LocalStatsStore:
             "samples": 0,
             "success": 0,
             "rate_limit_errors": 0,
+            "timeout_errors": 0,
             "other_errors": 0
         })
     
@@ -54,7 +55,7 @@ class LocalStatsStore:
         filename = dt.strftime("stats_%Y-%m-%d_%H-%M.json")
         return self.base_dir / filename
     
-    def record_sample(self, hotkey: str, revision: str, env: str, 
+    def record_sample(self, hotkey: str, revision: str, env: str,
                      success: bool, error_type: str):
         """Record a sampling event (accumulate to current window)
         
@@ -63,7 +64,7 @@ class LocalStatsStore:
             revision: Model revision
             env: Environment name
             success: Whether sample succeeded
-            error_type: Error type ('rate_limit', 'other', or None)
+            error_type: Error type ('rate_limit', 'timeout', 'other', or None)
         """
         current_time = int(time.time())
         window_start = self._get_window_start(current_time)
@@ -82,6 +83,8 @@ class LocalStatsStore:
             stats["success"] += 1
         elif error_type == "rate_limit":
             stats["rate_limit_errors"] += 1
+        elif error_type == "timeout":
+            stats["timeout_errors"] += 1
         elif error_type == "other":
             stats["other_errors"] += 1
     
@@ -110,6 +113,7 @@ class LocalStatsStore:
             "samples": 0,
             "success": 0,
             "rate_limit_errors": 0,
+            "timeout_errors": 0,
             "other_errors": 0
         })
     
@@ -126,7 +130,8 @@ class LocalStatsStore:
                     "samples": 1000,
                     "success": 950,
                     "rate_limit_errors": 30,
-                    "other_errors": 20
+                    "timeout_errors": 10,
+                    "other_errors": 10
                 }
             }
         """
@@ -135,6 +140,7 @@ class LocalStatsStore:
             "samples": 0,
             "success": 0,
             "rate_limit_errors": 0,
+            "timeout_errors": 0,
             "other_errors": 0
         })
         
@@ -154,6 +160,7 @@ class LocalStatsStore:
                     agg["samples"] += stats["samples"]
                     agg["success"] += stats["success"]
                     agg["rate_limit_errors"] += stats["rate_limit_errors"]
+                    agg["timeout_errors"] += stats.get("timeout_errors", 0)
                     agg["other_errors"] += stats["other_errors"]
             
             except Exception as e:

@@ -62,6 +62,7 @@ def get_stats(hotkey: str, revision: str):
                         click.echo(f"  Success rate: {wstats.get('success_rate', 0.0):.2%}")
                         click.echo(f"  Samples/min: {wstats.get('samples_per_min', 0.0):.2f}")
                         click.echo(f"  Rate limit errors: {wstats.get('rate_limit_errors', 0)}")
+                        click.echo(f"  Timeout errors: {wstats.get('timeout_errors', 0)}")
                         click.echo(f"  Other errors: {wstats.get('other_errors', 0)}")
             
             # Display per-environment statistics

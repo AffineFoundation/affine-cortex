@@ -53,6 +53,8 @@ class SamplingStatsCollector:
         if not success and error_message:
             if "RateLimitError" in error_message or "429" in error_message:
                 error_type = "rate_limit"
+            elif "timed out after" in error_message or "ReadTimeout" in error_message or "APITimeoutError" in error_message:
+                error_type = "timeout"
             else:
                 error_type = "other"
         
@@ -105,6 +107,7 @@ class SamplingStatsCollector:
                     "samples": samples,
                     "success": stats["success"],
                     "rate_limit_errors": stats["rate_limit_errors"],
+                    "timeout_errors": stats.get("timeout_errors", 0),
                     "other_errors": stats["other_errors"],
                     "success_rate": success_rate,
                     "samples_per_min": samples_per_min
