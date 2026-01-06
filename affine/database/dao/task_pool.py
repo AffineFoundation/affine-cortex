@@ -490,7 +490,8 @@ class TaskPoolDAO(BaseDAO):
         self,
         miner_hotkey: str,
         model_revision: str,
-        env: str
+        env: str,
+        include_paused: bool = True
     ) -> Set[int]:
         """Get set of task_ids in queue for a miner's env.
         
@@ -500,6 +501,9 @@ class TaskPoolDAO(BaseDAO):
             miner_hotkey: Miner's hotkey
             model_revision: Model revision
             env: Environment name
+            include_paused: Whether to include paused tasks (default: True)
+                - True: Include paused tasks (for duplicate detection)
+                - False: Exclude paused tasks (for concurrency control)
             
         Returns:
             Set of task_ids (integers)
@@ -535,9 +539,14 @@ class TaskPoolDAO(BaseDAO):
             if not last_key:
                 break
         
+        # Filter by status based on include_paused parameter
+        valid_statuses = ['pending', 'assigned']
+        if include_paused:
+            valid_statuses.append('paused')
+        
         return {
             item['task_id'] for item in all_items
-            if item.get('status') in ['pending', 'assigned', 'paused']
+            if item.get('status') in valid_statuses
         }
     
     async def cleanup_invalid_tasks(
