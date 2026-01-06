@@ -1,10 +1,10 @@
 """
 Task Pool Manager
 
-Implements weighted random task selection with UUID caching.
+Implements random task selection with UUID caching.
 
 Key Features:
-- Weighted random selection: probability proportional to pending task count per miner
+- Random task selection: avoid miner starvation
 - UUID location cache: fast O(1) task lookup during completion
 - Idempotent completion: gracefully handle already-completed/deleted tasks
 
@@ -115,11 +115,10 @@ class TaskPoolManager:
     Uses background refresh for miner counts to avoid blocking fetch requests.
     """
     
-    def __init__(self, count_cache_ttl: int = 30, miners_cache_ttl: int = 60, stats_cache_ttl: int = 60, block_cache_ttl: int = 10, warmup: bool = True):
+    def __init__(self, miners_cache_ttl: int = 60, stats_cache_ttl: int = 60, block_cache_ttl: int = 10, warmup: bool = True):
         """Initialize TaskPoolManager with caches.
         
         Args:
-            count_cache_ttl: TTL for miner count cache (seconds)
             miners_cache_ttl: TTL for miners cache (seconds)
             stats_cache_ttl: TTL for pool stats cache (seconds)
             block_cache_ttl: TTL for block number cache (seconds)
@@ -131,8 +130,6 @@ class TaskPoolManager:
         self.sample_dao = SampleResultsDAO()
         
         # Async caches with background refresh
-        self._count_caches: Dict[str, AsyncCache[Dict[str, int]]] = {}  # {env: cache}
-        self._count_cache_ttl = count_cache_ttl
         self._miners_cache = AsyncCache[Dict[str, Dict[str, Any]]](
             ttl=miners_cache_ttl,
             name="miners"
@@ -160,20 +157,7 @@ class TaskPoolManager:
         # Timeout cleanup task
         self._timeout_cleanup_task: Optional[asyncio.Task] = None
         
-        logger.info(f"TaskPoolManager initialized (count_cache_ttl={count_cache_ttl}s, miners_cache_ttl={miners_cache_ttl}s, stats_cache_ttl={stats_cache_ttl}s, block_cache_ttl={block_cache_ttl}s, warmup={warmup})")
-    
-    async def _get_miner_counts(self, env: str) -> Dict[str, int]:
-        """Get task counts per miner with non-blocking cache refresh."""
-        # Create cache for this env if not exists
-        if env not in self._count_caches:
-            self._count_caches[env] = AsyncCache[Dict[str, int]](
-                ttl=self._count_cache_ttl,
-                name=f"count[{env}]"
-            )
-        
-        return await self._count_caches[env].get(
-            lambda: self.dao.get_miner_task_counts(env)
-        )
+        logger.info(f"TaskPoolManager initialized (miners_cache_ttl={miners_cache_ttl}s, stats_cache_ttl={stats_cache_ttl}s, block_cache_ttl={block_cache_ttl}s, warmup={warmup})")
     
     async def _get_miners(self) -> Dict[str, Dict[str, Any]]:
         """Get all miners with non-blocking cache refresh."""
@@ -411,29 +395,6 @@ class TaskPoolManager:
         self._timeout_cleanup_task = asyncio.create_task(cleanup_loop())
         logger.info("Runtime timeout cleanup background task started")
     
-    def _select_miners_weighted(
-        self,
-        miner_counts: Dict[str, int],
-        count: int,
-    ) -> List[str]:
-        """Select miners using uniform random sampling.
-        
-        Simplified: randomly shuffle and take first `count` miners.
-        
-        Args:
-            miner_counts: Dict mapping miner_key -> pending task count
-            count: Number of miners to select
-        
-        Returns:
-            List of selected miner_keys (no duplicates, length <= count)
-        """
-        if not miner_counts:
-            return []
-
-        miner_keys = list(miner_counts.keys())
-        random.shuffle(miner_keys)
-        return miner_keys[:count]
-    
     async def _get_task_location(
         self, 
         task_uuid: str
@@ -481,12 +442,18 @@ class TaskPoolManager:
         batch_size: int = 1
     ) -> List[Dict[str, Any]]:
         """
-        Fetch task(s) using weighted random selection with parallel queries.
+        Fetch task(s) by randomly selecting from pending tasks.
         
-        Algorithm:
-        1. Select N miners randomly (weighted), where N = batch_size * 2-3
-        2. Query all selected miners in parallel (asyncio.gather)
-        3. Collect valid tasks and assign in parallel
+        Simplified approach:
+        1. Get all pending tasks for environment (no limit)
+        2. Randomly shuffle to avoid miner starvation
+        3. Take first batch_size tasks and assign
+        
+        Rationale for no limit:
+        - Total task pool size is bounded (~few thousand across all miners)
+        - Sampling pool controls per-miner concurrency (~10 tasks per miner)
+        - Without full sampling, GSI1 ordering causes miner starvation
+          (tasks are sorted by MINER#hotkey, so limited query returns same miners)
         
         Args:
             executor_hotkey: Executor's hotkey
@@ -502,47 +469,18 @@ class TaskPoolManager:
                 logger.error("env parameter is required for fetch_task")
                 return []
             
-            # Get miner counts (cached)
-            all_miner_counts = await self._get_miner_counts(env)
+            # Get ALL pending tasks for environment (no limit to avoid miner starvation)
+            pending_tasks = await self.dao.get_pending_tasks_by_env(env, limit=None)
             
-            if not all_miner_counts:
-                logger.debug(f"No available tasks found for env={env}")
+            if not pending_tasks:
+                logger.debug(f"No pending tasks found for env={env}")
                 return []
             
-            # Weighted random selection of miners (without replacement)
-            num_miners_to_query = min(int(batch_size * 1.5), len(all_miner_counts))
+            # Randomly shuffle to avoid miner starvation
+            random.shuffle(pending_tasks)
             
-            # Select miners using weighted random sampling (anti-starvation: max_ratio=2.0)
-            selected_miners = self._select_miners_weighted(
-                all_miner_counts,
-                num_miners_to_query,
-            )
-            
-            # Parallel query all selected miners
-            query_tasks = []
-            for miner_key in selected_miners:
-                hotkey, revision = miner_key.split('#', 1)
-                query_tasks.append(
-                    self.dao.get_pending_tasks_for_miner(env, hotkey, revision, limit=1)
-                )
-            
-            # Execute all queries in parallel
-            results = await asyncio.gather(*query_tasks, return_exceptions=True)
-            
-            # Collect valid tasks (filter out exceptions and empty results)
-            candidate_tasks = []
-            for result in results:
-                if isinstance(result, Exception):
-                    continue
-                if isinstance(result, list) and result:
-                    candidate_tasks.append(result[0])  # Take first task
-            
-            # Take first batch_size tasks and assign in parallel
-            tasks_to_assign = candidate_tasks[:batch_size]
-            
-            if not tasks_to_assign:
-                logger.debug(f"No valid tasks found for env={env} after querying {num_miners_to_query} miners")
-                return []
+            # Take first batch_size tasks
+            tasks_to_assign = pending_tasks[:batch_size]
             
             # Parallel assignment
             try:
@@ -601,7 +539,7 @@ class TaskPoolManager:
             
             logger.info(
                 f"TaskPoolManager.fetch_task({env}): "
-                f"queried {num_miners_to_query} miners, assigned {len(assigned_tasks)}/{batch_size} tasks"
+                f"shuffled {len(pending_tasks)} pending tasks, assigned {len(assigned_tasks)}/{batch_size} tasks"
             )
             
             # Always return list
