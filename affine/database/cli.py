@@ -1189,8 +1189,14 @@ async def cmd_get_pool():
         
         # Get all miner stats for sampling statistics
         all_miner_stats = await miner_stats_dao.get_all_historical_miners()
-        stats_by_miner = {
+        # For global view: use sampling_stats (global aggregated)
+        # For per-env view: use env_stats (per-environment breakdown)
+        global_stats_by_miner = {
             (m['hotkey'], m['revision']): m.get('sampling_stats', {})
+            for m in all_miner_stats
+        }
+        env_stats_by_miner = {
+            (m['hotkey'], m['revision']): m.get('env_stats', {})
             for m in all_miner_stats
         }
         
@@ -1250,8 +1256,8 @@ async def cmd_get_pool():
                 total = pending + assigned + paused
                 uid = uid_by_hotkey.get(hotkey, '?')
                 
-                # Get sampling stats
-                sampling_stats = stats_by_miner.get((hotkey, revision), {})
+                # Get global sampling stats
+                sampling_stats = global_stats_by_miner.get((hotkey, revision), {})
                 stats_15m = sampling_stats.get('last_15min', {})
                 stats_1h = sampling_stats.get('last_1hour', {})
                 stats_6h = sampling_stats.get('last_6hours', {})
@@ -1320,12 +1326,13 @@ async def cmd_get_pool():
                 total = pending + assigned + paused
                 uid = uid_by_hotkey.get(hotkey, '?')
                 
-                # Get sampling stats
-                sampling_stats = stats_by_miner.get((hotkey, revision), {})
-                stats_15m = sampling_stats.get('last_15min', {})
-                stats_1h = sampling_stats.get('last_1hour', {})
-                stats_6h = sampling_stats.get('last_6hours', {})
-                stats_24h = sampling_stats.get('last_24hours', {})
+                # Get sampling stats for this specific environment
+                miner_env_stats = env_stats_by_miner.get((hotkey, revision), {})
+                env_specific_stats = miner_env_stats.get(env, {})
+                stats_15m = env_specific_stats.get('last_15min', {})
+                stats_1h = env_specific_stats.get('last_1hour', {})
+                stats_6h = env_specific_stats.get('last_6hours', {})
+                stats_24h = env_specific_stats.get('last_24hours', {})
                 
                 env_totals.append((
                     uid, hotkey, revision, pending, assigned, paused, total,

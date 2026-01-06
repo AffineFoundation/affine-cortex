@@ -323,7 +323,11 @@ class PerMinerSamplingScheduler:
     ) -> List[Dict[str, Any]]:
         """Select tasks to create from missing tasks across environments.
         
-        Strategy: Randomly distribute slots across environments with missing tasks.
+        Strategy: Guarantee-first + Random distribution
+        1. First, ensure each env gets at least 1 task (prevent starvation)
+        2. Then, randomly distribute remaining slots
+        
+        This prevents slow envs from being starved while maintaining fairness.
         
         Returns:
             List of task specs with env and task_id
@@ -331,20 +335,49 @@ class PerMinerSamplingScheduler:
         if slots_available <= 0:
             return []
         
-        # Flatten all missing tasks with env info
-        all_candidates = []
-        for env, task_ids in env_missing_tasks.items():
-            for task_id in task_ids:
-                all_candidates.append({'env': env, 'task_id': task_id})
+        selected = []
+        remaining_slots = slots_available
+        remaining_env_tasks = dict(env_missing_tasks)  # Copy to avoid modifying original
         
-        # Randomly shuffle and select up to slots_available
-        random.shuffle(all_candidates)
-        selected = all_candidates[:slots_available]
+        # Phase 1: Guarantee each env gets at least 1 task (if slots allow)
+        for env in list(remaining_env_tasks.keys()):
+            if remaining_slots <= 0:
+                break
+            
+            task_ids = remaining_env_tasks[env]
+            if not task_ids:
+                continue
+            
+            # Select first task from this env (prioritize tail tasks which are already sorted)
+            selected_task = {'env': env, 'task_id': task_ids[0]}
+            selected.append(selected_task)
+            remaining_slots -= 1
+            
+            # Remove selected task from candidates
+            remaining_env_tasks[env] = task_ids[1:]
+            if not remaining_env_tasks[env]:
+                del remaining_env_tasks[env]
+        
+        # Phase 2: Randomly distribute remaining slots
+        if remaining_slots > 0 and remaining_env_tasks:
+            # Flatten remaining candidates
+            remaining_candidates = []
+            for env, task_ids in remaining_env_tasks.items():
+                for task_id in task_ids:
+                    remaining_candidates.append({'env': env, 'task_id': task_id})
+            
+            # Randomly shuffle and select
+            random.shuffle(remaining_candidates)
+            selected.extend(remaining_candidates[:remaining_slots])
         
         if selected:
+            env_distribution = {}
+            for task in selected:
+                env_distribution[task['env']] = env_distribution.get(task['env'], 0) + 1
+            
             logger.info(
                 f"Selected {len(selected)} tasks for miner U{miner.get('uid', -1)}"
-                f"({miner['hotkey'][:8]}...) from {len(all_candidates)} candidates"
+                f"({miner['hotkey'][:8]}...) - distribution: {env_distribution}"
             )
         
         return selected
