@@ -17,6 +17,7 @@ from typing import Dict, Optional
 from affine.core.setup import logger, setup_logging
 from affine.utils.api_client import create_api_client
 from affine.utils.subtensor import get_subtensor
+from affine.utils.errors import NetworkError
 from affine.src.validator.weight_setter import WeightSetter
 
 
@@ -50,9 +51,12 @@ class ValidatorService:
         try:
             self.wallet = bt.Wallet(name=wallet_name, hotkey=hotkey_name)
             logger.info(f"Wallet: {self.wallet}")
+        except (FileNotFoundError, KeyError) as e:
+            logger.error(f"Wallet file not found or invalid: {e}")
+            raise RuntimeError(f"Failed to load wallet '{wallet_name}/{hotkey_name}': {e}") from e
         except Exception as e:
-            logger.error(f"Failed to load wallet: {e}")
-            raise
+            logger.error(f"Failed to load wallet: {e}", exc_info=True)
+            raise RuntimeError(f"Unexpected error loading wallet: {e}") from e
 
         self.api_client = None
         self.running = False
@@ -98,8 +102,17 @@ class ValidatorService:
                 logger.info(f"Fetched {len(weights_dict)} weights (block={block_number})")
                 return response
             
+            except (NetworkError, ConnectionError, TimeoutError) as e:
+                logger.error(f"Network error fetching weights (attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying in {retry_interval}s...")
+                    self.update_watchdog("weights fetch network error retry wait")
+                    await asyncio.sleep(retry_interval)
+                else:
+                    logger.error(f"Failed to fetch weights after {max_retries} attempts due to network errors")
+                    return None
             except Exception as e:
-                logger.error(f"Error fetching weights (attempt {attempt}/{max_retries}): {e}")
+                logger.error(f"Unexpected error fetching weights (attempt {attempt}/{max_retries}): {e}", exc_info=True)
                 if attempt < max_retries:
                     logger.info(f"Retrying in {retry_interval}s...")
                     self.update_watchdog("weights fetch error retry wait")
@@ -144,8 +157,17 @@ class ValidatorService:
                 logger.info(f"Fetched {len(configs)} config parameters")
                 return configs
             
+            except (NetworkError, ConnectionError, TimeoutError) as e:
+                logger.error(f"Network error fetching config (attempt {attempt}/{max_retries}): {e}")
+                if attempt < max_retries:
+                    logger.info(f"Retrying in {retry_interval}s...")
+                    self.update_watchdog("config fetch network error retry wait")
+                    await asyncio.sleep(retry_interval)
+                else:
+                    logger.error(f"Failed to fetch config after {max_retries} attempts due to network errors")
+                    return None
             except Exception as e:
-                logger.error(f"Error fetching config (attempt {attempt}/{max_retries}): {e}")
+                logger.error(f"Unexpected error fetching config (attempt {attempt}/{max_retries}): {e}", exc_info=True)
                 if attempt < max_retries:
                     logger.info(f"Retrying in {retry_interval}s...")
                     self.update_watchdog("config fetch error retry wait")
