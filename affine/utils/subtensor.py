@@ -11,6 +11,12 @@ from typing import Optional, Any
 import bittensor as bt
 from affine.core.setup import logger
 
+_affine_logger = logging.getLogger("affine")
+if _affine_logger.level >= logging.CRITICAL:
+    _root = logging.getLogger()
+    if _root.handlers:
+        _affine_logger.setLevel(_root.level)
+
 
 class SubtensorWrapper:
     """

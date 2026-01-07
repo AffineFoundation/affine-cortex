@@ -19,8 +19,6 @@ from affine.core.models import (
 # --------------------------------------------------------------------------- #
 #                   Miners (lazy import to avoid CLI interference)            #
 # --------------------------------------------------------------------------- #
-from affine.utils.subtensor import get_subtensor
-
 def miners(*args, **kwargs):
     """Query miner information from blockchain.
     
