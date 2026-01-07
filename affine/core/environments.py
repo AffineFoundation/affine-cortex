@@ -128,9 +128,9 @@ _ENV_CONFIGS_CANONICAL = {
         env_vars={"UVICORN_WORKERS": "30"},
         eval_params={
             "temperature": 0.0,
-            "timeout": 300,
+            "timeout": 600,
         },
-        proxy_timeout=320,
+        proxy_timeout=620,
     ),
     "game": EnvConfig(
         name="game",

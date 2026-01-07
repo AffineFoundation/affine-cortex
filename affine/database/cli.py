@@ -1169,7 +1169,7 @@ async def cmd_get_pool():
     """Get task pool statistics: task count per miner per environment.
     
     Shows how many tasks each miner has in the sampling pool for each environment,
-    including pending, assigned, and paused tasks, plus sampling statistics.
+    including pending, assigned, and paused tasks, plus sampling statistics and missing tasks.
     Only displays environments where enabled_for_sampling=True.
     """
     print("Fetching task pool statistics...\n")
@@ -1177,11 +1177,13 @@ async def cmd_get_pool():
     
     try:
         from affine.database.dao.miner_stats import MinerStatsDAO
+        from affine.database.dao.sample_results import SampleResultsDAO
         
         task_dao = TaskPoolDAO()
         miners_dao = MinersDAO()
         miner_stats_dao = MinerStatsDAO()
         config_dao = SystemConfigDAO()
+        sample_dao = SampleResultsDAO()
         
         # Get all miners for hotkey lookup
         all_miners = await miners_dao.get_all_miners()
@@ -1215,13 +1217,21 @@ async def cmd_get_pool():
         global_stats = {
             'pending': {},  # {(hotkey, revision): count}
             'assigned': {},
-            'paused': {}
+            'paused': {},
+            'missing': {}  # {(hotkey, revision): count}
         }
         
         env_stats = {}  # {env: {status: {(hotkey, revision): count}}}
+        env_missing_stats = {}  # {env: {(hotkey, revision): count}}
         
         for env in active_envs:
             env_stats[env] = {}
+            env_missing_stats[env] = {}
+            
+            # Get sampling_list for this environment
+            env_config = environments.get(env, {})
+            sampling_config = env_config.get('sampling_config', {})
+            sampling_list = set(sampling_config.get('sampling_list', []))
             
             for status in ['pending', 'assigned', 'paused']:
                 counts = await task_dao.get_miner_task_counts(env, status)
@@ -1234,11 +1244,39 @@ async def cmd_get_pool():
                         hotkey, revision = parts[0], parts[1]
                         key = (hotkey, revision)
                         global_stats[status][key] = global_stats[status].get(key, 0) + count
+            
+            # Calculate missing tasks for each miner in this environment
+            all_miner_keys_in_env = set()
+            for status_dict in env_stats[env].values():
+                for miner_key in status_dict.keys():
+                    all_miner_keys_in_env.add(miner_key)
+            
+            for miner_key in all_miner_keys_in_env:
+                parts = miner_key.split('#')
+                if len(parts) >= 2:
+                    hotkey, revision = parts[0], parts[1]
+                    
+                    # Get completed task IDs
+                    completed_taskids = await sample_dao.get_completed_task_ids(hotkey, revision, env)
+                    
+                    # Get pool task IDs (pending + assigned + paused)
+                    pool_taskids = await task_dao.get_pending_task_ids_for_miner(hotkey, revision, env, include_paused=True)
+                    
+                    # Calculate missing tasks
+                    missing_taskids = sampling_list - completed_taskids - pool_taskids
+                    missing_count = len(missing_taskids)
+                    
+                    # Store in env-specific stats
+                    env_missing_stats[env][miner_key] = missing_count
+                    
+                    # Aggregate to global
+                    key = (hotkey, revision)
+                    global_stats['missing'][key] = global_stats['missing'].get(key, 0) + missing_count
         
         # Print global summary with sampling stats
-        print("=" * 180)
+        print("=" * 200)
         print("GLOBAL TASK POOL SUMMARY")
-        print("=" * 180)
+        print("=" * 200)
         
         all_miners_keys = set()
         for status_dict in global_stats.values():
@@ -1253,6 +1291,7 @@ async def cmd_get_pool():
                 pending = global_stats['pending'].get((hotkey, revision), 0)
                 assigned = global_stats['assigned'].get((hotkey, revision), 0)
                 paused = global_stats['paused'].get((hotkey, revision), 0)
+                missing = global_stats['missing'].get((hotkey, revision), 0)
                 total = pending + assigned + paused
                 uid = uid_by_hotkey.get(hotkey, '?')
                 
@@ -1264,7 +1303,7 @@ async def cmd_get_pool():
                 stats_24h = sampling_stats.get('last_24hours', {})
                 
                 miner_totals.append((
-                    uid, hotkey, revision, pending, assigned, paused, total,
+                    uid, hotkey, revision, pending, assigned, paused, missing, total,
                     stats_15m, stats_1h, stats_6h, stats_24h
                 ))
             
@@ -1274,16 +1313,17 @@ async def cmd_get_pool():
             # Print header
             print(
                 f"\n{'UID':<5} {'Hotkey':<19} {'Rev':<11} "
-                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Total':<6} "
+                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Miss':<6} {'Total':<6} "
                 f"{'15m':<12} {'1h':<12} {'6h':<12} {'24h':<12}"
             )
-            print("-" * 180)
+            print("-" * 200)
             
             total_pending = sum(global_stats['pending'].values())
             total_assigned = sum(global_stats['assigned'].values())
             total_paused = sum(global_stats['paused'].values())
+            total_missing = sum(global_stats['missing'].values())
             
-            for uid, hotkey, revision, pending, assigned, paused, total, s15m, s1h, s6h, s24h in miner_totals:
+            for uid, hotkey, revision, pending, assigned, paused, missing, total, s15m, s1h, s6h, s24h in miner_totals:
                 # Format sampling stats as "samples/succ"
                 def format_stats(stats):
                     if not stats or stats.get('samples', 0) == 0:
@@ -1294,26 +1334,26 @@ async def cmd_get_pool():
                 
                 print(
                     f"{str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
-                    f"{pending:<6} {assigned:<6} {paused:<6} {total:<6} "
+                    f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} {total:<6} "
                     f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
                     f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
                 )
             
-            print("-" * 180)
+            print("-" * 200)
             print(
                 f"{'TOTAL':<5} {'':<18} {'':<10} "
-                f"{total_pending:<6} {total_assigned:<6} {total_paused:<6} "
+                f"{total_pending:<6} {total_assigned:<6} {total_paused:<6} {total_missing:<6} "
                 f"{total_pending + total_assigned + total_paused:<6}"
             )
         
         # Print per-environment breakdown
-        print("\n" + "=" * 180)
+        print("\n" + "=" * 200)
         print("PER-ENVIRONMENT TASK POOL BREAKDOWN")
-        print("=" * 180)
+        print("=" * 200)
         
         for env in active_envs:
             print(f"\n{env}:")
-            print("-" * 180)
+            print("-" * 200)
             
             # Use ALL valid miners for consistency (not just those with tasks in this env)
             # Aggregate counts for this environment
@@ -1323,6 +1363,7 @@ async def cmd_get_pool():
                 pending = env_stats[env]['pending'].get(miner_key, 0)
                 assigned = env_stats[env]['assigned'].get(miner_key, 0)
                 paused = env_stats[env]['paused'].get(miner_key, 0)
+                missing = env_missing_stats[env].get(miner_key, 0)
                 total = pending + assigned + paused
                 uid = uid_by_hotkey.get(hotkey, '?')
                 
@@ -1335,7 +1376,7 @@ async def cmd_get_pool():
                 stats_24h = env_specific_stats.get('last_24hours', {})
                 
                 env_totals.append((
-                    uid, hotkey, revision, pending, assigned, paused, total,
+                    uid, hotkey, revision, pending, assigned, paused, missing, total,
                     stats_15m, stats_1h, stats_6h, stats_24h
                 ))
             
@@ -1344,16 +1385,17 @@ async def cmd_get_pool():
             
             print(
                 f"  {'UID':<5} {'Hotkey':<19} {'Rev':<11} "
-                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Total':<6} "
+                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Miss':<6} {'Total':<6} "
                 f"{'15m':<12} {'1h':<12} {'6h':<12} {'24h':<12}"
             )
-            print("  " + "-" * 176)
+            print("  " + "-" * 196)
             
             env_total_pending = sum(env_stats[env]['pending'].values())
             env_total_assigned = sum(env_stats[env]['assigned'].values())
             env_total_paused = sum(env_stats[env]['paused'].values())
+            env_total_missing = sum(env_missing_stats[env].values())
             
-            for uid, hotkey, revision, pending, assigned, paused, total, s15m, s1h, s6h, s24h in env_totals:
+            for uid, hotkey, revision, pending, assigned, paused, missing, total, s15m, s1h, s6h, s24h in env_totals:
                 # Format sampling stats as "samples/succ"
                 def format_stats(stats):
                     if not stats or stats.get('samples', 0) == 0:
@@ -1364,19 +1406,19 @@ async def cmd_get_pool():
                 
                 print(
                     f"  {str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
-                    f"{pending:<6} {assigned:<6} {paused:<6} {total:<6} "
+                    f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} {total:<6} "
                     f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
                     f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
                 )
             
-            print("  " + "-" * 176)
+            print("  " + "-" * 196)
             print(
                 f"  {'TOTAL':<5} {'':<18} {'':<10} "
-                f"{env_total_pending:<6} {env_total_assigned:<6} {env_total_paused:<6} "
+                f"{env_total_pending:<6} {env_total_assigned:<6} {env_total_paused:<6} {env_total_missing:<6} "
                 f"{env_total_pending + env_total_assigned + env_total_paused:<6}"
             )
         
-        print("\n" + "=" * 180)
+        print("\n" + "=" * 200)
     
     finally:
         await close_client()

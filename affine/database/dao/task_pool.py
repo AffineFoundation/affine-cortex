@@ -452,7 +452,7 @@ class TaskPoolDAO(BaseDAO):
             task['assigned_at'] = None
             task['gsi1_pk'] = new_gsi1_pk
             task['gsi1_sk'] = new_gsi1_sk
-            task['ttl'] = int(time.time()) + 7200
+            task['ttl'] = int(time.time()) + 3600 * 5
             
             await self.put(task)
             await self.delete(old_pk, old_sk)
