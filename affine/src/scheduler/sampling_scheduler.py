@@ -15,17 +15,23 @@ from affine.database.dao.system_config import SystemConfigDAO
 from affine.database.dao.task_pool import TaskPoolDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.sample_results import SampleResultsDAO
+from affine.database.dao.miner_stats import MinerStatsDAO
 
 
 class PerMinerSamplingScheduler:
-    """Per-miner sampling pool scheduler.
+    """Per-miner sampling pool scheduler with weighted allocation.
     
-    New architecture:
-    1. Each miner has independent sampling concurrency limit N (default 5)
-    2. Incremental scheduling every 10s (vs 300s full scan)
-    3. Priority-based task selection from sampling list tail
-    4. Supports dynamic sampling list rotation
+    Architecture:
+    1. Each miner has dynamic slots (3-10, default 6), stored in MinerStats
+    2. Weighted allocation across environments based on scheduling_weight config
+    3. Minimum guarantee: each env gets at least 1 slot
+    4. Incremental scheduling every 10s
+    5. Priority-based task selection from sampling list tail
     """
+    
+    DEFAULT_SLOTS = 6
+    MIN_SLOTS = 3
+    MAX_SLOTS = 10
     
     def __init__(
         self,
@@ -33,16 +39,19 @@ class PerMinerSamplingScheduler:
         task_pool_dao: Optional[TaskPoolDAO] = None,
         sample_results_dao: Optional[SampleResultsDAO] = None,
         miners_dao: Optional[MinersDAO] = None,
-        default_concurrency: int = 5,
+        miner_stats_dao: Optional[MinerStatsDAO] = None,
         scheduling_interval: int = 10
     ):
         self.config_dao = system_config_dao or SystemConfigDAO()
         self.task_pool_dao = task_pool_dao or TaskPoolDAO()
         self.sample_results_dao = sample_results_dao or SampleResultsDAO()
         self.miners_dao = miners_dao or MinersDAO()
+        self.miner_stats_dao = miner_stats_dao or MinerStatsDAO()
         
-        self.default_concurrency = default_concurrency
         self.scheduling_interval = scheduling_interval
+        
+        # Cache for env weights (refreshed each scheduling cycle)
+        self._env_weights: Dict[str, float] = {}
         
         # Track last known sampling lists per env
         self._last_sampling_lists: Dict[str, List[int]] = {}
@@ -58,7 +67,7 @@ class PerMinerSamplingScheduler:
         """Start per-miner sampling scheduler."""
         logger.info(
             f"Starting per-miner sampling scheduler: "
-            f"concurrency={self.default_concurrency}, interval={self.scheduling_interval}s"
+            f"default_slots={self.DEFAULT_SLOTS}, interval={self.scheduling_interval}s"
         )
         self._running = True
         
@@ -166,6 +175,42 @@ class PerMinerSamplingScheduler:
         except Exception as e:
             logger.error(f"Error in schedule_all_miners: {e}", exc_info=True)
     
+    async def _get_miner_slots(self, miner: Dict[str, Any]) -> int:
+        """Get current slots allocation for a miner from MinerStats.
+        
+        Args:
+            miner: Miner dict with hotkey, revision
+            
+        Returns:
+            Number of slots (3-10, default 6)
+        """
+        try:
+            hotkey = miner['hotkey']
+            revision = miner['revision']
+            stats = await self.miner_stats_dao.get_miner_slots(hotkey, revision)
+            return stats if stats else self.DEFAULT_SLOTS
+        except Exception as e:
+            logger.debug(f"Error getting miner slots, using default: {e}")
+            return self.DEFAULT_SLOTS
+    
+    def _get_env_weights(self, environments: Dict[str, Any]) -> Dict[str, float]:
+        """Extract scheduling weights from environment configurations.
+        
+        Args:
+            environments: Full environment configurations
+            
+        Returns:
+            Dict mapping env name to weight (default 1.0 if not configured)
+        """
+        weights = {}
+        for env_name, env_config in environments.items():
+            if not env_config.get('enabled_for_sampling', False):
+                continue
+            sampling_config = env_config.get('sampling_config', {})
+            # Default weight is 1.0 if not specified
+            weights[env_name] = float(sampling_config.get('scheduling_weight', 1.0))
+        return weights
+    
     async def _schedule_miner(
         self,
         miner: Dict[str, Any],
@@ -174,6 +219,12 @@ class PerMinerSamplingScheduler:
     ):
         """Schedule sampling tasks for a single miner across all environments.
         
+        Uses weighted allocation strategy:
+        1. Calculate target slots per env based on weights
+        2. Ensure minimum 1 slot per env with missing tasks
+        3. Allocate by deficit (target - active), highest first
+        4. Remaining slots use round-robin
+        
         Args:
             miner: Miner dict with hotkey, revision, etc.
             sampling_envs: List of environment names
@@ -181,6 +232,9 @@ class PerMinerSamplingScheduler:
         """
         hotkey = miner['hotkey']
         revision = miner['revision']
+        
+        # Get miner's total slots from MinerStats
+        total_slots = await self._get_miner_slots(miner)
         
         # Get current active task count per env (exclude paused tasks)
         env_active_counts: Dict[str, int] = {}
@@ -197,11 +251,14 @@ class PerMinerSamplingScheduler:
             total_pool_count += len(active_task_ids)
         
         # Check if pool is already at capacity
-        if total_pool_count >= self.default_concurrency:
+        if total_pool_count >= total_slots:
             return
         
         # Calculate how many tasks we can add
-        slots_available = self.default_concurrency - total_pool_count
+        slots_available = total_slots - total_pool_count
+        
+        # Get env weights for weighted allocation
+        env_weights = self._get_env_weights(environments)
         
         # Collect missing task IDs from all environments
         env_missing_tasks: Dict[str, List[int]] = {}
@@ -225,12 +282,14 @@ class PerMinerSamplingScheduler:
         if not env_missing_tasks:
             return
         
-        # Select tasks to create with env-aware strategy
+        # Select tasks to create with weighted allocation strategy
         tasks_to_create = self._select_tasks_to_create(
             env_missing_tasks=env_missing_tasks,
             env_active_counts=env_active_counts,
             slots_available=slots_available,
-            miner=miner
+            total_slots=total_slots,
+            miner=miner,
+            env_weights=env_weights
         )
         
         # Create selected tasks
@@ -325,21 +384,32 @@ class PerMinerSamplingScheduler:
         env_missing_tasks: Dict[str, List[int]],
         env_active_counts: Dict[str, int],
         slots_available: int,
-        miner: Dict[str, Any]
+        total_slots: int,
+        miner: Dict[str, Any],
+        env_weights: Dict[str, float]
     ) -> List[Dict[str, Any]]:
-        """Select tasks to create from missing tasks across environments.
+        """Select tasks to create using weighted allocation strategy.
         
-        Strategy: Fair round-robin allocation to prevent slot monopolization
+        Strategy: Weighted target allocation with deficit-based scheduling
         
         Algorithm:
-        1. Sort envs by active_count (ascending) - prioritize underutilized envs
-        2. Round-robin distribute slots evenly across envs
-        3. Each env gets at most ceil(slots_available / num_envs) slots
+        1. Calculate target slots per env: total_slots * (weight / sum_weights)
+        2. Calculate deficit: target - active_count (how many more each env needs)
+        3. Allocate directly based on deficit (not proportionally to slots_available)
+        4. Cap allocation by slots_available
+        5. Ensure minimum 1 slot per env with positive deficit and missing tasks
         
-        This ensures:
-        - No env monopolizes all slots (even slow-running envs)
-        - Envs with lower active_count are prioritized
-        - Slots distributed evenly (not weighted by missing task count)
+        Example with total_slots=6, weights: game=2, lgc-v2=1, print=1 (sum=4):
+        - game target: 6 * 2/4 = 3 slots
+        - lgc-v2 target: 6 * 1/4 = 1.5 -> 2 slots (ceiling for fairness)
+        - print target: 6 * 1/4 = 1.5 -> 1 slot (floor to not exceed total)
+        
+        If game has 1 active, lgc-v2 has 0, print has 2, slots_available=5:
+        - game deficit: 3-1 = 2 -> allocate 2
+        - lgc-v2 deficit: 2-0 = 2 -> allocate 2
+        - print deficit: 1-2 = 0 -> allocate 0
+        - Total allocation: 4 (within slots_available=5)
+        - Remaining 1 slot: round-robin among envs with missing tasks
         
         Returns:
             List of task specs with env and task_id
@@ -347,36 +417,165 @@ class PerMinerSamplingScheduler:
         if slots_available <= 0 or not env_missing_tasks:
             return []
         
-        selected = []
+        # Step 1: Calculate total weight for envs with missing tasks
+        active_envs = list(env_missing_tasks.keys())
+        total_weight = sum(env_weights.get(env, 1.0) for env in active_envs)
         
-        # Sort envs by active_count (ascending) to prioritize underutilized envs
-        sorted_envs = sorted(
-            env_missing_tasks.keys(),
-            key=lambda e: env_active_counts.get(e, 0)
+        if total_weight == 0:
+            total_weight = len(active_envs)  # Fallback to equal weights
+        
+        # Step 2: Calculate target slots per env based on total_slots and weights
+        # Use integer allocation with remainder distribution for fairness
+        target_slots = {}
+        remainder_pool = []
+        allocated_sum = 0
+        
+        for env in active_envs:
+            weight = env_weights.get(env, 1.0)
+            raw_target = total_slots * (weight / total_weight)
+            floor_target = int(raw_target)
+            remainder = raw_target - floor_target
+            
+            target_slots[env] = floor_target
+            allocated_sum += floor_target
+            remainder_pool.append((env, remainder))
+        
+        # Distribute remaining slots to envs with highest remainders
+        remainder_pool.sort(key=lambda x: x[1], reverse=True)
+        remaining_to_distribute = total_slots - allocated_sum
+        
+        for i, (env, _) in enumerate(remainder_pool):
+            if i >= remaining_to_distribute:
+                break
+            target_slots[env] += 1
+        
+        # Step 3: Calculate deficit (target - active) for each env
+        # Deficit represents how many slots each env needs to reach its target
+        slot_deficit = {}
+        for env in active_envs:
+            target = target_slots.get(env, 1)
+            active = env_active_counts.get(env, 0)
+            # Deficit: how many more tasks needed to reach target
+            deficit = max(0, target - active)
+            slot_deficit[env] = deficit
+        
+        # Step 4: Calculate minimum allocation (1 slot per env with missing tasks and positive deficit)
+        # Step 5: Allocate remaining slots based on deficit
+        
+        # Guarantee 1 slot per env with missing tasks and positive deficit
+        env_allocation = {}
+        envs_with_deficit = [e for e in active_envs if slot_deficit.get(e, 0) > 0]
+        
+        if not envs_with_deficit:
+            # No env has deficit, use round-robin in step 7
+            env_allocation = {e: 0 for e in active_envs}
+        else:
+            # Step 4a: Allocate minimum 1 slot to each env with deficit (if available)
+            min_allocation_needed = len(envs_with_deficit)
+            
+            if min_allocation_needed <= slots_available:
+                # Can guarantee 1 slot per env with deficit
+                for env in envs_with_deficit:
+                    missing_count = len(env_missing_tasks.get(env, []))
+                    env_allocation[env] = min(1, missing_count)
+                
+                for env in active_envs:
+                    if env not in envs_with_deficit:
+                        env_allocation[env] = 0
+                
+                remaining_slots = slots_available - sum(env_allocation.values())
+                
+                # Step 4b: Distribute remaining slots based on remaining deficit
+                if remaining_slots > 0:
+                    # Calculate remaining deficit after minimum allocation
+                    remaining_deficit = {}
+                    for env in envs_with_deficit:
+                        current_alloc = env_allocation.get(env, 0)
+                        deficit = slot_deficit.get(env, 0)
+                        remaining_def = max(0, deficit - current_alloc)
+                        missing_count = len(env_missing_tasks.get(env, []))
+                        # Cap by available tasks
+                        remaining_deficit[env] = min(remaining_def, missing_count - current_alloc)
+                    
+                    total_remaining_deficit = sum(remaining_deficit.values())
+                    
+                    if total_remaining_deficit > 0:
+                        # Allocate remaining slots proportionally to remaining deficit
+                        for env in envs_with_deficit:
+                            if remaining_slots <= 0:
+                                break
+                            
+                            rem_def = remaining_deficit.get(env, 0)
+                            if rem_def > 0:
+                                # Proportional allocation
+                                additional = int(remaining_slots * (rem_def / total_remaining_deficit))
+                                # Ensure we don't exceed remaining deficit or available tasks
+                                additional = min(additional, rem_def, remaining_slots)
+                                env_allocation[env] += additional
+                                remaining_slots -= additional
+            else:
+                # Not enough slots for minimum guarantee, allocate proportionally
+                for env in envs_with_deficit:
+                    deficit = slot_deficit.get(env, 0)
+                    missing_count = len(env_missing_tasks.get(env, []))
+                    # Proportional allocation based on deficit
+                    total_deficit = sum(slot_deficit.get(e, 0) for e in envs_with_deficit)
+                    proportional = int(slots_available * (deficit / total_deficit)) if total_deficit > 0 else 0
+                    env_allocation[env] = min(proportional, missing_count, deficit)
+                
+                for env in active_envs:
+                    if env not in envs_with_deficit:
+                        env_allocation[env] = 0
+        
+        selected = []
+        remaining_slots = slots_available
+        
+        # Step 6: Allocate based on calculated allocation (sorted by weight descending)
+        sorted_by_weight_desc = sorted(
+            active_envs,
+            key=lambda e: env_weights.get(e, 1.0),
+            reverse=True
         )
         
-        # Round-robin: cycle through envs, take 1 task from each until slots exhausted
-        remaining_slots = slots_available
-        env_index = 0
+        for env in sorted_by_weight_desc:
+            if remaining_slots <= 0:
+                break
+            
+            if env not in env_missing_tasks or not env_missing_tasks[env]:
+                continue
+            
+            alloc_count = env_allocation.get(env, 0)
+            allocate_count = min(
+                alloc_count,
+                remaining_slots,
+                len(env_missing_tasks[env])
+            )
+            
+            for _ in range(allocate_count):
+                if env_missing_tasks[env]:
+                    task_id = env_missing_tasks[env].pop(0)
+                    selected.append({'env': env, 'task_id': task_id})
+                    remaining_slots -= 1
         
-        while remaining_slots > 0 and sorted_envs:
-            # Get next env in round-robin order
-            env = sorted_envs[env_index % len(sorted_envs)]
+        # Step 7: Round-robin for remaining slots (when deficits are satisfied)
+        # This handles cases where all envs reached their targets but slots remain
+        if remaining_slots > 0:
+            envs_with_tasks = [e for e in sorted_by_weight_desc if env_missing_tasks.get(e)]
+            env_index = 0
             
-            # Take 1 task from this env if available
-            if env_missing_tasks.get(env):
-                task_id = env_missing_tasks[env].pop(0)
-                selected.append({'env': env, 'task_id': task_id})
-                remaining_slots -= 1
+            while remaining_slots > 0 and envs_with_tasks:
+                env = envs_with_tasks[env_index % len(envs_with_tasks)]
                 
-                # Remove env from rotation if no more tasks
-                if not env_missing_tasks[env]:
-                    del env_missing_tasks[env]
-                    sorted_envs.remove(env)
-                    continue  # Don't increment index after removal
-            
-            # Increment index to move to next env
-            env_index += 1
+                if env_missing_tasks.get(env):
+                    task_id = env_missing_tasks[env].pop(0)
+                    selected.append({'env': env, 'task_id': task_id})
+                    remaining_slots -= 1
+                    
+                    if not env_missing_tasks[env]:
+                        envs_with_tasks.remove(env)
+                        continue
+                
+                env_index += 1
         
         if selected:
             env_distribution = {}
@@ -385,7 +584,7 @@ class PerMinerSamplingScheduler:
             
             logger.info(
                 f"Selected {len(selected)} tasks for miner U{miner.get('uid', -1)}"
-                f"({miner['hotkey'][:8]}...) - distribution: {env_distribution}"
+                f"({miner['hotkey'][:8]}...) - slots={total_slots}, distribution: {env_distribution}"
             )
         
         return selected

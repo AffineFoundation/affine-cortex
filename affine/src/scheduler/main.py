@@ -13,6 +13,7 @@ from affine.core.setup import setup_logging, logger
 from affine.database import init_client, close_client
 from affine.database.dao.task_pool import TaskPoolDAO
 from .sampling_scheduler import SamplingScheduler, PerMinerSamplingScheduler
+from .slots_adjuster import MinerSlotsAdjuster
 
 
 async def run_service(cleanup_interval: int):
@@ -41,6 +42,7 @@ async def run_service(cleanup_interval: int):
     # Initialize schedulers
     sampling_scheduler = None
     per_miner_scheduler = None
+    slots_adjuster = None
     try:
         # Create and start SamplingScheduler (rotation only)
         sampling_scheduler = SamplingScheduler()
@@ -49,11 +51,15 @@ async def run_service(cleanup_interval: int):
         
         # Create and start PerMinerSamplingScheduler (task generation + all cleanup)
         per_miner_scheduler = PerMinerSamplingScheduler(
-            default_concurrency=6,
             scheduling_interval=10
         )
         await per_miner_scheduler.start()
         logger.info("PerMinerSamplingScheduler started (task generation + cleanup)")
+        
+        # Create and start MinerSlotsAdjuster (dynamic slots based on success rate)
+        slots_adjuster = MinerSlotsAdjuster()
+        await slots_adjuster.start()
+        logger.info("MinerSlotsAdjuster started (dynamic slots adjustment)")
         
         # Wait for shutdown signal
         await shutdown_event.wait()
@@ -63,6 +69,13 @@ async def run_service(cleanup_interval: int):
         raise
     finally:
         # Cleanup
+        if slots_adjuster:
+            try:
+                await slots_adjuster.stop()
+                logger.info("MinerSlotsAdjuster stopped")
+            except Exception as e:
+                logger.error(f"Error stopping MinerSlotsAdjuster: {e}")
+        
         if per_miner_scheduler:
             try:
                 await per_miner_scheduler.stop()

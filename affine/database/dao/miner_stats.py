@@ -84,7 +84,7 @@ class MinerStatsDAO(BaseDAO):
             if weight is not None and (item.get('best_weight', 0) < weight):
                 item['best_weight'] = weight
         else:
-            # Create new record
+            # Create new record with all fields initialized
             item = {
                 'pk': pk,
                 'sk': sk,
@@ -97,7 +97,9 @@ class MinerStatsDAO(BaseDAO):
                 'best_weight': weight if weight is not None else 0.0,
                 'is_currently_online': is_online,
                 'sampling_stats': {},
-                'env_stats': {}
+                'env_stats': {},
+                'sampling_slots': 6,  # Default slots
+                'slots_last_adjusted_at': 0  # Never adjusted
             }
         
         await self.put(item)
@@ -360,3 +362,73 @@ class MinerStatsDAO(BaseDAO):
             logger.info(f"Cleaned up {len(inactive_miners)} inactive miners")
         
         return inactive_miners
+    
+    async def get_miner_slots(
+        self,
+        hotkey: str,
+        revision: str
+    ) -> Optional[int]:
+        """Get sampling slots for a miner.
+        
+        Args:
+            hotkey: Miner hotkey
+            revision: Model revision
+            
+        Returns:
+            Number of slots (None if not found, caller should use default)
+        """
+        pk = self._make_pk(hotkey)
+        sk = self._make_sk(revision)
+        item = await self.get(pk, sk)
+        
+        if not item:
+            return None
+        
+        return item.get('sampling_slots')
+    
+    async def update_sampling_slots(
+        self,
+        hotkey: str,
+        revision: str,
+        slots: int,
+        adjusted_at: int
+    ) -> bool:
+        """Update sampling slots for a miner.
+        
+        Args:
+            hotkey: Miner's hotkey
+            revision: Model revision
+            slots: New slots value (3-10)
+            adjusted_at: Timestamp of adjustment
+            
+        Returns:
+            True if successful
+        """
+        from affine.database.client import get_client
+        client = get_client()
+        
+        pk = self._make_pk(hotkey)
+        sk = self._make_sk(revision)
+        
+        try:
+            await client.update_item(
+                TableName=self.table_name,
+                Key={
+                    'pk': {'S': pk},
+                    'sk': {'S': sk}
+                },
+                UpdateExpression='SET sampling_slots = :slots, slots_last_adjusted_at = :adjusted_at, last_updated_at = :now',
+                ExpressionAttributeValues={
+                    ':slots': {'N': str(slots)},
+                    ':adjusted_at': {'N': str(adjusted_at)},
+                    ':now': {'N': str(int(time.time()))}
+                },
+                ConditionExpression='attribute_exists(pk)'
+            )
+            return True
+        except client.exceptions.ConditionalCheckFailedException:
+            logger.warning(f"Miner stats not found for {hotkey[:8]}..., cannot update slots")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to update sampling slots for {hotkey[:8]}...: {e}")
+            return False
