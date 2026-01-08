@@ -196,7 +196,9 @@ class MinerStatsDAO(BaseDAO):
                 'best_weight': 0.0,
                 'is_currently_online': True,
                 'sampling_stats': global_stats,
-                'env_stats': env_stats
+                'env_stats': env_stats,
+                'sampling_slots': 6,  # Default slots
+                'slots_last_adjusted_at': 0  # Never adjusted
             }
             await self.put(updated_item)
             return  # Exit early, no need for second update

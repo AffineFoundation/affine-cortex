@@ -149,7 +149,13 @@ class MinerSlotsAdjuster:
                 last_adjusted = 0
         
         # Check if adjustment is due (every 6 hours)
-        if current_time - last_adjusted < self.ADJUSTMENT_INTERVAL:
+        # If last_adjusted is 0 (never adjusted), skip this check and allow first adjustment
+        # Otherwise, enforce 6-hour interval strictly
+        if last_adjusted > 0 and current_time - last_adjusted < self.ADJUSTMENT_INTERVAL:
+            logger.debug(
+                f"Miner {hotkey[:8]}... last adjusted {current_time - last_adjusted}s ago, "
+                f"skipping (interval={self.ADJUSTMENT_INTERVAL}s)"
+            )
             return False
         
         # Get sampling stats from MinerStats.sampling_stats.last_6hours
