@@ -371,7 +371,8 @@ cli.add_command(miner_stats)
 @click.argument("service", type=click.Choice(["validator", "backend", "api"]))
 @click.option("--local", is_flag=True, help="Use local build mode")
 @click.option("--recreate", is_flag=True, help="Recreate containers")
-def deploy(service, local, recreate):
+@click.option("--restart", is_flag=True, help="Restart containers without recreating")
+def deploy(service, local, recreate, restart):
     """Deploy docker containers for validator, backend, or api services.
     
     SERVICE: Either 'validator', 'backend', or 'api'
@@ -380,8 +381,13 @@ def deploy(service, local, recreate):
         af deploy validator --recreate --local
         af deploy backend --local
         af deploy api --local
+        af deploy backend --restart --local
         af deploy validator
     """
+    # Validate conflicting options
+    if recreate and restart:
+        logger.error("Cannot use both --recreate and --restart options")
+        sys.exit(1)
     # Get the affine directory (where docker-compose files are located)
     affine_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     
@@ -400,16 +406,21 @@ def deploy(service, local, recreate):
             compose_files.extend(["-f", "compose/docker-compose.backend.local.yml"])
     
     # Build the command with project directory
-    cmd = ["docker", "compose", "--project-directory", affine_dir] + compose_files + ["up", "-d"]
-    
-    if recreate:
-        cmd.append("--force-recreate")
-    
-    if local:
-        cmd.append("--build")
+    if restart:
+        # Use restart command instead of up
+        cmd = ["docker", "compose", "--project-directory", affine_dir] + compose_files + ["restart"]
+    else:
+        cmd = ["docker", "compose", "--project-directory", affine_dir] + compose_files + ["up", "-d"]
+        
+        if recreate:
+            cmd.append("--force-recreate")
+        
+        if local:
+            cmd.append("--build")
     
     # Execute the command
-    logger.info(f"Deploying {service} services...")
+    action = "Restarting" if restart else "Deploying"
+    logger.info(f"{action} {service} services...")
     logger.info(f"Running: {' '.join(cmd)}")
     
     try:
@@ -419,9 +430,11 @@ def deploy(service, local, recreate):
             check=True,
             capture_output=False
         )
-        logger.info(f"✓ {service.capitalize()} services deployed successfully")
+        success_msg = "restarted" if restart else "deployed"
+        logger.info(f"✓ {service.capitalize()} services {success_msg} successfully")
     except subprocess.CalledProcessError as e:
-        logger.error(f"✗ Failed to deploy {service} services")
+        action_msg = "restart" if restart else "deploy"
+        logger.error(f"✗ Failed to {action_msg} {service} services")
         sys.exit(e.returncode)
 
 
