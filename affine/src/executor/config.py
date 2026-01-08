@@ -4,13 +4,12 @@ Executor configuration for different environments
 
 # Max concurrent tasks for each environment
 ENV_MAX_CONCURRENT = {
-    "LGC": 90,
-    "GAME": 180,
-    "LGC-v2": 120,
+    "GAME": 500,
+    "LGC-v2": 300,
 }
 
 # Default max concurrent tasks if environment not found in config
-DEFAULT_MAX_CONCURRENT = 60
+DEFAULT_MAX_CONCURRENT = 200
 
 
 def get_max_concurrent(env: str) -> int:

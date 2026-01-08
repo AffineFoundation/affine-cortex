@@ -33,7 +33,7 @@
         "dataset_range": [[0, 23302]],
         "sampling_count": 200,
         "rotation_enabled": true,
-        "rotation_count": 3,
+        "rotation_count": 2,
         "rotation_interval": 3600
       }
     },
@@ -69,7 +69,7 @@
         "dataset_range": [[0, 399999999]],
         "sampling_count": 350,
         "rotation_enabled": true,
-        "rotation_count": 5,
+        "rotation_count": 4,
         "rotation_interval": 3600
       }
     },
