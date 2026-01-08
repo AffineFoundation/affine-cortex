@@ -35,7 +35,7 @@ class MinerSlotsAdjuster:
     MAX_SLOTS = 10
     ADJUSTMENT_INTERVAL = 21600  # 6 hours in seconds
     MIN_SAMPLES_FOR_ADJUSTMENT = 10
-    HIGH_SUCCESS_THRESHOLD = 0.90
+    HIGH_SUCCESS_THRESHOLD = 0.80
     LOW_SUCCESS_THRESHOLD = 0.50
     
     def __init__(
