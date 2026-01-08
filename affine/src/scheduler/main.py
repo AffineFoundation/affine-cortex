@@ -49,7 +49,7 @@ async def run_service(cleanup_interval: int):
         
         # Create and start PerMinerSamplingScheduler (task generation + all cleanup)
         per_miner_scheduler = PerMinerSamplingScheduler(
-            default_concurrency=3,
+            default_concurrency=6,
             scheduling_interval=10
         )
         await per_miner_scheduler.start()

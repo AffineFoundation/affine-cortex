@@ -1185,8 +1185,8 @@ async def cmd_get_pool():
         config_dao = SystemConfigDAO()
         sample_dao = SampleResultsDAO()
         
-        # Get all miners for hotkey lookup
-        all_miners = await miners_dao.get_all_miners()
+        # Get only valid miners for hotkey lookup
+        all_miners = await miners_dao.get_valid_miners()
         uid_by_hotkey = {m['hotkey']: m['uid'] for m in all_miners}
         
         # Get all miner stats for sampling statistics
@@ -1251,20 +1251,36 @@ async def cmd_get_pool():
                 for miner_key in status_dict.keys():
                     all_miner_keys_in_env.add(miner_key)
             
-            for miner_key in all_miner_keys_in_env:
+            # Prepare concurrent tasks for all miners
+            async def process_miner_missing_tasks(miner_key: str):
+                """Process missing tasks calculation for a single miner."""
                 parts = miner_key.split('#')
-                if len(parts) >= 2:
-                    hotkey, revision = parts[0], parts[1]
-                    
-                    # Get completed task IDs
-                    completed_taskids = await sample_dao.get_completed_task_ids(hotkey, revision, env)
-                    
-                    # Get pool task IDs (pending + assigned + paused)
-                    pool_taskids = await task_dao.get_pending_task_ids_for_miner(hotkey, revision, env, include_paused=True)
-                    
-                    # Calculate missing tasks
-                    missing_taskids = sampling_list - completed_taskids - pool_taskids
-                    missing_count = len(missing_taskids)
+                if len(parts) < 2:
+                    return None
+                
+                hotkey, revision = parts[0], parts[1]
+                
+                # Get completed task IDs and pool task IDs concurrently
+                completed_taskids, pool_taskids = await asyncio.gather(
+                    sample_dao.get_completed_task_ids(hotkey, revision, env),
+                    task_dao.get_pending_task_ids_for_miner(hotkey, revision, env, include_paused=True)
+                )
+                
+                # Calculate missing tasks
+                missing_taskids = sampling_list - completed_taskids - pool_taskids
+                missing_count = len(missing_taskids)
+                
+                return miner_key, hotkey, revision, missing_count
+            
+            # Execute all miner processing concurrently
+            results = await asyncio.gather(
+                *[process_miner_missing_tasks(miner_key) for miner_key in all_miner_keys_in_env]
+            )
+            
+            # Aggregate results
+            for result in results:
+                if result is not None:
+                    miner_key, hotkey, revision, missing_count = result
                     
                     # Store in env-specific stats
                     env_missing_stats[env][miner_key] = missing_count
@@ -1278,12 +1294,16 @@ async def cmd_get_pool():
         print("GLOBAL TASK POOL SUMMARY")
         print("=" * 200)
         
+        # Build miner list from valid miners only (no historical miners)
+        # Each valid miner has: uid, hotkey, revision from miners table
         all_miners_keys = set()
-        for status_dict in global_stats.values():
-            all_miners_keys.update(status_dict.keys())
+        for m in all_miners:
+            hotkey = m['hotkey']
+            revision = m['revision']
+            all_miners_keys.add((hotkey, revision))
         
         if not all_miners_keys:
-            print("No tasks in pool.")
+            print("No miners found.")
         else:
             # Sort by total tasks descending
             miner_totals = []
@@ -1307,8 +1327,13 @@ async def cmd_get_pool():
                     stats_15m, stats_1h, stats_6h, stats_24h
                 ))
             
-            # Sort by UID (numeric) for consistency
-            miner_totals.sort(key=lambda x: (int(x[0]) if str(x[0]).isdigit() else 99999))
+            # Sort by (UID, hotkey, revision) to ensure unique ordering
+            # Use (hotkey, revision) as primary sort key since it's the unique identifier
+            miner_totals.sort(key=lambda x: (
+                int(x[0]) if str(x[0]).isdigit() else 99999,  # UID (numeric)
+                x[1],  # hotkey
+                x[2]   # revision
+            ))
             
             # Print header
             print(
@@ -1380,8 +1405,12 @@ async def cmd_get_pool():
                     stats_15m, stats_1h, stats_6h, stats_24h
                 ))
             
-            # Sort by UID (numeric) for consistency
-            env_totals.sort(key=lambda x: (int(x[0]) if str(x[0]).isdigit() else 99999))
+            # Sort by (UID, hotkey, revision) to ensure unique ordering
+            env_totals.sort(key=lambda x: (
+                int(x[0]) if str(x[0]).isdigit() else 99999,  # UID (numeric)
+                x[1],  # hotkey
+                x[2]   # revision
+            ))
             
             print(
                 f"  {'UID':<5} {'Hotkey':<19} {'Rev':<11} "
