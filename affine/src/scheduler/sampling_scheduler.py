@@ -219,11 +219,13 @@ class PerMinerSamplingScheduler:
     ):
         """Schedule sampling tasks for a single miner across all environments.
         
-        Uses weighted allocation strategy:
+        Uses weighted allocation strategy with starvation prevention:
         1. Calculate target slots per env based on weights
         2. Ensure minimum 1 slot per env with missing tasks
         3. Allocate by deficit (target - active), highest first
         4. Remaining slots use round-robin
+        5. **Anti-starvation**: If any env has missing tasks but active=0,
+           allow allocation even if total_pool_count >= total_slots
         
         Args:
             miner: Miner dict with hotkey, revision, etc.
@@ -250,17 +252,7 @@ class PerMinerSamplingScheduler:
             env_active_counts[env] = len(active_task_ids)
             total_pool_count += len(active_task_ids)
         
-        # Check if pool is already at capacity
-        if total_pool_count >= total_slots:
-            return
-        
-        # Calculate how many tasks we can add
-        slots_available = total_slots - total_pool_count
-        
-        # Get env weights for weighted allocation
-        env_weights = self._get_env_weights(environments)
-        
-        # Collect missing task IDs from all environments
+        # Collect missing task IDs from all environments (before capacity check)
         env_missing_tasks: Dict[str, List[int]] = {}
         
         for env in sampling_envs:
@@ -281,6 +273,28 @@ class PerMinerSamplingScheduler:
         
         if not env_missing_tasks:
             return
+        
+        # Anti-starvation check: detect envs with missing tasks but no active tasks
+        starving_envs = [
+            env for env in env_missing_tasks
+            if env_active_counts.get(env, 0) == 0
+        ]
+        
+        # Check pool capacity with starvation prevention
+        if total_pool_count >= total_slots:
+            if not starving_envs:
+                return
+        
+        # Calculate how many tasks we can add
+        slots_available = total_slots - total_pool_count
+        
+        # Anti-starvation: If pool is full but has starving envs, allocate at least 1 slot per starving env
+        if slots_available <= 0 and starving_envs:
+            # Override slots_available to allow allocation for starving envs
+            slots_available = len(starving_envs)
+        
+        # Get env weights for weighted allocation
+        env_weights = self._get_env_weights(environments)
         
         # Select tasks to create with weighted allocation strategy
         tasks_to_create = self._select_tasks_to_create(
