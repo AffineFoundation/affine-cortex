@@ -47,9 +47,6 @@ async def lifespan(app: FastAPI):
             task_pool_manager = get_task_pool_manager()
             logger.info("TaskPoolManager initialized")
             
-            # Reset all assigned tasks to pending on startup (executor processes are lost)
-            await task_pool_manager.reset_assigned_on_startup()
-
             # Start runtime timeout cleanup loop (for long-running operation)
             await task_pool_manager.start_timeout_cleanup_loop()
         except Exception as e:

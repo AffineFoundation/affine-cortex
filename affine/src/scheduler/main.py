@@ -28,6 +28,15 @@ async def run_service(cleanup_interval: int):
         logger.error(f"Failed to initialize database: {e}")
         raise
     
+    # Cleanup orphaned assigned tasks on startup
+    try:
+        task_pool_dao = TaskPoolDAO()
+        deleted_count = await task_pool_dao.delete_all_assigned_tasks()
+        logger.info(f"Startup cleanup: deleted {deleted_count} orphaned assigned tasks")
+    except Exception as e:
+        logger.error(f"Failed to cleanup orphaned tasks on startup: {e}", exc_info=True)
+        # Non-fatal: continue startup
+    
     # Setup signal handlers
     shutdown_event = asyncio.Event()
     

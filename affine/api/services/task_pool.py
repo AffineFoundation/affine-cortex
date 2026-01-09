@@ -115,14 +115,13 @@ class TaskPoolManager:
     Uses background refresh for miner counts to avoid blocking fetch requests.
     """
     
-    def __init__(self, miners_cache_ttl: int = 60, stats_cache_ttl: int = 60, block_cache_ttl: int = 10, warmup: bool = True):
+    def __init__(self, miners_cache_ttl: int = 60, stats_cache_ttl: int = 60, block_cache_ttl: int = 10):
         """Initialize TaskPoolManager with caches.
         
         Args:
             miners_cache_ttl: TTL for miners cache (seconds)
             stats_cache_ttl: TTL for pool stats cache (seconds)
             block_cache_ttl: TTL for block number cache (seconds)
-            warmup: Whether to warmup caches on startup (default: True)
         """
         self.dao = TaskPoolDAO()
         self.logs_dao = ExecutionLogsDAO()
@@ -150,14 +149,10 @@ class TaskPoolManager:
         self._uuid_cache: Dict[str, Tuple[str, str, int, str]] = {}
         self._cache_lock = asyncio.Lock()
         
-        # Warmup flag
-        self._warmup_enabled = warmup
-        self._warmup_done = False
-        
         # Timeout cleanup task
         self._timeout_cleanup_task: Optional[asyncio.Task] = None
         
-        logger.info(f"TaskPoolManager initialized (miners_cache_ttl={miners_cache_ttl}s, stats_cache_ttl={stats_cache_ttl}s, block_cache_ttl={block_cache_ttl}s, warmup={warmup})")
+        logger.info(f"TaskPoolManager initialized (miners_cache_ttl={miners_cache_ttl}s, stats_cache_ttl={stats_cache_ttl}s, block_cache_ttl={block_cache_ttl}s)")
     
     async def _get_miners(self) -> Dict[str, Dict[str, Any]]:
         """Get all miners with non-blocking cache refresh."""
@@ -174,42 +169,6 @@ class TaskPoolManager:
             return await subtensor.get_current_block()
         
         return await self._block_cache.get(fetch_block)
-    
-    async def reset_assigned_on_startup(self):
-        """Reset all assigned tasks to pending on API server startup.
-        
-        Rationale:
-        - When API server restarts, all executor processes are restarted/lost
-        - Any tasks in 'assigned' status are orphaned (no executor running them)
-        - We reset them to 'pending' so they can be reassigned to new executors
-        
-        This is different from timeout cleanup:
-        - Startup reset: unconditional, all assigned -> pending (no timeout check)
-        - Timeout cleanup: runtime check, only reset tasks that exceeded timeout
-        
-        This is called automatically during server startup if warmup=True.
-        """
-        if not self._warmup_enabled or self._warmup_done:
-            return
-        
-        try:
-            logger.info("TaskPoolManager startup reset: resetting all assigned tasks to pending...")
-            start_time = time.time()
-            
-            # Reset all assigned tasks to pending via DAO
-            reset_count = await self.dao.reset_all_assigned_to_pending()
-            
-            elapsed = time.time() - start_time
-            logger.info(
-                f"TaskPoolManager startup reset completed: "
-                f"reset {reset_count} assigned tasks to pending in {elapsed:.2f}s"
-            )
-            
-            self._warmup_done = True
-            
-        except Exception as e:
-            logger.error(f"TaskPoolManager startup reset failed: {e}", exc_info=True)
-            # Non-fatal: continue startup, tasks may be orphaned but will timeout eventually
     
     async def get_pool_stats(self, env: str) -> Dict[str, int]:
         """Get pool statistics for an environment with caching.
@@ -365,9 +324,9 @@ class TaskPoolManager:
         This runs continuously during API server operation to detect and reset
         tasks that have exceeded their execution timeout.
         
-        Note: This is different from startup reset (reset_assigned_on_startup):
-        - Startup: unconditional reset of all assigned tasks (executor processes lost)
-        - Runtime: conditional reset of only timed-out tasks (executor may be running)
+        Note: This handles runtime timeout detection for tasks that exceed their
+        environment-specific timeout limits during normal operation.
+        Orphaned task cleanup on restart is now handled by the scheduler service.
         """
         if self._timeout_cleanup_task is not None:
             logger.warning("Timeout cleanup loop already started")

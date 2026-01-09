@@ -888,14 +888,16 @@ class TaskPoolDAO(BaseDAO):
         
         return stats
     
-    async def reset_all_assigned_to_pending(self) -> int:
-        """Reset all assigned tasks to pending status on startup.
+    async def delete_all_assigned_tasks(self) -> int:
+        """Delete all assigned tasks on startup.
         
-        Called on API server restart to handle lost executor tasks.
-        Uses Scan to find all assigned tasks, then batch resets them.
+        Called by scheduler service on startup to clean up orphaned assigned tasks
+        from previous runs (executor processes are lost on restart).
+        
+        Uses Scan to find all assigned tasks, then batch deletes them.
         
         Returns:
-            Number of tasks reset
+            Number of tasks deleted
         """
         from affine.database.client import get_client
         client = get_client()
@@ -926,71 +928,16 @@ class TaskPoolDAO(BaseDAO):
                 break
         
         if not all_assigned_tasks:
-            logger.info("No assigned tasks to reset on startup")
+            logger.info("No assigned tasks to delete on startup")
             return 0
         
-        logger.info(f"Found {len(all_assigned_tasks)} assigned tasks to reset on startup")
+        logger.info(f"Found {len(all_assigned_tasks)} assigned tasks to delete on startup")
         
-        # Reset each task: delete old assigned record + create new pending record
-        # Each task needs 2 operations (delete + put), so batch_size = 12 to stay under 25 limit
-        reset_count = 0
-        batch_size = 12  # 12 tasks × 2 ops = 24 requests (< 25 DynamoDB limit)
+        # Batch delete all assigned tasks
+        deleted_count = await self._batch_delete_tasks(all_assigned_tasks)
         
-        for i in range(0, len(all_assigned_tasks), batch_size):
-            batch = all_assigned_tasks[i:i + batch_size]
-            
-            # Build batch requests (delete + put for each task)
-            requests = []
-            for task in batch:
-                # Delete old assigned record
-                requests.append({
-                    'DeleteRequest': {
-                        'Key': {
-                            'pk': {'S': task['pk']},
-                            'sk': {'S': task['sk']}
-                        }
-                    }
-                })
-                
-                # Create new pending record
-                new_status = 'pending'
-                new_sk = self._make_sk(task['env'], new_status, task['task_id'])
-                new_gsi1_pk = self._make_gsi1_pk(task['env'], new_status)
-                new_gsi1_sk = self._make_gsi1_sk(
-                    task['miner_hotkey'],
-                    task['model_revision'],
-                    task['task_id']
-                )
-                
-                new_task = {
-                    **task,
-                    'sk': new_sk,
-                    'status': new_status,
-                    'assigned_to': None,
-                    'assigned_at': None,
-                    'gsi1_pk': new_gsi1_pk,
-                    'gsi1_sk': new_gsi1_sk,
-                }
-                
-                requests.append({
-                    'PutRequest': {
-                        'Item': self._serialize(new_task)
-                    }
-                })
-            
-            # Execute batch
-            try:
-                await client.batch_write_item(
-                    RequestItems={
-                        self.table_name: requests
-                    }
-                )
-                reset_count += len(batch)
-            except Exception as e:
-                logger.error(f"Batch reset failed for batch {i//batch_size}: {e}")
-        
-        logger.info(f"Reset {reset_count} assigned tasks to pending on startup")
-        return reset_count
+        logger.info(f"Deleted {deleted_count} assigned tasks on startup")
+        return deleted_count
     
     async def get_all_paused_tasks(self) -> List[Dict[str, Any]]:
         """Get all paused tasks across all environments.
