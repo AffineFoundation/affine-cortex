@@ -85,7 +85,7 @@ class TaskPoolDAO(BaseDAO):
                 'assigned_to': None,
                 'assigned_at': None,
                 'retry_count': 0,
-                'max_retries': 5,
+                'max_retries': 3,
                 'last_error': None,
                 'last_error_code': None,
                 'last_failed_at': None,
@@ -452,7 +452,7 @@ class TaskPoolDAO(BaseDAO):
             task['assigned_at'] = None
             task['gsi1_pk'] = new_gsi1_pk
             task['gsi1_sk'] = new_gsi1_sk
-            task['ttl'] = int(time.time()) + 3600 * 5
+            task['ttl'] = int(time.time()) + 3600 * 4
             
             await self.put(task)
             await self.delete(old_pk, old_sk)

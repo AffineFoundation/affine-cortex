@@ -1218,6 +1218,14 @@ async def cmd_get_pool():
             print("No environments configured.")
             return
         
+        # Build miner list from valid miners only (no historical miners)
+        # Each valid miner has: uid, hotkey, revision from miners table
+        all_miners_keys = set()
+        for m in all_miners:
+            hotkey = m['hotkey']
+            revision = m['revision']
+            all_miners_keys.add((hotkey, revision))
+        
         # Aggregate statistics across all environments
         global_stats = {
             'pending': {},  # {(hotkey, revision): count}
@@ -1251,10 +1259,10 @@ async def cmd_get_pool():
                         global_stats[status][key] = global_stats[status].get(key, 0) + count
             
             # Calculate missing tasks for each miner in this environment
+            # Use all valid miners (not just those with tasks in pool)
             all_miner_keys_in_env = set()
-            for status_dict in env_stats[env].values():
-                for miner_key in status_dict.keys():
-                    all_miner_keys_in_env.add(miner_key)
+            for hotkey, revision in all_miners_keys:
+                all_miner_keys_in_env.add(f"{hotkey}#{revision}")
             
             # Prepare concurrent tasks for all miners
             async def process_miner_missing_tasks(miner_key: str):
@@ -1298,14 +1306,6 @@ async def cmd_get_pool():
         print("=" * 200)
         print("GLOBAL TASK POOL SUMMARY")
         print("=" * 200)
-        
-        # Build miner list from valid miners only (no historical miners)
-        # Each valid miner has: uid, hotkey, revision from miners table
-        all_miners_keys = set()
-        for m in all_miners:
-            hotkey = m['hotkey']
-            revision = m['revision']
-            all_miners_keys.add((hotkey, revision))
         
         if not all_miners_keys:
             print("No miners found.")
@@ -1479,6 +1479,223 @@ def get_pool():
         af db get-pool
     """
     asyncio.run(cmd_get_pool())
+
+
+async def cmd_get_miner(hotkey: str, revision: Optional[str]):
+    """Get detailed performance data for a specific miner.
+    
+    Shows all performance metrics including:
+    - Basic info (model, timestamps, rank, weight)
+    - Sampling slots and adjustment history
+    - Global sampling statistics (aggregated across all envs)
+    - Per-environment sampling statistics
+    
+    Args:
+        hotkey: Miner's hotkey (full or prefix)
+        revision: Model revision (optional, if not provided shows all revisions)
+    """
+    import json
+    import time
+    from datetime import datetime
+    
+    print(f"Fetching miner stats for hotkey={hotkey}...\n")
+    await init_client()
+    
+    try:
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        from affine.database.dao.miners import MinersDAO
+        
+        miner_stats_dao = MinerStatsDAO()
+        miners_dao = MinersDAO()
+        
+        # Get all miner stats
+        all_stats = await miner_stats_dao.get_all_historical_miners()
+        
+        # Filter by hotkey (support prefix matching)
+        matching_stats = [
+            s for s in all_stats
+            if s['hotkey'].startswith(hotkey) or hotkey in s['hotkey']
+        ]
+        
+        if not matching_stats:
+            print(f"No miner found with hotkey matching '{hotkey}'")
+            return
+        
+        # Further filter by revision if provided
+        if revision:
+            matching_stats = [
+                s for s in matching_stats
+                if s['revision'].startswith(revision) or revision in s['revision']
+            ]
+            
+            if not matching_stats:
+                print(f"No miner found with revision matching '{revision}'")
+                return
+        
+        # Get online miners for UID lookup
+        online_miners = await miners_dao.get_valid_miners()
+        uid_by_hotkey = {m['hotkey']: m['uid'] for m in online_miners}
+        
+        # Print each matching miner
+        for i, stats in enumerate(matching_stats, 1):
+            if i > 1:
+                print("\n" + "=" * 120 + "\n")
+            
+            hotkey_val = stats['hotkey']
+            revision_val = stats['revision']
+            uid = uid_by_hotkey.get(hotkey_val, 'offline')
+            
+            print("=" * 120)
+            print(f"MINER #{i}: {hotkey_val}")
+            print("=" * 120)
+            
+            # Basic Info
+            print("\n[BASIC INFO]")
+            print(f"  UID: {uid}")
+            print(f"  Hotkey: {hotkey_val}")
+            print(f"  Revision: {revision_val}")
+            print(f"  Model: {stats.get('model', 'N/A')}")
+            
+            first_seen = stats.get('first_seen_at', 0)
+            last_updated = stats.get('last_updated_at', 0)
+            if first_seen > 0:
+                first_seen_dt = datetime.fromtimestamp(first_seen)
+                print(f"  First seen: {first_seen_dt.strftime('%Y-%m-%d %H:%M:%S')} ({first_seen})")
+            else:
+                print(f"  First seen: N/A")
+            
+            if last_updated > 0:
+                last_updated_dt = datetime.fromtimestamp(last_updated)
+                elapsed = int(time.time()) - last_updated
+                print(f"  Last updated: {last_updated_dt.strftime('%Y-%m-%d %H:%M:%S')} ({elapsed}s ago)")
+            else:
+                print(f"  Last updated: N/A")
+            
+            print(f"  Best rank: {stats.get('best_rank', 'N/A')}")
+            print(f"  Best weight: {stats.get('best_weight', 0.0):.6f}")
+            print(f"  Currently online: {stats.get('is_currently_online', False)}")
+            
+            # Slots Info
+            print("\n[SAMPLING SLOTS]")
+            slots = stats.get('sampling_slots', 6)
+            slots_last_adjusted = stats.get('slots_last_adjusted_at', 0)
+            print(f"  Current slots: {slots}")
+            
+            if slots_last_adjusted > 0:
+                adjusted_dt = datetime.fromtimestamp(slots_last_adjusted)
+                elapsed = int(time.time()) - slots_last_adjusted
+                print(f"  Last adjusted: {adjusted_dt.strftime('%Y-%m-%d %H:%M:%S')} ({elapsed}s ago)")
+            else:
+                print(f"  Last adjusted: Never")
+            
+            # Global Sampling Stats
+            print("\n[GLOBAL SAMPLING STATISTICS]")
+            sampling_stats = stats.get('sampling_stats', {})
+            
+            if not sampling_stats:
+                print("  No global statistics available")
+            else:
+                windows = ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']
+                window_labels = {
+                    'last_15min': '15min',
+                    'last_1hour': '1hour',
+                    'last_6hours': '6hours',
+                    'last_24hours': '24hours'
+                }
+                
+                print(f"\n  {'Window':<10} {'Samples':<10} {'Success':<10} {'Rate':<10} {'Slots':<8} {'RateLimit':<12} {'Timeout':<10} {'Other':<10} {'Samp/min':<10}")
+                print("  " + "-" * 118)
+                
+                for window in windows:
+                    wstats = sampling_stats.get(window, {})
+                    if not wstats:
+                        continue
+                    
+                    samples = wstats.get('samples', 0)
+                    success = wstats.get('success', 0)
+                    success_rate = wstats.get('success_rate', 0.0)
+                    rate_limit = wstats.get('rate_limit_errors', 0)
+                    timeout = wstats.get('timeout_errors', 0)
+                    other = wstats.get('other_errors', 0)
+                    samp_per_min = wstats.get('samples_per_min', 0.0)
+                    
+                    # Show slots in 6hours row (used by adjuster)
+                    slots_display = str(slots) if window == 'last_6hours' else '-'
+                    
+                    print(
+                        f"  {window_labels[window]:<10} {samples:<10} {success:<10} "
+                        f"{success_rate:<10.2%} {slots_display:<8} {rate_limit:<12} {timeout:<10} {other:<10} {samp_per_min:<10.2f}"
+                    )
+            
+            # Per-Environment Stats
+            print("\n[PER-ENVIRONMENT STATISTICS]")
+            env_stats = stats.get('env_stats', {})
+            
+            if not env_stats:
+                print("  No per-environment statistics available")
+            else:
+                for env_name in sorted(env_stats.keys()):
+                    env_data = env_stats[env_name]
+                    print(f"\n  Environment: {env_name}")
+                    print("  " + "-" * 110)
+                    
+                    windows = ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']
+                    window_labels = {
+                        'last_15min': '15min',
+                        'last_1hour': '1hour',
+                        'last_6hours': '6hours',
+                        'last_24hours': '24hours'
+                    }
+                    
+                    print(f"    {'Window':<10} {'Samples':<10} {'Success':<10} {'Rate':<10} {'Slots':<8} {'RateLimit':<12} {'Timeout':<10} {'Other':<10} {'Samp/min':<10}")
+                    print("    " + "-" * 116)
+                    
+                    for window in windows:
+                        wstats = env_data.get(window, {})
+                        if not wstats:
+                            continue
+                        
+                        samples = wstats.get('samples', 0)
+                        success = wstats.get('success', 0)
+                        success_rate = wstats.get('success_rate', 0.0)
+                        rate_limit = wstats.get('rate_limit_errors', 0)
+                        timeout = wstats.get('timeout_errors', 0)
+                        other = wstats.get('other_errors', 0)
+                        samp_per_min = wstats.get('samples_per_min', 0.0)
+                        
+                        # Show slots in 6hours row (used by adjuster)
+                        slots_display = str(slots) if window == 'last_6hours' else '-'
+                        
+                        print(
+                            f"    {window_labels[window]:<10} {samples:<10} {success:<10} "
+                            f"{success_rate:<10.2%} {slots_display:<8} {rate_limit:<12} {timeout:<10} {other:<10} {samp_per_min:<10.2f}"
+                        )
+            
+            print("\n" + "=" * 120)
+        
+        print(f"\n✓ Found {len(matching_stats)} matching miner(s)")
+    
+    finally:
+        await close_client()
+
+
+@db.command("get-miner")
+@click.option("--hotkey", required=True, help="Miner's hotkey (full or prefix)")
+@click.option("--revision", default=None, help="Model revision (optional)")
+def get_miner(hotkey: str, revision: Optional[str]):
+    """Get detailed performance data for a specific miner.
+    
+    Shows comprehensive statistics including sampling performance, slots,
+    and adjustment history for the specified miner.
+    
+    Examples:
+        # Get stats for all revisions of a hotkey
+        af db get-miner --hotkey 5DJHkQEio6qSayH3
+        
+        # Get stats for specific revision
+        af db get-miner --hotkey 5DJHkQEio6qSayH3 --revision 7b4a3a20
+    """
+    asyncio.run(cmd_get_miner(hotkey, revision))
 
 
 def main():

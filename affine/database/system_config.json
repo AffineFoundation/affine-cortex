@@ -34,7 +34,8 @@
         "sampling_count": 200,
         "rotation_enabled": true,
         "rotation_count": 2,
-        "rotation_interval": 3600
+        "rotation_interval": 3600,
+        "scheduling_weight": 1.0
       }
     },
     "CDE": {
@@ -69,8 +70,9 @@
         "dataset_range": [[0, 399999999]],
         "sampling_count": 350,
         "rotation_enabled": true,
-        "rotation_count": 4,
-        "rotation_interval": 3600
+        "rotation_count": 10,
+        "rotation_interval": 3600,
+        "scheduling_weight": 1.0
       }
     },
     "SWE-PRO": {
@@ -90,11 +92,12 @@
       "enabled_for_scoring": true,
       "min_completeness": 0.8,
       "sampling_config": {
-        "dataset_range": [[0, 700000000]],
+        "dataset_range": [[0, 500000000],[600000000, 800000000]],
         "sampling_count": 250,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 3600
+        "rotation_interval": 3600,
+        "scheduling_weight": 3.0
       }
     }
   }
