@@ -1346,11 +1346,11 @@ async def cmd_get_pool():
             # Print header
             print(
                 f"\n{'UID':<5} {'Hotkey':<19} {'Rev':<11} "
-                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Miss':<6} {'Total':<6} "
+                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Miss':<6} "
                 f"{'Slots':<6} "
                 f"{'15m':<12} {'1h':<12} {'6h':<12} {'24h':<12}"
             )
-            print("-" * 206)
+            print("-" * 200)
             
             total_pending = sum(global_stats['pending'].values())
             total_assigned = sum(global_stats['assigned'].values())
@@ -1368,17 +1368,16 @@ async def cmd_get_pool():
                 
                 print(
                     f"{str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
-                    f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} {total:<6} "
+                    f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} "
                     f"{slots:<6} "
                     f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
                     f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
                 )
             
-            print("-" * 206)
+            print("-" * 200)
             print(
                 f"{'TOTAL':<5} {'':<18} {'':<10} "
-                f"{total_pending:<6} {total_assigned:<6} {total_paused:<6} {total_missing:<6} "
-                f"{total_pending + total_assigned + total_paused:<6}"
+                f"{total_pending:<6} {total_assigned:<6} {total_paused:<6} {total_missing:<6}"
             )
         
         # Print per-environment breakdown
@@ -1427,11 +1426,11 @@ async def cmd_get_pool():
             
             print(
                 f"  {'UID':<5} {'Hotkey':<19} {'Rev':<11} "
-                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Miss':<6} {'Total':<6} "
+                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Miss':<6} "
                 f"{'Slots':<6} "
                 f"{'15m':<12} {'1h':<12} {'6h':<12} {'24h':<12}"
             )
-            print("  " + "-" * 202)
+            print("  " + "-" * 196)
             
             env_total_pending = sum(env_stats[env]['pending'].values())
             env_total_assigned = sum(env_stats[env]['assigned'].values())
@@ -1449,17 +1448,16 @@ async def cmd_get_pool():
                 
                 print(
                     f"  {str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
-                    f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} {total:<6} "
+                    f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} "
                     f"{slots:<6} "
                     f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
                     f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
                 )
             
-            print("  " + "-" * 202)
+            print("  " + "-" * 196)
             print(
                 f"  {'TOTAL':<5} {'':<18} {'':<10} "
-                f"{env_total_pending:<6} {env_total_assigned:<6} {env_total_paused:<6} {env_total_missing:<6} "
-                f"{env_total_pending + env_total_assigned + env_total_paused:<6}"
+                f"{env_total_pending:<6} {env_total_assigned:<6} {env_total_paused:<6} {env_total_missing:<6}"
             )
         
         print("\n" + "=" * 206)
