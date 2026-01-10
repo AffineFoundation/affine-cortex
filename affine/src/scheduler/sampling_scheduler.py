@@ -280,18 +280,23 @@ class PerMinerSamplingScheduler:
             if env_active_counts.get(env, 0) == 0
         ]
         
-        # Check pool capacity with starvation prevention
-        if total_pool_count >= total_slots:
-            if not starving_envs:
-                return
+        # Capacity policy:
+        # - Normal case: do not exceed total_slots
+        # - Anti-starvation: allow a bounded temporary overflow of +1 per starving env
+        #   (this overflow is meant to "un-starve" envs; it must not grow unbounded)
+        if not starving_envs and total_pool_count >= total_slots:
+            return
         
-        # Calculate how many tasks we can add
-        slots_available = total_slots - total_pool_count
+        # Only allow temporary overflow when the pool is already at capacity.
+        # If the pool is not full, the scheduler can un-starve envs within total_slots,
+        # so extra overflow would be unnecessary and would inflate concurrency.
+        allowed_total = total_slots
+        if total_pool_count >= total_slots and starving_envs:
+            allowed_total = total_slots + len(starving_envs)
+        if total_pool_count >= allowed_total:
+            return
         
-        # Anti-starvation: If pool is full but has starving envs, allocate at least 1 slot per starving env
-        if slots_available <= 0 and starving_envs:
-            # Override slots_available to allow allocation for starving envs
-            slots_available = len(starving_envs)
+        slots_available = allowed_total - total_pool_count
         
         # Get env weights for weighted allocation
         env_weights = self._get_env_weights(environments)
@@ -431,171 +436,124 @@ class PerMinerSamplingScheduler:
         if slots_available <= 0 or not env_missing_tasks:
             return []
         
-        # Step 1: Calculate total weight for envs with missing tasks
-        active_envs = list(env_missing_tasks.keys())
-        total_weight = sum(env_weights.get(env, 1.0) for env in active_envs)
+        # Eligible envs are those that actually have missing tasks (i.e. tasks to create).
+        # Envs with no tasks should not consume slots; this matches the original design goal.
+        eligible_envs = [e for e, tasks in env_missing_tasks.items() if tasks]
+        if not eligible_envs:
+            return []
         
-        if total_weight == 0:
-            total_weight = len(active_envs)  # Fallback to equal weights
+        # Deterministic ordering helpers
+        def _weight(env: str) -> float:
+            try:
+                w = float(env_weights.get(env, 1.0))
+            except Exception:
+                w = 1.0
+            return max(0.0, w)
         
-        # Step 2: Calculate target slots per env based on total_slots and weights
-        # Use integer allocation with remainder distribution for fairness
-        target_slots = {}
+        sorted_by_weight_desc = sorted(
+            eligible_envs,
+            key=lambda e: (-_weight(e), e),
+        )
+        
+        # Stage 1: anti-starvation reservation.
+        # If an eligible env has active==0, allocate 1 first to ensure it stops being starving.
+        selected: List[Dict[str, Any]] = []
+        planned_active_counts = {env: int(env_active_counts.get(env, 0)) for env in eligible_envs}
+        
+        starving_envs = [e for e in eligible_envs if planned_active_counts.get(e, 0) == 0]
+        reserved = min(slots_available, len(starving_envs))
+        
+        if reserved > 0:
+            starving_order = sorted(starving_envs, key=lambda e: (-_weight(e), e))
+            for env in starving_order:
+                if reserved <= 0:
+                    break
+                if not env_missing_tasks.get(env):
+                    continue
+                task_id = env_missing_tasks[env].pop(0)
+                selected.append({'env': env, 'task_id': task_id})
+                planned_active_counts[env] = planned_active_counts.get(env, 0) + 1
+                reserved -= 1
+        
+        remaining_slots = slots_available - len(selected)
+        if remaining_slots <= 0:
+            return selected
+        
+        # Stage 2: weighted fairness allocation within eligible envs.
+        # Compute integer targets using floor + remainder distribution (fair under non-divisible slots).
+        total_weight = sum(_weight(env) for env in eligible_envs)
+        if total_weight <= 0:
+            total_weight = float(len(eligible_envs))
+        
+        target_slots: Dict[str, int] = {}
         remainder_pool = []
         allocated_sum = 0
-        
-        for env in active_envs:
-            weight = env_weights.get(env, 1.0)
-            raw_target = total_slots * (weight / total_weight)
+        for env in eligible_envs:
+            raw_target = total_slots * (_weight(env) / total_weight)
             floor_target = int(raw_target)
             remainder = raw_target - floor_target
-            
             target_slots[env] = floor_target
             allocated_sum += floor_target
             remainder_pool.append((env, remainder))
         
-        # Distribute remaining slots to envs with highest remainders
-        remainder_pool.sort(key=lambda x: x[1], reverse=True)
-        remaining_to_distribute = total_slots - allocated_sum
-        
-        for i, (env, _) in enumerate(remainder_pool):
-            if i >= remaining_to_distribute:
+        # Remainder distribution tie-break:
+        # 1) larger remainder first
+        # 2) higher weight first
+        # 3) env name ascending (deterministic & intuitive)
+        remainder_pool.sort(key=lambda x: (-x[1], -_weight(x[0]), x[0]))
+        for i in range(max(0, total_slots - allocated_sum)):
+            if i >= len(remainder_pool):
                 break
+            env = remainder_pool[i][0]
             target_slots[env] += 1
         
-        # Step 3: Calculate deficit (target - active) for each env
-        # Deficit represents how many slots each env needs to reach its target
-        slot_deficit = {}
-        for env in active_envs:
-            target = target_slots.get(env, 1)
-            active = env_active_counts.get(env, 0)
-            # Deficit: how many more tasks needed to reach target
-            deficit = max(0, target - active)
-            slot_deficit[env] = deficit
-        
-        # Step 4: Calculate minimum allocation (1 slot per env with missing tasks and positive deficit)
-        # Step 5: Allocate remaining slots based on deficit
-        
-        # Guarantee 1 slot per env with missing tasks and positive deficit
-        env_allocation = {}
-        envs_with_deficit = [e for e in active_envs if slot_deficit.get(e, 0) > 0]
-        
-        if not envs_with_deficit:
-            # No env has deficit, use round-robin in step 7
-            env_allocation = {e: 0 for e in active_envs}
-        else:
-            # Step 4a: Allocate minimum 1 slot to each env with deficit (if available)
-            min_allocation_needed = len(envs_with_deficit)
-            
-            if min_allocation_needed <= slots_available:
-                # Can guarantee 1 slot per env with deficit
-                for env in envs_with_deficit:
-                    missing_count = len(env_missing_tasks.get(env, []))
-                    env_allocation[env] = min(1, missing_count)
-                
-                for env in active_envs:
-                    if env not in envs_with_deficit:
-                        env_allocation[env] = 0
-                
-                remaining_slots = slots_available - sum(env_allocation.values())
-                
-                # Step 4b: Distribute remaining slots based on remaining deficit
-                if remaining_slots > 0:
-                    # Calculate remaining deficit after minimum allocation
-                    remaining_deficit = {}
-                    for env in envs_with_deficit:
-                        current_alloc = env_allocation.get(env, 0)
-                        deficit = slot_deficit.get(env, 0)
-                        remaining_def = max(0, deficit - current_alloc)
-                        missing_count = len(env_missing_tasks.get(env, []))
-                        # Cap by available tasks
-                        remaining_deficit[env] = min(remaining_def, missing_count - current_alloc)
-                    
-                    total_remaining_deficit = sum(remaining_deficit.values())
-                    
-                    if total_remaining_deficit > 0:
-                        # Allocate remaining slots proportionally to remaining deficit
-                        for env in envs_with_deficit:
-                            if remaining_slots <= 0:
-                                break
-                            
-                            rem_def = remaining_deficit.get(env, 0)
-                            if rem_def > 0:
-                                # Proportional allocation
-                                additional = int(remaining_slots * (rem_def / total_remaining_deficit))
-                                # Ensure we don't exceed remaining deficit or available tasks
-                                additional = min(additional, rem_def, remaining_slots)
-                                env_allocation[env] += additional
-                                remaining_slots -= additional
-            else:
-                # Not enough slots for minimum guarantee, allocate proportionally
-                for env in envs_with_deficit:
-                    deficit = slot_deficit.get(env, 0)
-                    missing_count = len(env_missing_tasks.get(env, []))
-                    # Proportional allocation based on deficit
-                    total_deficit = sum(slot_deficit.get(e, 0) for e in envs_with_deficit)
-                    proportional = int(slots_available * (deficit / total_deficit)) if total_deficit > 0 else 0
-                    env_allocation[env] = min(proportional, missing_count, deficit)
-                
-                for env in active_envs:
-                    if env not in envs_with_deficit:
-                        env_allocation[env] = 0
-        
-        selected = []
-        remaining_slots = slots_available
-        
-        # Step 6: Allocate based on calculated allocation (sorted by weight descending)
-        sorted_by_weight_desc = sorted(
-            active_envs,
-            key=lambda e: env_weights.get(e, 1.0),
-            reverse=True
-        )
-        
-        for env in sorted_by_weight_desc:
-            if remaining_slots <= 0:
+        # Fill deficits first: allocate to envs that are below their targets.
+        while remaining_slots > 0:
+            deficit_envs = [
+                env for env in eligible_envs
+                if env_missing_tasks.get(env)
+                and planned_active_counts.get(env, 0) < target_slots.get(env, 0)
+            ]
+            if not deficit_envs:
                 break
             
-            if env not in env_missing_tasks or not env_missing_tasks[env]:
-                continue
+            # Pick the env with largest deficit; tie-break by weight then name.
+            def _deficit(env: str) -> int:
+                return target_slots.get(env, 0) - planned_active_counts.get(env, 0)
             
-            alloc_count = env_allocation.get(env, 0)
-            allocate_count = min(
-                alloc_count,
-                remaining_slots,
-                len(env_missing_tasks[env])
-            )
+            chosen = sorted(
+                deficit_envs,
+                key=lambda e: (_deficit(e), _weight(e), e),
+                reverse=True,
+            )[0]
             
-            for _ in range(allocate_count):
-                if env_missing_tasks[env]:
-                    task_id = env_missing_tasks[env].pop(0)
-                    selected.append({'env': env, 'task_id': task_id})
-                    remaining_slots -= 1
+            task_id = env_missing_tasks[chosen].pop(0)
+            selected.append({'env': chosen, 'task_id': task_id})
+            planned_active_counts[chosen] = planned_active_counts.get(chosen, 0) + 1
+            remaining_slots -= 1
         
-        # Step 7: Round-robin for remaining slots (when deficits are satisfied)
-        # This handles cases where all envs reached their targets but slots remain
+        # Stage 3: round-robin for any remaining slots.
+        # Only used when under-quota envs have no available tasks; in that case, it is better
+        # to allocate to any env with available tasks than to waste capacity.
         if remaining_slots > 0:
             envs_with_tasks = [e for e in sorted_by_weight_desc if env_missing_tasks.get(e)]
             env_index = 0
-            
             while remaining_slots > 0 and envs_with_tasks:
                 env = envs_with_tasks[env_index % len(envs_with_tasks)]
-                
                 if env_missing_tasks.get(env):
                     task_id = env_missing_tasks[env].pop(0)
                     selected.append({'env': env, 'task_id': task_id})
+                    planned_active_counts[env] = planned_active_counts.get(env, 0) + 1
                     remaining_slots -= 1
-                    
                     if not env_missing_tasks[env]:
                         envs_with_tasks.remove(env)
                         continue
-                
                 env_index += 1
         
         if selected:
-            env_distribution = {}
+            env_distribution: Dict[str, int] = {}
             for task in selected:
                 env_distribution[task['env']] = env_distribution.get(task['env'], 0) + 1
-            
             logger.info(
                 f"Selected {len(selected)} tasks for miner U{miner.get('uid', -1)}"
                 f"({miner['hotkey'][:8]}...) - slots={total_slots}, distribution: {env_distribution}"
