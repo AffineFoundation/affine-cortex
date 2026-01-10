@@ -235,8 +235,9 @@ class MinersMonitor:
         3. Check chute is hot
         4. Verify model name matches chute
         5. Verify model name contains "Affine" or "affine" (except uid 0)
-        6. Verify revision matches chute
-        7. Fetch HuggingFace model info and verify revision
+        6. Verify repo name ends with hotkey
+        7. Verify revision matches chute
+        8. Fetch HuggingFace model info and verify revision
 
         Args:
             uid: Miner UID
@@ -296,14 +297,25 @@ class MinersMonitor:
                 info.invalid_reason = "model_name_missing_affine"
                 return info
 
-        # Step 6: Verify revision matches chute
+        # Step 6: Verify repo name ends with hotkey
+        if uid != 0 and block >= 7290000:
+            # Extract repo name from model (format: owner/repo_name)
+            repo_name = model.split('/')[-1] if '/' in model else model
+            
+            # Check if repo name ends with hotkey (case-insensitive)
+            if not repo_name.lower().endswith(hotkey.lower()):
+                info.is_valid = False
+                info.invalid_reason = f"repo_name_not_ending_with_hotkey:repo={repo_name}"
+                return info
+
+        # Step 7: Verify revision matches chute
         chute_revision = chute.get("revision", "")
         if chute_revision and revision != chute_revision:
             info.is_valid = False
             info.invalid_reason = f"revision_mismatch:chute={chute_revision}"
             return info
         
-        # Step 7: Fetch HuggingFace model info and verify revision
+        # Step 8: Fetch HuggingFace model info and verify revision
         model_info = await self._get_model_info(model, revision)
         if not model_info:
             info.is_valid = False
