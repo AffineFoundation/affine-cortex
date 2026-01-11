@@ -95,7 +95,7 @@
         "dataset_range": [[0, 500000000],[600000000, 800000000]],
         "sampling_count": 200,
         "rotation_enabled": true,
-        "rotation_count": 5,
+        "rotation_count": 2,
         "rotation_interval": 3600,
         "scheduling_weight": 3.0
       }

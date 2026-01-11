@@ -292,7 +292,10 @@ class PerMinerSamplingScheduler:
         # so extra overflow would be unnecessary and would inflate concurrency.
         allowed_total = total_slots
         if total_pool_count >= total_slots and starving_envs:
-            allowed_total = total_slots + len(starving_envs)
+            # Relative overflow cap: at most 1.5x total_slots (ceiling).
+            # extra_cap = ceil(0.5 * total_slots)
+            extra_cap = (total_slots + 1) // 2
+            allowed_total = total_slots + min(len(starving_envs), extra_cap)
         if total_pool_count >= allowed_total:
             return
         
@@ -308,7 +311,7 @@ class PerMinerSamplingScheduler:
             slots_available=slots_available,
             total_slots=total_slots,
             miner=miner,
-            env_weights=env_weights
+            env_weights=env_weights,
         )
         
         # Create selected tasks
@@ -405,7 +408,7 @@ class PerMinerSamplingScheduler:
         slots_available: int,
         total_slots: int,
         miner: Dict[str, Any],
-        env_weights: Dict[str, float]
+        env_weights: Dict[str, float],
     ) -> List[Dict[str, Any]]:
         """Select tasks to create using weighted allocation strategy.
         
@@ -464,16 +467,17 @@ class PerMinerSamplingScheduler:
         reserved = min(slots_available, len(starving_envs))
         
         if reserved > 0:
-            starving_order = sorted(starving_envs, key=lambda e: (-_weight(e), e))
-            for env in starving_order:
-                if reserved <= 0:
-                    break
+            # Uniform random sampling among starving envs (frequency fairness).
+            # Note: tests should not rely on a fixed seed; in production we want true randomness.
+            k = min(reserved, len(starving_envs))
+            chosen_envs = random.sample(starving_envs, k) if k > 0 else []
+
+            for env in chosen_envs:
                 if not env_missing_tasks.get(env):
                     continue
                 task_id = env_missing_tasks[env].pop(0)
                 selected.append({'env': env, 'task_id': task_id})
                 planned_active_counts[env] = planned_active_counts.get(env, 0) + 1
-                reserved -= 1
         
         remaining_slots = slots_available - len(selected)
         if remaining_slots <= 0:
