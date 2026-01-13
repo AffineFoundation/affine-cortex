@@ -1,30 +1,6 @@
 {
   "validator_burn_percentage": 0.0,
   "environments": {
-    "affine:ded-v2": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
-      "sampling_config": {
-        "dataset_range": [[0, 23302]],
-        "sampling_count": 800,
-        "rotation_enabled": true,
-        "rotation_count": 8,
-        "rotation_interval": 3600
-      }
-    },
-    "affine:abd-v2": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
-      "sampling_config": {
-        "dataset_range": [[0, 23302]],
-        "sampling_count": 800,
-        "rotation_enabled": true,
-        "rotation_count": 8,
-        "rotation_interval": 3600
-      }
-    },
     "PRINT": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
@@ -38,53 +14,17 @@
         "scheduling_weight": 1.0
       }
     },
-    "CDE": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
-      "sampling_config": {
-        "dataset_range": [[0, 8580]],
-        "sampling_count": 200,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 3600
-      }
-    },
-    "LGC": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
-      "sampling_config": {
-        "dataset_range": [[0, 1080979]],
-        "sampling_count": 800,
-        "rotation_enabled": true,
-        "rotation_count": 0,
-        "rotation_interval": 3600
-      }
-    },
     "LGC-v2": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "min_completeness": 0.7,
       "sampling_config": {
-        "dataset_range": [[0, 399999999]],
-        "sampling_count": 300,
+        "dataset_range": [[0, 599999999]],
+        "sampling_count": 200,
         "rotation_enabled": true,
         "rotation_count": 10,
         "rotation_interval": 3600,
         "scheduling_weight": 1.0
-      }
-    },
-    "SWE-PRO": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
-      "sampling_config": {
-        "dataset_range": [[0, 731]],
-        "sampling_count": 40,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 7200
       }
     },
     "GAME": {
@@ -95,7 +35,7 @@
         "dataset_range": [[0, 500000000],[600000000, 800000000]],
         "sampling_count": 200,
         "rotation_enabled": true,
-        "rotation_count": 2,
+        "rotation_count": 3,
         "rotation_interval": 3600,
         "scheduling_weight": 3.0
       }

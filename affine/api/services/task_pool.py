@@ -219,7 +219,7 @@ class TaskPoolManager:
                     logger.warning(f"Unknown environment {env} for task {task_uuid}, skipping")
                     continue
                 
-                timeout_seconds = env_config.eval_params['timeout']
+                timeout_seconds = env_config.proxy_timeout + 10
                 
                 # Check if task has timed out
                 timeout_threshold = current_time - timeout_seconds

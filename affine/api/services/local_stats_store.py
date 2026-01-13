@@ -21,15 +21,17 @@ class LocalStatsStore:
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
         
-        # Current 5-minute window statistics (in-memory buffer)
-        self._current_window_start = self._get_window_start(int(time.time()))
-        self._current_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {
-            "samples": 0,
-            "success": 0,
-            "rate_limit_errors": 0,
-            "timeout_errors": 0,
-            "other_errors": 0
-        })
+        # Multi-window buffer: {window_start: {miner_key: stats}}
+        # Each window's data is tracked separately
+        self._window_buffers: Dict[int, Dict[str, Dict[str, int]]] = defaultdict(
+            lambda: defaultdict(lambda: {
+                "samples": 0,
+                "success": 0,
+                "rate_limit_errors": 0,
+                "timeout_errors": 0,
+                "other_errors": 0
+            })
+        )
     
     def _get_window_start(self, timestamp: int) -> int:
         """Get 5-minute window start for a timestamp
@@ -57,7 +59,7 @@ class LocalStatsStore:
     
     def record_sample(self, hotkey: str, revision: str, env: str,
                      success: bool, error_type: str):
-        """Record a sampling event (accumulate to current window)
+        """Record a sampling event (accumulate to window buffer)
         
         Args:
             hotkey: Miner hotkey
@@ -65,18 +67,18 @@ class LocalStatsStore:
             env: Environment name
             success: Whether sample succeeded
             error_type: Error type ('rate_limit', 'timeout', 'other', or None)
+        
+        Note:
+            Data is accumulated to the appropriate time window buffer
+            and will be flushed periodically by the sync loop.
         """
+        # Determine which window this sample belongs to
         current_time = int(time.time())
         window_start = self._get_window_start(current_time)
         
-        # Check if window rotation is needed
-        if window_start > self._current_window_start:
-            self.flush()
-            self._current_window_start = window_start
-        
-        # Accumulate statistics
+        # Accumulate to the appropriate window buffer
         key = f"{hotkey}#{revision}#{env}"
-        stats = self._current_stats[key]
+        stats = self._window_buffers[window_start][key]
         stats["samples"] += 1
         
         if success:
@@ -89,33 +91,73 @@ class LocalStatsStore:
             stats["other_errors"] += 1
     
     def flush(self):
-        """Flush current window statistics to file"""
-        if not self._current_stats:
+        """Flush all accumulated window buffers to files
+        
+        This method:
+        1. Iterates through all window buffers
+        2. For each window: reads existing file, accumulates buffer, writes back
+        3. Clears all flushed buffers
+        
+        Called periodically by sync loop (every 5 minutes).
+        """
+        if not self._window_buffers:
             return
         
-        window_file = self._get_window_filename(self._current_window_start)
+        flushed_windows = []
         
-        data = {
-            "timestamp": self._current_window_start,
-            "window_start": self._current_window_start,
-            "window_end": self._current_window_start + 300,
-            "miners": {k: dict(v) for k, v in self._current_stats.items()}
-        }
+        # Flush each window's buffer
+        for window_start, window_buffer in self._window_buffers.items():
+            if not window_buffer:
+                continue
+            
+            window_file = self._get_window_filename(window_start)
+            
+            # Step 1: Read existing data from file
+            existing_miners = {}
+            if window_file.exists():
+                try:
+                    with open(window_file, 'r') as f:
+                        existing_data = json.load(f)
+                        existing_miners = existing_data.get("miners", {})
+                except Exception as e:
+                    logger.warning(f"Failed to load existing stats from {window_file}: {e}")
+            
+            # Step 2: Accumulate buffer to existing data
+            for miner_key, buffer_stats in window_buffer.items():
+                if miner_key not in existing_miners:
+                    existing_miners[miner_key] = {
+                        "samples": 0,
+                        "success": 0,
+                        "rate_limit_errors": 0,
+                        "timeout_errors": 0,
+                        "other_errors": 0
+                    }
+                
+                # Accumulate all metrics
+                existing_miners[miner_key]["samples"] += buffer_stats["samples"]
+                existing_miners[miner_key]["success"] += buffer_stats["success"]
+                existing_miners[miner_key]["rate_limit_errors"] += buffer_stats["rate_limit_errors"]
+                existing_miners[miner_key]["timeout_errors"] += buffer_stats["timeout_errors"]
+                existing_miners[miner_key]["other_errors"] += buffer_stats["other_errors"]
+            
+            # Step 3: Write accumulated data to file
+            data = {
+                "timestamp": window_start,
+                "window_start": window_start,
+                "window_end": window_start + 300,
+                "miners": existing_miners
+            }
+            
+            with open(window_file, 'w') as f:
+                json.dump(data, f, separators=(',', ':'))
+            
+            dt = datetime.fromtimestamp(window_start)
+            logger.info(f"Flushed stats for window {dt.strftime('%Y-%m-%d %H:%M')}")
+            flushed_windows.append(window_start)
         
-        with open(window_file, 'w') as f:
-            json.dump(data, f, separators=(',', ':'))
-        
-        dt = datetime.fromtimestamp(self._current_window_start)
-        logger.info(f"Flushed stats for window {dt.strftime('%Y-%m-%d %H:%M')}")
-        
-        # Reset to new defaultdict to avoid lingering references
-        self._current_stats = defaultdict(lambda: {
-            "samples": 0,
-            "success": 0,
-            "rate_limit_errors": 0,
-            "timeout_errors": 0,
-            "other_errors": 0
-        })
+        # Step 4: Clear flushed buffers
+        for window_start in flushed_windows:
+            del self._window_buffers[window_start]
     
     def load_aggregated_stats(self, hours: float) -> Dict[str, Dict[str, int]]:
         """Load and aggregate statistics for the last N hours
