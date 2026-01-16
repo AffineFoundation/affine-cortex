@@ -45,11 +45,12 @@ class MinersDAO(BaseDAO):
         invalid_reason: Optional[str],
         block_number: int,
         first_block: int,
+        template_check_result: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Save or update miner validation state.
-        
+
         Directly updates the record for this UID (no history tracking).
-        
+
         Args:
             uid: Miner UID (0-255)
             hotkey: Miner's SS58 hotkey
@@ -63,7 +64,8 @@ class MinersDAO(BaseDAO):
             invalid_reason: Reason if invalid (null if valid)
             block_number: Current block when this record was updated
             first_block: Block when miner first committed
-            
+            template_check_result: Template check result ("safe", "unsafe:reason", or null)
+
         Returns:
             Saved miner record
         """
@@ -81,8 +83,9 @@ class MinersDAO(BaseDAO):
             'invalid_reason': invalid_reason,
             'block_number': block_number,
             'first_block': first_block,
+            'template_check_result': template_check_result,
         }
-        
+
         return await self.put(item)
     
     async def get_miner_by_uid(

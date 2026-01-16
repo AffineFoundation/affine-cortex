@@ -57,7 +57,7 @@ requires-dist = [
     { name = "aiofiles" },
     { name = "aiohttp", specifier = ">=3.10.11" },
     { name = "alive-progress", specifier = ">=3.0.0" },
-    { name = "basilica-sdk", specifier = ">=0.10.0" },
+    { name = "basilica-sdk", specifier = ">=0.11.0" },
     { name = "bittensor" },
     { name = "bittensor-cli" },
     { name = "boto3", specifier = ">=1.34" },
@@ -386,13 +386,13 @@ wheels = [
 
 [[package]]
 name = "basilica-sdk"
-version = "0.10.0"
+version = "0.11.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c5/25/279d34ba963efd5a1bb5214300441beee8ec7071beae60f12bbf2a735af6/basilica_sdk-0.10.0.tar.gz", hash = "sha256:a46d3cf8cef505b610b7a6198695d0520afd9e58b6cef9fdc839c5ae5a6ed07b", size = 1496331, upload-time = "2025-12-19T17:30:56.048Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3a/50/41e17245d93a0c1f4635cd5ddbde4a20b93e3d40de7b5b24bd95d7ec4015/basilica_sdk-0.11.0.tar.gz", hash = "sha256:bb31f93257a6f2cf756bb1eb2090bb72f888892cfd09e3cf52e664ccbc8bdc7e", size = 1607516, upload-time = "2025-12-31T11:01:33.35Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/5e/326f03523a3e128e3b613fcb31cec2a7f6bcc4be9dcb332987c70f3880fc/basilica_sdk-0.10.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:6da37c686b948ec282afae43a46fed45ab7441743c947da617c66407b1eb1973", size = 2881111, upload-time = "2025-12-19T17:30:51.324Z" },
-    { url = "https://files.pythonhosted.org/packages/2a/78/1683032472b2b41e3240da851b317e3482ac3d9470a556ff01337ff466e8/basilica_sdk-0.10.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:0ecf486d777114410ecaa761971b94bf3e443f674eade3cbce97b400247fe4e5", size = 2796934, upload-time = "2025-12-19T17:30:52.84Z" },
-    { url = "https://files.pythonhosted.org/packages/31/fb/eaed968d0dac8c288ee70d1f3c6464c6fa9367d03d37e54dedb8e48db632/basilica_sdk-0.10.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9dd80c7edb34b8e862facc24a73e717dbf874510c5127dec3bc95209290070e0", size = 3892800, upload-time = "2025-12-19T17:30:54.252Z" },
+    { url = "https://files.pythonhosted.org/packages/66/07/3204788eaf98cd8916215209a27ec5e182445f92c48adffb3b87402e8a3d/basilica_sdk-0.11.0-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:ca7c9525299d6adbaea732963dd74d90a4a01f40991799c1b5e933d3fab3749f", size = 3308474, upload-time = "2025-12-31T11:01:26.947Z" },
+    { url = "https://files.pythonhosted.org/packages/89/24/6ae74f5372616155f609a4bd2fcb72f80f87692c14fc2c0e78c9a3ae80e7/basilica_sdk-0.11.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:c278eedca6f71df869a8414382894e1dbe14fc0221c0cefcdcd453644c8954cf", size = 3121257, upload-time = "2025-12-31T11:01:28.989Z" },
+    { url = "https://files.pythonhosted.org/packages/9d/ac/1a67cd149e77487d0adf4662ecbab2dfd159635d98eb3785e47495c2bc94/basilica_sdk-0.11.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:f51bb404ced4f9bb7268777084c31fafed04b874de7fe490051e9c63c5b13fab", size = 3878391, upload-time = "2025-12-31T11:01:31.301Z" },
 ]
 
 [[package]]
