@@ -17,6 +17,7 @@ from huggingface_hub import HfApi
 
 from affine.utils.subtensor import get_subtensor
 from affine.utils.api_client import get_chute_info
+from affine.utils.template_checker import check_template_safety
 from affine.core.setup import NETUID
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
@@ -38,7 +39,8 @@ class MinerInfo:
     model_hash: str = ""  # HuggingFace model hash (cached)
     hf_revision: str = ""  # HuggingFace actual revision (cached)
     chute_status: str = ""
-    
+    template_check_result: Optional[str] = None  # "safe", "unsafe:reason", or None (unchecked)
+
     def key(self) -> str:
         """Generate unique key: hotkey#revision"""
         return f"{self.hotkey}#{self.revision}"
@@ -333,7 +335,61 @@ class MinersMonitor:
             info.is_valid = False
             info.invalid_reason = f"revision_mismatch:hf={hf_revision}"
             return info
-        
+
+        # Step 9: Check chat_template for malicious code (with database cache)
+        # Skip for uid 0 (test/admin miner)
+        if uid == 0:
+            info.template_check_result = "safe"
+            info.is_valid = True
+            return info
+
+        try:
+            existing = await self.dao.get_miner_by_uid(uid)
+            cached_result = None
+
+            # Use cached result if model/revision unchanged
+            if (existing and
+                existing.get('model') == model and
+                existing.get('revision') == revision):
+                cached_result = existing.get('template_check_result')
+
+            if cached_result == "safe":
+                # Previously passed, skip check
+                logger.debug(f"[MinersMonitor] Skipping template check for uid={uid} (cached: safe)")
+                info.template_check_result = "safe"
+            elif cached_result and cached_result.startswith("unsafe:"):
+                # Previously failed, use cached result directly
+                info.is_valid = False
+                info.invalid_reason = f"malicious_template:{cached_result[7:]}"
+                info.template_check_result = cached_result
+                logger.debug(f"[MinersMonitor] Using cached template result for uid={uid}: {cached_result}")
+                return info
+            else:
+                # No cache or model/revision changed, execute check
+                template_result = await check_template_safety(model, revision)
+                if not template_result["safe"]:
+                    reason = template_result['reason']
+                    info.is_valid = False
+                    info.invalid_reason = f"malicious_template:{reason}"
+                    info.template_check_result = f"unsafe:{reason}"
+                    logger.warning(
+                        f"[MinersMonitor] Malicious template detected for uid={uid}: {reason}"
+                    )
+                    return info
+
+                # Check if audit was skipped (no API key, error, etc.)
+                if template_result['reason'].startswith("llm_audit_skipped:"):
+                    # Leave template_check_result as None, will retry next time
+                    logger.debug(
+                        f"[MinersMonitor] Template check skipped for uid={uid}: "
+                        f"{template_result['reason']}"
+                    )
+                else:
+                    info.template_check_result = "safe"
+        except Exception as e:
+            logger.warning(f"[MinersMonitor] Template check failed for uid={uid}: {e}")
+            # Continue validation even if template check fails
+
         # All checks passed
         info.is_valid = True
         return info
@@ -510,6 +566,7 @@ class MinersMonitor:
                     invalid_reason=miner.invalid_reason,
                     block_number=current_block,
                     first_block=miner.block,
+                    template_check_result=miner.template_check_result,
                 )
             
             valid_miners = {m.key(): m for m in miners if m.is_valid}
