@@ -98,6 +98,15 @@ class ScorerConfig:
     ENV_SCORE_RANGES: Dict[str, tuple] = {
         'agentgym:sciworld': (-100, 100.0)  # sciworld 分数范围 0-100
     }
+
+    # Environment-specific threshold difficulty configs
+    # Format: env_name -> {z_score, min_improvement, max_improvement}
+    # Lower values = easier to beat (lower difficulty)
+    # Higher values = harder to beat (higher difficulty)
+    ENV_THRESHOLD_CONFIGS: Dict[str, Dict[str, float]] = {
+        'GAME': {'z_score': 1},    # easier to beat (default 1.5)
+        'PRINT': {'z_score': 2.0},   # harder to beat (default 1.5)
+    }
     
     # Database & Storage
     SCORE_RECORD_TTL_DAYS: int = 30

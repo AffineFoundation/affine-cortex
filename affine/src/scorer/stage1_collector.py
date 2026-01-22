@@ -176,12 +176,18 @@ class Stage1Collector:
                 is_valid = completeness >= env_min_completeness
 
                 # Calculate required score threshold (sample-size aware)
+                # Get environment-specific threshold config or use defaults
+                env_threshold_config = self.config.ENV_THRESHOLD_CONFIGS.get(env_name, {})
+                z_score = env_threshold_config.get('z_score', self.config.Z_SCORE)
+                min_improvement = env_threshold_config.get('min_improvement', self.config.MIN_IMPROVEMENT)
+                max_improvement = env_threshold_config.get('max_improvement', self.config.MAX_IMPROVEMENT)
+
                 threshold = calculate_required_score(
                     avg_score,
                     completed_count,
-                    self.config.Z_SCORE,
-                    self.config.MIN_IMPROVEMENT,
-                    self.config.MAX_IMPROVEMENT
+                    z_score,
+                    min_improvement,
+                    max_improvement
                 )
                 
                 # Store environment score
