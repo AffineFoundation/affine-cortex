@@ -203,6 +203,18 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 600,
         },
     ),
+    # ARC-GEN environment
+    "arc-gen": EnvConfig(
+        name="arc-gen",
+        docker_image="affinefoundation/arc:latest",
+        env_vars={"UVICORN_WORKERS": "10"},
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 600,
+            "num_train": 3,
+        },
+        proxy_timeout=620,
+    ),
 }
 
 # Alias mappings (multiple names can map to the same canonical config)
@@ -233,6 +245,10 @@ _ENV_ALIASES = {
     
     # Print aliases
     "PRINT": "print",
+
+    # ARC-GEN aliases
+    "ARC-GEN": "arc-gen",
+    "ARCGEN": "arc-gen",
 }
 
 # Build final ENV_CONFIGS with aliases
@@ -602,6 +618,7 @@ GAME_factory = lambda mode=None: create_environment("game", mode=mode)
 SWE_PRO_factory = lambda mode=None: create_environment("swe-pro", mode=mode)
 SWE_SYNTH_factory = lambda mode=None: create_environment("swe-synth", mode=mode)
 PRINT_factory = lambda mode=None: create_environment("print", mode=mode)
+ARC_GEN_factory = lambda mode=None: create_environment("arc-gen", mode=mode)
 
 # Legacy class aliases
 SAT = SAT_factory
@@ -618,3 +635,6 @@ PRINT = PRINT_factory
 # SWE-bench factories
 SWE_PRO = SWE_PRO_factory
 SWE_SYNTH = SWE_SYNTH_factory
+
+# ARC-GEN factory
+ARC_GEN = ARC_GEN_factory

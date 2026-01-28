@@ -47,6 +47,7 @@ from affine.core.environments import (
     SWE_PRO_factory as SWEPRO,
     SWE_SYNTH_factory as SWESYNTH,
     PRINT_factory as PRINT,
+    ARC_GEN_factory as ARCGEN,
     list_available_environments,
 )
 
