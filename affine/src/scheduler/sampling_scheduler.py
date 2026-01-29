@@ -849,15 +849,38 @@ class SamplingScheduler:
     
     async def _check_and_rotate_all_envs(self):
         """Check all environments and rotate if needed."""
+        from affine.core.dataset_range_resolver import resolve_dataset_range_source
+
         environments = await self.config_dao.get_param_value('environments', {})
         current_time = int(time.time())
-        
+
         for env_name, env_config in environments.items():
             try:
                 sampling_config = env_config.get('sampling_config')
                 if not sampling_config:
                     continue
-                
+
+                # Re-resolve dynamic dataset_range from remote source
+                range_source = sampling_config.get('dataset_range_source')
+                if range_source:
+                    resolved_range = await resolve_dataset_range_source(range_source)
+                    if resolved_range is not None:
+                        old_range = sampling_config.get('dataset_range')
+                        if resolved_range != old_range:
+                            sampling_config['dataset_range'] = resolved_range
+                            environments[env_name]['sampling_config'] = sampling_config
+                            await self.config_dao.set_param(
+                                param_name='environments',
+                                param_value=environments,
+                                param_type='dict',
+                                description='Environment configurations with dynamic sampling',
+                                updated_by='sampling_scheduler_range_resolve'
+                            )
+                            logger.info(
+                                f"Updated dataset_range for {env_name}: "
+                                f"{old_range} -> {resolved_range}"
+                            )
+
                 # Check if list size needs adjustment
                 current_size = len(sampling_config.get('sampling_list', []))
                 target_size = sampling_config.get('sampling_count', 0)
