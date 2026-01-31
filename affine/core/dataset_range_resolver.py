@@ -61,18 +61,67 @@ def _build_range(value: int, range_type: str) -> List[List[int]]:
     raise ValueError(f"Unknown range_type: {range_type}")
 
 
+def expand_dataset_range(
+    old_range: List[List[int]],
+    new_value: int,
+    range_type: str = "zero_to_value",
+) -> Optional[List[List[int]]]:
+    """Expand dataset_range by appending the new portion as a separate segment.
+
+    Instead of replacing the whole range, this preserves existing segments
+    and appends only the delta. This allows rotation logic to distinguish
+    newer data from older data via segment order.
+
+    Example:
+        old_range=[[0, 141]], new_value=200, range_type="zero_to_value"
+        -> [[0, 141], [141, 199]]  (new segment [141, 199) appended)
+
+    Args:
+        old_range: Current dataset_range segments
+        new_value: New value from remote metadata
+        range_type: How to interpret the value
+
+    Returns:
+        Expanded range with new segment appended, or None if no expansion needed
+    """
+    if range_type == "zero_to_value":
+        new_end = new_value - 1
+        if new_end <= 0:
+            return None
+
+        if not old_range:
+            return [[0, new_end]]
+
+        # Find the max end across all existing segments
+        current_max_end = max(seg[1] for seg in old_range)
+
+        if new_end <= current_max_end:
+            return None  # No expansion needed
+
+        # Append delta as a new segment: [current_max_end, new_end)
+        return old_range + [[current_max_end, new_end]]
+
+    raise ValueError(f"Unknown range_type: {range_type}")
+
+
 async def resolve_dataset_range_source(
     source: Dict[str, str],
+    old_range: Optional[List[List[int]]] = None,
     timeout: float = 10.0,
 ) -> Optional[List[List[int]]]:
     """Resolve dataset_range from a remote metadata source.
 
+    If old_range is provided, expands by appending a new segment for the
+    delta (so rotation can prioritize newer data). If old_range is None,
+    builds a fresh single-segment range.
+
     Args:
         source: Dict with keys: url, field, range_type
+        old_range: Current dataset_range to expand (None for fresh build)
         timeout: HTTP request timeout in seconds
 
     Returns:
-        Resolved dataset_range, or None if resolution fails
+        Resolved dataset_range, or None if resolution fails / no change
     """
     url = source.get("url")
     field_path = source.get("field")
@@ -95,12 +144,17 @@ async def resolve_dataset_range_source(
 
         value = _extract_field(data, field_path)
         value = int(value)
-        resolved_range = _build_range(value, range_type)
 
-        logger.info(
-            f"Resolved dataset_range_source: {url} -> "
-            f"{field_path}={value} -> range={resolved_range}"
-        )
+        if old_range:
+            resolved_range = expand_dataset_range(old_range, value, range_type)
+        else:
+            resolved_range = _build_range(value, range_type)
+
+        if resolved_range is not None:
+            logger.info(
+                f"Resolved dataset_range_source: {url} -> "
+                f"{field_path}={value} -> range={resolved_range}"
+            )
         return resolved_range
 
     except (aiohttp.ClientError, TimeoutError) as e:

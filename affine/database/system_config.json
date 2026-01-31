@@ -41,11 +41,11 @@
       }
     },
     "SWE-SYNTH": {
-      "enabled_for_sampling": true,
+      "enabled_for_sampling": false,
       "enabled_for_scoring": false,
       "min_completeness": 0.5,
       "sampling_config": {
-        "dataset_range": [[0, 999]],
+        "dataset_range": [[0, 141]],
         "dataset_range_source": {
           "url": "https://pub-4b43a94ed07d4ac38fae3f4cb5070d6c.r2.dev/bugs/metadata.json",
           "field": "tasks.completed_up_to",
@@ -55,7 +55,7 @@
         "rotation_enabled": false,
         "rotation_count": 0,
         "rotation_interval": 3600,
-        "scheduling_weight": 1.0
+        "scheduling_weight": 0.5
       }
     },
     "ARC-GEN": {
@@ -68,7 +68,7 @@
         "rotation_enabled": false,
         "rotation_count": 0,
         "rotation_interval": 3600,
-        "scheduling_weight": 1.0
+        "scheduling_weight": 0.5
       }
     }
   }

@@ -186,6 +186,54 @@ class RangeSet:
         
         return samples[:n]
     
+    def prioritized_sample(self, n: int) -> List[int]:
+        """Sample n IDs, prioritizing later ranges (newest data first).
+
+        Iterates ranges from last to first, randomly sampling from each
+        segment until n IDs are collected. This ensures newly added
+        range segments are sampled before older ones.
+
+        Args:
+            n: Number of IDs to sample
+
+        Returns:
+            List of randomly selected IDs
+
+        Raises:
+            ValueError: If n > total available IDs
+        """
+        total_size = self.size()
+
+        if n > total_size:
+            raise ValueError(
+                f"Cannot sample {n} IDs from RangeSet with only {total_size} IDs"
+            )
+
+        if n == 0:
+            return []
+
+        samples: set = set()
+
+        for start, end in reversed(self.ranges):
+            if len(samples) >= n:
+                break
+
+            segment_size = end - start
+            needed = n - len(samples)
+            sample_count = min(needed, segment_size)
+
+            if sample_count >= segment_size:
+                # Take all IDs from this segment
+                samples.update(range(start, end))
+            else:
+                # Randomly sample from this segment
+                segment_samples: set = set()
+                while len(segment_samples) < sample_count:
+                    segment_samples.add(random.randint(start, end - 1))
+                samples.update(segment_samples)
+
+        return list(samples)[:n]
+
     def to_list(self) -> List[List[int]]:
         """Convert to list of [start, end) pairs.
         
