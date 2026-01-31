@@ -41,7 +41,7 @@
       }
     },
     "SWE-SYNTH": {
-      "enabled_for_sampling": false,
+      "enabled_for_sampling": true,
       "enabled_for_scoring": false,
       "min_completeness": 0.5,
       "sampling_config": {
@@ -51,7 +51,7 @@
           "field": "tasks.completed_up_to",
           "range_type": "zero_to_value"
         },
-        "sampling_count": 10,
+        "sampling_count": 20,
         "rotation_enabled": false,
         "rotation_count": 0,
         "rotation_interval": 3600,

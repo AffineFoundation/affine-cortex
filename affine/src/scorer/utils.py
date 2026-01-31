@@ -117,30 +117,43 @@ def calculate_subset_weights(
     return subset_weights
 
 
-def geometric_mean(values: List[float]) -> float:
-    """Calculate geometric mean of a list of values.
-    
-    Formula: (∏ values)^(1/N)
-    
+def geometric_mean(values: List[float], epsilon: float = 0.0) -> float:
+    """Calculate geometric mean of a list of values with optional smoothing.
+
+    When epsilon > 0, applies smoothing to prevent zero scores from collapsing
+    the entire geometric mean to 0:
+        GM_smoothed = ((v1+ε) × (v2+ε) × ... × (vn+ε))^(1/n) - ε
+
+    When epsilon = 0, uses standard geometric mean (returns 0 if any value is 0).
+
     Args:
         values: List of numeric values
-        
+        epsilon: Smoothing offset. Shifts scores from [0,1] to [ε, 1+ε]
+                 before calculation, then shifts back.
+
     Returns:
-        Geometric mean, or 0.0 if any value is 0
+        Geometric mean (smoothed if epsilon > 0)
     """
     if not values:
         return 0.0
-    
-    # If any value is 0, return 0 (penalizes poor performance)
+
+    n = len(values)
+
+    if epsilon > 0:
+        # Smoothed geometric mean: shift up, compute, shift back
+        product = 1.0
+        for v in values:
+            product *= (v + epsilon)
+        return max(product ** (1.0 / n) - epsilon, 0.0)
+
+    # Standard geometric mean: any zero collapses result to 0
     if any(v <= 0 for v in values):
         return 0.0
-    
-    # Calculate product and take Nth root
-    n = len(values)
+
     product = 1.0
     for v in values:
         product *= v
-    
+
     return product ** (1.0 / n)
 
 

@@ -44,6 +44,7 @@ class Stage3SubsetScorer:
         self.config = config
         self.decay_factor = config.DECAY_FACTOR
         self.score_precision = config.SCORE_PRECISION
+        self.geometric_mean_epsilon = config.GEOMETRIC_MEAN_EPSILON
     
     def score(
         self,
@@ -158,7 +159,8 @@ class Stage3SubsetScorer:
             ]
             
             # Always use geometric mean to penalize poor performance in any environment
-            score = geometric_mean(env_scores)
+            # Smoothing epsilon prevents zero scores from collapsing the entire result
+            score = geometric_mean(env_scores, epsilon=self.geometric_mean_epsilon)
             miner_scores.append((miner.uid, score))
             miner.subset_scores[subset_key] = score
         
