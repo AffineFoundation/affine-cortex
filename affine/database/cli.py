@@ -156,12 +156,24 @@ async def cmd_load_config(json_file: str):
             existing_envs = await config_dao.get_param_value('environments', default={})
             manager = SamplingListManager()
             
+            from affine.core.dataset_range_resolver import resolve_dataset_range_source
+
             for env_name, env_config in environments.items():
                 sampling_config = env_config.get('sampling_config')
                 if not sampling_config:
                     print(f"  Warning: {env_name} missing sampling_config, skipping")
                     continue
-                
+
+                # Resolve dynamic dataset_range from remote source if configured
+                range_source = sampling_config.get('dataset_range_source')
+                if range_source:
+                    resolved_range = await resolve_dataset_range_source(range_source)
+                    if resolved_range is not None:
+                        sampling_config['dataset_range'] = resolved_range
+                        print(f"  {env_name}: Resolved dataset_range from remote source: {resolved_range}")
+                    else:
+                        print(f"  {env_name}: Failed to resolve dataset_range_source, using fallback: {sampling_config.get('dataset_range')}")
+
                 # Check if initial_range is provided
                 if 'initial_range' in sampling_config:
                     # Use initial_range to generate sampling_list

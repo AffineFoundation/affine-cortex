@@ -849,15 +849,39 @@ class SamplingScheduler:
     
     async def _check_and_rotate_all_envs(self):
         """Check all environments and rotate if needed."""
+        from affine.core.dataset_range_resolver import resolve_dataset_range_source
+
         environments = await self.config_dao.get_param_value('environments', {})
         current_time = int(time.time())
-        
+
         for env_name, env_config in environments.items():
             try:
                 sampling_config = env_config.get('sampling_config')
                 if not sampling_config:
                     continue
-                
+
+                # Re-resolve dynamic dataset_range from remote source
+                range_source = sampling_config.get('dataset_range_source')
+                if range_source:
+                    old_range = sampling_config.get('dataset_range')
+                    resolved_range = await resolve_dataset_range_source(
+                        range_source, old_range=old_range
+                    )
+                    if resolved_range is not None:
+                        sampling_config['dataset_range'] = resolved_range
+                        environments[env_name]['sampling_config'] = sampling_config
+                        await self.config_dao.set_param(
+                            param_name='environments',
+                            param_value=environments,
+                            param_type='dict',
+                            description='Environment configurations with dynamic sampling',
+                            updated_by='sampling_scheduler_range_resolve'
+                        )
+                        logger.info(
+                            f"Updated dataset_range for {env_name}: "
+                            f"{old_range} -> {resolved_range}"
+                        )
+
                 # Check if list size needs adjustment
                 current_size = len(sampling_config.get('sampling_list', []))
                 target_size = sampling_config.get('sampling_count', 0)
@@ -895,18 +919,20 @@ class SamplingScheduler:
     async def _rotate_environment(self, env: str, sampling_config: dict):
         """Rotate sampling list for a single environment."""
         logger.info(f"Rotating sampling list for {env}")
-        
+
         current_list = sampling_config['sampling_list']
         dataset_range = sampling_config['dataset_range']
         sampling_count = sampling_config['sampling_count']
         rotation_count = sampling_config['rotation_count']
-        
+        prioritize_new = 'dataset_range_source' in sampling_config
+
         new_list, removed_ids, added_ids = await self.manager.rotate_sampling_list(
             env=env,
             current_list=current_list,
             dataset_range=dataset_range,
             sampling_count=sampling_count,
-            rotation_count=rotation_count
+            rotation_count=rotation_count,
+            prioritize_new=prioritize_new
         )
         
         logger.info(
@@ -951,12 +977,15 @@ class SamplingScheduler:
             f"Adjusting sampling list size for {env}: {current_size} -> {target_size}"
         )
         
+        prioritize_new = 'dataset_range_source' in sampling_config
+
         new_list, removed_ids, added_ids = await self.manager.rotate_sampling_list(
             env=env,
             current_list=current_list,
             dataset_range=sampling_config['dataset_range'],
             sampling_count=target_size,
-            rotation_count=0
+            rotation_count=0,
+            prioritize_new=prioritize_new
         )
         
         logger.info(

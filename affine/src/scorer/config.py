@@ -71,15 +71,32 @@ class ScorerConfig:
     SUBSET_WEIGHT_EXPONENT: int = 2
     """Exponent base for layer weights (layer_weight = N * base^(layer-1))."""
     
+    GEOMETRIC_MEAN_EPSILON: float = 0.1
+    """
+    Smoothing epsilon for geometric mean calculation.
+
+    Shifts all scores by +ε before computing geometric mean, then shifts
+    back by -ε. This prevents zero scores from collapsing the entire
+    geometric mean to 0, which is critical when a new environment is added
+    and all miners initially score 0.
+
+    Score range shifts from [0, 1] to [ε, 1+ε].
+
+    Formula: GM_smoothed = ((v1+ε) × (v2+ε) × ... × (vn+ε))^(1/n) - ε
+
+    Set to 0.0 to disable smoothing (original behavior).
+    Recommended value: 0.1
+    """
+
     DECAY_FACTOR: float = 0.5
     """
     Rank-based decay factor for score_proportional weighting.
-    
+
     Applied as: adjusted_score = score × decay_factor^(rank - 1)
     - Rank 1: score × 1.0
     - Rank 2: score × decay_factor^1
     - Rank 3: score × decay_factor^2
-    
+
     Set to 1.0 to disable decay (all ranks weighted equally).
     Set to 0.5 for exponential decay (each rank gets 50% of previous).
     """
@@ -126,6 +143,7 @@ class ScorerConfig:
             'decay_factor': cls.DECAY_FACTOR,
             'min_weight_threshold': cls.MIN_WEIGHT_THRESHOLD,
             'min_completeness': cls.MIN_COMPLETENESS,
+            'geometric_mean_epsilon': cls.GEOMETRIC_MEAN_EPSILON,
         }
     
     @classmethod
@@ -140,6 +158,7 @@ class ScorerConfig:
         assert 0.0 <= cls.DECAY_FACTOR <= 1.0, "DECAY_FACTOR must be in [0, 1]"
         assert 0.0 <= cls.MIN_WEIGHT_THRESHOLD <= 1.0, "MIN_WEIGHT_THRESHOLD must be in [0, 1]"
         assert 0.0 <= cls.MIN_COMPLETENESS <= 1.0, "MIN_COMPLETENESS must be in [0, 1]"
+        assert cls.GEOMETRIC_MEAN_EPSILON >= 0.0, "GEOMETRIC_MEAN_EPSILON must be non-negative"
 
 
 # Validate configuration on import

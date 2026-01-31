@@ -79,24 +79,27 @@ class SamplingListManager:
         current_list: List[int],
         dataset_range: List[List[int]],
         sampling_count: int,
-        rotation_count: int
+        rotation_count: int,
+        prioritize_new: bool = False
     ) -> Tuple[List[int], List[int], List[int]]:
         """Rotate sampling list while maintaining sampling_count size.
-        
+
         Rotation strategy:
         1. Use RangeSet to avoid expanding large dataset_range
         2. Calculate available = dataset - current (using RangeSet)
         3. Determine removal/addition counts based on current vs target size
         4. Remove from the FRONT of the list (old data first)
         5. Add new data to the END (no sorting to preserve order)
-        
+
         Args:
             env: Environment name
             current_list: Current sampling list (order matters)
             dataset_range: Dataset range in [[start, end], ...] format (supports multiple ranges)
             sampling_count: Target sampling list size
             rotation_count: Number of IDs to rotate per cycle
-            
+            prioritize_new: If True, prioritize sampling from later range segments
+                (for dynamic-range environments where newer segments = newer data)
+
         Returns:
             (new_list, removed_ids, added_ids)
         """
@@ -160,8 +163,24 @@ class SamplingListManager:
         
         # Execute addition: Add to END (recalculate available after removal)
         remaining_set = set(remaining_list)
-        available_for_add = dataset_rangeset.subtract_ids(remaining_set)
-        added_ids = available_for_add.random_sample(to_add)
+        if prioritize_new:
+            # Iterate raw segments in reverse (newest first) to preserve
+            # segment ordering that RangeSet normalization would merge away
+            added_ids = []
+            needed = to_add
+            for segment in reversed(dataset_range):
+                if needed <= 0:
+                    break
+                seg_available = RangeSet([segment]).subtract_ids(remaining_set)
+                seg_count = min(needed, seg_available.size())
+                if seg_count > 0:
+                    sampled = seg_available.random_sample(seg_count)
+                    added_ids.extend(sampled)
+                    remaining_set.update(sampled)
+                    needed -= seg_count
+        else:
+            available_for_add = dataset_rangeset.subtract_ids(remaining_set)
+            added_ids = available_for_add.random_sample(to_add)
         
         # Merge: Keep order - remaining list + new additions at end
         new_list = remaining_list + added_ids
