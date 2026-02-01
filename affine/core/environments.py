@@ -209,6 +209,27 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=620,
     ),
+
+    # LiveWeb Arena environment (browser-based web interaction evaluation)
+    "liveweb": EnvConfig(
+        name="liveweb",
+        docker_image="affinefoundation/liveweb-arena:latest",
+        env_type="liveweb",
+        mem_limit="20g",
+        env_vars={"UVICORN_WORKERS": "4"},
+        volumes={
+            "/var/lib/liveweb-arena/cache": {
+                "bind": "/var/lib/liveweb-arena/cache",
+                "mode": "rw",
+            },
+        },
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 3600,
+            "max_concurrency": 6,
+        },
+        proxy_timeout=3700,
+    ),
 }
 
 # Alias mappings (multiple names can map to the same canonical config)
@@ -243,6 +264,10 @@ _ENV_ALIASES = {
     # ARC-GEN aliases
     "ARC-GEN": "arc-gen",
     "ARCGEN": "arc-gen",
+
+    # LiveWeb Arena aliases
+    "LIVEWEB": "liveweb",
+    "liveweb-arena": "liveweb",
 }
 
 # Build final ENV_CONFIGS with aliases
@@ -295,7 +320,7 @@ class SDKEnvironment:
         if not api_key:
             raise ValueError("CHUTES_API_KEY environment variable is required")
         
-        env_vars = {"CHUTES_API_KEY": api_key}
+        env_vars = {"CHUTES_API_KEY": api_key, "API_KEY": api_key}
 
         # Forward any required host env vars into the container for this environment
         for key in self.config.required_env_vars:
@@ -632,3 +657,7 @@ SWE_SYNTH = SWE_SYNTH_factory
 
 # ARC-GEN factory
 ARC_GEN = ARC_GEN_factory
+
+# LiveWeb Arena factory
+LIVEWEB_factory = lambda mode=None: create_environment("liveweb", mode=mode)
+LIVEWEB = LIVEWEB_factory
