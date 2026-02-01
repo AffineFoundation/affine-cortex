@@ -52,10 +52,10 @@
           "range_type": "zero_to_value"
         },
         "sampling_count": 100,
-        "rotation_enabled": false,
-        "rotation_count": 0,
+        "rotation_enabled": true,
+        "rotation_count": 2,
         "rotation_interval": 3600,
-        "scheduling_weight": 0.5
+        "scheduling_weight": 1.0
       }
     },
     "ARC-GEN": {
