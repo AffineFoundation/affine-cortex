@@ -61,28 +61,49 @@ def _build_range(value: int, range_type: str) -> List[List[int]]:
     raise ValueError(f"Unknown range_type: {range_type}")
 
 
+def _compact_segments(
+    segments: List[List[int]],
+    min_segment_size: int = 100,
+    max_segments: int = 5,
+) -> List[List[int]]:
+    """Compact segments: merge undersized non-tail segments, enforce max count.
+
+    Tail segment is always preserved as-is (accumulation zone for new data).
+    """
+    if len(segments) <= 1:
+        return segments
+
+    tail = segments[-1]
+    rest = segments[:-1]
+
+    merged: List[List[int]] = [rest[0]]
+    for seg in rest[1:]:
+        if seg[1] - seg[0] < min_segment_size:
+            merged[-1] = [merged[-1][0], seg[1]]
+        else:
+            merged.append(seg)
+
+    merged.append(tail)
+
+    if len(merged) > max_segments:
+        to_merge = len(merged) - max_segments + 1
+        merged = [[merged[0][0], merged[to_merge - 1][1]]] + merged[to_merge:]
+
+    return merged
+
+
 def expand_dataset_range(
     old_range: List[List[int]],
     new_value: int,
     range_type: str = "zero_to_value",
+    min_segment_size: int = 100,
+    max_segments: int = 5,
 ) -> Optional[List[List[int]]]:
-    """Expand dataset_range by appending the new portion as a separate segment.
+    """Expand dataset_range with controlled segmentation.
 
-    Instead of replacing the whole range, this preserves existing segments
-    and appends only the delta. This allows rotation logic to distinguish
-    newer data from older data via segment order.
-
-    Example:
-        old_range=[[0, 141]], new_value=200, range_type="zero_to_value"
-        -> [[0, 141], [141, 199]]  (new segment [141, 199) appended)
-
-    Args:
-        old_range: Current dataset_range segments
-        new_value: New value from remote metadata
-        range_type: How to interpret the value
-
-    Returns:
-        Expanded range with new segment appended, or None if no expansion needed
+    - If tail size < min_segment_size: extend the tail segment's end
+    - If tail size >= min_segment_size: start a new tail segment
+    - Then compact to enforce min_segment_size and max_segments
     """
     if range_type == "zero_to_value":
         new_end = new_value - 1
@@ -92,14 +113,21 @@ def expand_dataset_range(
         if not old_range:
             return [[0, new_end]]
 
-        # Find the max end across all existing segments
         current_max_end = max(seg[1] for seg in old_range)
 
         if new_end <= current_max_end:
-            return None  # No expansion needed
+            compacted = _compact_segments(old_range, min_segment_size, max_segments)
+            return compacted if compacted != old_range else None
 
-        # Append delta as a new segment: [current_max_end, new_end)
-        return old_range + [[current_max_end, new_end]]
+        tail = old_range[-1]
+        tail_size = tail[1] - tail[0]
+
+        if tail_size < min_segment_size:
+            expanded = old_range[:-1] + [[tail[0], new_end]]
+        else:
+            expanded = old_range + [[current_max_end, new_end]]
+
+        return _compact_segments(expanded, min_segment_size, max_segments)
 
     raise ValueError(f"Unknown range_type: {range_type}")
 
