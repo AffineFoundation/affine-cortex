@@ -70,9 +70,10 @@ class MinersMonitor:
         self.refresh_interval_seconds = refresh_interval_seconds
         self.last_update: int = 0
         
-        # Caches
-        self.weights_cache: Dict[tuple, tuple] = {}  # (model, revision) -> (sha_set, timestamp)
-        self.weights_ttl = 3600  # 1 hour
+        # Caches: (type, model, revision) -> (result, timestamp)
+        # type: "model_info" | "duplicate"
+        self.weights_cache: Dict[tuple, tuple] = {}
+        self.weights_ttl = 1800  # 30 minutes
         
         # Background task management
         self._running = False
@@ -154,43 +155,52 @@ class MinersMonitor:
         
         return merged_blacklist
     
-    async def _get_model_info(self, model_id: str, revision: str) -> Optional[tuple[str, str]]:
-        """Get model hash and actual revision from HuggingFace
-        
+    async def _get_model_info(self, model_id: str, revision: str) -> Optional[tuple[str, str, str]]:
+        """Get model hash, actual revision and commit title from HuggingFace
+
         Args:
             model_id: HuggingFace model repo
             revision: Git commit hash
-            
+
         Returns:
-            Tuple of (model_hash, actual_revision) or None if failed
+            Tuple of (model_hash, actual_revision, commit_title) or None if failed
         """
         key = (model_id, revision)
         now = time.time()
         cached = self.weights_cache.get(key)
-        
+
         if cached and now - cached[1] < self.weights_ttl:
             return cached[0]
-        
+
         try:
+            hf_api = HfApi(token=os.getenv("HF_TOKEN"))
+
             def _repo_info():
-                return HfApi(token=os.getenv("HF_TOKEN")).repo_info(
+                return hf_api.repo_info(
                     repo_id=model_id,
                     repo_type="model",
                     revision=revision,
                     files_metadata=True,
                 )
-            
+
+            def _list_commits():
+                return hf_api.list_repo_commits(
+                    repo_id=model_id,
+                    repo_type="model",
+                    revision=revision,
+                )
+
             info = await asyncio.to_thread(_repo_info)
-            
+
             # Get actual revision (git SHA)
             actual_revision = getattr(info, "sha", None)
-            
+
             # Get model weight hashes
             siblings = getattr(info, "siblings", None) or []
-            
+
             def _name(s):
                 return getattr(s, "rfilename", None) or getattr(s, "path", "") or ""
-            
+
             shas = {
                 str(getattr(s, "lfs", {})["sha256"])
                 for s in siblings
@@ -201,14 +211,25 @@ class MinersMonitor:
                     and "sha256" in getattr(s, "lfs", {})
                 )
             }
-            
+
             # Compute total hash
             model_hash = None
             if shas:
                 import hashlib
                 model_hash = hashlib.sha256("".join(sorted(shas)).encode()).hexdigest()
-            
-            result = (model_hash, actual_revision) if model_hash and actual_revision else None
+
+            # Get commit title for duplicate check
+            commit_title = ""
+            try:
+                commits = await asyncio.to_thread(_list_commits)
+                for commit in commits:
+                    if getattr(commit, "commit_id", None) == revision:
+                        commit_title = getattr(commit, "title", "") or ""
+                        break
+            except Exception as e:
+                logger.debug(f"Failed to get commit title for {model_id}@{revision}: {e}")
+
+            result = (model_hash, actual_revision, commit_title) if model_hash and actual_revision else None
             self.weights_cache[key] = (result, now)
             return result
 
@@ -223,6 +244,8 @@ class MinersMonitor:
     async def _is_duplicate_commit(self, model_id: str, revision: str) -> Optional[str]:
         """Check if the commit is a 'Duplicate from xxx' commit
 
+        Uses cached commit_title from _get_model_info().
+
         Args:
             model_id: HuggingFace model repo
             revision: Git commit hash to check
@@ -230,35 +253,17 @@ class MinersMonitor:
         Returns:
             Source repo name if it's a duplicate commit, None otherwise
         """
-        try:
-            def _list_commits():
-                return HfApi(token=os.getenv("HF_TOKEN")).list_repo_commits(
-                    repo_id=model_id,
-                    repo_type="model",
-                    revision=revision,
-                )
+        key = (model_id, revision)
+        cached = self.weights_cache.get(key)
 
-            commits = await asyncio.to_thread(_list_commits)
-
-            # Find the commit matching the revision
-            for commit in commits:
-                commit_id = getattr(commit, "commit_id", None)
-                if commit_id == revision:
-                    title = getattr(commit, "title", "") or ""
-                    # Check if title starts with "Duplicate from"
-                    if title.lower().startswith("duplicate from"):
-                        # Extract source repo (format: "Duplicate from xxx")
-                        source = title[len("Duplicate from"):].strip()
-                        return source
-                    break
-
+        if not cached or not cached[0]:
             return None
 
-        except Exception as e:
-            logger.warning(
-                f"Failed to check duplicate commit for {model_id}@{revision}: {type(e).__name__}: {e}"
-            )
-            return None
+        commit_title = cached[0][2] or ""
+        if commit_title.lower().startswith("duplicate from"):
+            return commit_title[len("Duplicate from"):].strip()
+
+        return None
     
     async def _validate_miner(
         self,
@@ -377,7 +382,7 @@ class MinersMonitor:
             info.invalid_reason = "hf_model_fetch_failed"
             return info
         
-        model_hash, hf_revision = model_info
+        model_hash, hf_revision, _ = model_info
         
         # Cache model info in MinerInfo
         info.model_hash = model_hash
