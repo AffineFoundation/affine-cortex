@@ -166,7 +166,7 @@ class MinersMonitor:
             Tuple of (model_hash, actual_revision, duplicate_source) or None if failed
             duplicate_source can be:
             - "" (empty): no duplicate detected
-            - "blocked:too_many_commits": more than 5 commits in history
+            - "blocked:too_many_commits": more than 100 commits in history
             - "blocked:commit_msg_too_long": any commit message > 200 chars
             - "<repo_name>": duplicated from this repo
         """
@@ -229,7 +229,7 @@ class MinersMonitor:
                 commits = list(await asyncio.to_thread(_list_commits))
 
                 # Block if too many commits
-                if len(commits) > 5:
+                if len(commits) > 100:
                     duplicate_source = "blocked:too_many_commits"
                 else:
                     # Check all commits for duplicate or long messages
