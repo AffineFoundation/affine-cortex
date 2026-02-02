@@ -164,15 +164,28 @@ async def cmd_load_config(json_file: str):
                     print(f"  Warning: {env_name} missing sampling_config, skipping")
                     continue
 
-                # Resolve dynamic dataset_range from remote source if configured
+                # Resolve dynamic dataset_range: preserve DB expansion, only fresh-build if no existing range
                 range_source = sampling_config.get('dataset_range_source')
+                existing_env = existing_envs.get(env_name, {})
+                existing_config = existing_env.get('sampling_config', {})
+                existing_range = existing_config.get('dataset_range')
+
                 if range_source:
-                    resolved_range = await resolve_dataset_range_source(range_source)
+                    if existing_range:
+                        resolved_range = await resolve_dataset_range_source(range_source, old_range=existing_range)
+                    else:
+                        resolved_range = await resolve_dataset_range_source(range_source)
                     if resolved_range is not None:
                         sampling_config['dataset_range'] = resolved_range
                         print(f"  {env_name}: Resolved dataset_range from remote source: {resolved_range}")
+                    elif existing_range:
+                        sampling_config['dataset_range'] = existing_range
+                        print(f"  {env_name}: Preserved existing dataset_range from database: {existing_range}")
                     else:
                         print(f"  {env_name}: Failed to resolve dataset_range_source, using fallback: {sampling_config.get('dataset_range')}")
+                elif existing_range:
+                    sampling_config['dataset_range'] = existing_range
+                    print(f"  {env_name}: Preserved existing dataset_range from database: {existing_range}")
 
                 # Check if initial_range is provided
                 if 'initial_range' in sampling_config:
