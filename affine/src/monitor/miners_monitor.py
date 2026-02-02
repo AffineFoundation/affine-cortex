@@ -156,14 +156,19 @@ class MinersMonitor:
         return merged_blacklist
     
     async def _get_model_info(self, model_id: str, revision: str) -> Optional[tuple[str, str, str]]:
-        """Get model hash, actual revision and commit title from HuggingFace
+        """Get model hash, actual revision and duplicate source from HuggingFace
 
         Args:
             model_id: HuggingFace model repo
             revision: Git commit hash
 
         Returns:
-            Tuple of (model_hash, actual_revision, commit_title) or None if failed
+            Tuple of (model_hash, actual_revision, duplicate_source) or None if failed
+            duplicate_source can be:
+            - "" (empty): no duplicate detected
+            - "blocked:too_many_commits": more than 5 commits in history
+            - "blocked:commit_msg_too_long": any commit message > 200 chars
+            - "<repo_name>": duplicated from this repo
         """
         key = (model_id, revision)
         now = time.time()
@@ -218,18 +223,32 @@ class MinersMonitor:
                 import hashlib
                 model_hash = hashlib.sha256("".join(sorted(shas)).encode()).hexdigest()
 
-            # Get commit title for duplicate check
-            commit_title = ""
+            # Check commit history for duplicate or suspicious patterns
+            duplicate_source = ""
             try:
-                commits = await asyncio.to_thread(_list_commits)
-                for commit in commits:
-                    if getattr(commit, "commit_id", None) == revision:
-                        commit_title = getattr(commit, "title", "") or ""
-                        break
-            except Exception as e:
-                logger.debug(f"Failed to get commit title for {model_id}@{revision}: {e}")
+                commits = list(await asyncio.to_thread(_list_commits))
 
-            result = (model_hash, actual_revision, commit_title) if model_hash and actual_revision else None
+                # Block if too many commits
+                if len(commits) > 5:
+                    duplicate_source = "blocked:too_many_commits"
+                else:
+                    # Check all commits for duplicate or long messages
+                    for commit in commits:
+                        title = getattr(commit, "title", "") or ""
+
+                        # Block if commit message too long
+                        if len(title) > 200:
+                            duplicate_source = "blocked:commit_msg_too_long"
+                            break
+
+                        # Check for duplicate
+                        if title.lower().startswith("duplicate from"):
+                            duplicate_source = title[len("Duplicate from"):].strip()
+                            break
+            except Exception as e:
+                logger.debug(f"Failed to get commits for {model_id}@{revision}: {e}")
+
+            result = (model_hash, actual_revision, duplicate_source) if model_hash and actual_revision else None
             self.weights_cache[key] = (result, now)
             return result
 
@@ -242,16 +261,19 @@ class MinersMonitor:
             return None
 
     async def _is_duplicate_commit(self, model_id: str, revision: str) -> Optional[str]:
-        """Check if the commit is a 'Duplicate from xxx' commit
+        """Check if repo has duplicate commit or suspicious patterns
 
-        Uses cached commit_title from _get_model_info().
+        Uses cached duplicate_source from _get_model_info().
 
         Args:
             model_id: HuggingFace model repo
             revision: Git commit hash to check
 
         Returns:
-            Source repo name if it's a duplicate commit, None otherwise
+            - None: no issues detected
+            - "blocked:too_many_commits": suspicious commit history
+            - "blocked:commit_msg_too_long": suspicious commit message
+            - "<repo_name>": duplicated from this repo
         """
         key = (model_id, revision)
         cached = self.weights_cache.get(key)
@@ -259,11 +281,8 @@ class MinersMonitor:
         if not cached or not cached[0]:
             return None
 
-        commit_title = cached[0][2] or ""
-        if commit_title.lower().startswith("duplicate from"):
-            return commit_title[len("Duplicate from"):].strip()
-
-        return None
+        duplicate_source = cached[0][2] or ""
+        return duplicate_source if duplicate_source else None
     
     async def _validate_miner(
         self,
