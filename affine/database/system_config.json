@@ -70,6 +70,19 @@
         "rotation_interval": 3600,
         "scheduling_weight": 0.5
       }
+    },
+    "LIVEWEB": {
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": false,
+      "min_completeness": 0.5,
+      "sampling_config": {
+        "dataset_range": [[0, 65790000]],
+        "sampling_count": 20,
+        "rotation_enabled": false,
+        "rotation_count": 0,
+        "rotation_interval": 3600,
+        "scheduling_weight": 0.5
+      }
     }
   }
 }

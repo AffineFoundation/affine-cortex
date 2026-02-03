@@ -530,10 +530,19 @@ def _create_environment(env_name: str, network_host: bool = False, basilica: boo
     api_key = os.getenv("CHUTES_API_KEY", "")
     env_vars = {"CHUTES_API_KEY": api_key}
     
+    # Forward required host env vars into the container
+    for key in config.required_env_vars:
+        value = os.getenv(key)
+        if not value:
+            raise ValueError(
+                f"{key} environment variable is required for environment '{env_name}'"
+            )
+        env_vars[key] = value
+
     # Add ENV_NAME for affine environments
     if "task_type" in config.eval_params:
         env_vars["ENV_NAME"] = config.eval_params["task_type"]
-    
+
     env_vars.update(config.env_vars)
     
     # Choose execution mode
