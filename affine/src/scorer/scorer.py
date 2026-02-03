@@ -46,22 +46,38 @@ class Scorer:
     def calculate_scores(
         self,
         scoring_data: Dict[str, Any],
-        environments: list,
-        env_configs: Dict[str, Any],
+        environments: List[str],
         block_number: int,
         print_summary: bool = True
     ) -> ScoringResult:
-        """Execute the four-stage scoring algorithm.
+        """
+        Execute the four-stage scoring algorithm.
+        
+        This method orchestrates the complete scoring pipeline:
+        1. Stage 1: Collect and validate sample data from all miners
+        2. Stage 2: Apply Pareto filtering to detect plagiarism
+        3. Stage 3: Calculate geometric mean scores and distribute weights across subsets
+        4. Stage 4: Normalize weights and apply minimum threshold
         
         Args:
-            scoring_data: Response from /api/v1/samples/scoring
-            environments: List of environment names participating in scoring
-            env_configs: Dict mapping env_name -> env_config (including min_completeness)
-            block_number: Current block number
-            print_summary: Whether to print detailed summaries (default: True)
+            scoring_data: Response from /api/v1/samples/scoring endpoint.
+                Expected format: {"hotkey#revision": {...miner data...}}
+            environments: List of environment names participating in scoring.
+                Only miners with valid scores in these environments are considered.
+            block_number: Current block number for this scoring calculation
+            print_summary: Whether to print detailed summary table (default: True)
             
         Returns:
-            ScoringResult with complete scoring data
+            ScoringResult containing:
+            - Final normalized weights for all miners
+            - Complete miner data with scores per environment
+            - Pareto comparison results
+            - Subset scoring information
+            - Statistics (total, valid, invalid miners)
+            
+        Raises:
+            RuntimeError: If scoring_data is invalid or contains API error response
+            ValueError: If environments list is empty or invalid
         """
         start_time = time.time()
         logger.info(f"Total Miners: {len(scoring_data)}")
