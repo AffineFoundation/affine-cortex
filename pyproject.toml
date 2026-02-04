@@ -32,7 +32,8 @@ dependencies = [
     "fastapi>=0.110.1,<0.111",
     "uvicorn==0.22.0",
     "gunicorn>=23.0.0",
-    "basilica-sdk>=0.11.0"
+    "basilica-sdk>=0.11.0",
+    "protobuf>=3.20.0",
 ]
 readme = "README.md"
 requires-python = ">=3.11"
