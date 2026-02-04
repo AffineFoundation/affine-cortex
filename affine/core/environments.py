@@ -226,10 +226,10 @@ _ENV_CONFIGS_CANONICAL = {
         },
         eval_params={
             "temperature": 0.0,
-            "timeout": 3600,
+            "timeout": 7200,
             "max_concurrency": 6,
         },
-        proxy_timeout=3700,
+        proxy_timeout=7300,
     ),
 }
 
