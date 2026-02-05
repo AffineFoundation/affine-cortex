@@ -215,7 +215,7 @@ def get_miner(ctx):
 
     Examples:
         af get-miner 42
-        af get-miner --uid -1
+        af get-miner n1  (n1 means UID -1)
     """
     from affine.src.miner.main import get_miner as miner_get_miner
 
