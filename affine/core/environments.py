@@ -217,7 +217,7 @@ _ENV_CONFIGS_CANONICAL = {
         env_type="liveweb",
         mem_limit="20g",
         env_vars={"UVICORN_WORKERS": "4"},
-        required_env_vars=["COINGECKO_API_KEY", "TAOSTATS_API_KEY"],
+        required_env_vars=["COINGECKO_API_KEY"],
         volumes={
             "/var/lib/liveweb-arena/cache": {
                 "bind": "/var/lib/liveweb-arena/cache",
