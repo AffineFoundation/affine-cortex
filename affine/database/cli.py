@@ -1801,7 +1801,7 @@ async def cmd_delete_miner(uid: int):
 
 @db.command("set-miner")
 @click.option("--uid", required=True, type=int, help="System miner UID (must be negative)")
-@click.option("--model", required=True, help="Model identifier (e.g., 'openai/gpt-4o')")
+@click.option("--model", required=True, help="Model identifier (e.g., 'zai-org/GLM-4.7')")
 def set_miner(uid: int, model: str):
     """Set a system miner configuration.
 
@@ -1810,8 +1810,8 @@ def set_miner(uid: int, model: str):
     to UID 0 (validator) when setting chain weights.
 
     Examples:
-        af db set-miner --uid -1 --model "openai/gpt-4o"
-        af db set-miner --uid -2 --model "anthropic/claude-3.5-sonnet"
+        af db set-miner --uid -1 --model "zai-org/GLM-4.7"
+        af db set-miner --uid -2 --model "deepseek-ai/DeepSeek-V3.2"
     """
     asyncio.run(cmd_set_miner(uid, model))
 
