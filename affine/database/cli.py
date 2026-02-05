@@ -1707,18 +1707,138 @@ async def cmd_get_miner(hotkey: str, revision: Optional[str]):
 @click.option("--revision", default=None, help="Model revision (optional)")
 def get_miner(hotkey: str, revision: Optional[str]):
     """Get detailed performance data for a specific miner.
-    
+
     Shows comprehensive statistics including sampling performance, slots,
     and adjustment history for the specified miner.
-    
+
     Examples:
         # Get stats for all revisions of a hotkey
         af db get-miner --hotkey 5DJHkQEio6qSayH3
-        
+
         # Get stats for specific revision
         af db get-miner --hotkey 5DJHkQEio6qSayH3 --revision 7b4a3a20
     """
     asyncio.run(cmd_get_miner(hotkey, revision))
+
+
+# System Miners Commands
+
+async def cmd_set_miner(uid: int, model: str):
+    """Set a system miner configuration."""
+    if uid >= 0:
+        print(f"Error: System miner UID must be negative (got {uid})")
+        sys.exit(1)
+
+    print(f"Setting system miner: uid={uid}, model={model}")
+    await init_client()
+
+    try:
+        config_dao = SystemConfigDAO()
+        result = await config_dao.set_system_miner(uid, model, updated_by='cli_set_miner')
+
+        print(f"✓ System miner set successfully")
+        print(f"  UID: {uid}")
+        print(f"  Model: {model}")
+
+    finally:
+        await close_client()
+
+
+async def cmd_list_system_miners():
+    """List all system miners."""
+    print("Fetching system miners...\n")
+    await init_client()
+
+    try:
+        config_dao = SystemConfigDAO()
+        system_miners = await config_dao.get_system_miners()
+
+        if not system_miners:
+            print("No system miners configured")
+        else:
+            print(f"System miners ({len(system_miners)} total):")
+            print("-" * 60)
+            print(f"{'UID':<8} {'Model':<50}")
+            print("-" * 60)
+
+            # Sort by UID (descending, so -1 comes first)
+            for uid_str in sorted(system_miners.keys(), key=lambda x: int(x), reverse=True):
+                config = system_miners[uid_str]
+                model = config.get('model', 'N/A')
+                print(f"{uid_str:<8} {model:<50}")
+
+            print("-" * 60)
+
+    finally:
+        await close_client()
+
+
+async def cmd_delete_miner(uid: int):
+    """Delete a system miner."""
+    print(f"Deleting system miner: uid={uid}")
+    await init_client()
+
+    try:
+        config_dao = SystemConfigDAO()
+
+        # Check if exists
+        current = await config_dao.get_system_miners()
+        if str(uid) not in current:
+            print(f"Error: System miner with uid={uid} not found")
+            sys.exit(1)
+
+        result = await config_dao.delete_system_miner(uid, updated_by='cli_delete_miner')
+
+        if result:
+            print(f"✓ System miner uid={uid} deleted successfully")
+        else:
+            print(f"Error: Failed to delete system miner")
+            sys.exit(1)
+
+    finally:
+        await close_client()
+
+
+@db.command("set-miner")
+@click.option("--uid", required=True, type=int, help="System miner UID (must be negative)")
+@click.option("--model", required=True, help="Model identifier (e.g., 'zai-org/GLM-4.7')")
+def set_miner(uid: int, model: str):
+    """Set a system miner configuration.
+
+    System miners are benchmark models (like GPT-4o, Claude) that participate
+    in scoring but don't receive actual rewards. Their weights are allocated
+    to UID 0 (validator) when setting chain weights.
+
+    Examples:
+        af db set-miner --uid -1 --model "zai-org/GLM-4.7"
+        af db set-miner --uid -2 --model "deepseek-ai/DeepSeek-V3.2"
+    """
+    asyncio.run(cmd_set_miner(uid, model))
+
+
+@db.command("list-system-miners")
+def list_system_miners():
+    """List all configured system miners.
+
+    Shows all system miners with their UIDs and model identifiers.
+
+    Example:
+        af db list-system-miners
+    """
+    asyncio.run(cmd_list_system_miners())
+
+
+@db.command("delete-miner")
+@click.option("--uid", required=True, type=int, help="System miner UID to delete")
+def delete_miner(uid: int):
+    """Delete a system miner configuration.
+
+    Removes the specified system miner from the configuration.
+
+    Example:
+        af db delete-miner --uid -1
+    """
+    asyncio.run(cmd_delete_miner(uid))
 
 
 def main():

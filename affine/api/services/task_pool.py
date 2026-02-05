@@ -481,12 +481,16 @@ class TaskPoolManager:
                 if not chute_slug:
                     logger.warning(f"chute_slug not found for hotkey {miner_hotkey[:16]}..., skipping task")
                     continue
-                
-                # Add miner_uid and chute_slug to task
+
+                # Get model identifier (needed for system miners to call the correct API)
+                model = miner_record.get('model', '')
+
+                # Add miner_uid, chute_slug, and model to task
                 enriched_task = {
                     **result,
                     'miner_uid': miner_uid,
                     'chute_slug': chute_slug,
+                    'model': model,
                 }
                 
                 assigned_tasks.append(enriched_task)
