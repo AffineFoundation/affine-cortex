@@ -12,6 +12,8 @@ Provides command-line interface for miner operations:
 import click
 import asyncio
 
+from affine.cli.types import UID
+
 from affine.src.miner.commands import (
     pull_command,
     chutes_push_command,
@@ -29,11 +31,14 @@ from affine.src.miner.rank import get_rank_command
 
 
 @click.command()
-@click.argument("uid", type=int)
+@click.argument("uid", type=UID)
 @click.option("--model-path", "-p", default="./model_path", type=click.Path(), help="Local directory to save the model")
 @click.option("--hf-token", help="Hugging Face API token")
 def pull(uid, model_path, hf_token):
-    """Pull model from Hugging Face."""
+    """Pull model from Hugging Face.
+
+    UID can use 'n' prefix for negative values (e.g., n1 means -1).
+    """
     asyncio.run(pull_command(
         uid=uid,
         model_path=model_path,
@@ -74,14 +79,15 @@ def commit(repo, revision, chute_id, coldkey, hotkey):
 
 
 @click.command("get-sample")
-@click.argument("uid", type=int)
+@click.argument("uid", type=UID)
 @click.argument("env", type=str)
 @click.argument("task_id", type=str)
 def get_sample(uid, env, task_id):
     """Query sample result by UID, environment, and task ID.
-    
-    Example:
+
+    Examples:
         af get-sample 42 affine task_123
+        af get-sample n1 affine task_123  (n1 means UID -1)
     """
     asyncio.run(get_sample_command(
         uid=uid,
@@ -90,15 +96,16 @@ def get_sample(uid, env, task_id):
     ))
 
 @click.command("get-miner")
-@click.argument("uid", type=int)
+@click.argument("uid", type=UID)
 def get_miner(uid):
     """Query miner status and information by UID.
-    
+
     Returns complete miner info including hotkey, model, revision,
     chute_id, validation status, and timestamps.
-    
-    Example:
+
+    Examples:
         af get-miner 42
+        af get-miner n1  (n1 means UID -1)
     """
     asyncio.run(get_miner_command(
         uid=uid,
@@ -131,32 +138,34 @@ def get_scores(top):
     asyncio.run(get_scores_command(top=top))
 
 @click.command("get-score")
-@click.argument("uid", type=int)
+@click.argument("uid", type=UID)
 def get_score(uid):
     """Query score for a specific miner by UID.
-    
+
     Returns the score details for the specified miner from the latest snapshot.
-    
-    Example:
+
+    Examples:
         af get-score 42
+        af get-score n1  (n1 means UID -1)
     """
     asyncio.run(get_score_command(uid=uid))
 
-@click.command("get-pool")
-@click.argument("uid", type=int)
-@click.argument("env", type=str)
-@click.option("--full", is_flag=True, help="Print full task_ids lists without truncation")
-def get_pool(uid, env, full):
-    """Query task pool status for a miner in an environment.
-    
-    Returns the list of task IDs currently in the sampling queue
-    for the specified miner and environment.
-    
-    Example:
-        af get-pool 100 agentgym:webshop
-        af get-pool 100 agentgym:webshop --full
-    """
-    asyncio.run(get_pool_command(uid=uid, env=env, full=full))
+# @click.command("get-pool")
+# @click.argument("uid", type=UID)
+# @click.argument("env", type=str)
+# @click.option("--full", is_flag=True, help="Print full task_ids lists without truncation")
+# def get_pool(uid, env, full):
+#     """Query task pool status for a miner in an environment.
+
+#     Returns the list of task IDs currently in the sampling queue
+#     for the specified miner and environment.
+
+#     Examples:
+#         af get-pool 100 agentgym:webshop
+#         af get-pool n1 agentgym:webshop  (n1 means UID -1)
+#         af get-pool 100 agentgym:webshop --full
+#     """
+#     asyncio.run(get_pool_command(uid=uid, env=env, full=full))
 
 
 @click.command("get-rank")
