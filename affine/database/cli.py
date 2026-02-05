@@ -20,6 +20,7 @@ from affine.database.dao import (
     SystemConfigDAO,
     MinersDAO,
 )
+from affine.cli.types import UID
 
 
 async def cmd_init():
@@ -1491,17 +1492,169 @@ async def cmd_get_pool():
         await close_client()
 
 
-@db.command("get-pool")
-def get_pool():
+@db.command("get-pools")
+def get_pools():
     """Get task pool statistics per miner per environment.
-    
+
     Shows the number of tasks each miner has in the sampling pool,
     broken down by environment and status (pending/assigned/paused).
-    
+
     Example:
-        af db get-pool
+        af db get-pools
     """
     asyncio.run(cmd_get_pool())
+
+
+async def cmd_get_pool_by_uid(uid: int, env: Optional[str], full: bool):
+    """Get task pool status for a specific miner.
+
+    Shows sampled, pool, and missing task IDs for the miner.
+    If env is not specified, shows all environments.
+    """
+    print(f"Fetching task pool for UID={uid}...\n")
+    await init_client()
+
+    try:
+        from affine.core.sampling_list import get_task_id_set_from_config
+
+        miners_dao = MinersDAO()
+        task_pool_dao = TaskPoolDAO()
+        sample_dao = SampleResultsDAO()
+        config_dao = SystemConfigDAO()
+
+        # Get miner info by UID
+        miner = await miners_dao.get_miner_by_uid(uid)
+        if not miner:
+            print(f"Error: Miner not found for UID={uid}")
+            return
+
+        hotkey = miner['hotkey']
+        model_revision = miner['revision']
+        model = miner.get('model', 'N/A')
+
+        print(f"Miner: UID={uid}, Hotkey={hotkey[:16]}..., Revision={model_revision[:8]}...")
+        print(f"Model: {model}\n")
+
+        # Get environments
+        environments = await config_dao.get_param_value('environments', default={})
+
+        # Filter environments if specified
+        if env:
+            # Resolve shorthand
+            if env not in environments and ':' not in env:
+                matching_envs = [e for e in environments.keys() if e.endswith(f':{env}')]
+                if len(matching_envs) == 1:
+                    env = matching_envs[0]
+                elif len(matching_envs) > 1:
+                    print(f"Error: Ambiguous environment name: {env}. Matches: {', '.join(matching_envs)}")
+                    return
+                else:
+                    print(f"Error: Environment not found: {env}. Available: {', '.join(environments.keys())}")
+                    return
+            elif env not in environments:
+                print(f"Error: Environment not found: {env}. Available: {', '.join(environments.keys())}")
+                return
+            target_envs = {env: environments[env]}
+        else:
+            # Only show environments enabled for sampling
+            target_envs = {
+                e: c for e, c in environments.items()
+                if c.get('enabled_for_sampling', False)
+            }
+
+        if not target_envs:
+            print("No environments enabled for sampling.")
+            return
+
+        # Process each environment
+        for env_name, env_config in sorted(target_envs.items()):
+            print("=" * 80)
+            print(f"Environment: {env_name}")
+            print("=" * 80)
+
+            # Get all task IDs from sampling config
+            all_task_ids = get_task_id_set_from_config(env_config)
+
+            # Get sampling config info
+            sampling_config = env_config.get('sampling_config', {})
+            sampling_list = sampling_config.get('sampling_list', [])
+
+            # Get already sampled task_ids
+            sampled_task_ids = await sample_dao.get_completed_task_ids(
+                miner_hotkey=hotkey,
+                model_revision=model_revision,
+                env=env_name
+            )
+
+            # Get tasks in the task pool
+            tasks = await task_pool_dao.get_tasks_by_miner(
+                miner_hotkey=hotkey,
+                model_revision=model_revision,
+                env=env_name
+            )
+
+            # Separate by status
+            pending_task_ids = {t['task_id'] for t in tasks if t.get('status') == 'pending'}
+            assigned_task_ids = {t['task_id'] for t in tasks if t.get('status') == 'assigned'}
+            paused_task_ids = {t['task_id'] for t in tasks if t.get('status') == 'paused'}
+            pool_task_ids = pending_task_ids | assigned_task_ids | paused_task_ids
+
+            # Calculate missing task_ids
+            missing_task_ids = all_task_ids - sampled_task_ids - pool_task_ids
+
+            # Print summary
+            print(f"\nSampling list size: {len(sampling_list)}")
+            print(f"Total tasks in range: {len(all_task_ids)}")
+            print(f"\nStatus:")
+            print(f"  Sampled:  {len(sampled_task_ids):>6}")
+            print(f"  Pending:  {len(pending_task_ids):>6}")
+            print(f"  Assigned: {len(assigned_task_ids):>6}")
+            print(f"  Paused:   {len(paused_task_ids):>6}")
+            print(f"  Missing:  {len(missing_task_ids):>6}")
+
+            # Print task IDs if --full or small count
+            def print_task_ids(label: str, task_ids: set, threshold: int = 20):
+                if not task_ids:
+                    return
+                sorted_ids = sorted(task_ids)
+                if full or len(sorted_ids) <= threshold:
+                    print(f"\n{label}: {sorted_ids}")
+                else:
+                    preview = sorted_ids[:10] + ['...'] + sorted_ids[-5:]
+                    print(f"\n{label}: {preview}")
+
+            print_task_ids("Sampled task_ids", sampled_task_ids)
+            print_task_ids("Pending task_ids", pending_task_ids)
+            print_task_ids("Assigned task_ids", assigned_task_ids)
+            print_task_ids("Paused task_ids", paused_task_ids)
+            print_task_ids("Missing task_ids", missing_task_ids)
+
+            print()
+
+    finally:
+        await close_client()
+
+
+@db.command("get-pool")
+@click.argument("uid", type=UID)
+@click.argument("env", type=str, required=False, default=None)
+@click.option("--full", is_flag=True, help="Print full task_ids lists without truncation")
+def get_pool_by_uid(uid: int, env: Optional[str], full: bool):
+    """Get task pool status for a specific miner by UID.
+
+    Shows sampled, pending, assigned, paused, and missing task IDs
+    for the specified miner. If ENV is not specified, shows all
+    environments enabled for sampling.
+
+    Use 'n' prefix for negative UIDs (e.g., n1 means -1).
+
+    Examples:
+        af db get-pool 42
+        af db get-pool n1
+        af db get-pool n1 agentgym:webshop
+        af db get-pool 100 webshop --full
+    """
+    asyncio.run(cmd_get_pool_by_uid(uid, env, full))
 
 
 async def cmd_get_miner(hotkey: str, revision: Optional[str]):
@@ -1555,29 +1708,34 @@ async def cmd_get_miner(hotkey: str, revision: Optional[str]):
                 print(f"No miner found with revision matching '{revision}'")
                 return
         
-        # Get online miners for UID lookup
+        # Get online miners for UID and model lookup
         online_miners = await miners_dao.get_valid_miners()
-        uid_by_hotkey = {m['hotkey']: m['uid'] for m in online_miners}
-        
+        miners_by_hotkey = {m['hotkey']: m for m in online_miners}
+
         # Print each matching miner
         for i, stats in enumerate(matching_stats, 1):
             if i > 1:
                 print("\n" + "=" * 120 + "\n")
-            
+
             hotkey_val = stats['hotkey']
             revision_val = stats['revision']
-            uid = uid_by_hotkey.get(hotkey_val, 'offline')
-            
+
+            # Get miner info from miners table (has accurate model for system miners)
+            miner_record = miners_by_hotkey.get(hotkey_val, {})
+            uid = miner_record.get('uid', 'offline')
+            # Prefer model from miners table, fallback to miner_stats
+            model = miner_record.get('model') or stats.get('model', 'N/A')
+
             print("=" * 120)
             print(f"MINER #{i}: {hotkey_val}")
             print("=" * 120)
-            
+
             # Basic Info
             print("\n[BASIC INFO]")
             print(f"  UID: {uid}")
             print(f"  Hotkey: {hotkey_val}")
             print(f"  Revision: {revision_val}")
-            print(f"  Model: {stats.get('model', 'N/A')}")
+            print(f"  Model: {model}")
             
             first_seen = stats.get('first_seen_at', 0)
             last_updated = stats.get('last_updated_at', 0)

@@ -209,15 +209,16 @@ def get_sample(ctx):
 @click.pass_context
 def get_miner(ctx):
     """Query miner status and information by UID.
-    
+
     Returns complete miner info including hotkey, model, revision,
     chute_id, validation status, and timestamps.
-    
-    Example:
+
+    Examples:
         af get-miner 42
+        af get-miner --uid -1
     """
     from affine.src.miner.main import get_miner as miner_get_miner
-    
+
     sys.argv = ["get-miner"] + ctx.args
     miner_get_miner.main(standalone_mode=False)
 
@@ -276,14 +277,14 @@ def get_score(ctx):
 # @click.pass_context
 # def get_pool(ctx):
 #     """Query pending task IDs for a miner in an environment.
-#
+
 #     Returns the list of task IDs currently in the sampling queue.
-#
+
 #     Example:
 #         af get-pool 100 agentgym:webshop
 #     """
 #     from affine.src.miner.main import get_pool as miner_get_pool
-#
+
 #     sys.argv = ["get-pool"] + ctx.args
 #     miner_get_pool.main(standalone_mode=False)
 
