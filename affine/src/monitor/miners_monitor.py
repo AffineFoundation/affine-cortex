@@ -631,8 +631,38 @@ class MinersMonitor:
             
             # Detect plagiarism
             miners = await self._detect_plagiarism(miners)
-            
-            # Persist to database
+
+            # Merge system miners (uid < 0) from configuration
+            system_miners_config = await self.config_dao.get_system_miners()
+            for uid_str, config in system_miners_config.items():
+                uid = int(uid_str)
+                if uid >= 0:
+                    continue
+
+                # Generate virtual hotkey and revision
+                hotkey = f"SYSTEM{uid}"  # e.g., "SYSTEM-1"
+                revision = f"SYSTEM{uid}"
+                model = config.get("model", "")
+
+                # Create system miner's MinerInfo (always valid, skips all validation)
+                system_miner = MinerInfo(
+                    uid=uid,
+                    hotkey=hotkey,
+                    model=model,
+                    revision=revision,
+                    chute_id="",
+                    chute_slug="llm",
+                    block=0,
+                    is_valid=True,
+                    invalid_reason=None,
+                    model_hash="",
+                    hf_revision=revision,
+                    chute_status="hot",
+                    template_check_result="safe",
+                )
+                miners.append(system_miner)
+
+            # Persist to database (including system miners)
             for miner in miners:
                 await self.dao.save_miner(
                     uid=miner.uid,
@@ -649,16 +679,21 @@ class MinersMonitor:
                     first_block=miner.block,
                     template_check_result=miner.template_check_result,
                 )
-            
+
             valid_miners = {m.key(): m for m in miners if m.is_valid}
-            
+
+            # Count system miners separately for logging
+            system_miner_count = len([m for m in miners if m.uid < 0])
+            regular_miner_count = len(miners) - system_miner_count
+
             self.last_update = int(time.time())
-            
+
             logger.info(
-                f"[MinersMonitor] Refreshed {len(miners)} miners "
+                f"[MinersMonitor] Refreshed {regular_miner_count} regular miners + "
+                f"{system_miner_count} system miners "
                 f"({len(valid_miners)} valid, {len(miners) - len(valid_miners)} invalid)"
             )
-            
+
             return valid_miners
             
         except Exception as e:

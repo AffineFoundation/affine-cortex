@@ -22,38 +22,78 @@ class WeightSetter:
         api_weights: Dict[str, Dict],
         burn_percentage: float = 0.0
     ) -> Tuple[List[int], List[float]]:
-        """Process and normalize weights, applying burn if specified."""
+        """Process and normalize weights, applying burn and system miner weights.
+
+        System miners (uid < 0) participate in scoring but don't receive actual
+        rewards on chain. Their weights are accumulated and allocated to UID 0
+        (validator) along with burn percentage.
+
+        Args:
+            api_weights: Dict mapping uid string to weight data
+            burn_percentage: Percentage of total weight to burn (allocate to UID 0)
+
+        Returns:
+            Tuple of (uids, weights) for chain setting (only uid >= 0)
+        """
         uids = []
         weights = []
-        
-        # Parse and filter valid weights
+        system_weight_total = 0.0  # Accumulate system miner weights
+
+        # Parse weights, separating regular miners from system miners
         for uid_str, weight_data in api_weights.items():
             try:
                 uid = int(uid_str)
                 weight = float(weight_data.get("weight", 0.0))
-                if uid >= 0 and weight > 0:
+
+                if weight <= 0:
+                    continue
+
+                if uid < 0:
+                    # System miner: accumulate weight for UID 0
+                    system_weight_total += weight
+                else:
+                    # Regular miner: add to chain weights
                     uids.append(uid)
                     weights.append(weight)
             except (ValueError, TypeError):
                 continue
-                
-        if not uids:
+
+        if not uids and system_weight_total == 0:
             return [], []
 
-        # Normalize to sum = 1.0
+        # Calculate total weight (including system miners) for normalization
+        total_weight = sum(weights) + system_weight_total
+
+        if total_weight == 0:
+            return [], []
+
+        # Normalize regular miner weights
         weights_array = np.array(weights, dtype=np.float64)
-        weights_array = weights_array / weights_array.sum()
-        
-        # Apply burn: scale all by (1 - burn%), then UID 0 += burn%
+        weights_array = weights_array / total_weight
+
+        # Normalize system weight
+        normalized_system_weight = system_weight_total / total_weight
+
+        # Calculate extra weight for UID 0 (burn + system miners)
+        extra_weight = 0.0
+
+        # Apply burn: scale all by (1 - burn%), add burn% to extra
         if burn_percentage > 0 and burn_percentage <= 1.0:
             weights_array *= (1.0 - burn_percentage)
-            
+            normalized_system_weight *= (1.0 - burn_percentage)
+            extra_weight += burn_percentage
+
+        # Add system miner weights to extra
+        extra_weight += normalized_system_weight
+
+        # Add extra weight to UID 0
+        if extra_weight > 0:
             if 0 in uids:
-                weights_array[uids.index(0)] += burn_percentage
+                weights_array[uids.index(0)] += extra_weight
             else:
                 uids = [0] + uids
-                weights_array = np.concatenate([[burn_percentage], weights_array])
-                
+                weights_array = np.concatenate([[extra_weight], weights_array])
+
         return uids, weights_array.tolist()
 
     async def set_weights(
@@ -71,9 +111,9 @@ class WeightSetter:
             return False
 
         logger.info(f"Setting weights for {len(uids)} miners (burn={burn_percentage:.1%})")
-        if burn_percentage > 0 and 0 in uids:
-            logger.info(f"  UID 0 (burn): {weights[uids.index(0)]:.6f}")
-            
+        if 0 in uids:
+            logger.info(f"  UID 0 (burn + system miners): {weights[uids.index(0)]:.6f}")
+
         # Print uid:weight mapping
         logger.info("Weights to be set:")
         for uid, weight in zip(uids, weights):

@@ -274,14 +274,91 @@ class SystemConfigDAO(BaseDAO):
         self, hotkeys: List[str], updated_by: str = "system"
     ) -> Dict[str, Any]:
         """Remove hotkeys from blacklist.
-        
+
         Args:
             hotkeys: List of hotkey strings to remove
             updated_by: Who updated the parameter
-            
+
         Returns:
             Saved config item
         """
         current_blacklist = await self.get_blacklist()
         updated_blacklist = [hk for hk in current_blacklist if hk not in hotkeys]
         return await self.set_blacklist(updated_blacklist, updated_by)
+
+    # System Miners Configuration Management
+
+    async def get_system_miners(self) -> Dict[str, Dict]:
+        """Get all system miners configuration.
+
+        System miners are benchmark models (like GPT-4o, Claude) that participate
+        in scoring but don't receive actual rewards. They use negative UIDs.
+
+        Storage format (param_name="system_miners"):
+        {
+            "-1": {"model": "openai/gpt-4o"},
+            "-2": {"model": "anthropic/claude-3.5-sonnet"}
+        }
+
+        Returns:
+            Dict mapping uid string to config dict
+        """
+        return await self.get_param_value("system_miners", default={})
+
+    async def set_system_miner(
+        self, uid: int, model: str, updated_by: str = "cli"
+    ) -> Dict[str, Any]:
+        """Set a system miner configuration.
+
+        System miners must have negative UIDs to distinguish them from
+        regular miners on the metagraph.
+
+        Args:
+            uid: System miner UID (must be negative)
+            model: Model identifier (e.g., "openai/gpt-4o")
+            updated_by: Who updated the parameter
+
+        Returns:
+            Saved config item
+
+        Raises:
+            ValueError: If uid is not negative
+        """
+        if uid >= 0:
+            raise ValueError("System miner UID must be negative")
+
+        current = await self.get_system_miners()
+        current[str(uid)] = {"model": model}
+
+        return await self.set_param(
+            param_name="system_miners",
+            param_value=current,
+            param_type="dict",
+            description="System miners configuration",
+            updated_by=updated_by
+        )
+
+    async def delete_system_miner(
+        self, uid: int, updated_by: str = "cli"
+    ) -> bool:
+        """Delete a system miner configuration.
+
+        Args:
+            uid: System miner UID to delete
+            updated_by: Who updated the parameter
+
+        Returns:
+            True if deleted, False if not found
+        """
+        current = await self.get_system_miners()
+        if str(uid) in current:
+            del current[str(uid)]
+            await self.set_param(
+                param_name="system_miners",
+                param_value=current,
+                param_type="dict",
+                description="System miners configuration",
+                updated_by=updated_by
+            )
+            return True
+        return False
