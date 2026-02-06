@@ -23,10 +23,6 @@ from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.core.setup import logger
 
-# Commits after this block are subject to the single-commit rule.
-# Miners with more than one commit after this block are marked invalid.
-COMMIT_CUTOFF_BLOCK = 7485000
-
 
 @dataclass
 class MinerInfo:
@@ -575,22 +571,6 @@ class MinersMonitor:
                     continue
                 
                 try:
-                    # Check for multiple commits after cutoff block (uid 0 exempt)
-                    if uid != 0:
-                        recent_commits = [c for c in commits[hotkey] if c[0] >= COMMIT_CUTOFF_BLOCK]
-                        if len(recent_commits) > 1:
-                            miners.append(MinerInfo(
-                                uid=uid,
-                                hotkey=hotkey,
-                                model="",
-                                revision="",
-                                chute_id="",
-                                block=0,
-                                is_valid=False,
-                                invalid_reason="multiple_commit"
-                            ))
-                            continue
-
                     block, commit_data = commits[hotkey][-1]
                     data = json.loads(commit_data)
                     
