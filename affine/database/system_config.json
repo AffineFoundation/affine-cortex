@@ -65,8 +65,8 @@
       "sampling_config": {
         "dataset_range": [[0, 40000000000]],
         "sampling_count": 20,
-        "rotation_enabled": false,
-        "rotation_count": 0,
+        "rotation_enabled": true,
+        "rotation_count": 2,
         "rotation_interval": 3600,
         "scheduling_weight": 0.5
       }
