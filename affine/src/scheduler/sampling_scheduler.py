@@ -4,6 +4,7 @@ Sampling Scheduler
 Manages sampling list rotation and per-miner sampling pool allocation.
 """
 
+import math
 import time
 import asyncio
 import random
@@ -29,6 +30,8 @@ class PerMinerSamplingScheduler:
     5. Priority-based task selection from sampling list tail
     6. Rate limiting: when rotation_enabled, actual sampling rate is limited to
        rotation_rate * RATE_MARGIN to prevent answer memorization attacks
+    7. Minimum rate guarantee: allowed rate is at least sampling_count/48 per hour
+       to ensure sampling completes within 2 days
     """
 
     DEFAULT_SLOTS = 6
@@ -318,14 +321,23 @@ class PerMinerSamplingScheduler:
         if rotation_count <= 0 or rotation_interval <= 0:
             return False
 
-        # Calculate allowed count per hour
+        # Calculate allowed count per hour based on rotation rate
         allowed_per_hour = rotation_count * (3600 / rotation_interval) * self.RATE_MARGIN
+
+        # Minimum rate guarantee: ensure sampling can complete within 48 hours
+        sampling_count = sampling_config.get('sampling_count', 0)
+        if sampling_count > 0:
+            min_rate_per_hour = sampling_count / 48  # Complete in 2 days
+            allowed_per_hour = max(allowed_per_hour, min_rate_per_hour)
+
+        # Round up to make fractional rates effective
+        allowed_per_hour = math.ceil(allowed_per_hour)
 
         # Compare allocation count with limit
         if allocation_count >= allowed_per_hour:
             logger.debug(
                 f"Rate limit: miner={miner['hotkey'][:8]}... env={env} "
-                f"allocations={allocation_count} allowed={allowed_per_hour:.1f}/hour"
+                f"allocations={allocation_count} allowed={allowed_per_hour}/hour"
             )
             return True
 
