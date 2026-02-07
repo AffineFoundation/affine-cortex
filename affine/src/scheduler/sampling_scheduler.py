@@ -20,18 +20,23 @@ from affine.database.dao.miner_stats import MinerStatsDAO
 
 class PerMinerSamplingScheduler:
     """Per-miner sampling pool scheduler with weighted allocation.
-    
+
     Architecture:
     1. Each miner has dynamic slots (3-10, default 6), stored in MinerStats
     2. Weighted allocation across environments based on scheduling_weight config
     3. Minimum guarantee: each env gets at least 1 slot
     4. Incremental scheduling every 10s
     5. Priority-based task selection from sampling list tail
+    6. Rate limiting: when rotation_enabled, actual sampling rate is limited to
+       rotation_rate * RATE_MARGIN to prevent answer memorization attacks
     """
-    
+
     DEFAULT_SLOTS = 6
     MIN_SLOTS = 3
     MAX_SLOTS = 10
+
+    # Rate limiting: allow actual sampling rate to exceed rotation rate by this margin
+    RATE_MARGIN = 1.2
     
     def __init__(
         self,
@@ -58,7 +63,11 @@ class PerMinerSamplingScheduler:
         
         # Track last known valid miners for detecting additions/removals
         self._last_valid_miners: Set[tuple] = set()  # Set of (hotkey, revision) tuples
-        
+
+        # Rate limiting: track allocation timestamps per miner/env (sliding window)
+        # Key: "{hotkey}#{revision}#{env}", Value: list of unix timestamps
+        self._allocation_timestamps: Dict[str, List[float]] = {}
+
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -195,10 +204,10 @@ class PerMinerSamplingScheduler:
     
     def _get_env_weights(self, environments: Dict[str, Any]) -> Dict[str, float]:
         """Extract scheduling weights from environment configurations.
-        
+
         Args:
             environments: Full environment configurations
-            
+
         Returns:
             Dict mapping env name to weight (default 1.0 if not configured)
         """
@@ -210,7 +219,118 @@ class PerMinerSamplingScheduler:
             # Default weight is 1.0 if not specified
             weights[env_name] = float(sampling_config.get('scheduling_weight', 1.0))
         return weights
-    
+
+    def _get_allocation_count(
+        self,
+        hotkey: str,
+        revision: str,
+        env: str,
+        window_seconds: int = 3600
+    ) -> int:
+        """Get allocation count in the sliding window for rate limiting.
+
+        Also cleans up expired timestamps.
+
+        Args:
+            hotkey: Miner hotkey
+            revision: Model revision
+            env: Environment name
+            window_seconds: Time window in seconds (default 1 hour)
+
+        Returns:
+            Number of allocations in the time window
+        """
+        key = f"{hotkey}#{revision}#{env}"
+        timestamps = self._allocation_timestamps.get(key, [])
+
+        if not timestamps:
+            return 0
+
+        # Clean up expired timestamps
+        cutoff = time.time() - window_seconds
+        valid_timestamps = [t for t in timestamps if t > cutoff]
+
+        # Update stored timestamps (cleanup)
+        if len(valid_timestamps) != len(timestamps):
+            if valid_timestamps:
+                self._allocation_timestamps[key] = valid_timestamps
+            else:
+                self._allocation_timestamps.pop(key, None)
+
+        return len(valid_timestamps)
+
+    def _record_allocations(
+        self,
+        hotkey: str,
+        revision: str,
+        tasks: List[Dict[str, Any]]
+    ):
+        """Record task allocations for rate limiting.
+
+        Args:
+            hotkey: Miner hotkey
+            revision: Model revision
+            tasks: List of task specs with 'env' key
+        """
+        now = time.time()
+        for task in tasks:
+            env = task['env']
+            key = f"{hotkey}#{revision}#{env}"
+            if key not in self._allocation_timestamps:
+                self._allocation_timestamps[key] = []
+            self._allocation_timestamps[key].append(now)
+
+    def _should_skip_env_for_miner(
+        self,
+        miner: Dict[str, Any],
+        env: str,
+        sampling_config: Dict[str, Any],
+        allocation_count: int = 0
+    ) -> bool:
+        """Check if sampling should be skipped for this miner/env due to rate limiting.
+
+        This prevents answer memorization attacks by limiting the allocation rate
+        to slightly above the rotation rate when rotation is enabled.
+
+        Uses internal allocation counter (real-time) to avoid 5-minute stats delay.
+
+        Args:
+            miner: Miner dict with hotkey, revision, uid
+            env: Environment name
+            sampling_config: Environment's sampling configuration
+            allocation_count: Allocations in last hour from internal counter
+
+        Returns:
+            True if sampling should be skipped, False otherwise
+        """
+        # System models (uid < 0) are not rate limited
+        if miner.get('uid', 0) < 0:
+            return False
+
+        # Only limit rate when rotation is enabled
+        if not sampling_config.get('rotation_enabled', False):
+            return False
+
+        # Get rotation parameters
+        rotation_count = sampling_config.get('rotation_count', 0)
+        rotation_interval = sampling_config.get('rotation_interval', 0)
+
+        if rotation_count <= 0 or rotation_interval <= 0:
+            return False
+
+        # Calculate allowed count per hour
+        allowed_per_hour = rotation_count * (3600 / rotation_interval) * self.RATE_MARGIN
+
+        # Compare allocation count with limit
+        if allocation_count >= allowed_per_hour:
+            logger.debug(
+                f"Rate limit: miner={miner['hotkey'][:8]}... env={env} "
+                f"allocations={allocation_count} allowed={allowed_per_hour:.1f}/hour"
+            )
+            return True
+
+        return False
+
     async def _schedule_miner(
         self,
         miner: Dict[str, Any],
@@ -218,7 +338,7 @@ class PerMinerSamplingScheduler:
         environments: Dict[str, Any]
     ):
         """Schedule sampling tasks for a single miner across all environments.
-        
+
         Uses weighted allocation strategy with starvation prevention:
         1. Calculate target slots per env based on weights
         2. Ensure minimum 1 slot per env with missing tasks
@@ -226,7 +346,9 @@ class PerMinerSamplingScheduler:
         4. Remaining slots use round-robin
         5. **Anti-starvation**: If any env has missing tasks but active=0,
            allow allocation even if total_pool_count >= total_slots
-        
+        6. **Rate limiting**: Skip envs where actual sampling rate exceeds
+           rotation_rate * RATE_MARGIN (anti-memorization)
+
         Args:
             miner: Miner dict with hotkey, revision, etc.
             sampling_envs: List of environment names
@@ -234,14 +356,14 @@ class PerMinerSamplingScheduler:
         """
         hotkey = miner['hotkey']
         revision = miner['revision']
-        
+
         # Get miner's total slots from MinerStats
         total_slots = await self._get_miner_slots(miner)
-        
+
         # Get current active task count per env (exclude paused tasks)
         env_active_counts: Dict[str, int] = {}
         total_pool_count = 0
-        
+
         for env in sampling_envs:
             active_task_ids = await self.task_pool_dao.get_pending_task_ids_for_miner(
                 miner_hotkey=hotkey,
@@ -251,11 +373,17 @@ class PerMinerSamplingScheduler:
             )
             env_active_counts[env] = len(active_task_ids)
             total_pool_count += len(active_task_ids)
-        
+
         # Collect missing task IDs from all environments (before capacity check)
         env_missing_tasks: Dict[str, List[int]] = {}
-        
+
         for env in sampling_envs:
+            # Check rate limiting - skip env if allocation rate exceeds allowed rate
+            sampling_config = environments.get(env, {}).get('sampling_config', {})
+            allocation_count = self._get_allocation_count(hotkey, revision, env)
+            if self._should_skip_env_for_miner(miner, env, sampling_config, allocation_count):
+                continue
+
             try:
                 missing_ids = await self._get_missing_task_ids(
                     miner=miner,
@@ -314,10 +442,11 @@ class PerMinerSamplingScheduler:
             env_weights=env_weights,
         )
         
-        # Create selected tasks
+        # Create selected tasks and record allocations for rate limiting
         if tasks_to_create:
             await self._create_tasks(tasks_to_create, miner)
-    
+            self._record_allocations(hotkey, revision, tasks_to_create)
+
     async def _get_missing_task_ids(
         self,
         miner: Dict[str, Any],
