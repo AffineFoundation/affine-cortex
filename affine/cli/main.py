@@ -273,20 +273,20 @@ def get_score(ctx):
     miner_get_score.main(standalone_mode=False)
 
 
-# @cli.command("get-pool", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-# @click.pass_context
-# def get_pool(ctx):
-#     """Query pending task IDs for a miner in an environment.
+@cli.command("get-pool", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.pass_context
+def get_pool(ctx):
+    """Query pending task IDs for a miner in an environment.
 
-#     Returns the list of task IDs currently in the sampling queue.
+    Returns the list of task IDs currently in the sampling queue.
 
-#     Example:
-#         af get-pool 100 agentgym:webshop
-#     """
-#     from affine.src.miner.main import get_pool as miner_get_pool
+    Example:
+        af get-pool 100 agentgym:webshop
+    """
+    from affine.src.miner.main import get_pool as miner_get_pool
 
-#     sys.argv = ["get-pool"] + ctx.args
-#     miner_get_pool.main(standalone_mode=False)
+    sys.argv = ["get-pool"] + ctx.args
+    miner_get_pool.main(standalone_mode=False)
 
 
 @cli.command("get-rank", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
