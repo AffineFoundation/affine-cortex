@@ -1931,6 +1931,46 @@ async def cmd_list_system_miners():
         await close_client()
 
 
+async def cmd_set_slots(uid: int, slots: int):
+    """Set sampling slots for a miner by UID."""
+    import time
+
+    if slots < 1:
+        print(f"Error: slots must be >= 1 (got {slots})")
+        sys.exit(1)
+
+    await init_client()
+
+    try:
+        from affine.database.dao.miner_stats import MinerStatsDAO
+
+        miners_dao = MinersDAO()
+        miner = await miners_dao.get_miner_by_uid(uid)
+        if not miner:
+            print(f"Error: Miner not found for UID={uid}")
+            sys.exit(1)
+
+        hotkey = miner['hotkey']
+        revision = miner['revision']
+
+        miner_stats_dao = MinerStatsDAO()
+        success = await miner_stats_dao.update_sampling_slots(
+            hotkey=hotkey,
+            revision=revision,
+            slots=slots,
+            adjusted_at=int(time.time())
+        )
+
+        if success:
+            print(f"✓ Set sampling_slots={slots} for UID={uid} (hotkey={hotkey[:16]}..., rev={revision[:8]}...)")
+        else:
+            print(f"✗ Failed to update slots (miner_stats record may not exist for this hotkey/revision)")
+            sys.exit(1)
+
+    finally:
+        await close_client()
+
+
 async def cmd_delete_miner(uid: int):
     """Delete a system miner."""
     print(f"Deleting system miner: uid={uid}")
@@ -1984,6 +2024,21 @@ def list_system_miners():
         af db list-system-miners
     """
     asyncio.run(cmd_list_system_miners())
+
+
+@db.command("set-slots")
+@click.argument("uid", type=UID)
+@click.argument("slots", type=int)
+def set_slots(uid: int, slots: int):
+    """Set sampling slots for a miner by UID.
+
+    Use 'n' prefix for negative UIDs (e.g., n1 means -1).
+
+    Examples:
+        af db set-slots 42 8
+        af db set-slots n1 10
+    """
+    asyncio.run(cmd_set_slots(uid, slots))
 
 
 @db.command("delete-miner")
