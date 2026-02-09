@@ -59,7 +59,7 @@
       }
     },
     "ARC-GEN": {
-      "enabled_for_sampling": true,
+      "enabled_for_sampling": false,
       "enabled_for_scoring": false,
       "min_completeness": 0.5,
       "sampling_config": {
