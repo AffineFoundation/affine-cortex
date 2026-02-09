@@ -81,7 +81,7 @@
         "rotation_enabled": true,
         "rotation_count": 3,
         "rotation_interval": 3600,
-        "scheduling_weight": 1
+        "scheduling_weight": 1.0
       }
     }
   }
