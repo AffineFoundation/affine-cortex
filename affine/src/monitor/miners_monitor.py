@@ -632,16 +632,17 @@ class MinersMonitor:
             # Detect plagiarism
             miners = await self._detect_plagiarism(miners)
 
-            # Merge system miners (uid < 0) from configuration
+            # Merge system miners (uid > 1000) from configuration
             system_miners_config = await self.config_dao.get_system_miners()
             for uid_str, config in system_miners_config.items():
                 uid = int(uid_str)
-                if uid >= 0:
+                if uid <= 1000:
                     continue
 
                 # Generate virtual hotkey and revision
-                hotkey = f"SYSTEM{uid}"  # e.g., "SYSTEM-1"
-                revision = f"SYSTEM{uid}"
+                # uid 1001 -> "SYSTEM-1", uid 1002 -> "SYSTEM-2", etc.
+                hotkey = f"SYSTEM-{uid - 1000}"
+                revision = f"SYSTEM-{uid - 1000}"
                 model = config.get("model", "")
 
                 # Create system miner's MinerInfo (always valid, skips all validation)
@@ -683,7 +684,7 @@ class MinersMonitor:
             valid_miners = {m.key(): m for m in miners if m.is_valid}
 
             # Count system miners separately for logging
-            system_miner_count = len([m for m in miners if m.uid < 0])
+            system_miner_count = len([m for m in miners if m.uid == 0 or m.uid > 1000])
             regular_miner_count = len(miners) - system_miner_count
 
             self.last_update = int(time.time())

@@ -1646,12 +1646,12 @@ def get_pool_by_uid(uid: int, env: Optional[str], full: bool):
     for the specified miner. If ENV is not specified, shows all
     environments enabled for sampling.
 
-    Use 'n' prefix for negative UIDs (e.g., n1 means -1).
+    System miners use UIDs > 1000 (e.g., 1001, 1002).
 
     Examples:
         af db get-pool 42
-        af db get-pool n1
-        af db get-pool n1 agentgym:webshop
+        af db get-pool 1001
+        af db get-pool 1001 agentgym:webshop
         af db get-pool 100 webshop --full
     """
     asyncio.run(cmd_get_pool_by_uid(uid, env, full))
@@ -1883,11 +1883,17 @@ def get_miner(hotkey: str, revision: Optional[str]):
 
 async def cmd_set_miner(uid: int, model: str):
     """Set a system miner configuration."""
-    if uid >= 0:
-        print(f"Error: System miner UID must be negative (got {uid})")
+    if uid <= 0:
+        print(f"Error: System miner UID must be positive (got {uid})")
         sys.exit(1)
 
+    # Normalize UID: small numbers (1-1000) are treated as system miner number
+    # e.g., 3 -> 1003, 1003 -> 1003
+    if uid <= 1000:
+        uid = uid + 1000
+
     print(f"Setting system miner: uid={uid}, model={model}")
+    print(f"  Hotkey/Revision: SYSTEM-{uid - 1000}")
     await init_client()
 
     try:
@@ -1919,8 +1925,8 @@ async def cmd_list_system_miners():
             print(f"{'UID':<8} {'Model':<50}")
             print("-" * 60)
 
-            # Sort by UID (descending, so -1 comes first)
-            for uid_str in sorted(system_miners.keys(), key=lambda x: int(x), reverse=True):
+            # Sort by UID ascending
+            for uid_str in sorted(system_miners.keys(), key=lambda x: int(x)):
                 config = system_miners[uid_str]
                 model = config.get('model', 'N/A')
                 print(f"{uid_str:<8} {model:<50}")
@@ -1973,6 +1979,10 @@ async def cmd_set_slots(uid: int, slots: int):
 
 async def cmd_delete_miner(uid: int):
     """Delete a system miner."""
+    # Normalize UID: small numbers (1-1000) -> 1000+N
+    if 0 < uid <= 1000:
+        uid = uid + 1000
+
     print(f"Deleting system miner: uid={uid}")
     await init_client()
 
@@ -1998,7 +2008,7 @@ async def cmd_delete_miner(uid: int):
 
 
 @db.command("set-miner")
-@click.option("--uid", required=True, type=int, help="System miner UID (must be negative)")
+@click.option("--uid", required=True, type=int, help="System miner UID (e.g., 1001 or 1; small numbers auto-convert to 1000+N)")
 @click.option("--model", required=True, help="Model identifier (e.g., 'zai-org/GLM-4.7')")
 def set_miner(uid: int, model: str):
     """Set a system miner configuration.
@@ -2007,9 +2017,12 @@ def set_miner(uid: int, model: str):
     in scoring but don't receive actual rewards. Their weights are allocated
     to UID 0 (validator) when setting chain weights.
 
+    UIDs > 1000 are system miners. Small numbers (1-1000) are auto-converted
+    to 1000+N (e.g., 3 -> 1003). Hotkey/revision = SYSTEM-N.
+
     Examples:
-        af db set-miner --uid -1 --model "zai-org/GLM-4.7"
-        af db set-miner --uid -2 --model "deepseek-ai/DeepSeek-V3.2"
+        af db set-miner --uid 1001 --model "zai-org/GLM-4.7"
+        af db set-miner --uid 3 --model "deepseek-ai/DeepSeek-V3.2"
     """
     asyncio.run(cmd_set_miner(uid, model))
 
@@ -2032,11 +2045,11 @@ def list_system_miners():
 def set_slots(uid: int, slots: int):
     """Set sampling slots for a miner by UID.
 
-    Use 'n' prefix for negative UIDs (e.g., n1 means -1).
+    System miners use UIDs > 1000 (e.g., 1001, 1002).
 
     Examples:
         af db set-slots 42 8
-        af db set-slots n1 10
+        af db set-slots 1001 10
     """
     asyncio.run(cmd_set_slots(uid, slots))
 
@@ -2047,9 +2060,10 @@ def delete_miner(uid: int):
     """Delete a system miner configuration.
 
     Removes the specified system miner from the configuration.
+    Small UIDs (1-1000) are auto-converted to 1000+N.
 
     Example:
-        af db delete-miner --uid -1
+        af db delete-miner --uid 1001
     """
     asyncio.run(cmd_delete_miner(uid))
 
@@ -2127,11 +2141,11 @@ def delete_paused(uid: int, env: str):
     Paused tasks are failed sampling tasks that exceeded max retries.
     Deleting them allows re-sampling of those tasks.
 
-    Use 'n' prefix for negative UIDs (e.g., n1 means -1).
+    System miners use UIDs > 1000 (e.g., 1001, 1002).
 
     Examples:
         af db delete-paused 42 agentgym:alfworld
-        af db delete-paused n1 webshop
+        af db delete-paused 1001 webshop
     """
     asyncio.run(cmd_delete_paused(uid, env))
 

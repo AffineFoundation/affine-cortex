@@ -24,7 +24,7 @@ class WeightSetter:
     ) -> Tuple[List[int], List[float]]:
         """Process and normalize weights, applying burn and system miner weights.
 
-        System miners (uid < 0) participate in scoring but don't receive actual
+        System miners (uid > 1000) participate in scoring but don't receive actual
         rewards on chain. Their weights are accumulated and allocated to UID 0
         (validator) along with burn percentage.
 
@@ -33,7 +33,7 @@ class WeightSetter:
             burn_percentage: Percentage of total weight to burn (allocate to UID 0)
 
         Returns:
-            Tuple of (uids, weights) for chain setting (only uid >= 0)
+            Tuple of (uids, weights) for chain setting (only regular miners)
         """
         uids = []
         weights = []
@@ -48,8 +48,8 @@ class WeightSetter:
                 if weight <= 0:
                     continue
 
-                if uid < 0:
-                    # System miner: accumulate weight for UID 0
+                if uid < 0 or uid > 1000:
+                    # System miner (uid <= 0 or uid > 1000): accumulate weight for UID 0
                     system_weight_total += weight
                 else:
                     # Regular miner: add to chain weights

@@ -233,7 +233,7 @@ class ScoresDAO(BaseDAO):
     async def get_weights_for_setting(self) -> Dict[str, Any]:
         """Get the latest weights in a format suitable for chain setting.
 
-        Includes both regular miners (uid >= 0) and system miners (uid < 0).
+        Includes both regular miners and system miners (uid > 1000).
         The validator's process_weights() method will handle allocating
         system miner weights to UID 0.
 
@@ -241,7 +241,7 @@ class ScoresDAO(BaseDAO):
             Dict with:
                 - block_number: Block at which weights were calculated
                 - weights: Dict mapping hotkey -> weight
-                - uids: Dict mapping uid -> weight (includes negative UIDs for system miners)
+                - uids: Dict mapping uid -> weight (includes UIDs > 1000 for system miners)
         """
         latest = await self.get_latest_scores()
 
@@ -263,8 +263,8 @@ class ScoresDAO(BaseDAO):
             if hotkey:
                 weights_by_hotkey[hotkey] = weight
 
-            # Include all UIDs (both positive and negative)
-            # Negative UIDs are system miners whose weights will be
+            # Include all UIDs (both regular and system miners)
+            # System miners (uid > 1000) whose weights will be
             # allocated to UID 0 by the validator
             if uid is not None:
                 weights_by_uid[uid] = weight

@@ -52,7 +52,7 @@ class MinersDAO(BaseDAO):
         Directly updates the record for this UID (no history tracking).
 
         Args:
-            uid: Miner UID (0-255 for regular miners, negative for system miners)
+            uid: Miner UID (0-255 for regular miners, > 1000 for system miners)
             hotkey: Miner's SS58 hotkey (or virtual hotkey like "SYSTEM-1" for system miners)
             model: HuggingFace model repo
             revision: Git commit hash
