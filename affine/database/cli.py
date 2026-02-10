@@ -2054,6 +2054,88 @@ def delete_miner(uid: int):
     asyncio.run(cmd_delete_miner(uid))
 
 
+async def cmd_delete_paused(uid: int, env: str):
+    """Delete all paused tasks for a miner in an environment."""
+    print(f"Looking up paused tasks for UID={uid}, env={env}...\n")
+    await init_client()
+
+    try:
+        miners_dao = MinersDAO()
+        task_pool_dao = TaskPoolDAO()
+        config_dao = SystemConfigDAO()
+
+        # Get miner info by UID
+        miner = await miners_dao.get_miner_by_uid(uid)
+        if not miner:
+            print(f"Error: Miner not found for UID={uid}")
+            return
+
+        hotkey = miner['hotkey']
+        model_revision = miner['revision']
+        model = miner.get('model', 'N/A')
+
+        print(f"Miner: UID={uid}, Hotkey={hotkey[:16]}..., Revision={model_revision[:8]}...")
+        print(f"Model: {model}\n")
+
+        # Resolve env shorthand
+        environments = await config_dao.get_param_value('environments', default={})
+        if env not in environments and ':' not in env:
+            matching_envs = [e for e in environments.keys() if e.endswith(f':{env}')]
+            if len(matching_envs) == 1:
+                env = matching_envs[0]
+            elif len(matching_envs) > 1:
+                print(f"Error: Ambiguous environment name: {env}. Matches: {', '.join(matching_envs)}")
+                return
+            else:
+                print(f"Error: Environment not found: {env}. Available: {', '.join(environments.keys())}")
+                return
+        elif env not in environments:
+            print(f"Error: Environment not found: {env}. Available: {', '.join(environments.keys())}")
+            return
+
+        # Get tasks and filter for paused
+        tasks = await task_pool_dao.get_tasks_by_miner(
+            miner_hotkey=hotkey,
+            model_revision=model_revision,
+            env=env
+        )
+        paused_tasks = [t for t in tasks if t.get('status') == 'paused']
+
+        if not paused_tasks:
+            print(f"No paused tasks found for UID={uid} in {env}.")
+            return
+
+        print(f"Found {len(paused_tasks)} paused task(s) in {env}.")
+        confirm = input("Delete these tasks? [y/N] ").strip().lower()
+        if confirm != 'y':
+            print("Aborted.")
+            return
+
+        deleted = await task_pool_dao._batch_delete_tasks(paused_tasks)
+        print(f"Deleted {deleted} paused task(s).")
+
+    finally:
+        await close_client()
+
+
+@db.command("delete-paused")
+@click.argument("uid", type=UID)
+@click.argument("env", type=str)
+def delete_paused(uid: int, env: str):
+    """Delete all paused tasks for a miner in an environment.
+
+    Paused tasks are failed sampling tasks that exceeded max retries.
+    Deleting them allows re-sampling of those tasks.
+
+    Use 'n' prefix for negative UIDs (e.g., n1 means -1).
+
+    Examples:
+        af db delete-paused 42 agentgym:alfworld
+        af db delete-paused n1 webshop
+    """
+    asyncio.run(cmd_delete_paused(uid, env))
+
+
 def main():
     """Main CLI entry point."""
     db()
