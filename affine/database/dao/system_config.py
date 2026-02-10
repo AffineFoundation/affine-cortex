@@ -292,12 +292,12 @@ class SystemConfigDAO(BaseDAO):
         """Get all system miners configuration.
 
         System miners are benchmark models (like GPT-4o, Claude) that participate
-        in scoring but don't receive actual rewards. They use negative UIDs.
+        in scoring but don't receive actual rewards. They use UIDs > 1000.
 
         Storage format (param_name="system_miners"):
         {
-            "-1": {"model": "openai/gpt-4o"},
-            "-2": {"model": "anthropic/claude-3.5-sonnet"}
+            "1001": {"model": "openai/gpt-4o"},
+            "1002": {"model": "anthropic/claude-3.5-sonnet"}
         }
 
         Returns:
@@ -310,11 +310,11 @@ class SystemConfigDAO(BaseDAO):
     ) -> Dict[str, Any]:
         """Set a system miner configuration.
 
-        System miners must have negative UIDs to distinguish them from
+        System miners use UIDs > 1000 to distinguish them from
         regular miners on the metagraph.
 
         Args:
-            uid: System miner UID (must be negative)
+            uid: System miner UID (must be > 1000)
             model: Model identifier (e.g., "openai/gpt-4o")
             updated_by: Who updated the parameter
 
@@ -322,10 +322,10 @@ class SystemConfigDAO(BaseDAO):
             Saved config item
 
         Raises:
-            ValueError: If uid is not negative
+            ValueError: If uid is not > 1000
         """
-        if uid >= 0:
-            raise ValueError("System miner UID must be negative")
+        if uid <= 1000:
+            raise ValueError("System miner UID must be > 1000")
 
         current = await self.get_system_miners()
         current[str(uid)] = {"model": model}

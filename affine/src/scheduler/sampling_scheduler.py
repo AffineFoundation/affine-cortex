@@ -306,8 +306,8 @@ class PerMinerSamplingScheduler:
         Returns:
             True if sampling should be skipped, False otherwise
         """
-        # System models (uid <= 0) are not rate limited
-        if miner.get('uid', 0) <= 0:
+        # System models (uid == 0 or uid > 1000) are not rate limited
+        if miner.get('uid', 0) == 0 or miner.get('uid', 0) > 1000:
             return False
 
         # Only limit rate when rotation is enabled
