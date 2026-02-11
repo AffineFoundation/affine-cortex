@@ -71,7 +71,7 @@ class ScorerConfig:
     SUBSET_WEIGHT_EXPONENT: int = 2
     """Exponent base for layer weights (layer_weight = N * base^(layer-1))."""
     
-    GEOMETRIC_MEAN_EPSILON: float = 0.1
+    GEOMETRIC_MEAN_EPSILON: float = 0.01
     """
     Smoothing epsilon for geometric mean calculation.
 
@@ -85,7 +85,7 @@ class ScorerConfig:
     Formula: GM_smoothed = ((v1+ε) × (v2+ε) × ... × (vn+ε))^(1/n) - ε
 
     Set to 0.0 to disable smoothing (original behavior).
-    Recommended value: 0.1
+    Recommended value: 0.01
     """
 
     DECAY_FACTOR: float = 0.5
