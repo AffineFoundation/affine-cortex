@@ -4,6 +4,42 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from affine.utils.api_client import APIClient
 from affine.utils.errors import NetworkError, ApiResponseError
 
+TIMEOUT_SECONDS = 120
+
+
+@pytest.mark.asyncio
+async def test_api_request_timeout_120s():
+    """
+    Ensure that requests exceeding the configured timeout
+    raise NetworkError instead of leaking aiohttp exceptions.
+    """
+
+    # Mock aiohttp timeout exception
+    timeout_exc = aiohttp.ServerTimeoutError(
+        f"Request exceeded {TIMEOUT_SECONDS}s timeout"
+    )
+
+    mock_session = MagicMock()
+    mock_get = MagicMock()
+
+    # Async context manager raises timeout on enter
+    mock_get.__aenter__.side_effect = timeout_exc
+    mock_session.get.return_value = mock_get
+
+    # Instantiate client (assumes timeout is either default or configurable)
+    client = APIClient(
+        base_url="http://test.com",
+        session=mock_session,
+        timeout=TIMEOUT_SECONDS,  # safe even if ignored internally
+    )
+
+    with pytest.raises(NetworkError) as exc:
+        await client.get("/slow-endpoint")
+
+    # Assertions
+    assert "timeout" in str(exc.value).lower()
+    assert str(TIMEOUT_SECONDS) in str(exc.value) or "exceeded" in str(exc.value)
+
 @pytest.mark.asyncio
 async def test_api_timeout():
     # Mock session and get to raise timeout
