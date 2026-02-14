@@ -48,48 +48,46 @@ async def cmd_list():
         await close_client()
 
 
-async def cmd_reset():
+async def cmd_reset(yes: bool = False):
     """Reset all tables (delete and recreate)."""
-    confirm = input("WARNING: This will delete all data. Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
-    
+    if not yes:
+        if not click.confirm("WARNING: This will delete all data. Continue?"):
+            click.echo("Aborted")
+            return
+
     await init_client()
-    
+
     try:
         await reset_tables()
-        print("✓ Tables reset successfully")
+        click.echo("✓ Tables reset successfully")
     finally:
         await close_client()
 
 
-async def cmd_reset_table(table_name: str):
+async def cmd_reset_table(table_name: str, yes: bool = False):
     """Reset a single table (delete and recreate)."""
     from affine.database.schema import get_table_name
-    
+
     # Get full table name with environment prefix
     full_table_name = get_table_name(table_name)
-    
-    confirm = input(f"WARNING: This will delete all data in '{full_table_name}'. Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
-    
+
+    if not yes:
+        if not click.confirm(f"WARNING: This will delete all data in '{full_table_name}'. Continue?"):
+            click.echo("Aborted")
+            return
+
     await init_client()
-    
+
     try:
-        print(f"Deleting table '{full_table_name}'...")
+        click.echo(f"Deleting table '{full_table_name}'...")
         await delete_table(full_table_name)
-        
-        print(f"Recreating table '{full_table_name}'...")
+
+        click.echo(f"Recreating table '{full_table_name}'...")
         await init_tables()
-        
-        print(f"✓ Table '{full_table_name}' reset successfully")
+
+        click.echo(f"✓ Table '{full_table_name}' reset successfully")
     except Exception as e:
-        print(f"✗ Failed to reset table: {e}")
+        click.echo(f"✗ Failed to reset table: {e}")
         sys.exit(1)
     finally:
         await close_client()
@@ -350,15 +348,14 @@ async def cmd_blacklist_remove(hotkeys: list):
         await close_client()
 
 
-async def cmd_blacklist_clear():
+async def cmd_blacklist_clear(yes: bool = False):
     """Clear all hotkeys from blacklist."""
-    confirm = input("WARNING: This will clear the entire blacklist. Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
-    
-    print("Clearing blacklist...")
+    if not yes:
+        if not click.confirm("WARNING: This will clear the entire blacklist. Continue?"):
+            click.echo("Aborted")
+            return
+
+    click.echo("Clearing blacklist...")
     await init_client()
     
     try:
@@ -547,23 +544,25 @@ async def cmd_delete_samples_by_range(
     revision: Optional[str],
     env: str,
     start_task_id: int,
-    end_task_id: int
+    end_task_id: int,
+    yes: bool = False
 ):
     """Delete samples within a task_id range.
     
     If hotkey and revision are provided, deletes samples for that specific miner.
     If they are not provided, deletes all samples in the environment and range.
     """
+    # interactive confirmation unless `yes` flag is provided
     if hotkey and revision:
-        print(f"Deleting samples for hotkey={hotkey[:12]}..., revision={revision[:8]}..., env={env}, task_id range=[{start_task_id}, {end_task_id})...")
-        confirm = input(f"WARNING: This will delete samples for specific miner in range [{start_task_id}, {end_task_id}). Type 'yes' to confirm: ")
+        click.echo(f"Deleting samples for hotkey={hotkey[:12]}..., revision={revision[:8]}..., env={env}, task_id range=[{start_task_id}, {end_task_id})...")
+        if not yes and not click.confirm(f"WARNING: This will delete samples for specific miner in range [{start_task_id}, {end_task_id}). Continue?"):
+            click.echo("Aborted")
+            return
     else:
-        print(f"Deleting ALL samples for env={env}, task_id range=[{start_task_id}, {end_task_id})...")
-        confirm = input(f"WARNING: This will delete ALL samples across all miners/revisions for env={env} in range [{start_task_id}, {end_task_id}). Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
+        click.echo(f"Deleting ALL samples for env={env}, task_id range=[{start_task_id}, {end_task_id})...")
+        if not yes and not click.confirm(f"WARNING: This will delete ALL samples across all miners/revisions for env={env} in range [{start_task_id}, {end_task_id}). Continue?"):
+            click.echo("Aborted")
+            return
     
     await init_client()
     
@@ -596,16 +595,14 @@ async def cmd_delete_samples_by_range(
         await close_client()
 
 
-async def cmd_delete_samples_empty_conversation():
+async def cmd_delete_samples_empty_conversation(yes: bool = False):
     """Delete all samples with empty conversation across the entire database."""
-    print("Scanning entire sample database for invalid samples (empty conversation)...")
-    
-    confirm = input("WARNING: This will scan and delete ALL samples with empty conversation in the database. Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
+    click.echo("Scanning entire sample database for invalid samples (empty conversation)...")
+
+    if not yes and not click.confirm("WARNING: This will scan and delete ALL samples with empty conversation in the database. Continue?"):
+        click.echo("Aborted")
         return
-    
+
     await init_client()
     
     try:
@@ -907,16 +904,20 @@ def list_cmd():
 
 
 @db.command()
-def reset():
+@click.option("--yes", "-y", is_flag=True, help="Assume yes for confirmation prompts")
+@click.option("--force", "-f", is_flag=True, help="Alias for --yes")
+def reset(yes, force):
     """Reset all tables (delete and recreate)."""
-    asyncio.run(cmd_reset())
+    asyncio.run(cmd_reset(yes=yes or force))
 
 
 @db.command("reset-table")
 @click.option("--table", required=True, help="Table name to reset (e.g., task_queue, sample_results)")
-def reset_table(table):
+@click.option("--yes", "-y", is_flag=True, help="Assume yes for confirmation prompts")
+@click.option("--force", "-f", is_flag=True, help="Alias for --yes")
+def reset_table(table, yes, force):
     """Reset a single table (delete and recreate)."""
-    asyncio.run(cmd_reset_table(table))
+    asyncio.run(cmd_reset_table(table, yes=yes or force))
 
 
 @db.command()
@@ -965,9 +966,11 @@ def remove(hotkeys):
 
 
 @blacklist.command()
-def clear():
+@click.option("--yes", "-y", is_flag=True, help="Assume yes for confirmation prompts")
+@click.option("--force", "-f", is_flag=True, help="Alias for --yes")
+def clear(yes, force):
     """Clear all hotkeys from blacklist."""
-    asyncio.run(cmd_blacklist_clear())
+    asyncio.run(cmd_blacklist_clear(yes=yes or force))
 
 
 @db.command("set-burn")
@@ -995,7 +998,9 @@ def get_config():
 @click.option("--env", required=True, help="Environment name (e.g., agentgym:alfworld)")
 @click.option("--start-task-id", required=True, type=int, help="Start task_id (inclusive)")
 @click.option("--end-task-id", required=True, type=int, help="End task_id (exclusive)")
-def delete_samples_by_range(hotkey, revision, env, start_task_id, end_task_id):
+@click.option("--yes", "-y", is_flag=True, help="Assume yes for confirmation prompts")
+@click.option("--force", "-f", is_flag=True, help="Alias for --yes")
+def delete_samples_by_range(hotkey, revision, env, start_task_id, end_task_id, yes, force):
     """Delete samples within a task_id range for a specific miner and environment.
     
     If --hotkey and --revision are provided, deletes samples for that specific miner.
@@ -1010,14 +1015,16 @@ def delete_samples_by_range(hotkey, revision, env, start_task_id, end_task_id):
     """
     # Validate that both hotkey and revision are provided together or both omitted
     if (hotkey is None) != (revision is None):
-        print("Error: --hotkey and --revision must be provided together or both omitted")
+        click.echo("Error: --hotkey and --revision must be provided together or both omitted")
         sys.exit(1)
-    
-    asyncio.run(cmd_delete_samples_by_range(hotkey, revision, env, start_task_id, end_task_id))
+
+    asyncio.run(cmd_delete_samples_by_range(hotkey, revision, env, start_task_id, end_task_id, yes=(yes or force)))
 
 
 @db.command("delete-samples-empty-conversation")
-def delete_samples_empty_conversation():
+@click.option("--yes", "-y", is_flag=True, help="Assume yes for confirmation prompts")
+@click.option("--force", "-f", is_flag=True, help="Alias for --yes")
+def delete_samples_empty_conversation(yes, force):
     """Delete all samples with empty conversation across the entire database.
     
     This command will scan the entire sample_results table and delete any samples
@@ -1026,7 +1033,7 @@ def delete_samples_empty_conversation():
     Example:
         af db delete-samples-empty-conversation
     """
-    asyncio.run(cmd_delete_samples_empty_conversation())
+    asyncio.run(cmd_delete_samples_empty_conversation(yes=(yes or force)))
 
 
 @db.command("cleanup-inactive-miners")
