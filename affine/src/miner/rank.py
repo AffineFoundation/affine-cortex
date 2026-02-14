@@ -145,7 +145,7 @@ async def print_rank_table():
         print("=" * 180, flush=True)
         
         # Build header - Hotkey first, then UID, then Model, then First Block, then environments
-        header_parts = ["Hotkey  ", "UID", "Model                    ", " FirstBlk "]
+        header_parts = ["Hotkey  ", " UID", "Model                    ", " FirstBlk "]
         
         # Format environment names - keep everything after ':'
         for env in environments:
@@ -192,7 +192,7 @@ async def print_rank_table():
             
             row_parts = [
                 f"{hotkey[:8]:8s}",
-                f"{uid:3d}",
+                f"{uid:4d}",
                 f"{model_display:25s}",
                 f"{first_block:10d}"
             ]
