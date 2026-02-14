@@ -28,8 +28,8 @@ class PerMinerSamplingScheduler:
     3. Minimum guarantee: each env gets at least 1 slot
     4. Incremental scheduling every 10s
     5. Priority-based task selection from sampling list tail
-    6. Rate limiting: when rotation_enabled, actual sampling rate is limited to
-       rotation_rate * RATE_MARGIN to prevent answer memorization attacks
+    6. Rate limiting: actual sampling rate is limited to rotation_rate * RATE_MARGIN
+       to prevent answer memorization attacks (independent of rotation_enabled)
     7. Minimum rate guarantee: allowed rate is at least sampling_count/48 per hour
        to ensure sampling completes within 2 days
     """
@@ -310,25 +310,26 @@ class PerMinerSamplingScheduler:
         if miner.get('uid', 0) == 0 or miner.get('uid', 0) > 1000:
             return False
 
-        # Only limit rate when rotation is enabled
-        if not sampling_config.get('rotation_enabled', False):
-            return False
-
-        # Get rotation parameters
+        # Get config parameters (rate limiting is independent of rotation_enabled)
         rotation_count = sampling_config.get('rotation_count', 0)
         rotation_interval = sampling_config.get('rotation_interval', 0)
+        sampling_count = sampling_config.get('sampling_count', 0)
 
-        if rotation_count <= 0 or rotation_interval <= 0:
-            return False
-
-        # Calculate allowed count per hour based on rotation rate
-        allowed_per_hour = rotation_count * (3600 / rotation_interval) * self.RATE_MARGIN
+        # Calculate rotation-based rate (0 if params invalid)
+        if rotation_count > 0 and rotation_interval > 0:
+            rotation_rate = rotation_count * (3600 / rotation_interval) * self.RATE_MARGIN
+        else:
+            rotation_rate = 0
 
         # Minimum rate guarantee: ensure sampling can complete within 48 hours
-        sampling_count = sampling_config.get('sampling_count', 0)
-        if sampling_count > 0:
-            min_rate_per_hour = sampling_count / 48  # Complete in 2 days
-            allowed_per_hour = max(allowed_per_hour, min_rate_per_hour)
+        min_rate = sampling_count / 48 if sampling_count > 0 else 0
+
+        # Use the higher of rotation rate and minimum rate
+        allowed_per_hour = max(rotation_rate, min_rate)
+
+        # If no valid rate can be calculated, don't limit
+        if allowed_per_hour <= 0:
+            return False
 
         # Round up to make fractional rates effective
         allowed_per_hour = math.ceil(allowed_per_hour)
