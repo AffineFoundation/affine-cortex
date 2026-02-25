@@ -189,10 +189,10 @@ class PerMinerSamplingScheduler:
     
     async def _get_miner_slots(self, miner: Dict[str, Any]) -> int:
         """Get current slots allocation for a miner from MinerStats.
-        
+
         Args:
             miner: Miner dict with hotkey, revision
-            
+
         Returns:
             Number of slots (3-10, default 6)
         """
@@ -308,6 +308,14 @@ class PerMinerSamplingScheduler:
         """
         # System models (uid == 0 or uid > 1000) are not rate limited
         if miner.get('uid', 0) == 0 or miner.get('uid', 0) > 1000:
+            return False
+
+        # Models submitting for more than 48 hours (~14400 blocks at 12s/block)
+        # are exempt from rate limiting. By then, sampling has completed at least
+        # one full cycle (guaranteed by min_rate = sampling_count/48).
+        first_block = miner.get('first_block', 0)
+        block_number = miner.get('block_number', 0)
+        if first_block > 0 and block_number - first_block > 14400:
             return False
 
         # Get config parameters (rate limiting is independent of rotation_enabled)
