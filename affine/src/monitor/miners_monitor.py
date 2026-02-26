@@ -18,6 +18,7 @@ from huggingface_hub import HfApi
 from affine.utils.subtensor import get_subtensor
 from affine.utils.api_client import get_chute_info
 from affine.utils.template_checker import check_template_safety
+from affine.utils.model_size_checker import check_model_size
 from affine.core.setup import NETUID
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
@@ -304,8 +305,9 @@ class MinersMonitor:
         6. Verify repo name ends with hotkey
         7. Verify revision matches chute
         8. Fetch HuggingFace model info and verify revision
-        9. Check if commit is "Duplicate from xxx" (plagiarism check)
-        10. Check chat_template for malicious code
+        9. Check model size (parameter count ≤ 120B)
+        10. Check if commit is "Duplicate from xxx" (plagiarism check)
+        11. Check chat_template for malicious code
 
         Args:
             uid: Miner UID
@@ -413,7 +415,22 @@ class MinersMonitor:
             info.invalid_reason = f"revision_mismatch:hf={hf_revision}"
             return info
 
-        # Step 9: Check if commit is a "Duplicate from xxx" (except uid 0)
+        # Step 9: Check model size (parameter count)
+        # Skip for system miners (uid 0 or uid > 1000)
+        if uid != 0 and uid <= 1000:
+            size_result = await check_model_size(model, revision)
+            if not size_result["pass"]:
+                info.is_valid = False
+                info.invalid_reason = f"model_size:{size_result['reason']}"
+                estimated = size_result.get("estimated_params")
+                est_str = f" estimated={estimated:,}" if estimated else ""
+                logger.info(
+                    f"[MinersMonitor] Model size rejected for uid={uid}: "
+                    f"model={model}{est_str} reason={size_result['reason']}"
+                )
+                return info
+
+        # Step 10: Check if commit is a "Duplicate from xxx" (except uid 0)
         if uid != 0:
             duplicate_source = await self._is_duplicate_commit(model, revision)
             if duplicate_source:
@@ -425,7 +442,7 @@ class MinersMonitor:
                 )
                 return info
 
-        # Step 10: Check chat_template for malicious code (with database cache)
+        # Step 11: Check chat_template for malicious code (with database cache)
         # Skip for uid 0 (test/admin miner)
         if uid == 0:
             info.template_check_result = "safe"
