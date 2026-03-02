@@ -27,7 +27,7 @@ dependencies = [
     "tabulate>=0.9.0",
     "prometheus-client>=0.21.0",
     "scipy>=1.11.0",
-    "affinetes @ git+https://github.com/AffineIO/affinetes.git",
+    "affinetes @ git+https://github.com/AffineFoundation/affinetes.git",
     "httpx>=0.27.0",
     "fastapi>=0.110.1,<0.111",
     "uvicorn==0.22.0",

@@ -184,9 +184,6 @@ async def cmd_load_config(json_file: str):
                         print(f"  {env_name}: Preserved existing dataset_range from database: {existing_range}")
                     else:
                         print(f"  {env_name}: Failed to resolve dataset_range_source, using fallback: {sampling_config.get('dataset_range')}")
-                elif existing_range:
-                    sampling_config['dataset_range'] = existing_range
-                    print(f"  {env_name}: Preserved existing dataset_range from database: {existing_range}")
 
                 # Check if initial_range is provided
                 if 'initial_range' in sampling_config:
@@ -254,8 +251,9 @@ async def cmd_load_config(json_file: str):
                 sampling_config = env_config.get('sampling_config')
                 if sampling_config:
                     sampling_list = sampling_config.get('sampling_list', [])
+                    dataset_range = sampling_config.get('dataset_range', [])
                     rotation_count = sampling_config.get('rotation_count', 0)
-                    status = f"sampling_list={len(sampling_list)} tasks"
+                    status = f"dataset_range={dataset_range}, sampling_list={len(sampling_list)} tasks"
                     if rotation_count > 0:
                         status += f", rotation={rotation_count} tasks/hour"
                     else:
