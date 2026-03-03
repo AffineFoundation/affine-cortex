@@ -231,6 +231,31 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=7300,
     ),
+
+    # NavWorld Travel Planning environment (anti-hack hardened scoring)
+    # Uses MCP tool servers (AMap + Transport) for real tool invocation.
+    # Scoring: 50/50 code-LLM split, 7 problem types, 15 tool steps max.
+    # Requires AMAP_MAPS_API_KEY for POI/routing/weather tools.
+    "navworld": EnvConfig(
+        name="navworld",
+        docker_image="affinefoundation/navworld:latest",
+        env_type="navworld",
+        mem_limit="5g",
+        env_vars={"QQR_CACHE_DIR": "/var/lib/navworld/cache"},
+        required_env_vars=["AMAP_MAPS_API_KEY"],
+        volumes={
+            "/var/lib/navworld/cache": {
+                "bind": "/var/lib/navworld/cache",
+                "mode": "rw",
+            },
+        },
+        eval_params={
+            "temperature": 0.7,
+            "timeout": 1200,
+        },
+        proxy_timeout=1260,
+        cpu_limit="2000m",
+    ),
 }
 
 # Alias mappings (multiple names can map to the same canonical config)
@@ -269,6 +294,10 @@ _ENV_ALIASES = {
     # LiveWeb Arena aliases
     "LIVEWEB": "liveweb",
     "liveweb-arena": "liveweb",
+
+    # NavWorld aliases
+    "NAVWORLD": "navworld",
+    "NavWorld": "navworld",
 }
 
 # Build final ENV_CONFIGS with aliases
@@ -662,3 +691,7 @@ ARC_GEN = ARC_GEN_factory
 # LiveWeb Arena factory
 LIVEWEB_factory = lambda mode=None: create_environment("liveweb", mode=mode)
 LIVEWEB = LIVEWEB_factory
+
+# NavWorld factory
+NAVWORLD_factory = lambda mode=None: create_environment("navworld", mode=mode)
+NAVWORLD = NAVWORLD_factory
