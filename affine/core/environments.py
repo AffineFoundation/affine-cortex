@@ -174,6 +174,7 @@ _ENV_CONFIGS_CANONICAL = {
         docker_image="affinefoundation/swebench:synth",
         env_type="swebench",
         env_vars={"UVICORN_WORKERS": "10"},
+        required_env_vars=["DOCKER_HUB_USERNAME", "DOCKER_HUB_TOKEN"],
         mem_limit="10g",
         volumes={
             "/var/run/docker.sock": {
