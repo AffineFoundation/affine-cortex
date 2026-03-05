@@ -612,7 +612,7 @@ class MinersMonitor:
                     # Disqualify if hotkey has more than one commit.
                     # Only enforced for miners whose first commit is at or after block 7678012.
                     # Miners that committed before this block are grandfathered.
-                    _MULTI_COMMIT_ENFORCE_BLOCK = 7682000
+                    _MULTI_COMMIT_ENFORCE_BLOCK = 7679000
                     first_commit_block = int(commits[hotkey][0][0])
                     if uid != 0 and len(commits[hotkey]) > 1 and first_commit_block >= _MULTI_COMMIT_ENFORCE_BLOCK:
                         miners.append(MinerInfo(
