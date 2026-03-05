@@ -305,7 +305,7 @@ class MinersMonitor:
         6. Verify repo name ends with hotkey
         7. Verify revision matches chute
         8. Fetch HuggingFace model info and verify revision
-        9. Check model size (parameter count ≤ 120B)
+        9. Check model architecture (must be Qwen3-32B)
         10. Check if commit is "Duplicate from xxx" (plagiarism check)
         11. Check chat_template for malicious code
 
@@ -415,18 +415,16 @@ class MinersMonitor:
             info.invalid_reason = f"revision_mismatch:hf={hf_revision}"
             return info
 
-        # Step 9: Check model size (parameter count)
+        # Step 9: Check model architecture (must be Qwen3-32B)
         # Skip for system miners (uid 0 or uid > 1000)
         if uid != 0 and uid <= 1000:
             size_result = await check_model_size(model, revision)
             if not size_result["pass"]:
                 info.is_valid = False
-                info.invalid_reason = f"model_size:{size_result['reason']}"
-                estimated = size_result.get("estimated_params")
-                est_str = f" estimated={estimated:,}" if estimated else ""
+                info.invalid_reason = f"model_check:{size_result['reason']}"
                 logger.info(
-                    f"[MinersMonitor] Model size rejected for uid={uid}: "
-                    f"model={model}{est_str} reason={size_result['reason']}"
+                    f"[MinersMonitor] Model rejected for uid={uid}: "
+                    f"model={model} reason={size_result['reason']}"
                 )
                 return info
 
