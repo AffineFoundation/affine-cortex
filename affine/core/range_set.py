@@ -24,6 +24,38 @@ class RangeSet:
         """
         self.ranges = self._normalize_ranges(ranges)
     
+    @classmethod
+    def from_ids(cls, ids: List[int]) -> 'RangeSet':
+        """Create a RangeSet from a list of individual IDs.
+        
+        Efficiently converts a list of IDs into merged intervals.
+        For example, [1, 2, 3, 7, 8, 10] becomes [[1, 4), [7, 9), [10, 11)].
+        
+        Args:
+            ids: List of integer IDs (need not be sorted or unique)
+            
+        Returns:
+            RangeSet covering exactly the given IDs
+        """
+        if not ids:
+            return cls([])
+        
+        sorted_ids = sorted(set(ids))
+        ranges = []
+        start = sorted_ids[0]
+        prev = start
+        
+        for id_val in sorted_ids[1:]:
+            if id_val == prev + 1:
+                prev = id_val
+            else:
+                ranges.append([start, prev + 1])
+                start = id_val
+                prev = id_val
+        
+        ranges.append([start, prev + 1])
+        return cls(ranges)
+    
     def _normalize_ranges(self, ranges: List[List[int]]) -> List[Tuple[int, int]]:
         """Normalize ranges: merge overlapping intervals and sort.
         
@@ -241,6 +273,83 @@ class RangeSet:
             List of [start, end) intervals
         """
         return [[start, end] for start, end in self.ranges]
+    
+    def __contains__(self, item: int) -> bool:
+        """Check if an ID is contained in any range using binary search.
+        
+        Args:
+            item: Integer ID to check
+            
+        Returns:
+            True if item is in any range
+        """
+        import bisect
+        
+        if not self.ranges:
+            return False
+        
+        # Binary search for the rightmost range whose start <= item
+        starts = [r[0] for r in self.ranges]
+        idx = bisect.bisect_right(starts, item) - 1
+        
+        if idx < 0:
+            return False
+        
+        start, end = self.ranges[idx]
+        return start <= item < end
+    
+    def __len__(self) -> int:
+        """Return the total number of IDs in all ranges."""
+        return self.size()
+    
+    def __eq__(self, other: object) -> bool:
+        """Check equality with another RangeSet."""
+        if not isinstance(other, RangeSet):
+            return NotImplemented
+        return self.ranges == other.ranges
+    
+    def intersection(self, other: 'RangeSet') -> 'RangeSet':
+        """Compute the intersection of two RangeSets.
+        
+        Args:
+            other: Another RangeSet
+            
+        Returns:
+            New RangeSet containing only IDs present in both
+        """
+        result = []
+        i, j = 0, 0
+        
+        while i < len(self.ranges) and j < len(other.ranges):
+            a_start, a_end = self.ranges[i]
+            b_start, b_end = other.ranges[j]
+            
+            # Find overlap
+            overlap_start = max(a_start, b_start)
+            overlap_end = min(a_end, b_end)
+            
+            if overlap_start < overlap_end:
+                result.append([overlap_start, overlap_end])
+            
+            # Advance the range that ends first
+            if a_end < b_end:
+                i += 1
+            else:
+                j += 1
+        
+        return RangeSet(result)
+    
+    def union(self, other: 'RangeSet') -> 'RangeSet':
+        """Compute the union of two RangeSets.
+        
+        Args:
+            other: Another RangeSet
+            
+        Returns:
+            New RangeSet containing IDs from either set
+        """
+        combined = self.to_list() + other.to_list()
+        return RangeSet(combined)
     
     def __repr__(self) -> str:
         """String representation for debugging."""
