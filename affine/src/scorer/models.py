@@ -11,13 +11,14 @@ from dataclasses import dataclass, field
 @dataclass
 class EnvScore:
     """Score data for a single environment."""
-    
+
     avg_score: float
     sample_count: int
     completeness: float
     is_valid: bool
     threshold: float
-    
+    task_scores: Dict[int, float] = field(default_factory=dict)  # task_id -> normalized score
+
     def __repr__(self) -> str:
         return f"EnvScore(avg={self.avg_score:.3f}, samples={self.sample_count}, complete={self.completeness:.2%})"
 

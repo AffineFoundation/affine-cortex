@@ -154,17 +154,28 @@ class Stage1Collector:
                 completed_count = env_info.get('completed_count', 0)
                 completeness = env_info.get('completeness', 0.0)
                 
-                # Calculate average score
+                # Calculate average score and collect per-task scores
+                task_scores: Dict[int, float] = {}
                 if samples:
-                    scores = [s.get('score', 0.0) for s in samples]
-                    raw_avg_score = sum(scores) / len(scores)
+                    raw_scores = []
+                    for s in samples:
+                        raw = s.get('score', 0.0)
+                        raw_scores.append(raw)
+                        tid = s.get('task_id')
+                        if tid is not None:
+                            task_scores[int(tid)] = raw
+                    raw_avg_score = sum(raw_scores) / len(raw_scores)
                 else:
                     raw_avg_score = 0.0
-                
+
                 # Apply environment-specific normalization if configured
                 if env_name in self.config.ENV_SCORE_RANGES:
                     min_score, max_score = self.config.ENV_SCORE_RANGES[env_name]
                     avg_score = (raw_avg_score - min_score) / (max_score - min_score)
+                    task_scores = {
+                        tid: (s - min_score) / (max_score - min_score)
+                        for tid, s in task_scores.items()
+                    }
                 else:
                     avg_score = raw_avg_score
                 
@@ -196,7 +207,8 @@ class Stage1Collector:
                     sample_count=completed_count,
                     completeness=completeness,
                     is_valid=is_valid,
-                    threshold=threshold
+                    threshold=threshold,
+                    task_scores=task_scores,
                 )
                 
                 # Only log invalid environments in DEBUG mode
