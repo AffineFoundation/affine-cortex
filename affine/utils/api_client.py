@@ -223,7 +223,7 @@ class APIClient:
                         import json as json_lib
                         error_json = json_lib.loads(body)
                         msg = error_json.get("detail", str(error_json))
-                    except:
+                    except Exception:
                         msg = body[:200]
                     
                     if output_json:
