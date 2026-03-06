@@ -58,19 +58,6 @@
         "scheduling_weight": 1.0
       }
     },
-    "ARC-GEN": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.5,
-      "sampling_config": {
-        "dataset_range": [[0, 40000000000]],
-        "sampling_count": 20,
-        "rotation_enabled": true,
-        "rotation_count": 2,
-        "rotation_interval": 3600,
-        "scheduling_weight": 0.5
-      }
-    },
     "LIVEWEB": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
@@ -87,7 +74,7 @@
     "NAVWORLD": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.7,
+      "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
         "sampling_count": 100,
