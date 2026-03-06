@@ -153,7 +153,7 @@ _ENV_CONFIGS_CANONICAL = {
         name="swe-pro",
         docker_image="affinefoundation/swebench:pro",
         env_type="swebench",
-        env_vars={"UVICORN_WORKERS": "10"},
+        env_vars={"UVICORN_WORKERS": "8"},
         mem_limit="10g",
         volumes={
             "/var/run/docker.sock": {

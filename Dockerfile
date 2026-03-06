@@ -1,11 +1,11 @@
 # syntax=docker/dockerfile:1.4
-FROM rust:1.79-slim-bookworm AS base
+FROM rust:1.88-slim-bookworm AS base
 
 # 1) Install Python and system dependencies
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip python3-dev \
-    build-essential curl pkg-config libssl-dev docker.io git openssh-client \
+    build-essential curl pkg-config libssl-dev protobuf-compiler libprotobuf-dev docker.io git openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 # 2) Install the 'uv' CLI
