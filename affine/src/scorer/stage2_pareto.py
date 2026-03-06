@@ -12,6 +12,7 @@ from affine.src.scorer.models import (
     Stage2Output,
 )
 from affine.src.scorer.config import ScorerConfig
+from affine.src.scorer.utils import calculate_required_score
 
 from affine.core.setup import logger
 
@@ -173,28 +174,45 @@ class Stage2ParetoFilter:
         for env in envs:
             # Get scores and threshold (already validated in filter())
             env_score_a = miner_a.env_scores[env]
-            score_a = env_score_a.avg_score
-            score_b = miner_b.env_scores[env].avg_score
-            
-            # Use stored threshold instead of recalculating
-            threshold = env_score_a.threshold
-            
+            env_score_b = miner_b.env_scores[env]
+
+            # Align scores to common tasks if per-task data is available
+            common_tasks = set(env_score_a.task_scores) & set(env_score_b.task_scores)
+            if common_tasks:
+                score_a = sum(env_score_a.task_scores[t] for t in common_tasks) / len(common_tasks)
+                score_b = sum(env_score_b.task_scores[t] for t in common_tasks) / len(common_tasks)
+                # Recompute threshold from A's aligned score and intersection count
+                env_threshold_config = self.config.ENV_THRESHOLD_CONFIGS.get(env, {})
+                threshold = calculate_required_score(
+                    score_a,
+                    len(common_tasks),
+                    env_threshold_config.get('z_score', self.config.Z_SCORE),
+                    env_threshold_config.get('min_improvement', self.config.MIN_IMPROVEMENT),
+                    env_threshold_config.get('max_improvement', self.config.MAX_IMPROVEMENT),
+                )
+            else:
+                # Fall back to pre-computed avg scores and threshold
+                score_a = env_score_a.avg_score
+                score_b = env_score_b.avg_score
+                threshold = env_score_a.threshold
+
             # B wins if it beats the threshold (with epsilon for floating point comparison)
             eps = 1e-9
             b_wins_env = score_b > (threshold + eps)
-            
+
             if b_wins_env:
                 b_wins_count += 1
             else:
                 a_wins_count += 1
-            
+
             # Store comparison details
             env_comparisons[env] = {
                 "a_score": score_a,
                 "b_score": score_b,
                 "threshold": threshold,
                 "b_beats_threshold": b_wins_env,
-                "winner": "B" if b_wins_env else "A"
+                "winner": "B" if b_wins_env else "A",
+                "aligned_tasks": len(common_tasks) if common_tasks else None,
             }
         
         # Determine dominance based on winning all environments
