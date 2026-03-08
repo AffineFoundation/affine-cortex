@@ -176,11 +176,11 @@ class Stage2ParetoFilter:
             env_score_a = miner_a.env_scores[env]
             env_score_b = miner_b.env_scores[env]
 
-            # Align scores to common tasks if per-task data is available
-            common_tasks = set(env_score_a.task_scores) & set(env_score_b.task_scores)
+            # Align scores to common tasks using all available samples (not just sampling list)
+            common_tasks = set(env_score_a.all_task_scores) & set(env_score_b.all_task_scores)
             if common_tasks:
-                score_a = sum(env_score_a.task_scores[t] for t in common_tasks) / len(common_tasks)
-                score_b = sum(env_score_b.task_scores[t] for t in common_tasks) / len(common_tasks)
+                score_a = sum(env_score_a.all_task_scores[t] for t in common_tasks) / len(common_tasks)
+                score_b = sum(env_score_b.all_task_scores[t] for t in common_tasks) / len(common_tasks)
                 # Recompute threshold from A's aligned score and intersection count
                 env_threshold_config = self.config.ENV_THRESHOLD_CONFIGS.get(env, {})
                 threshold = calculate_required_score(

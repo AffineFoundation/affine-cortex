@@ -17,7 +17,8 @@ class EnvScore:
     completeness: float
     is_valid: bool
     threshold: float
-    task_scores: Dict[int, float] = field(default_factory=dict)  # task_id -> normalized score
+    task_scores: Dict[int, float] = field(default_factory=dict)  # task_id -> normalized score (sampling list only)
+    all_task_scores: Dict[int, float] = field(default_factory=dict)  # task_id -> normalized score (all samples, for Pareto)
 
     def __repr__(self) -> str:
         return f"EnvScore(avg={self.avg_score:.3f}, samples={self.sample_count}, complete={self.completeness:.2%})"

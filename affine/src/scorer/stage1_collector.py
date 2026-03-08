@@ -168,6 +168,14 @@ class Stage1Collector:
                 else:
                     raw_avg_score = 0.0
 
+                # Collect all_task_scores from all_samples (for Pareto comparison)
+                all_samples = env_info.get('all_samples', [])
+                all_task_scores: Dict[int, float] = {}
+                for s in all_samples:
+                    tid = s.get('task_id')
+                    if tid is not None:
+                        all_task_scores[int(tid)] = s.get('score', 0.0)
+
                 # Apply environment-specific normalization if configured
                 if env_name in self.config.ENV_SCORE_RANGES:
                     min_score, max_score = self.config.ENV_SCORE_RANGES[env_name]
@@ -175,6 +183,10 @@ class Stage1Collector:
                     task_scores = {
                         tid: (s - min_score) / (max_score - min_score)
                         for tid, s in task_scores.items()
+                    }
+                    all_task_scores = {
+                        tid: (s - min_score) / (max_score - min_score)
+                        for tid, s in all_task_scores.items()
                     }
                 else:
                     avg_score = raw_avg_score
@@ -209,6 +221,7 @@ class Stage1Collector:
                     is_valid=is_valid,
                     threshold=threshold,
                     task_scores=task_scores,
+                    all_task_scores=all_task_scores,
                 )
                 
                 # Only log invalid environments in DEBUG mode

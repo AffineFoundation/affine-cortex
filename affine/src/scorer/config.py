@@ -62,11 +62,8 @@ class ScorerConfig:
     """Number of decimal places for score comparison (avoid floating point issues)."""
     
     # Stage 3: Subset Scoring
-    MAX_LAYERS: int = 6
-    """Maximum number of layers to evaluate. Due to exponential growth, 6 layers provide sufficient differentiation (2^5 = 32x difference between L1 and L6)."""
-    
-    SUBSET_WEIGHT_BASE: int = 1
-    """Base weight multiplier for subset layers (N for L1, N*2 for L2, N*4 for L3, etc.)."""
+    MAX_LAYERS: int = 1
+    """Maximum number of layers to evaluate. Set to 1 to only evaluate the last layer (all environments combined)."""
     
     SUBSET_WEIGHT_EXPONENT: int = 2
     """Exponent base for layer weights (layer_weight = N * base^(layer-1))."""
@@ -139,7 +136,6 @@ class ScorerConfig:
             'max_improvement': cls.MAX_IMPROVEMENT,
             'score_precision': cls.SCORE_PRECISION,
             'max_layers': cls.MAX_LAYERS,
-            'subset_weight_base': cls.SUBSET_WEIGHT_BASE,
             'subset_weight_exponent': cls.SUBSET_WEIGHT_EXPONENT,
             'decay_factor': cls.DECAY_FACTOR,
             'min_weight_threshold': cls.MIN_WEIGHT_THRESHOLD,
@@ -154,7 +150,6 @@ class ScorerConfig:
         assert cls.MIN_IMPROVEMENT >= 0.0, "MIN_IMPROVEMENT must be non-negative"
         assert cls.MAX_IMPROVEMENT >= cls.MIN_IMPROVEMENT, "MAX_IMPROVEMENT must be >= MIN_IMPROVEMENT"
         assert cls.SCORE_PRECISION >= 0, "SCORE_PRECISION must be non-negative"
-        assert cls.SUBSET_WEIGHT_BASE > 0, "SUBSET_WEIGHT_BASE must be positive"
         assert cls.SUBSET_WEIGHT_EXPONENT >= 2, "SUBSET_WEIGHT_EXPONENT must be >= 2"
         assert 0.0 <= cls.DECAY_FACTOR <= 1.0, "DECAY_FACTOR must be in [0, 1]"
         assert 0.0 <= cls.MIN_WEIGHT_THRESHOLD <= 1.0, "MIN_WEIGHT_THRESHOLD must be in [0, 1]"
