@@ -53,7 +53,8 @@ class Stage1Collector:
                         "model_revision": "...",
                         "env": {
                             "affine:sat": {
-                                "samples": [...],
+                                "all_samples": [...],
+                                "sampling_task_ids": [...],
                                 "total_count": 500,
                                 "completed_count": 498,
                                 "completeness": 0.996
@@ -149,32 +150,28 @@ class Stage1Collector:
                     continue
                 
                 # Extract environment data
-                samples = env_info.get('samples', [])
+                all_samples = env_info.get('all_samples', [])
+                sampling_task_ids = set(env_info.get('sampling_task_ids', []))
                 total_count = env_info.get('total_count', 0)
                 completed_count = env_info.get('completed_count', 0)
                 completeness = env_info.get('completeness', 0.0)
-                
-                # Calculate average score and collect per-task scores
-                task_scores: Dict[int, float] = {}
-                if samples:
-                    raw_scores = []
-                    for s in samples:
-                        raw = s.get('score', 0.0)
-                        raw_scores.append(raw)
-                        tid = s.get('task_id')
-                        if tid is not None:
-                            task_scores[int(tid)] = raw
-                    raw_avg_score = sum(raw_scores) / len(raw_scores)
-                else:
-                    raw_avg_score = 0.0
 
-                # Collect all_task_scores from all_samples (for Pareto comparison)
-                all_samples = env_info.get('all_samples', [])
+                # Build all_task_scores from all_samples (full partition)
                 all_task_scores: Dict[int, float] = {}
                 for s in all_samples:
                     tid = s.get('task_id')
                     if tid is not None:
                         all_task_scores[int(tid)] = s.get('score', 0.0)
+
+                # Derive task_scores by filtering all_task_scores with sampling_task_ids
+                task_scores = {
+                    tid: score for tid, score in all_task_scores.items()
+                    if tid in sampling_task_ids
+                }
+                raw_avg_score = (
+                    sum(task_scores.values()) / len(task_scores)
+                    if task_scores else 0.0
+                )
 
                 # Apply environment-specific normalization if configured
                 if env_name in self.config.ENV_SCORE_RANGES:

@@ -309,11 +309,13 @@ class ScoringCacheManager:
         """Query and build cache data for a single miner+env combination.
 
         Returns:
-            Cache data dict with samples, all_samples, and statistics
+            Cache data dict with all_samples, sampling_task_ids, and statistics.
+            No redundant 'samples' field — Stage1 derives task_scores from
+            all_samples + sampling_task_ids.
 
         Strategy:
-        1. Query full partition to get all_samples (for Pareto alignment)
-        2. Filter by sampling_list to derive scoring samples
+        1. Query full partition to get all_samples
+        2. Compute completeness statistics against sampling_task_ids
         """
         from affine.core.sampling_list import get_task_id_set_from_config
         from affine.database.client import get_client
@@ -321,13 +323,13 @@ class ScoringCacheManager:
         hotkey = miner_info['hotkey']
         revision = miner_info['revision']
 
-        # 1. Get target task IDs
+        # 1. Get target task IDs (sampling list)
         target_task_ids = get_task_id_set_from_config(env_config)
 
         if not target_task_ids:
             return {
-                'samples': [],
                 'all_samples': [],
+                'sampling_task_ids': [],
                 'total_count': 0,
                 'completed_count': 0,
                 'missing_task_ids': [],
@@ -346,23 +348,19 @@ class ScoringCacheManager:
         raw_items = await sample_dao._query_all_pages(get_client(), params)
         all_samples = [sample_dao._deserialize(item) for item in raw_items]
 
-        # 3. Filter by sampling_list for scoring samples
-        samples = [s for s in all_samples if s.get('task_id') in target_task_ids]
-
-        # 4. Calculate statistics
+        # 3. Calculate completeness statistics against sampling list
+        completed_ids = {s['task_id'] for s in all_samples if s.get('task_id') in target_task_ids}
         expected_count = len(target_task_ids)
-        completed_count = len(samples)
+        completed_count = len(completed_ids)
         completeness = completed_count / expected_count if expected_count > 0 else 0.0
-
-        final_completed_ids = {s['task_id'] for s in samples}
-        final_missing_ids = sorted(list(target_task_ids - final_completed_ids))[:100]
+        missing_ids = sorted(list(target_task_ids - completed_ids))[:100]
 
         return {
-            'samples': samples,
             'all_samples': all_samples,
+            'sampling_task_ids': sorted(list(target_task_ids)),
             'total_count': expected_count,
             'completed_count': completed_count,
-            'missing_task_ids': final_missing_ids,
+            'missing_task_ids': missing_ids,
             'completeness': round(completeness, 4)
         }
     
