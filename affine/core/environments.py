@@ -233,6 +233,17 @@ _ENV_CONFIGS_CANONICAL = {
         proxy_timeout=7300,
     ),
 
+    # LogProbs evaluation environment
+    "logprobs": EnvConfig(
+        name="logprobs",
+        docker_image="affinefoundation/logprobs:latest",
+        env_vars={"UVICORN_WORKERS": "10"},
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 600,
+        },
+    ),
+
     # NavWorld Travel Planning environment (anti-hack hardened scoring)
     # Uses MCP tool servers (AMap + Transport) for real tool invocation.
     # Scoring: 50/50 code-LLM split, 7 problem types, 15 tool steps max.
@@ -299,6 +310,10 @@ _ENV_ALIASES = {
     # NavWorld aliases
     "NAVWORLD": "navworld",
     "NavWorld": "navworld",
+
+    # LogProbs aliases
+    "LOGPROBS": "logprobs",
+    "LogProbs": "logprobs",
 }
 
 # Build final ENV_CONFIGS with aliases
@@ -696,3 +711,7 @@ LIVEWEB = LIVEWEB_factory
 # NavWorld factory
 NAVWORLD_factory = lambda mode=None: create_environment("navworld", mode=mode)
 NAVWORLD = NAVWORLD_factory
+
+# LogProbs factory
+LOGPROBS_factory = lambda mode=None: create_environment("logprobs", mode=mode)
+LOGPROBS = LOGPROBS_factory
