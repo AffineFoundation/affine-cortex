@@ -307,99 +307,60 @@ class ScoringCacheManager:
         env_config: dict
     ) -> dict:
         """Query and build cache data for a single miner+env combination.
-        
+
         Returns:
-            Cache data dict with samples and statistics
-        
-        OPTIMIZED Strategy (Fixes AWS signature expiration):
-        1. Get target task IDs from sampling_list
-        2. Use get_samples_by_task_ids() for efficient batch query
-        3. Merge with cached data
-        
-        Performance:
-        - Before: 1 Query (get completed IDs) + N GetItem calls (N = missing count)
-        - After: ~N/100 Queries (batch query with FilterExpression IN clause)
-        - Avoids AWS signature expiration (5 min timeout)
+            Cache data dict with all_samples, sampling_task_ids, and statistics.
+            No redundant 'samples' field — Stage1 derives task_scores from
+            all_samples + sampling_task_ids.
+
+        Strategy:
+        1. Query full partition to get all_samples
+        2. Compute completeness statistics against sampling_task_ids
         """
         from affine.core.sampling_list import get_task_id_set_from_config
-        
+        from affine.database.client import get_client
+
         hotkey = miner_info['hotkey']
         revision = miner_info['revision']
-        key = f"{hotkey}#{revision}"
-        
-        # 1. Get target task IDs
+
+        # 1. Get target task IDs (sampling list)
         target_task_ids = get_task_id_set_from_config(env_config)
-        
+
         if not target_task_ids:
             return {
-                'samples': [],
+                'all_samples': [],
+                'sampling_task_ids': [],
                 'total_count': 0,
                 'completed_count': 0,
                 'missing_task_ids': [],
                 'completeness': 0.0
             }
-        
-        # 2. Get current cached samples (using hotkey#revision key)
-        current_cache = {}
-        if key in self._scoring_data and env in self._scoring_data[key]['env']:
-            current_cache = self._scoring_data[key]['env'][env]
-        elif key in self._sampling_data and env in self._sampling_data[key]['env']:
-            current_cache = self._sampling_data[key]['env'][env]
-        
-        current_samples = current_cache.get('samples', [])
-        cached_task_ids = {s['task_id'] for s in current_samples}
-        
-        # 3. Calculate what to query and what to remove
-        need_query = target_task_ids - cached_task_ids
-        obsolete_task_ids = cached_task_ids - target_task_ids
-        
-        # 4. Use efficient batch query for missing task IDs
-        # Sort task_ids for better DynamoDB scan performance (data is sorted by SK)
-        if need_query:
-            new_samples = await sample_dao.get_samples_by_task_ids(
-                miner_hotkey=hotkey,
-                model_revision=revision,
-                env=env,
-                task_ids=sorted(list(need_query))
-            )
-        else:
-            new_samples = []
-        
-        # 5. Remove obsolete task IDs from cache
-        if obsolete_task_ids:
-            updated_samples = [
-                s for s in current_samples
-                if s['task_id'] not in obsolete_task_ids
-            ]
-        else:
-            updated_samples = current_samples.copy()
-        
-        # 6. Merge new samples
-        updated_samples.extend(new_samples)
-        
-        # 7. Calculate statistics
+
+        # 2. Query full partition (all samples for this miner×env)
+        pk = sample_dao._make_pk(hotkey, revision, env)
+        params = {
+            'TableName': sample_dao.table_name,
+            'KeyConditionExpression': 'pk = :pk',
+            'ExpressionAttributeValues': {':pk': {'S': pk}},
+            'ProjectionExpression': 'task_id,score,#ts',
+            'ExpressionAttributeNames': {'#ts': 'timestamp'},
+        }
+        raw_items = await sample_dao._query_all_pages(get_client(), params)
+        all_samples = [sample_dao._deserialize(item) for item in raw_items]
+
+        # 3. Calculate completeness statistics against sampling list
+        completed_ids = {s['task_id'] for s in all_samples if s.get('task_id') in target_task_ids}
         expected_count = len(target_task_ids)
-        completed_count = len(updated_samples)
+        completed_count = len(completed_ids)
         completeness = completed_count / expected_count if expected_count > 0 else 0.0
-        
-        final_completed_ids = {s['task_id'] for s in updated_samples}
-        final_missing_ids = sorted(list(target_task_ids - final_completed_ids))[:100]
-        
-        # Log query statistics (only when there's actual work)
-        if need_query or obsolete_task_ids:
-            logger.debug(
-                f"Cache update for {hotkey[:8]}.../{env}: "
-                f"target={len(target_task_ids)}, "
-                f"queried={len(need_query)}, found={len(new_samples)}, "
-                f"removed={len(obsolete_task_ids)}, completeness={completeness:.2%}"
-            )
-        
-        # 8. Return cache data (caller will populate caches)
+        missing_ids = sorted(list(target_task_ids - completed_ids))[:100]
+
         return {
-            'samples': updated_samples,
+            'all_samples': all_samples,
+            'sampling_task_ids': sorted(list(target_task_ids)),
             'total_count': expected_count,
             'completed_count': completed_count,
-            'missing_task_ids': final_missing_ids,
+            'missing_task_ids': missing_ids,
             'completeness': round(completeness, 4)
         }
     
