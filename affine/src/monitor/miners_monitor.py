@@ -295,6 +295,7 @@ class MinersMonitor:
         revision: str,
         chute_id: str,
         block: int,
+        commit_count: int = 1,
     ) -> MinerInfo:
         """Validate a single miner
 
@@ -310,6 +311,7 @@ class MinersMonitor:
         9. Check model architecture (must be Qwen3-32B)
         10. Check if commit is "Duplicate from xxx" (plagiarism check)
         11. Check chat_template for malicious code
+        12. Check if hotkey has multiple commits
 
         Args:
             uid: Miner UID
@@ -341,6 +343,14 @@ class MinersMonitor:
                 info.template_check_result = existing.get('template_check_result')
         except Exception:
             pass  # Ignore errors, will check template later if needed
+
+        # Disqualify if hotkey has more than one commit.
+        # Only enforced when the latest commit is at or after this block.
+        _MULTI_COMMIT_ENFORCE_BLOCK = 7710000
+        if uid != 0 and commit_count > 1 and block >= _MULTI_COMMIT_ENFORCE_BLOCK:
+            info.is_valid = False
+            info.invalid_reason = f"multiple_commits:count={commit_count}"
+            return info
 
         # Step 1: Fetch chute info
         chute = await get_chute_info(chute_id)
@@ -638,23 +648,6 @@ class MinersMonitor:
                         ))
                         continue
 
-                    # Disqualify if hotkey has more than one commit.
-                    # Only enforced when the latest commit is at or after this block.
-                    _MULTI_COMMIT_ENFORCE_BLOCK = 7708800
-                    latest_commit_block = int(block)
-                    if uid != 0 and len(commits[hotkey]) > 1 and latest_commit_block >= _MULTI_COMMIT_ENFORCE_BLOCK:
-                        miners.append(MinerInfo(
-                            uid=uid,
-                            hotkey=hotkey,
-                            model=model,
-                            revision=revision,
-                            chute_id=chute_id,
-                            block=int(block) if uid != 0 else 0,
-                            is_valid=False,
-                            invalid_reason=f"multiple_commits:count={len(commits[hotkey])}"
-                        ))
-                        continue
-
                     # Validate miner
                     miner_info = await self._validate_miner(
                         uid=uid,
@@ -663,6 +656,7 @@ class MinersMonitor:
                         revision=revision,
                         chute_id=chute_id,
                         block=int(block) if uid != 0 else 0,
+                        commit_count=len(commits[hotkey]),
                     )
                     
                     miners.append(miner_info)
