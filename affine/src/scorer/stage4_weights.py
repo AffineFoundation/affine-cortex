@@ -5,7 +5,7 @@ Aggregates subset contributions, applies minimum threshold,
 and normalizes final weights.
 """
 
-from typing import Dict
+from typing import Dict, Any
 from affine.src.scorer.models import (
     MinerData,
     Stage4Output,
@@ -102,13 +102,16 @@ class Stage4WeightNormalizer:
         )
     
     
-    def print_detailed_table(self, miners: Dict[int, MinerData], environments: list):
+    def print_detailed_table(self, miners: Dict[int, MinerData], environments: list, env_configs: Dict[str, Any] = None):
         """Print detailed scoring table with all metrics.
-        
+
         Args:
             miners: Dict of all miners
             environments: List of environment names
+            env_configs: Optional env configs dict (used for display_name)
         """
+        if env_configs is None:
+            env_configs = {}
         print("=" * 180, flush=True)
         print("DETAILED SCORING TABLE", flush=True)
         print("=" * 180, flush=True)
@@ -116,9 +119,12 @@ class Stage4WeightNormalizer:
         # Build header - Hotkey first, then UID, then Model, then First Block, then environments
         header_parts = ["Hotkey  ", "UID", "Model               ", " FirstBlk "]
         
-        # Format environment names - keep everything after ':'
+        # Format environment names - use display_name if available
         for env in sorted(environments):
-            if ':' in env:
+            env_cfg = env_configs.get(env, {})
+            if isinstance(env_cfg, dict) and env_cfg.get('display_name'):
+                env_display = env_cfg['display_name']
+            elif ':' in env:
                 env_display = env.split(':', 1)[1]  # Keep everything after ':'
             else:
                 env_display = env

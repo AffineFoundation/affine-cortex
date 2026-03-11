@@ -15,6 +15,7 @@
       }
     },
     "LGC-v2": {
+      "display_name": "LGC",
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "min_completeness": 0.9,
@@ -41,6 +42,7 @@
       }
     },
     "SWE-SYNTH": {
+      "display_name": "SWE",
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "min_completeness": 0.8,

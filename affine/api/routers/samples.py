@@ -27,6 +27,38 @@ from affine.api.config import config
 router = APIRouter(prefix="/samples", tags=["Samples"])
 
 
+def resolve_env_name(env: str, environments: dict) -> str:
+    """Resolve environment name from exact key, colon shorthand, or display_name.
+
+    Returns the resolved environment key, or raises HTTPException if not found.
+    """
+    # Exact match
+    if env in environments:
+        return env
+
+    # Try colon shorthand (e.g., 'alfworld' -> 'agentgym:alfworld')
+    if ':' not in env:
+        matching_envs = [e for e in environments.keys() if e.endswith(f':{env}')]
+        if len(matching_envs) == 0:
+            # Try display_name (e.g., 'SWE' -> 'SWE-SYNTH', 'LGC' -> 'LGC-v2')
+            matching_envs = [
+                e for e, cfg in environments.items()
+                if isinstance(cfg, dict) and cfg.get('display_name') == env
+            ]
+        if len(matching_envs) == 1:
+            return matching_envs[0]
+        elif len(matching_envs) > 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Ambiguous environment name: {env}. Matches: {', '.join(matching_envs)}"
+            )
+
+    raise HTTPException(
+        status_code=status.HTTP_404_NOT_FOUND,
+        detail=f"Environment not found: {env}. Available: {', '.join(environments.keys())}"
+    )
+
+
 @router.get("/{hotkey}/{env}/{task_id}", response_model=Union[SampleFullResponse, TaskPoolResponse], dependencies=[Depends(rate_limit_read)])
 async def get_sample(
     hotkey: str,
@@ -112,31 +144,10 @@ async def get_sample_by_uid(
     If not found in sample_results, tries to query from task_pool.
     """
     try:
-        # Resolve env_name shorthand (e.g., 'alfworld' -> 'agentgym:alfworld')
+        # Resolve env_name shorthand or display_name
         environments = await config_dao.get_param_value('environments', default={})
-        
-        # Check if env is already a full environment name
-        if env not in environments:
-            # Try to resolve shorthand (e.g., 'alfworld' -> 'agentgym:alfworld')
-            if ':' not in env:
-                matching_envs = [e for e in environments.keys() if e.endswith(f':{env}')]
-                if len(matching_envs) == 0:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail=f"Environment not found: {env}. Available: {', '.join(environments.keys())}"
-                    )
-                elif len(matching_envs) > 1:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Ambiguous environment name: {env}. Matches: {', '.join(matching_envs)}"
-                    )
-                env = matching_envs[0]
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Environment not found: {env}. Available: {', '.join(environments.keys())}"
-                )
-        
+        env = resolve_env_name(env, environments)
+
         # Get miner info by UID
         miner = await miners_dao.get_miner_by_uid(uid)
         
@@ -241,28 +252,7 @@ async def get_task_pool(
     """
     try:
         environments = await config_dao.get_param_value('environments', default={})
-
-        # Check if env is already a full environment name
-        if env not in environments:
-            # Try to resolve shorthand (e.g., 'alfworld' -> 'agentgym:alfworld')
-            if ':' not in env:
-                matching_envs = [e for e in environments.keys() if e.endswith(f':{env}')]
-                if len(matching_envs) == 0:
-                    raise HTTPException(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        detail=f"Environment not found: {env}. Available: {', '.join(environments.keys())}"
-                    )
-                elif len(matching_envs) > 1:
-                    raise HTTPException(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        detail=f"Ambiguous environment name: {env}. Matches: {', '.join(matching_envs)}"
-                    )
-                env = matching_envs[0]
-            else:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=f"Environment not found: {env}. Available: {', '.join(environments.keys())}"
-                )
+        env = resolve_env_name(env, environments)
 
         # Get miner info by UID
         miner = await miners_dao.get_miner_by_uid(uid)

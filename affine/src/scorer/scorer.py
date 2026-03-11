@@ -103,7 +103,7 @@ class Scorer:
         
         # Print detailed summary table
         if print_summary:
-            self.stage4.print_detailed_table(stage3_output.miners, environments)
+            self.stage4.print_detailed_table(stage3_output.miners, environments, env_configs)
         
         return result
     
