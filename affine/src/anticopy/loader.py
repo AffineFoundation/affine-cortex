@@ -155,11 +155,7 @@ class LogprobsLoader(BaseDAO):
                     continue
 
                 tokens = extra.get("tokens")
-                if not tokens or len(tokens) < MIN_TOKENS:
-                    logger.debug(
-                        f"anti_copy: uid={uid} task={task_id} skipped "
-                        f"(tokens={len(tokens) if tokens else 0} < {MIN_TOKENS})"
-                    )
+                if not tokens:
                     continue
 
                 try:

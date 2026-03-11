@@ -35,22 +35,20 @@ class AntiCopyDetector:
         self,
         hs_threshold: float = 0.99,
         cosine_threshold: float = 0.99,
-        min_tasks: int = 20,
+        min_tasks: int = 30,
     ):
         self.hs_threshold = hs_threshold
         self.cosine_threshold = cosine_threshold
         self.min_tasks = min_tasks
 
-    def _cosine_per_task(
-        self, vecs_a: np.ndarray, vecs_b: np.ndarray
-    ) -> np.ndarray:
-        """Compute per-task cosine similarity. Shape (n_tasks,)."""
-        norms_a = np.linalg.norm(vecs_a, axis=1, keepdims=True)
-        norms_b = np.linalg.norm(vecs_b, axis=1, keepdims=True)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            na = np.where(norms_a > 0, vecs_a / norms_a, 0.0)
-            nb = np.where(norms_b > 0, vecs_b / norms_b, 0.0)
-        return (na * nb).sum(axis=1)
+    @staticmethod
+    def _cosine_pair(a: np.ndarray, b: np.ndarray) -> float:
+        """Compute cosine similarity between two 1-D vectors."""
+        na = np.linalg.norm(a)
+        nb = np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
 
     def detect(self, miners: Dict[int, MinerLogprobs]) -> List[CopyPair]:
         """Run detection over all miner pairs.
@@ -73,7 +71,8 @@ class AntiCopyDetector:
 
                 # ── Logprob signals ──────────────────────────────────
                 lp_common = sorted(
-                    set(ma.task_logprobs) & set(mb.task_logprobs)
+                    t for t in set(ma.task_logprobs) & set(mb.task_logprobs)
+                    if ma.task_logprobs[t].shape == mb.task_logprobs[t].shape
                 )
                 has_logprobs = len(lp_common) >= self.min_tasks
 
@@ -84,9 +83,10 @@ class AntiCopyDetector:
                 n_tasks = 0
 
                 if has_logprobs:
-                    vecs_a = np.stack([ma.task_logprobs[t] for t in lp_common])
-                    vecs_b = np.stack([mb.task_logprobs[t] for t in lp_common])
-                    cosines = self._cosine_per_task(vecs_a, vecs_b)
+                    cosines = np.array([
+                        self._cosine_pair(ma.task_logprobs[t], mb.task_logprobs[t])
+                        for t in lp_common
+                    ])
                     med_cosine = float(np.nanmedian(cosines))
                     task_cosine_map = {
                         t: float(c) for t, c in zip(lp_common, cosines)
@@ -115,15 +115,17 @@ class AntiCopyDetector:
 
                 # ── Hidden states signal ─────────────────────────────
                 hs_common = sorted(
-                    set(ma.task_hidden_states) & set(mb.task_hidden_states)
+                    t for t in set(ma.task_hidden_states) & set(mb.task_hidden_states)
+                    if ma.task_hidden_states[t].shape == mb.task_hidden_states[t].shape
                 )
                 has_hs = len(hs_common) >= self.min_tasks
                 med_hs = float("nan")
 
                 if has_hs:
-                    hs_a = np.stack([ma.task_hidden_states[t] for t in hs_common])
-                    hs_b = np.stack([mb.task_hidden_states[t] for t in hs_common])
-                    hs_cosines = self._cosine_per_task(hs_a, hs_b)
+                    hs_cosines = np.array([
+                        self._cosine_pair(ma.task_hidden_states[t], mb.task_hidden_states[t])
+                        for t in hs_common
+                    ])
                     med_hs = float(np.nanmedian(hs_cosines))
                     # Use max task count
                     n_tasks = max(n_tasks, len(hs_common))
