@@ -110,12 +110,24 @@ async def get_miner_stats_by_uid(
                 "env_stats": None
             }
         
+        # Replace env_stats keys with display_name if available
+        env_stats = stats.get('env_stats', {})
+        if env_stats:
+            from affine.database.dao.system_config import SystemConfigDAO
+            config_dao = SystemConfigDAO()
+            environments = await config_dao.get_param_value('environments', {})
+            env_stats = {
+                (environments.get(k, {}).get('display_name', k)
+                 if isinstance(environments.get(k), dict) else k): v
+                for k, v in env_stats.items()
+            }
+
         return {
             "uid": uid,
             "hotkey": hotkey,
             "revision": revision,
             "sampling_stats": stats.get('sampling_stats', {}),
-            "env_stats": stats.get('env_stats', {})
+            "env_stats": env_stats
         }
         
     except HTTPException:

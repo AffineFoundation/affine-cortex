@@ -523,7 +523,7 @@ async def get_miner_command(uid: int):
                     print("\n" + "="*80)
                     print("PER-ENVIRONMENT STATISTICS")
                     print("="*80)
-                    
+
                     env_stats = stats_data['env_stats']
                     for env_name, env_data in env_stats.items():
                         print(f"\n[{env_name}]")

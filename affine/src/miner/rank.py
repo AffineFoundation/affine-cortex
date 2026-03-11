@@ -147,9 +147,12 @@ async def print_rank_table():
         # Build header - Hotkey first, then UID, then Model, then First Block, then environments
         header_parts = ["Hotkey  ", " UID", "Model                    ", " FirstBlk "]
         
-        # Format environment names - keep everything after ':'
+        # Format environment names - use display_name if available
         for env in environments:
-            if ':' in env:
+            env_cfg = env_configs.get(env, {})
+            if isinstance(env_cfg, dict) and env_cfg.get('display_name'):
+                env_display = env_cfg['display_name']
+            elif ':' in env:
                 env_display = env.split(':', 1)[1]
             else:
                 env_display = env
