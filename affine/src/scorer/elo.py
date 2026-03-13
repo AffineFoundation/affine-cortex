@@ -130,7 +130,7 @@ def update_ratings(
 
     for uid_i in uids:
         rank_i = round_ranks[uid_i]
-        rating_i = current_ratings.get(uid_i, 1500.0)
+        rating_i = current_ratings.get(uid_i, 1200.0)
         rounds_i = current_rounds.get(uid_i, 0)
         age_i = model_ages.get(uid_i, 0)
 
@@ -144,7 +144,7 @@ def update_ratings(
                 continue
 
             rank_j = round_ranks[uid_j]
-            rating_j = current_ratings.get(uid_j, 1500.0)
+            rating_j = current_ratings.get(uid_j, 1200.0)
             age_j = model_ages.get(uid_j, 0)
 
             # 期望结果（clamp exponent to avoid OverflowError）

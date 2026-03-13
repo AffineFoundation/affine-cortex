@@ -136,8 +136,9 @@ class ScorerConfig:
     ELO_PROVISIONAL_ROUNDS: int = 48
     """Number of rounds a miner is considered provisional (~1 day)."""
 
-    ELO_BASE_RATING: float = 1500.0
-    """Initial ELO rating for new miners."""
+    ELO_BASE_RATING: float = 1200.0
+    """Initial ELO rating for new miners. Set below average (1500) to prevent
+    new-hotkey spam attacks: miners must prove skill before climbing to top."""
 
     ELO_SENIORITY_ALPHA: float = 0.0
     """Seniority advantage factor. 0.0 disables seniority bonus."""
