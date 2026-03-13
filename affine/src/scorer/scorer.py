@@ -49,6 +49,7 @@ class Scorer:
         environments: list,
         env_configs: Dict[str, Any],
         block_number: int,
+        prev_ratings: Optional[Dict[str, Any]] = None,
         print_summary: bool = True
     ) -> ScoringResult:
         """Execute the four-stage scoring algorithm.
@@ -74,8 +75,12 @@ class Scorer:
         subsets_meta = generate_all_subsets(environments, max_layers=self.config.MAX_LAYERS)
         stage2_output = self.stage2.filter(stage1_output.miners, subsets_meta)
         
-        # Stage 3: Subset Scoring
-        stage3_output = self.stage3.score(stage2_output.miners, environments)
+        # Stage 3: ELO Rating Update + Weight Distribution
+        stage3_output = self.stage3.score(
+            stage2_output.miners, environments,
+            prev_ratings=prev_ratings,
+            current_block=block_number,
+        )
         
         # Stage 4: Weight Normalization
         stage4_output = self.stage4.normalize(stage3_output.miners)
@@ -111,7 +116,8 @@ class Scorer:
         self,
         result: ScoringResult,
         score_snapshots_dao=None,
-        scores_dao=None
+        scores_dao=None,
+        miner_stats_dao=None
     ):
         """Save scoring results to database.
         
@@ -211,9 +217,23 @@ class Scorer:
                 # Additional detailed fields (formerly in miner_scores)
                 subset_contributions=subset_contributions,
                 cumulative_weight=miner.cumulative_weight,
-                filter_info=filter_info
+                filter_info=filter_info,
+                # ELO fields (redundant copy for API display)
+                elo_rating=miner.elo_rating,
+                elo_rounds_played=miner.elo_rounds_played,
+                elo_rating_change=miner.elo_rating_change,
             )
-        
+
+            # Update MINER_STATS (authoritative ELO data source)
+            if miner_stats_dao:
+                await miner_stats_dao.update_elo_rating(
+                    hotkey=miner.hotkey,
+                    revision=miner.model_revision,
+                    elo_rating=miner.elo_rating,
+                    elo_rounds_played=miner.elo_rounds_played,
+                    elo_model_submit_block=result.block_number if miner.elo_rounds_played == 1 else None,
+                )
+
         logger.info(f"Successfully saved complete scoring results for {len(result.miners)} miners to scores table")
 
 

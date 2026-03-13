@@ -123,6 +123,25 @@ class ScorerConfig:
         'SWE-SYNTH': {'z_score': 2.0},
     }
     
+    # ELO Parameters
+    ELO_D: float = 400.0
+    """Rating difference scale factor for expected score calculation."""
+
+    ELO_K_BASE: float = 32.0
+    """Base K-factor (update step size) for established miners."""
+
+    ELO_K_PROVISIONAL: float = 96.0
+    """Higher K-factor for new/provisional miners to converge faster."""
+
+    ELO_PROVISIONAL_ROUNDS: int = 48
+    """Number of rounds a miner is considered provisional (~1 day)."""
+
+    ELO_BASE_RATING: float = 1500.0
+    """Initial ELO rating for new miners."""
+
+    ELO_SENIORITY_ALPHA: float = 0.0
+    """Seniority advantage factor. 0.0 disables seniority bonus."""
+
     # Database & Storage
     SCORE_RECORD_TTL_DAYS: int = 30
     """TTL for score_snapshots table (in days)."""
@@ -141,6 +160,12 @@ class ScorerConfig:
             'min_weight_threshold': cls.MIN_WEIGHT_THRESHOLD,
             'min_completeness': cls.MIN_COMPLETENESS,
             'geometric_mean_epsilon': cls.GEOMETRIC_MEAN_EPSILON,
+            'elo_d': cls.ELO_D,
+            'elo_k_base': cls.ELO_K_BASE,
+            'elo_k_provisional': cls.ELO_K_PROVISIONAL,
+            'elo_provisional_rounds': cls.ELO_PROVISIONAL_ROUNDS,
+            'elo_base_rating': cls.ELO_BASE_RATING,
+            'elo_seniority_alpha': cls.ELO_SENIORITY_ALPHA,
         }
     
     @classmethod
@@ -155,6 +180,12 @@ class ScorerConfig:
         assert 0.0 <= cls.MIN_WEIGHT_THRESHOLD <= 1.0, "MIN_WEIGHT_THRESHOLD must be in [0, 1]"
         assert 0.0 <= cls.MIN_COMPLETENESS <= 1.0, "MIN_COMPLETENESS must be in [0, 1]"
         assert cls.GEOMETRIC_MEAN_EPSILON >= 0.0, "GEOMETRIC_MEAN_EPSILON must be non-negative"
+        assert cls.ELO_D > 0.0, "ELO_D must be positive"
+        assert cls.ELO_K_BASE > 0.0, "ELO_K_BASE must be positive"
+        assert cls.ELO_K_PROVISIONAL > 0.0, "ELO_K_PROVISIONAL must be positive"
+        assert cls.ELO_PROVISIONAL_ROUNDS >= 0, "ELO_PROVISIONAL_ROUNDS must be non-negative"
+        assert cls.ELO_BASE_RATING > 0.0, "ELO_BASE_RATING must be positive"
+        assert cls.ELO_SENIORITY_ALPHA >= 0.0, "ELO_SENIORITY_ALPHA must be non-negative"
 
 
 # Validate configuration on import

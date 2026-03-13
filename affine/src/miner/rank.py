@@ -144,9 +144,12 @@ async def print_rank_table():
         print(f"MINER RANKING TABLE - Block {block_number}", flush=True)
         print("=" * 180, flush=True)
         
-        # Build header - Hotkey first, then UID, then Model, then First Block, then environments
-        header_parts = ["Hotkey  ", " UID", "Model                    ", " FirstBlk "]
-        
+        # Sort by elo_rating descending
+        scores_list = sorted(scores_list, key=lambda s: s.get("elo_rating", 0) or 0, reverse=True)
+
+        # Build header - Hotkey, UID, Model, Rating, Δ, Rnd, environments, Weight, V
+        header_parts = ["Hotkey  ", " UID", "Model                    ", "Rating", "   Δ", " Rnd"]
+
         # Format environment names - use display_name if available
         for env in environments:
             env_cfg = env_configs.get(env, {})
@@ -156,25 +159,9 @@ async def print_rank_table():
                 env_display = env.split(':', 1)[1]
             else:
                 env_display = env
-            # Adjust width to accommodate "score[threshold]/count(!)" format
-            header_parts.append(f"{env_display:>20}")
-        
-        # Find all layers that have non-zero weights
-        all_layers = set()
-        for score in scores_list:
-            scores_by_layer = score.get("scores_by_layer", {})
-            for layer_key, weight in scores_by_layer.items():
-                if weight > 0:
-                    # Extract layer number from "L3" format
-                    layer_num = int(layer_key[1:])
-                    all_layers.add(layer_num)
-        
-        active_layers = sorted(all_layers)
-        
-        for layer in active_layers:
-            header_parts.append(f"{'L'+str(layer):>8}")
-        
-        header_parts.extend(["   Total ", "  Weight ", "V"])
+            header_parts.append(f"{env_display:>14}")
+
+        header_parts.extend(["  Weight  ", "V"])
         
         print(" | ".join(header_parts), flush=True)
         print("-" * 180, flush=True)
@@ -183,64 +170,59 @@ async def print_rank_table():
         for score in scores_list:
             uid = score.get("uid")
             hotkey = score.get("miner_hotkey")
-            model_revision = score.get("model_revision")
             model = score.get("model")
-            first_block = score.get("first_block")
             overall_score = score.get("overall_score")
             scores_by_env = score.get("scores_by_env", {})
-            scores_by_layer = score.get("scores_by_layer", {})
-            total_samples = score.get("total_samples")
-            
+            elo_rating = int(score.get("elo_rating") or 0)
+            elo_rounds_played = int(score.get("elo_rounds_played") or 0)
+            elo_rating_change = int(score.get("elo_rating_change") or 0)
+
             model_display = model[:25]
-            
+
+            # Format rating change with +/- sign
+            if elo_rating_change > 0:
+                delta_str = f"+{elo_rating_change}"
+            else:
+                delta_str = str(elo_rating_change)
+
             row_parts = [
                 f"{hotkey[:8]:8s}",
                 f"{uid:4d}",
                 f"{model_display:25s}",
-                f"{first_block:10d}"
+                f"{elo_rating:6d}",
+                f"{delta_str:>6s}",
+                f"{elo_rounds_played:4d}"
             ]
-            
-            # Environment scores - show "score[threshold]/count(!)" format (score × 100, 2 decimals)
+
+            # Environment scores - show "score/count(!)" format (score × 100, 2 decimals)
             # Get default min_completeness from config (default: 0.9 if not available)
             default_min_completeness = scorer_config.get("min_completeness", 0.9)
-            
+
             for env in environments:
                 if env in scores_by_env:
                     env_data = scores_by_env[env]
                     env_score = env_data.get("score", 0.0)
                     sample_count = env_data.get("sample_count", 0)
                     completeness = env_data.get("completeness", 1.0)
-                    threshold = env_data.get("threshold", 0.0)
-                    
+
                     score_percent = env_score * 100
-                    threshold_percent = threshold * 100
-                    
+
                     # Get environment-specific min_completeness or use default
                     env_config = env_configs.get(env, {})
                     env_min_completeness = env_config.get("min_completeness", default_min_completeness)
-                    
+
                     # Check if sample count is insufficient using environment-specific parameter
                     is_insufficient = completeness < env_min_completeness
-                    
+
                     if is_insufficient:
-                        score_str = f"{score_percent:.2f}[{threshold_percent:.2f}]/{sample_count}!"
+                        score_str = f"{score_percent:.2f}/{sample_count}!"
                     else:
-                        score_str = f"{score_percent:.2f}[{threshold_percent:.2f}]/{sample_count}"
-                    row_parts.append(f"{score_str:>20}")
+                        score_str = f"{score_percent:.2f}/{sample_count}"
+                    row_parts.append(f"{score_str:>14}")
                 else:
-                    row_parts.append(f"{'  -  ':>20}")
-            
-            # Layer weights - only for active layers
-            for layer in active_layers:
-                layer_key = f"L{layer}"
-                weight = scores_by_layer.get(layer_key, 0.0)
-                row_parts.append(f"{weight:>8.4f}")
-            
-            # Total (cumulative) and Weight (normalized)
-            # Use cumulative_weight if available, otherwise fall back to average_score
-            cumulative_weight = score.get("cumulative_weight")
-            row_parts.append(f"{cumulative_weight:>9.4f}")  # Total: cumulative weight before normalization
-            row_parts.append(f"{overall_score:>9.6f}")  # Weight: normalized weight
+                    row_parts.append(f"{'  -  ':>14}")
+
+            row_parts.append(f"{overall_score:>10.6f}")  # Weight: normalized weight
             row_parts.append("✓" if overall_score > 0 else "✗")
             
             print(" | ".join(row_parts), flush=True)

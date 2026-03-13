@@ -46,7 +46,10 @@ class ScoresDAO(BaseDAO):
         total_samples: int,
         subset_contributions: Optional[Dict[str, Dict[str, Any]]] = None,
         cumulative_weight: Optional[float] = None,
-        filter_info: Optional[Dict[str, Any]] = None
+        filter_info: Optional[Dict[str, Any]] = None,
+        elo_rating: Optional[float] = None,
+        elo_rounds_played: Optional[int] = None,
+        elo_rating_change: Optional[float] = None
     ) -> Dict[str, Any]:
         """Save a score snapshot for a miner at a specific block.
         
@@ -100,7 +103,14 @@ class ScoresDAO(BaseDAO):
         
         if filter_info is not None:
             item['filter_info'] = filter_info
-        
+
+        if elo_rating is not None:
+            item['elo_rating'] = elo_rating
+        if elo_rounds_played is not None:
+            item['elo_rounds_played'] = elo_rounds_played
+        if elo_rating_change is not None:
+            item['elo_rating_change'] = elo_rating_change
+
         # Conditional TTL: only set TTL for miners with zero weight
         if overall_score == 0:
             item['ttl'] = self.get_ttl(7)  # 30 days for inactive miners

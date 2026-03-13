@@ -91,6 +91,9 @@ class MinerScore(BaseModel):
     scores_by_env: Dict[str, Dict[str, Any]]  # Changed to support {env: {score, sample_count}}
     total_samples: int
     cumulative_weight: Optional[float] = None
+    elo_rating: Optional[float] = None
+    elo_rounds_played: Optional[int] = None
+    elo_rating_change: Optional[float] = None
 
 
 class ScoresResponse(BaseModel):

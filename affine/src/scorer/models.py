@@ -41,6 +41,11 @@ class MinerData:
     filtered_subsets: List[str] = field(default_factory=list)
     filter_reasons: Dict[str, str] = field(default_factory=dict)
     
+    # Stage 3: ELO
+    elo_rating: float = 1500.0
+    elo_rating_change: float = 0.0
+    elo_rounds_played: int = 0
+
     # Stage 3: Subset scores
     subset_scores: Dict[str, float] = field(default_factory=dict)
     subset_ranks: Dict[str, int] = field(default_factory=dict)

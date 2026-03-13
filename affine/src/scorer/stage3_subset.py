@@ -1,190 +1,189 @@
 """
-Stage 3: Subset Scoring and Weight Distribution
+Stage 3: ELO Rating Update and Weight Distribution
 
-Calculates geometric mean scores for miners within each subset and
-distributes weights proportionally based on performance.
+Uses per-round composite ranking (geometric mean of env avg_scores) to update
+ELO ratings, then distributes weights by rating rank with decay.
 """
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional, Tuple
 from affine.src.scorer.models import (
     MinerData,
     SubsetInfo,
     Stage3Output,
 )
 from affine.src.scorer.config import ScorerConfig
-from affine.src.scorer.utils import (
-    generate_all_subsets,
-    calculate_layer_weights,
-    calculate_subset_weights,
-    geometric_mean,
-)
+from affine.src.scorer.utils import geometric_mean
+from affine.src.scorer.elo import update_ratings
 
 from affine.core.setup import logger
 
 
 class Stage3SubsetScorer:
-    """Stage 3: Subset Scoring and Weight Distribution.
-    
+    """Stage 3: ELO Rating Update and Weight Distribution.
+
     Responsibilities:
-    1. Generate all subset combinations (L1, L2, L3, ...)
-    2. Calculate layer weights with exponential growth
-    3. For each subset:
-       - Calculate geometric mean scores for participating miners
-       - Rank miners by score
-       - Distribute subset weight proportionally
-    4. Apply optional rank-based decay
+    1. Compute round ranks from geometric_mean(env avg_scores)
+    2. Load previous ratings from MINER_STATS
+    3. Update ELO ratings for participating miners
+    4. Distribute weights by ELO rating rank with decay
     """
-    
+
     def __init__(self, config: ScorerConfig = ScorerConfig):
-        """Initialize Stage 3 subset scorer.
-        
-        Args:
-            config: Scorer configuration (defaults to global config)
-        """
         self.config = config
         self.decay_factor = config.DECAY_FACTOR
-        self.score_precision = config.SCORE_PRECISION
         self.geometric_mean_epsilon = config.GEOMETRIC_MEAN_EPSILON
-    
+
     def score(
         self,
         miners: Dict[int, MinerData],
-        environments: List[str]
+        environments: List[str],
+        prev_ratings: Optional[Dict[str, Dict[str, Any]]] = None,
+        current_block: int = 0,
     ) -> Stage3Output:
-        """Calculate subset scores and distribute weights.
-        
+        """Execute ELO-based scoring.
+
         Args:
-            miners: Dict of MinerData objects from Stage 2
-            environments: List of environment names
-            
-        Returns:
-            Stage3Output with subset scores and weights
+            miners: Stage 2 output
+            environments: Environment list
+            prev_ratings: {hotkey: {elo_rating, elo_rounds_played, elo_model_submit_block}}
+                         from MINER_STATS, None = first round
+            current_block: Current block height (for new revision model_submit_block)
         """
-        n_envs = len(environments)
-        logger.info(f"Stage 3: Processing {n_envs} environments")
-        
-        # Generate subsets: evaluate only top MAX_LAYERS
-        # e.g., 8 envs with MAX_LAYERS=6 -> evaluate L3-L8, skip L1-L2
-        subsets_meta = generate_all_subsets(environments, max_layers=self.config.MAX_LAYERS)
-        
-        # Calculate starting layer
-        start_layer = max(1, n_envs - self.config.MAX_LAYERS + 1) if n_envs > self.config.MAX_LAYERS else 1
-        actual_layers = n_envs - start_layer + 1
-        
-        logger.debug(
-            f"Generated {len(subsets_meta)} subsets across layers L{start_layer}-L{n_envs} "
-            f"({actual_layers} layers, max_layers={self.config.MAX_LAYERS})"
+        logger.info(f"Stage 3: ELO update for {len(miners)} miners, {len(environments)} environments")
+
+        # Step 1: Compute round ranks (geometric mean of env avg_scores)
+        round_ranks = self._compute_round_ranks(miners, environments)
+
+        # Step 2: Load previous ratings from MINER_STATS
+        current_ratings, current_rounds, model_ages = self._load_prev_ratings(
+            miners, prev_ratings, current_block
         )
-        
-        # Calculate layer and subset weights (starting from the actual start_layer)
-        layer_weights = calculate_layer_weights(n_envs, self.config.SUBSET_WEIGHT_EXPONENT, start_layer)
-        subset_weights = calculate_subset_weights(subsets_meta, layer_weights)
-        
-        # Create SubsetInfo objects
-        subsets: Dict[str, SubsetInfo] = {}
-        for subset_key, subset_meta in subsets_meta.items():
-            layer = subset_meta["layer"]
-            envs = subset_meta["envs"]
-            
-            subsets[subset_key] = SubsetInfo(
-                key=subset_key,
-                layer=layer,
-                envs=envs,
-                layer_weight=layer_weights[layer],
-                subset_weight=subset_weights[subset_key]
+
+        # Step 3: ELO update (only for miners in round_ranks)
+        if round_ranks:
+            elo_results = update_ratings(
+                round_ranks=round_ranks,
+                current_ratings={uid: current_ratings[uid] for uid in round_ranks},
+                current_rounds={uid: current_rounds[uid] for uid in round_ranks},
+                model_ages={uid: model_ages[uid] for uid in round_ranks},
+                D=self.config.ELO_D,
+                K_base=self.config.ELO_K_BASE,
+                K_provisional=self.config.ELO_K_PROVISIONAL,
+                provisional_rounds=self.config.ELO_PROVISIONAL_ROUNDS,
+                alpha=self.config.ELO_SENIORITY_ALPHA,
             )
-        
-        # Score each subset
-        for subset_key, subset_info in subsets.items():
-            self._score_subset(subset_key, subset_info, miners)
-        
-        # Calculate layer contributions for each miner
-        for miner in miners.values():
-            layer_totals = {}
-            for subset_key, weight in miner.subset_weights.items():
-                layer = subsets[subset_key].layer
-                layer_totals[layer] = layer_totals.get(layer, 0.0) + weight
-            miner.layer_weights = layer_totals
-        
-        logger.info(f"Stage 3: Scored {len(subsets)} subsets")
-        
-        return Stage3Output(
-            miners=miners,
-            subsets=subsets
-        )
-    
-    def _score_subset(
+
+            # Write results to MinerData
+            for uid, (new_rating, change, new_rounds) in elo_results.items():
+                miners[uid].elo_rating = new_rating
+                miners[uid].elo_rating_change = change
+                miners[uid].elo_rounds_played = new_rounds
+
+        # Non-ranked miners (absent/Pareto-filtered) keep previous rating unchanged
+        for uid, miner in miners.items():
+            if uid not in round_ranks:
+                miner.elo_rating = current_ratings.get(uid, self.config.ELO_BASE_RATING)
+                miner.elo_rating_change = 0.0
+                miner.elo_rounds_played = current_rounds.get(uid, 0)
+
+        # Step 4: Distribute weights by ELO rating (exclude Pareto-filtered)
+        self._distribute_weights_by_rating(miners)
+
+        ranked_count = len(round_ranks)
+        logger.info(f"Stage 3: ELO updated for {ranked_count} ranked miners")
+
+        return Stage3Output(miners=miners, subsets={})
+
+    def _compute_round_ranks(
         self,
-        subset_key: str,
-        subset_info: SubsetInfo,
-        miners: Dict[int, MinerData]
-    ):
-        """Score miners within a single subset and distribute weights.
-        
-        Args:
-            subset_key: Subset identifier
-            subset_info: Subset metadata
-            miners: Dict of all miners
+        miners: Dict[int, MinerData],
+        environments: List[str],
+    ) -> Dict[int, int]:
+        """Compute round ranks from geometric_mean(env avg_scores).
+
+        Excludes:
+        - Miners that are not valid for scoring
+        - Miners filtered by Pareto (filtered_subsets non-empty)
         """
-        envs = subset_info.envs
-        
-        # Find miners eligible for this subset
-        eligible_miners = []
-        for miner in miners.values():
-            # Skip if filtered from this subset
-            if subset_key in miner.filtered_subsets:
-                subset_info.filtered_miners.append(miner.uid)
+        scores = {}
+        for uid, miner in miners.items():
+            if not miner.is_valid_for_scoring():
                 continue
-            
-            # Check if miner has valid scores in all subset environments
-            has_all_envs = all(
-                env in miner.env_scores and miner.env_scores[env].is_valid
-                for env in envs
-            )
-            
-            if has_all_envs:
-                eligible_miners.append(miner)
-                subset_info.valid_miners.append(miner.uid)
-        
-        # Skip if no eligible miners
-        if not eligible_miners:
-            return
-        
-        # Calculate geometric mean scores (always use geometric mean)
-        miner_scores = []
-        for miner in eligible_miners:
+            # Pareto-filtered miners don't participate in ELO ranking
+            if miner.filtered_subsets:
+                continue
             env_scores = [
                 miner.env_scores[env].avg_score
-                for env in envs
+                for env in environments
+                if env in miner.env_scores and miner.env_scores[env].is_valid
             ]
-            
-            # Always use geometric mean to penalize poor performance in any environment
-            # Smoothing epsilon prevents zero scores from collapsing the entire result
-            score = geometric_mean(env_scores, epsilon=self.geometric_mean_epsilon)
-            miner_scores.append((miner.uid, score))
-            miner.subset_scores[subset_key] = score
-        
-        # Sort by score (descending)
-        miner_scores.sort(key=lambda x: x[1], reverse=True)
-        
-        # Assign ranks and apply decay
-        adjusted_scores = []
-        for rank, (uid, score) in enumerate(miner_scores, start=1):
-            miners[uid].subset_ranks[subset_key] = rank
-            adjusted = score * (self.decay_factor ** (rank - 1))
-            adjusted_scores.append((uid, adjusted))
-        
-        # Calculate proportional weights
-        total_score = sum(score for _, score in adjusted_scores)
-        
-        if total_score > 0:
-            for uid, score in adjusted_scores:
-                proportion = score / total_score
-                weight_contribution = subset_info.subset_weight * proportion
-                miners[uid].subset_weights[subset_key] = weight_contribution
-        else:
-            # Edge case: all scores are 0
-            equal_weight = subset_info.subset_weight / len(adjusted_scores)
-            for uid, _ in adjusted_scores:
-                miners[uid].subset_weights[subset_key] = equal_weight
-    
+            if env_scores:
+                scores[uid] = geometric_mean(env_scores, epsilon=self.geometric_mean_epsilon)
+
+        # Rank with tied-rank handling
+        sorted_uids = sorted(scores.keys(), key=lambda u: scores[u], reverse=True)
+        ranks = {}
+        prev_score = None
+        prev_rank = 0
+        for i, uid in enumerate(sorted_uids):
+            if scores[uid] != prev_score:
+                prev_rank = i + 1
+                prev_score = scores[uid]
+            ranks[uid] = prev_rank
+        return ranks
+
+    def _load_prev_ratings(
+        self,
+        miners: Dict[int, MinerData],
+        prev_ratings: Optional[Dict[str, Dict[str, Any]]],
+        current_block: int,
+    ) -> Tuple[Dict[int, float], Dict[int, int], Dict[int, int]]:
+        """Load ratings from MINER_STATS, matched by hotkey+revision."""
+        current_ratings = {}
+        current_rounds = {}
+        model_ages = {}
+
+        for uid, miner in miners.items():
+            if prev_ratings and miner.hotkey in prev_ratings:
+                prev = prev_ratings[miner.hotkey]
+                # DynamoDB .get() returns None when key exists but value is None,
+                # so use `or` instead of default parameter
+                current_ratings[uid] = prev.get('elo_rating') or self.config.ELO_BASE_RATING
+                current_rounds[uid] = prev.get('elo_rounds_played') or 0
+                submit_block = prev.get('elo_model_submit_block') or current_block
+                model_ages[uid] = max(0, current_block - submit_block)
+            else:
+                # New miner or new revision (no MINER_STATS record)
+                current_ratings[uid] = self.config.ELO_BASE_RATING
+                current_rounds[uid] = 0
+                model_ages[uid] = 0
+
+        return current_ratings, current_rounds, model_ages
+
+    def _distribute_weights_by_rating(self, miners: Dict[int, MinerData]):
+        """Distribute weights by ELO rating rank with decay.
+
+        Excludes Pareto-filtered miners — they get weight=0 this round
+        but keep their rating for next round.
+        """
+        rated_miners = [
+            (uid, m) for uid, m in miners.items()
+            if m.is_valid_for_scoring()
+            and m.elo_rounds_played > 0
+            and not m.filtered_subsets  # Pareto-filtered get no weight
+        ]
+        rated_miners.sort(key=lambda x: x[1].elo_rating, reverse=True)
+
+        # Apply decay-based weight distribution
+        total = 0.0
+        for rank, (uid, miner) in enumerate(rated_miners, 1):
+            weight = self.decay_factor ** (rank - 1)
+            miner.subset_weights['elo'] = weight
+            miner.subset_ranks['elo'] = rank
+            total += weight
+
+        # Normalize
+        if total > 0:
+            for uid, miner in rated_miners:
+                miner.subset_weights['elo'] /= total
+                miner.cumulative_weight = miner.subset_weights['elo']

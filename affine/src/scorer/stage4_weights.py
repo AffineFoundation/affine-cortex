@@ -118,7 +118,7 @@ class Stage4WeightNormalizer:
         
         # Build header - Hotkey first, then UID, then Model, then First Block, then environments
         header_parts = ["Hotkey  ", "UID", "Model               ", " FirstBlk "]
-        
+
         # Format environment names - use display_name if available
         for env in sorted(environments):
             env_cfg = env_configs.get(env, {})
@@ -128,32 +128,17 @@ class Stage4WeightNormalizer:
                 env_display = env.split(':', 1)[1]  # Keep everything after ':'
             else:
                 env_display = env
-            # Adjust width to accommodate "score[threshold]/count(!)" format
-            header_parts.append(f"{env_display:>20}")
-        
-        # Add layer columns with fixed width - only non-zero layers
-        # Find all layers that have non-zero weights for any miner
-        all_layers = set()
-        for miner in miners.values():
-            for layer, weight in miner.layer_weights.items():
-                if weight > 0:
-                    all_layers.add(layer)
-        
-        # Sort layers
-        active_layers = sorted(all_layers)
-        
-        for layer in active_layers:
-            header_parts.append(f"{'L'+str(layer):>8}")
-        
-        header_parts.extend(["   Total ", "  Weight ", "V"])
+            header_parts.append(f"{env_display:>16}")
+
+        header_parts.extend(["  Rating", "    Δ", " Rnd", "  Weight ", "V"])
         
         print(" | ".join(header_parts), flush=True)
         print("-" * 180, flush=True)
         
-        # Sort miners by final weight
+        # Sort miners by Elo rating descending
         sorted_miners = sorted(
             miners.values(),
-            key=lambda m: m.normalized_weight,
+            key=lambda m: m.elo_rating,
             reverse=True
         )
         
@@ -169,33 +154,25 @@ class Stage4WeightNormalizer:
                 f"{miner.first_block:10d}"  # First block
             ]
             
-            # Environment scores - show "score[threshold]/count(!)" format (score × 100, 2 decimals)
+            # Environment scores - show "score/count" format (score × 100, 2 decimals)
             for env in sorted(environments):
                 if env in miner.env_scores:
                     score = miner.env_scores[env]
                     score_percent = score.avg_score * 100  # Convert to percentage
-                    
-                    # Use stored threshold instead of recalculating
-                    threshold_percent = score.threshold * 100
-                    
+
                     if score.is_valid:
-                        # Valid: show as "92.30[94.84]/500"
-                        score_str = f"{score_percent:.2f}[{threshold_percent:.2f}]/{score.sample_count}"
-                        row_parts.append(f"{score_str:>20}")
+                        score_str = f"{score_percent:.2f}/{score.sample_count}"
                     else:
-                        # Invalid (below threshold): show as "92.30[94.84]/50!" with ! suffix
-                        score_str = f"{score_percent:.2f}[{threshold_percent:.2f}]/{score.sample_count}!"
-                        row_parts.append(f"{score_str:>20}")
+                        score_str = f"{score_percent:.2f}/{score.sample_count}!"
+                    row_parts.append(f"{score_str:>16}")
                 else:
-                    row_parts.append(f"{'  -  ':>20}")
-            
-            # Layer weights - only for active layers
-            for layer in active_layers:
-                weight = miner.layer_weights.get(layer, 0.0)
-                row_parts.append(f"{weight:>8.4f}")
-            
-            # Total (cumulative weight sum) and Weight (normalized)
-            row_parts.append(f"{miner.cumulative_weight:>9.4f}")  # Total: raw sum
+                    row_parts.append(f"{'  -  ':>16}")
+
+            # Rating, Δ, Rnd, Weight, V
+            row_parts.append(f"{int(miner.elo_rating):>8d}")
+            elo_change = int(miner.elo_rating_change)
+            row_parts.append(f"{'+' + str(elo_change) if elo_change >= 0 else str(elo_change):>5}")
+            row_parts.append(f"{int(miner.elo_rounds_played):>4d}")
             row_parts.append(f"{miner.normalized_weight:>9.6f}")  # Weight: normalized
             row_parts.append("✓" if miner.is_valid_for_scoring() else "✗")
             

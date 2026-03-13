@@ -14,6 +14,7 @@ from affine.core.setup import logger
 from affine.database import init_client, close_client
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.scores import ScoresDAO
+from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.src.scorer.scorer import Scorer
 from affine.src.scorer.config import ScorerConfig
 from affine.utils.subtensor import get_subtensor
@@ -125,6 +126,29 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
         block_number = await subtensor.get_current_block()
         logger.info(f"Current block number: {block_number}")
         
+        # Read ELO ratings from MINER_STATS (authoritative source)
+        # Always read ratings (even in dry-run) so ELO ranking is meaningful
+        logger.info("Loading ELO ratings from MINER_STATS...")
+        miner_stats_dao = MinerStatsDAO()
+        prev_ratings = {}
+        try:
+            for composite_key, miner_info in scoring_data.items():
+                hotkey = miner_info.get('hotkey', '')
+                revision = miner_info.get('model_revision', '')
+                if not hotkey or not revision:
+                    continue
+                stats = await miner_stats_dao.get_miner_stats(hotkey, revision)
+                if stats:
+                    prev_ratings[hotkey] = {
+                        'elo_rating': stats.get('elo_rating') or None,
+                        'elo_rounds_played': stats.get('elo_rounds_played') or 0,
+                        'elo_model_submit_block': stats.get('elo_model_submit_block') or None,
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to load ELO ratings from MINER_STATS: {e}")
+            prev_ratings = {}
+        logger.info(f"Loaded ELO ratings for {len(prev_ratings)} miners")
+
         # Calculate scores
         logger.info("Starting scoring calculation...")
         result = scorer.calculate_scores(
@@ -132,6 +156,7 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
             environments=environments,
             env_configs=env_configs,
             block_number=block_number,
+            prev_ratings=prev_ratings if prev_ratings else None,
             print_summary=True
         )
         
@@ -144,7 +169,8 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
             await scorer.save_results(
                 result=result,
                 score_snapshots_dao=score_snapshots_dao,
-                scores_dao=scores_dao
+                scores_dao=scores_dao,
+                miner_stats_dao=miner_stats_dao
             )
             logger.info("Results saved successfully")
         

@@ -434,3 +434,39 @@ class MinerStatsDAO(BaseDAO):
         except Exception as e:
             logger.error(f"Failed to update sampling slots for {hotkey[:8]}...: {e}")
             return False
+
+    async def update_elo_rating(
+        self,
+        hotkey: str,
+        revision: str,
+        elo_rating: float,
+        elo_rounds_played: int,
+        elo_model_submit_block: Optional[int] = None,
+    ) -> None:
+        """Update miner's ELO rating (authoritative data source).
+
+        elo_model_submit_block is only written on first call (when rounds_played == 1).
+        """
+        from affine.database.client import get_client
+        client = get_client()
+
+        pk = self._make_pk(hotkey)
+        sk = self._make_sk(revision)
+
+        update_expr = "SET elo_rating = :r, elo_rounds_played = :rp"
+        expr_values = {
+            ':r': {'N': str(elo_rating)},
+            ':rp': {'N': str(elo_rounds_played)},
+        }
+
+        # First round: record model_submit_block
+        if elo_model_submit_block is not None and elo_rounds_played == 1:
+            update_expr += ", elo_model_submit_block = if_not_exists(elo_model_submit_block, :sb)"
+            expr_values[':sb'] = {'N': str(elo_model_submit_block)}
+
+        await client.update_item(
+            TableName=self.table_name,
+            Key={'pk': {'S': pk}, 'sk': {'S': sk}},
+            UpdateExpression=update_expr,
+            ExpressionAttributeValues=expr_values,
+        )

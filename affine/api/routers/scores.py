@@ -67,6 +67,9 @@ async def get_latest_scores(
                 scores_by_env=s.get("scores_by_env"),
                 total_samples=s.get("total_samples"),
                 cumulative_weight=s.get("cumulative_weight"),
+                elo_rating=s.get("elo_rating"),
+                elo_rounds_played=s.get("elo_rounds_played"),
+                elo_rating_change=s.get("elo_rating_change"),
             )
             for s in scores_list
         ]
@@ -144,6 +147,9 @@ async def get_score_by_uid(
             scores_by_env=miner_score.get("scores_by_env"),
             total_samples=miner_score.get("total_samples"),
             cumulative_weight=miner_score.get("cumulative_weight"),
+            elo_rating=miner_score.get("elo_rating"),
+            elo_rounds_played=miner_score.get("elo_rounds_played"),
+            elo_rating_change=miner_score.get("elo_rating_change"),
         )
         
     except HTTPException:
