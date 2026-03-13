@@ -176,6 +176,13 @@ def update_ratings(
 
             total_change += K_eff * sen_factor * (expected - actual)
 
+        # Normalize by number of opponents (Codeforces convention):
+        # use mean pairwise result instead of sum, so total change
+        # is bounded by K regardless of field size.
+        n_opponents = len(uids) - 1
+        if n_opponents > 1:
+            total_change /= n_opponents
+
         new_rating = max(rating_i + total_change, 0.0)  # 积分下限为 0
         rating_change = new_rating - rating_i  # 实际变化（考虑 floor 截断）
         new_rounds = rounds_i + 1

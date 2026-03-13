@@ -130,7 +130,7 @@ class Stage4WeightNormalizer:
                 env_display = env
             header_parts.append(f"{env_display:>16}")
 
-        header_parts.extend(["  Rating", "    Δ", " Rnd", "  Weight ", "V"])
+        header_parts.extend(["  Rating", "     Δ", " Rnd", "  Weight ", "V"])
         
         print(" | ".join(header_parts), flush=True)
         print("-" * 180, flush=True)
