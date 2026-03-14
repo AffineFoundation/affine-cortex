@@ -70,6 +70,7 @@ async def get_latest_scores(
                 elo_rating=s.get("elo_rating"),
                 elo_rounds_played=s.get("elo_rounds_played"),
                 elo_rating_change=s.get("elo_rating_change"),
+                filter_info=s.get("filter_info"),
             )
             for s in scores_list
         ]
@@ -150,6 +151,7 @@ async def get_score_by_uid(
             elo_rating=miner_score.get("elo_rating"),
             elo_rounds_played=miner_score.get("elo_rounds_played"),
             elo_rating_change=miner_score.get("elo_rating_change"),
+            filter_info=miner_score.get("filter_info"),
         )
         
     except HTTPException:

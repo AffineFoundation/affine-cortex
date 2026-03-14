@@ -94,6 +94,7 @@ class MinerScore(BaseModel):
     elo_rating: Optional[float] = None
     elo_rounds_played: Optional[int] = None
     elo_rating_change: Optional[float] = None
+    filter_info: Optional[Dict[str, Any]] = None
 
 
 class ScoresResponse(BaseModel):

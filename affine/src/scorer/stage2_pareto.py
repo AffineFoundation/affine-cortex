@@ -92,8 +92,9 @@ class Stage2ParetoFilter:
                 continue
             
             # Perform pairwise Pareto comparisons
-            dominated_in_subset = set()
-            
+            # {dominated_uid: dominator_uid}
+            dominated_in_subset: Dict[int, int] = {}
+
             for i, miner_a in enumerate(valid_miners_for_subset):
                 for miner_b in valid_miners_for_subset[i + 1:]:
                     # A came before B (sorted by first_block)
@@ -103,27 +104,27 @@ class Stage2ParetoFilter:
                         subset_envs,
                         subset_key
                     )
-                    
+
                     comparisons.append(comparison)
-                    
-                    # Track dominated miners
+
+                    # Track dominated miners with dominator uid
                     if comparison.a_dominates_b:
-                        dominated_in_subset.add(miner_b.uid)
+                        dominated_in_subset[miner_b.uid] = miner_a.uid
                     elif comparison.b_dominates_a:
-                        dominated_in_subset.add(miner_a.uid)
+                        dominated_in_subset[miner_a.uid] = miner_b.uid
                         logger.debug(
                             f"Subset {subset_key}: UID {miner_b.uid} dominates UID {miner_a.uid}"
                         )
-            
+
             # Update miners with filtering results
-            for miner_uid in dominated_in_subset:
+            for miner_uid, dominator_uid in dominated_in_subset.items():
                 if miner_uid in miners:
                     miners[miner_uid].filtered_subsets.append(subset_key)
-                    miners[miner_uid].filter_reasons[subset_key] = "dominated"
+                    miners[miner_uid].filter_reasons[subset_key] = f"dom>{dominator_uid}"
                     filtered_count += 1
-                    
+
                     logger.debug(
-                        f"UID {miner_uid} filtered from {subset_key} (Pareto dominated)"
+                        f"UID {miner_uid} filtered from {subset_key} (dominated by UID {dominator_uid})"
                     )
         
         logger.info(
