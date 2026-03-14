@@ -112,13 +112,15 @@ class Stage3SubsetScorer:
             # Pareto-filtered miners don't participate in ELO ranking
             if miner.filtered_subsets:
                 continue
-            env_scores = [
-                miner.env_scores[env].avg_score
+            # Miner must have valid scores in ALL subset environments
+            all_valid = all(
+                env in miner.env_scores and miner.env_scores[env].is_valid
                 for env in environments
-                if env in miner.env_scores and miner.env_scores[env].is_valid
-            ]
-            if env_scores:
-                scores[uid] = geometric_mean(env_scores, epsilon=self.geometric_mean_epsilon)
+            )
+            if not all_valid:
+                continue
+            env_scores = [miner.env_scores[env].avg_score for env in environments]
+            scores[uid] = geometric_mean(env_scores, epsilon=self.geometric_mean_epsilon)
 
         # Rank with tied-rank handling
         sorted_uids = sorted(scores.keys(), key=lambda u: scores[u], reverse=True)

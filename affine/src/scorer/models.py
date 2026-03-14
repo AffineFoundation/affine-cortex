@@ -42,7 +42,7 @@ class MinerData:
     filter_reasons: Dict[str, str] = field(default_factory=dict)
     
     # Stage 3: ELO
-    elo_rating: float = 1500.0
+    elo_rating: float = 1200.0
     elo_rating_change: float = 0.0
     elo_rounds_played: int = 0
 

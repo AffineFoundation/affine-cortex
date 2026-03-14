@@ -117,7 +117,7 @@ class Stage4WeightNormalizer:
         print("=" * 180, flush=True)
         
         # Build header - Hotkey first, then UID, then Model, then First Block, then environments
-        header_parts = ["Hotkey  ", "UID", "Model               ", " FirstBlk "]
+        header_parts = ["Hotkey  ", " UID", "Model               ", " FirstBlk "]
 
         # Format environment names - use display_name if available
         for env in sorted(environments):
@@ -149,7 +149,7 @@ class Stage4WeightNormalizer:
 
             row_parts = [
                 f"{miner.hotkey[:8]:8s}",  # Hotkey first
-                f"{miner.uid:3d}",          # UID second
+                f"{miner.uid:4d}",          # UID second
                 f"{model_display:20s}",     # Model repo name (20 chars)
                 f"{miner.first_block:10d}"  # First block
             ]
