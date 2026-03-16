@@ -290,6 +290,48 @@ class APIClient:
             raise NetworkError(f"Network error during PUT {url}: {e}", url, e)
         
 
+    async def delete(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        """Make DELETE request to API endpoint.
+        
+        Args:
+            endpoint: API endpoint path
+            params: Optional query parameters
+            headers: Optional request headers
+        
+        Returns:
+            Response data dict on success, empty dict for 204 No Content
+            
+        Raises:
+            NetworkError: On network/connection errors
+            ApiResponseError: On non-2xx response or invalid JSON
+        """
+        
+        url = f"{self.base_url}{endpoint}"
+        logger.debug(f"DELETE {url}")
+
+        try:
+            async with self._session.delete(url, params=params, headers=headers) as response:
+                if response.status >= 400:
+                    body = await response.text()
+                    raise ApiResponseError(f"HTTP {response.status}: {body[:200]}", response.status, url, body)
+                
+                if response.status == 204:
+                    return {}
+                
+                try:
+                    return await response.json()
+                except Exception:
+                    raw = await response.text()
+                    raise ApiResponseError(f"Invalid JSON response: {raw[:200]}", response.status, url, raw)
+
+        except aiohttp.ClientError as e:
+            raise NetworkError(f"Network error during DELETE {url}: {e}", url, e)
+
     async def get_chute_info(self, chute_id: str) -> Optional[Dict]:
         """Get chute info from Chutes API.
         
