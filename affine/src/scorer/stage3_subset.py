@@ -73,9 +73,9 @@ class Stage3SubsetScorer:
                 alpha=self.config.ELO_SENIORITY_ALPHA,
             )
 
-            # Write results to MinerData
+            # Write results to MinerData (enforce rating floor at BASE_RATING)
             for uid, (new_rating, change, new_rounds) in elo_results.items():
-                miners[uid].elo_rating = new_rating
+                miners[uid].elo_rating = max(new_rating, self.config.ELO_BASE_RATING)
                 miners[uid].elo_rating_change = change
                 miners[uid].elo_rounds_played = new_rounds
 
