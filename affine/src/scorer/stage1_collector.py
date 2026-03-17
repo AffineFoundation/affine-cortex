@@ -192,8 +192,8 @@ class Stage1Collector:
                 env_config = env_configs.get(env_name, {})
                 env_min_completeness = env_config.get('min_completeness', self.min_completeness)
                 
-                # Validate completeness
-                is_valid = completeness >= env_min_completeness
+                # Validate completeness (with epsilon tolerance for floating-point edge cases)
+                is_valid = completeness >= env_min_completeness - 1e-9
 
                 # Calculate required score threshold (sample-size aware)
                 # Get environment-specific threshold config or use defaults
