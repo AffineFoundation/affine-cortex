@@ -96,16 +96,92 @@ class WeightSetter:
 
         return uids, weights_array.tolist()
 
+    def _validate_uid_hotkey_mapping(
+        self,
+        api_weights: Dict[str, Dict],
+        metagraph,
+    ) -> Dict[str, Dict]:
+        """Validate UID-hotkey mappings against a fresh metagraph.
+
+        Compares the hotkey stored in each weight entry (set at scoring time)
+        with the current metagraph hotkey for that UID.  Entries that no longer
+        match are dropped so that weights are never applied to the wrong entity.
+
+        Returns:
+            Filtered copy of api_weights containing only valid entries.
+        """
+        if metagraph is None:
+            logger.warning("No metagraph provided for UID-hotkey validation; skipping check")
+            return api_weights
+
+        valid_weights: Dict[str, Dict] = {}
+        hotkeys = metagraph.hotkeys
+
+        for uid_str, weight_data in api_weights.items():
+            try:
+                uid = int(uid_str)
+            except (ValueError, TypeError):
+                continue
+
+            expected_hotkey = weight_data.get("hotkey")
+            if not expected_hotkey:
+                # No hotkey recorded — cannot validate, pass through
+                valid_weights[uid_str] = weight_data
+                continue
+
+            # System miners (uid > 1000 or uid < 0) are virtual; skip validation
+            if uid < 0 or uid > 1000:
+                valid_weights[uid_str] = weight_data
+                continue
+
+            if uid >= len(hotkeys):
+                logger.warning(
+                    f"UID {uid} out of metagraph range ({len(hotkeys)} neurons), "
+                    f"skipping weight entry"
+                )
+                continue
+
+            current_hotkey = hotkeys[uid]
+            if current_hotkey != expected_hotkey:
+                logger.warning(
+                    f"UID-hotkey mismatch for UID {uid}: "
+                    f"expected {expected_hotkey}, "
+                    f"metagraph has {current_hotkey}. "
+                    f"Dropping weight to prevent mis-assignment."
+                )
+                continue
+
+            valid_weights[uid_str] = weight_data
+
+        dropped = len(api_weights) - len(valid_weights)
+        if dropped:
+            logger.warning(f"Dropped {dropped} weight entries due to UID-hotkey mismatches")
+        return valid_weights
+
     async def set_weights(
         self,
         api_weights: Dict[str, Dict],
         burn_percentage: float = 0.0,
-        max_retries: int = 3
+        max_retries: int = 3,
+        metagraph=None,
     ) -> bool:
-        """Set weights on chain with retry logic."""
+        """Set weights on chain with retry logic.
+
+        Args:
+            api_weights: UID-string to weight-data mapping from the scoring API.
+            burn_percentage: Fraction of total weight to burn (allocate to UID 0).
+            max_retries: Number of on-chain submission retries.
+            metagraph: A freshly-synced metagraph used for UID-hotkey validation.
+                       When provided, entries whose hotkey no longer matches
+                       the current metagraph are dropped before submission.
+        """
         subtensor = await get_subtensor()
+
+        # Validate UID-hotkey mappings against fresh metagraph
+        api_weights = self._validate_uid_hotkey_mapping(api_weights, metagraph)
+
         uids, weights = await self.process_weights(api_weights, burn_percentage)
-        
+
         if not uids:
             logger.warning("No valid weights to set")
             return False

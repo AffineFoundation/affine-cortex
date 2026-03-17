@@ -248,14 +248,28 @@ class ValidatorService:
             burn_percentage = config.get("validator_burn_percentage", 0.0)
             burn_percentage = float(burn_percentage)
 
-        # 3. Set weights using WeightSetter with timeout
+        # 3. Refresh metagraph to get current UID-hotkey mappings
+        self.update_watchdog("refreshing metagraph")
+        try:
+            subtensor = await get_subtensor()
+            metagraph = await subtensor.metagraph(netuid=self.netuid)
+            logger.info(
+                f"Refreshed metagraph: {len(metagraph.hotkeys)} neurons "
+                f"at block {metagraph.block}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to refresh metagraph before weight setting: {e}")
+            return
+
+        # 4. Set weights using WeightSetter with timeout
         self.update_watchdog("setting weights")
         try:
             # Timeout set to 8 minutes (less than 10min watchdog timeout)
             await asyncio.wait_for(
                 self.weight_setter.set_weights(
                     weights_data.get("weights", {}),
-                    burn_percentage
+                    burn_percentage,
+                    metagraph=metagraph,
                 ),
                 timeout=480
             )
