@@ -1067,7 +1067,13 @@ class SamplingScheduler:
                 )
     
     async def _rotate_environment(self, env: str, sampling_config: dict):
-        """Rotate sampling list for a single environment."""
+        """Rotate sampling list for a single environment.
+
+        Order of operations matters for consistency:
+        1. Compute new list
+        2. Cleanup removed tasks FIRST (prevents stale task processing)
+        3. Update config LAST (new tasks only visible after cleanup)
+        """
         logger.info(f"Rotating sampling list for {env}")
 
         current_list = sampling_config['sampling_list']
@@ -1084,14 +1090,16 @@ class SamplingScheduler:
             rotation_count=rotation_count,
             prioritize_new=prioritize_new
         )
-        
+
         logger.info(
             f"Rotated {env}: removed={len(removed_ids)}, added={len(added_ids)}, "
             f"new_size={len(new_list)}"
         )
-        
-        await self._update_sampling_config(env, new_list)
+
+        # Cleanup removed tasks BEFORE updating config to prevent
+        # the race window where stale tasks are still fetchable
         await self._cleanup_removed_tasks(env, removed_ids)
+        await self._update_sampling_config(env, new_list)
     
     async def _update_sampling_config(self, env: str, new_list: List[int]):
         """Update sampling_list in SystemConfig."""
@@ -1143,9 +1151,10 @@ class SamplingScheduler:
             f"new_size={len(new_list)}"
         )
         
-        await self._update_sampling_config(env, new_list)
+        # Cleanup before config update to prevent stale task race
         await self._cleanup_removed_tasks(env, removed_ids)
-    
+        await self._update_sampling_config(env, new_list)
+
     async def _cleanup_removed_tasks(self, env: str, removed_ids: List[int]):
         """Cleanup removed task IDs from TaskPool (pending only)."""
         if not removed_ids:
