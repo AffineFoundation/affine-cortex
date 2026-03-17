@@ -29,7 +29,7 @@ router = APIRouter(prefix="/tasks", tags=["Tasks"])
 
 # Conditionally register task management endpoints based on SERVICES_ENABLED
 if config.SERVICES_ENABLED:
-    @router.post("/fetch", response_model=TaskFetchResponse)
+    @router.post("/fetch", response_model=TaskFetchResponse, dependencies=[Depends(rate_limit_read)])
     async def fetch_task(
         env: Optional[str] = Query(None, description="Environment filter (optional)"),
         batch_size: int = Query(1, ge=1, le=50, description="Number of tasks to fetch (1-50)"),
