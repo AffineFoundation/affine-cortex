@@ -257,7 +257,7 @@ async def create_auth_service_from_chain(netuid: int = 1) -> AuthService:
         
     except ImportError:
         logger.error("bittensor not installed, cannot fetch validators from chain")
-        return AuthService(authorized_validators=set(), strict_mode=False)
+        raise RuntimeError("Cannot create auth service: bittensor not installed")
     except Exception as e:
         logger.error(f"Error fetching validators from chain: {e}")
-        return AuthService(authorized_validators=set(), strict_mode=False)
+        raise RuntimeError(f"Cannot create auth service: {e}")

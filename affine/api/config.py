@@ -40,6 +40,11 @@ class APIConfig:
         os.getenv("API_MAX_REQUEST_SIZE", str(10 * 1024 * 1024))
     )  # 10MB
 
+    # Authentication
+    AUTH_STRICT_MODE: bool = (
+        os.getenv("AUTH_STRICT_MODE", "true").lower() == "true"
+    )
+
     # Services settings
     SERVICES_ENABLED: bool = (
         os.getenv("API_SERVICES_ENABLED", "false").lower() == "true"

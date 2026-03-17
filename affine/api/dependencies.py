@@ -93,12 +93,10 @@ def get_auth_service() -> AuthService:
     """Get AuthService instance for executor authentication."""
     global _auth_service
     if _auth_service is None:
-        # Create with non-strict mode for development
-        # In production, use create_auth_service_from_chain()
         _auth_service = AuthService(
             authorized_validators=set(),
-            signature_expiry_seconds=60,  # 1 minute timeout
-            strict_mode=False  # Non-strict for development
+            signature_expiry_seconds=60,
+            strict_mode=config.AUTH_STRICT_MODE,
         )
     return _auth_service
 
