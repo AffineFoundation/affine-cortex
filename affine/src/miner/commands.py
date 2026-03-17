@@ -9,6 +9,7 @@ Provides command functions for miners:
 """
 
 import os
+import re
 import sys
 import json
 import asyncio
@@ -18,6 +19,42 @@ from typing import Optional
 from affine.utils.api_client import cli_api_client
 from affine.core.setup import logger, NETUID
 from affine.utils.subtensor import get_subtensor
+
+
+# ---------------------------------------------------------------------------
+# Credential scrubbing - prevents secrets from leaking into log output
+# ---------------------------------------------------------------------------
+
+_CREDENTIAL_PATTERNS = [
+    # Chutes API keys (cpk_ prefix)
+    re.compile(r"(cpk_)[A-Za-z0-9_\-]{4,}", re.IGNORECASE),
+    # HuggingFace tokens (hf_ prefix)
+    re.compile(r"(hf_)[A-Za-z0-9]{4,}", re.IGNORECASE),
+    # Generic key=value patterns for known env-var names
+    re.compile(
+        r"(CHUTES_API_KEY|HF_TOKEN|HUGGING_FACE_HUB_TOKEN|API_KEY|SECRET_KEY|ACCESS_TOKEN)"
+        r"[\s=:]+\S+",
+        re.IGNORECASE,
+    ),
+    # Bearer / Authorization header values
+    re.compile(r"(Bearer\s+)\S+", re.IGNORECASE),
+    re.compile(r"(Authorization:\s*)\S+", re.IGNORECASE),
+    # token=<value> in URLs or key-value pairs
+    re.compile(r"(token=)[^\s&\"']+", re.IGNORECASE),
+    re.compile(r"(key=)[^\s&\"']+", re.IGNORECASE),
+    re.compile(r"(secret=)[^\s&\"']+", re.IGNORECASE),
+]
+
+
+def _scrub_credentials(text: str) -> str:
+    """Replace potential credentials in text with a redacted placeholder.
+
+    This is intentionally aggressive: it is better to over-redact in logs
+    than to leak a secret.
+    """
+    for pattern in _CREDENTIAL_PATTERNS:
+        text = pattern.sub(r"\1***REDACTED***", text)
+    return text
 
 
 def get_conf(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -353,10 +390,9 @@ chute = build_sglang_chute(
         
         stdout, _ = await proc.communicate()
         output = stdout.decode(errors="ignore")
-        logger.trace(output)
+        logger.trace(_scrub_credentials(output))
         
         # Check for errors
-        import re
         match = re.search(
             r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
         )
@@ -387,7 +423,7 @@ chute = build_sglang_chute(
         logger.info(f"Deployed to Chutes: {chute_id}")
     
     except Exception as e:
-        logger.error(f"Chutes deployment failed: {e}")
+        logger.error(f"Chutes deployment failed: {_scrub_credentials(str(e))}")
         print(json.dumps({"success": False, "error": str(e)}))
         tmp_file.unlink(missing_ok=True)
         sys.exit(1)
@@ -654,6 +690,82 @@ async def get_envs_command():
             print(json.dumps(data, indent=2, ensure_ascii=False))
 
 
+class DeploymentState:
+    """Tracks completed deployment steps for rollback on failure.
+
+    Each step records what was done so that, if a later step fails, we can
+    attempt to undo the already-completed work and avoid orphaned resources.
+    """
+
+    def __init__(self):
+        self.completed_steps: list = []
+        self.hf_repo_created = None
+        self.hf_revision = None
+        self.hf_token = None
+        self.hf_was_private = False
+        self.hf_made_public = False
+        self.chute_deployed = None
+        self.chutes_api_key = None
+        self.on_chain_committed = False
+
+    def record(self, step, **kwargs):
+        self.completed_steps.append(step)
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+        logger.debug(f"DeploymentState: completed '{step}' (total: {self.completed_steps})")
+
+    async def rollback(self):
+        """Best-effort rollback of all completed steps in reverse order."""
+        if not self.completed_steps:
+            return
+        logger.warning(f"Rolling back deployment. Completed steps: {self.completed_steps}")
+
+        for step in reversed(self.completed_steps):
+            try:
+                if step == "hf_upload" and self.hf_repo_created and self.hf_token:
+                    logger.warning(f"  Rollback: deleting HuggingFace repo {self.hf_repo_created}")
+                    from huggingface_hub import HfApi
+                    api = HfApi(token=self.hf_token)
+                    api.delete_repo(repo_id=self.hf_repo_created, repo_type="model")
+                    logger.info(f"  Rollback: deleted HF repo {self.hf_repo_created}")
+
+                elif step == "make_public" and self.hf_repo_created and self.hf_token:
+                    logger.warning(f"  Rollback: making HF repo {self.hf_repo_created} private again")
+                    from huggingface_hub import HfApi
+                    api = HfApi(token=self.hf_token)
+                    api.update_repo_visibility(
+                        repo_id=self.hf_repo_created,
+                        private=True,
+                        repo_type="model",
+                    )
+                    logger.info(f"  Rollback: repo {self.hf_repo_created} set back to private")
+
+                elif step == "chutes_deploy" and self.chute_deployed and self.chutes_api_key:
+                    logger.warning(f"  Rollback: removing Chutes deployment {self.chute_deployed}")
+                    import subprocess
+                    env = {**os.environ, "CHUTES_API_KEY": self.chutes_api_key}
+                    result = subprocess.run(
+                        ["chutes", "undeploy", self.chute_deployed],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        timeout=60,
+                    )
+                    if result.returncode == 0:
+                        logger.info(f"  Rollback: undeployed chute {self.chute_deployed}")
+                    else:
+                        logger.error(f"  Rollback: chute undeploy failed: {result.stderr}")
+
+                elif step == "on_chain_commit":
+                    logger.error(
+                        "  Rollback: on-chain commit CANNOT be automatically reverted. "
+                        "Manual intervention required to supersede the stale commitment."
+                    )
+
+            except Exception as e:
+                logger.error(f"  Rollback failed for step '{step}': {e}")
+
+
 async def deploy_command(
     repo: str,
     model_path: Optional[str] = None,
@@ -741,6 +853,11 @@ async def deploy_command(
                 print(json.dumps({"success": False, "error": "CHUTE_USER not configured"}))
                 sys.exit(1)
     
+    # Initialize deployment state tracker for rollback on failure
+    deploy_state = DeploymentState()
+    deploy_state.hf_token = hf_token
+    deploy_state.chutes_api_key = chutes_api_key
+
     # Determine which steps to run
     # For private_repo workflow: upload -> commit -> make_public -> deploy
     # For normal workflow: upload -> deploy -> commit
@@ -971,9 +1088,8 @@ chute = build_sglang_chute(
                     
                     stdout, _ = await proc.communicate()
                     output = stdout.decode(errors="ignore")
-                    logger.trace(output)
+                    logger.trace(_scrub_credentials(output))
                     
-                    import re
                     match = re.search(
                         r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
                     )
@@ -989,7 +1105,7 @@ chute = build_sglang_chute(
                     logger.info(f"  Chutes deployment complete. Chute ID: {chute_id}")
                     
                 except Exception as e:
-                    logger.error(f"Chutes deployment failed: {e}")
+                    logger.error(f"Chutes deployment failed: {_scrub_credentials(str(e))}")
                     if 'tmp_file' in locals():
                         tmp_file.unlink(missing_ok=True)
                     print(json.dumps({"success": False, "error": f"Chutes deployment failed: {str(e)}"}))
@@ -1056,9 +1172,8 @@ chute = build_sglang_chute(
                     
                     stdout, _ = await proc.communicate()
                     output = stdout.decode(errors="ignore")
-                    logger.trace(output)
+                    logger.trace(_scrub_credentials(output))
                     
-                    import re
                     match = re.search(
                         r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
                     )
@@ -1081,7 +1196,7 @@ chute = build_sglang_chute(
                     logger.info(f"  Chutes deployment complete. Chute ID: {chute_id}")
                     
                 except Exception as e:
-                    logger.error(f"Chutes deployment failed: {e}")
+                    logger.error(f"Chutes deployment failed: {_scrub_credentials(str(e))}")
                     if 'tmp_file' in locals():
                         tmp_file.unlink(missing_ok=True)
                     print(json.dumps({"success": False, "error": f"Chutes deployment failed: {str(e)}"}))
