@@ -220,11 +220,28 @@ class MinersMonitor:
                 )
             }
 
-            # Compute total hash
+            # Include config/architecture files in hash to prevent
+            # different models with identical weights from colliding.
+            # Without this, two models with different architectures or
+            # tokenizers but same weight tensors would produce the same hash.
+            _CONFIG_FILES = {
+                "config.json", "tokenizer_config.json", "tokenizer.json",
+                "modeling_config.json", "generation_config.json",
+            }
+            config_shas = set()
+            for s in siblings:
+                name = _name(s)
+                if name in _CONFIG_FILES or name.endswith(".py"):
+                    lfs = getattr(s, "lfs", None)
+                    if isinstance(lfs, dict) and "sha256" in lfs:
+                        config_shas.add(f"cfg:{name}:{lfs['sha256']}")
+
+            # Compute total hash (weights + config files)
             model_hash = None
-            if shas:
+            all_hashes = sorted(shas) + sorted(config_shas)
+            if all_hashes:
                 import hashlib
-                model_hash = hashlib.sha256("".join(sorted(shas)).encode()).hexdigest()
+                model_hash = hashlib.sha256("".join(all_hashes).encode()).hexdigest()
 
             # Check commit history for duplicate or suspicious patterns
             duplicate_source = ""

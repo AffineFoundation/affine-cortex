@@ -306,9 +306,10 @@ class PerMinerSamplingScheduler:
         Returns:
             True if sampling should be skipped, False otherwise
         """
-        # System models (uid == 0 or uid > 1000) are not rate limited
-        if miner.get('uid', 0) == 0 or miner.get('uid', 0) > 1000:
-            return False
+        # System models (uid == 0 or uid > 1000) get a higher rate limit
+        # instead of blanket exemption, to limit damage if credentials are compromised
+        is_system_miner = miner.get('uid', -1) == 0 or miner.get('uid', -1) > 1000
+        SYSTEM_MINER_RATE_MULTIPLIER = 5  # 5x normal rate limit
 
         # Models submitting for more than 48 hours (~14400 blocks at 12s/block)
         # are exempt from rate limiting. By then, sampling has completed at least
@@ -341,6 +342,10 @@ class PerMinerSamplingScheduler:
 
         # Round up to make fractional rates effective
         allowed_per_hour = math.ceil(allowed_per_hour)
+
+        # System miners get a higher limit instead of blanket exemption
+        if is_system_miner:
+            allowed_per_hour *= SYSTEM_MINER_RATE_MULTIPLIER
 
         # Compare allocation count with limit
         if allocation_count >= allowed_per_hour:
