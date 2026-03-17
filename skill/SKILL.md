@@ -264,15 +264,19 @@ af -vv eval --env GAME --uid 7 --samples 5
 
 ### 2.9 Monitor Your Miner
 
+**Essential — check these regularly:**
 ```bash
-af get-miner <your-uid>       # Miner info
-af get-rank                    # Full ranking table
-af get-score <your-uid>        # Your score
-af get-scores --top 20         # Top miners
-af get-sample <uid> <env> <task-id>  # Specific sample result
-af get-pool <uid> <env>        # Pending tasks
-af get-weights                 # Current weights
-af get-envs                    # Environment configs
+af get-rank                    # Full ranking table — see where you stand
+af get-miner <your-uid>        # Your detailed status: scores per env, online state, model info
+af get-score <your-uid>        # Quick score lookup
+af get-scores --top 20         # Top miners for benchmarking
+```
+
+**Occasionally useful:**
+```bash
+af get-weights                 # Current on-chain weights
+af get-envs                    # Environment configs (check if new envs added)
+af get-sample <uid> <env> <task-id>  # Inspect specific evaluation result (debugging)
 ```
 
 ### 2.10 Key Rules for Miners
@@ -287,12 +291,12 @@ af get-envs                    # Environment configs
 
 ### 2.11 Tips for Competitive Mining
 
-1. Use `--private-repo` to prevent copying before commit
-2. Keep Chutes warm — increase `shutdown_after_seconds` or send periodic requests
-3. Evaluate before deploying — benchmark against top miners with `af eval`
-4. Use negative UIDs: syntax `n1` for UID -1 (e.g., `af pull n1`)
-5. Monitor validator activity with `af get-pool`
-6. Iterate with RL — Pareto frontier means you need to be *better* than existing models
+1. **Use `--private-repo`** to prevent copying before your on-chain commit lands
+2. **Keep Chutes warm** — increase `shutdown_after_seconds` or send periodic health-check requests; offline chutes = zero score
+3. **Benchmark before deploying** — run `af eval --env <ENV> --uid <top-miner-uid> --samples 20` to compare your model against leaders
+4. **Track your rank daily** — `af get-rank` shows the full leaderboard; `af get-miner <your-uid>` shows your detailed status, scores per environment, and online state
+5. **Diversify across environments** — geometric mean scoring means a zero in ANY environment collapses your total score; train broadly
+6. **Iterate with RL** — Pareto dominance means you must *genuinely surpass* existing models, not just match them
 
 ---
 
@@ -551,18 +555,23 @@ Used primarily by SWE-INFINITE and complex agentic environments.
 | `af commit --repo <repo> --revision <SHA> --chute-id <id>` | Submit commitment on-chain |
 | `af eval` | Evaluate models against environments |
 
-### Query Commands
+### Query Commands — Core (daily use)
 
 | Command | Purpose |
 |---|---|
-| `af get-miner <uid>` | Query miner information |
-| `af get-rank` | Full miner ranking table |
-| `af get-scores [--top N]` | Top miners by score |
-| `af get-score <uid>` | Specific miner's score |
-| `af get-weights` | Normalized weights |
-| `af get-sample <uid> <env> <task_id>` | Evaluation sample result |
-| `af get-pool <uid> <env>` | Miner's task pool |
-| `af get-envs` | Environment configurations |
+| `af get-rank` | **Full miner ranking table** — your go-to for competitive overview |
+| `af get-miner <uid>` | **Detailed miner info** — scores per env, online status, model details |
+| `af get-score <uid>` | Quick score check for a specific miner |
+| `af get-scores [--top N]` | Top miners by score (default top 32) |
+
+### Query Commands — Supplementary
+
+| Command | Purpose |
+|---|---|
+| `af get-weights` | Current normalized on-chain weights |
+| `af get-envs` | Environment configurations and status |
+| `af get-sample <uid> <env> <task_id>` | Inspect a specific evaluation result |
+| `af get-pool <uid> <env>` | View pending tasks for a miner (niche — mainly for debugging task flow) |
 
 ### Admin/Server Commands
 
