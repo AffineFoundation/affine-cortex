@@ -181,6 +181,24 @@ class Stage2ParetoFilter:
             if common_tasks:
                 score_a = sum(env_score_a.all_task_scores[t] for t in common_tasks) / len(common_tasks)
                 score_b = sum(env_score_b.all_task_scores[t] for t in common_tasks) / len(common_tasks)
+
+                # Coverage penalty: if B evaluated far fewer tasks than A,
+                # penalize B's score proportionally to prevent cherry-picking.
+                # A miner who only evaluates easy tasks should not benefit from
+                # the intersection silently dropping hard tasks.
+                a_total = len(env_score_a.all_task_scores)
+                b_total = len(env_score_b.all_task_scores)
+                coverage_ratio = min(b_total / max(a_total, 1), 1.0)
+                if coverage_ratio < 0.5:
+                    # Severe cherry-picking: B evaluated less than half of A's tasks
+                    # Scale B's score down proportionally
+                    score_b *= coverage_ratio * 2  # 0 at 0% coverage, full at 50%+
+                    logger.debug(
+                        f"Coverage penalty applied: B ({miner_b.uid}) evaluated "
+                        f"{b_total}/{a_total} tasks (ratio={coverage_ratio:.2f}), "
+                        f"score adjusted to {score_b:.4f}"
+                    )
+
                 # Recompute threshold from A's aligned score and intersection count
                 env_threshold_config = self.config.ENV_THRESHOLD_CONFIGS.get(env, {})
                 threshold = calculate_required_score(

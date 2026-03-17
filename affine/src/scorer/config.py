@@ -118,7 +118,7 @@ class ScorerConfig:
     # Lower values = easier to beat (lower difficulty)
     # Higher values = harder to beat (higher difficulty)
     ENV_THRESHOLD_CONFIGS: Dict[str, Dict[str, float]] = {
-        'GAME': {'z_score': 1},    # easier to beat (default 1.5)
+        'GAME': {'z_score': 1.5},    # aligned with default (was 1.0, too permissive)
         'PRINT': {'z_score': 2.0},   # harder to beat (default 1.5)
         'SWE-SYNTH': {'z_score': 2.0},
         'SWE-INFINITE': {'z_score': 2.0},
