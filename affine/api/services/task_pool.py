@@ -17,6 +17,7 @@ Optimizations:
 import asyncio
 import time
 import random
+import secrets
 import os
 from typing import Dict, Any, Optional, List, Tuple, Callable, TypeVar, Generic
 
@@ -435,8 +436,10 @@ class TaskPoolManager:
                 logger.debug(f"No pending tasks found for env={env}")
                 return []
             
-            # Randomly shuffle to avoid miner starvation
-            random.shuffle(pending_tasks)
+            # Cryptographically secure shuffle to avoid miner starvation
+            # and prevent task ordering prediction via MT19937 state recovery
+            _sysrand = random.SystemRandom()
+            _sysrand.shuffle(pending_tasks)
             
             # Take first batch_size tasks
             tasks_to_assign = pending_tasks[:batch_size]

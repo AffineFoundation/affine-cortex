@@ -16,6 +16,7 @@ from affine.api.dependencies import (
     get_task_pool_manager,
     verify_executor_auth,
     rate_limit_read,
+    rate_limit_write,
 )
 from affine.api.config import config
 from affine.core.models import SampleSubmission
@@ -87,7 +88,7 @@ if config.SERVICES_ENABLED:
             )
 
 
-    @router.post("/submit", response_model=SampleSubmitResponse)
+    @router.post("/submit", response_model=SampleSubmitResponse, dependencies=[Depends(rate_limit_write)])
     async def submit_sample_from_executor(
         submission: Dict[str, Any],
         executor_hotkey: str = Depends(verify_executor_auth),
