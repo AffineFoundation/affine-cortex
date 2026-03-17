@@ -50,7 +50,7 @@ services:
       - .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-      - ~/.ssh:/root/.ssh
+      - ~/.ssh:/root/.ssh:ro
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
       - /var/log/affine/executor:/var/log/affine/executor
       - ./affinetes_hosts.json:/app/affinetes_hosts.json
