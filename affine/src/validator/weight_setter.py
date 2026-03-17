@@ -4,8 +4,9 @@ Weight Setter
 Handles weight processing and setting on chain.
 """
 
+import hashlib
 import bittensor as bt
-from typing import List, Tuple, Dict
+from typing import List, Optional, Tuple, Dict
 import numpy as np
 import asyncio
 
@@ -16,6 +17,8 @@ class WeightSetter:
     def __init__(self, wallet: bt.Wallet, netuid: int):
         self.wallet = wallet
         self.netuid = netuid
+        self._last_set_block: Optional[int] = None
+        self._last_weight_hash: Optional[str] = None
 
     async def process_weights(
         self,
@@ -96,21 +99,41 @@ class WeightSetter:
 
         return uids, weights_array.tolist()
 
+    @staticmethod
+    def _hash_weights(uids: List[int], weights: List[float]) -> str:
+        """Compute a deterministic hash of the weight vector for dedup."""
+        data = str(sorted(zip(uids, [f"{w:.8f}" for w in weights])))
+        return hashlib.sha256(data.encode()).hexdigest()[:16]
+
     async def set_weights(
         self,
         api_weights: Dict[str, Dict],
         burn_percentage: float = 0.0,
-        max_retries: int = 3
+        max_retries: int = 3,
+        interval_blocks: int = 180,
     ) -> bool:
-        """Set weights on chain with retry logic."""
+        """Set weights on chain with retry logic and deduplication.
+
+        Args:
+            api_weights: Weight data from API
+            burn_percentage: Burn percentage for UID 0
+            max_retries: Max retry attempts
+            interval_blocks: Submission window interval for block validation
+        """
         subtensor = await get_subtensor()
         uids, weights = await self.process_weights(api_weights, burn_percentage)
-        
+
         if not uids:
             logger.warning("No valid weights to set")
             return False
 
-        logger.info(f"Setting weights for {len(uids)} miners (burn={burn_percentage:.1%})")
+        # Dedup: skip if weights are identical to last successful submission
+        weight_hash = self._hash_weights(uids, weights)
+        if weight_hash == self._last_weight_hash:
+            logger.info(f"Weights unchanged since last submission (hash={weight_hash}), skipping")
+            return True
+
+        logger.info(f"Setting weights for {len(uids)} miners (burn={burn_percentage:.1%}, hash={weight_hash})")
         if 0 in uids:
             logger.info(f"  UID 0 (burn + system miners): {weights[uids.index(0)]:.6f}")
 
@@ -119,13 +142,26 @@ class WeightSetter:
         for uid, weight in zip(uids, weights):
             logger.info(f"  UID {uid:3d}: {weight:.6f}")
 
+        # Record the block at which we start this submission attempt
+        start_block = await subtensor.get_current_block()
+
         for attempt in range(max_retries):
             try:
                 logger.info(f"Attempt {attempt + 1}/{max_retries}")
-                
+
                 current_block = await subtensor.get_current_block()
                 logger.info(f"Current block: {current_block}")
-                
+
+                # Block drift check: abort if too many blocks have passed
+                # since we started (prevents submitting stale weights)
+                block_drift = current_block - start_block
+                if block_drift > interval_blocks // 2:
+                    logger.error(
+                        f"Block drift too large: {block_drift} blocks since start "
+                        f"(limit: {interval_blocks // 2}). Aborting to avoid stale submission."
+                    )
+                    return False
+
                 success = await subtensor.set_weights(
                     wallet=self.wallet,
                     netuid=self.netuid,
@@ -134,9 +170,11 @@ class WeightSetter:
                     wait_for_inclusion=True,
                     wait_for_finalization=True,
                 )
-                
+
                 if success:
                     logger.info("✅ Weights set successfully (chain confirmed)")
+                    self._last_set_block = current_block
+                    self._last_weight_hash = weight_hash
                     return True
                 else:
                     logger.error(f"❌ Chain rejected weight setting on attempt {attempt + 1}")
@@ -156,5 +194,5 @@ class WeightSetter:
                     continue
                 else:
                     return False
-        
+
         return False

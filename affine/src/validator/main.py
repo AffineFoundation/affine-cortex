@@ -232,6 +232,8 @@ class ValidatorService:
 
     async def run_iteration(self):
         """Run one iteration of weight setting"""
+        interval_blocks = int(os.getenv("WEIGHT_SET_INTERVAL_BLOCKS", "180"))
+
         # 1. Fetch weights
         self.update_watchdog("fetching weights")
         weights_data = await self.fetch_weights_from_api()
@@ -255,7 +257,8 @@ class ValidatorService:
             await asyncio.wait_for(
                 self.weight_setter.set_weights(
                     weights_data.get("weights", {}),
-                    burn_percentage
+                    burn_percentage,
+                    interval_blocks=interval_blocks,
                 ),
                 timeout=480
             )
