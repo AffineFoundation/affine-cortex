@@ -72,15 +72,17 @@ class AntiCopyDetector:
         tokens_b: List[str],
         min_prefix: int = 2,
     ) -> float:
-        """Compute logprob cosine only up to the token fork point.
+        """Compute logprob cosine, preferring the prefix up to the fork point.
 
         Each token position contributes TOP_K values in the logprob vector.
-        If the matching prefix is shorter than min_prefix, return NaN
-        (not enough shared context to compare).
+        If the matching prefix is shorter than min_prefix, fall back to the
+        full vector cosine instead of returning NaN. This prevents attackers
+        from eliminating the logprob signal by forcing early token divergence.
         """
         fork = self._find_fork_pos(tokens_a, tokens_b)
         if fork < min_prefix:
-            return float("nan")
+            # Fallback: compare full logprob vectors instead of skipping
+            return self._cosine_pair(lp_a, lp_b)
         end = fork * TOP_K
         return self._cosine_pair(lp_a[:end], lp_b[:end])
 
@@ -125,7 +127,7 @@ class AntiCopyDetector:
                         )
                         for t in lp_common
                     ])
-                    med_cosine = float(np.nanquantile(cosines, 0.25))
+                    med_cosine = float(np.nanquantile(cosines, 0.50))
                     task_cosine_map = {
                         t: float(c) for t, c in zip(lp_common, cosines)
                     }
@@ -139,7 +141,7 @@ class AntiCopyDetector:
                         if topk_a and topk_b:
                             js_vals.append(js_divergence_topk(topk_a, topk_b))
                     if js_vals:
-                        med_js = float(np.nanquantile(js_vals, 0.25))
+                        med_js = float(np.nanquantile(js_vals, 0.50))
 
                     # Token agreement
                     agree_vals = []
@@ -149,7 +151,7 @@ class AntiCopyDetector:
                         if tok_a and tok_b:
                             agree_vals.append(token_agreement_rate(tok_a, tok_b))
                     if agree_vals:
-                        med_agree = float(np.nanquantile(agree_vals, 0.25))
+                        med_agree = float(np.nanquantile(agree_vals, 0.50))
 
                 # ── Hidden states signal ─────────────────────────────
                 hs_common = sorted(
@@ -164,7 +166,7 @@ class AntiCopyDetector:
                         self._cosine_pair(ma.task_hidden_states[t], mb.task_hidden_states[t])
                         for t in hs_common
                     ])
-                    med_hs = float(np.nanquantile(hs_cosines, 0.25))
+                    med_hs = float(np.nanquantile(hs_cosines, 0.50))
                     # Use max task count
                     n_tasks = max(n_tasks, len(hs_common))
 
