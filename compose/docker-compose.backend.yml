@@ -49,6 +49,11 @@ services:
     env_file:
       - .env
     volumes:
+      # SECURITY WARNING: Docker socket mount grants full host Docker API access
+      # (equivalent to root on host). In production, replace with a Docker socket
+      # proxy (e.g., tecnativa/docker-socket-proxy) that restricts API access to
+      # only the endpoints needed: containers/create, start, wait, remove, images/pull.
+      # See: https://github.com/Tecnativa/docker-socket-proxy
       - /var/run/docker.sock:/var/run/docker.sock
       - ~/.ssh:/root/.ssh
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
@@ -110,6 +115,10 @@ services:
     container_name: affine-backend-watchtower
     restart: unless-stopped
     volumes:
+      # SECURITY WARNING: Watchtower needs Docker socket to detect and restart
+      # updated containers. In production, use a Docker socket proxy to restrict
+      # access to read-only container listing + restart only.
+      # See: https://github.com/Tecnativa/docker-socket-proxy
       - /var/run/docker.sock:/var/run/docker.sock
     command: --interval 30 affine-api affine-scheduler affine-executor affine-monitor affine-anticopy affine-scorer
 

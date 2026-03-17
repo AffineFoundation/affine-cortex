@@ -148,7 +148,12 @@ _ENV_CONFIGS_CANONICAL = {
         mem_limit="8g",
     ),
     
-    # SWE-bench Pro environment (requires DOOD)
+    # SWE-bench Pro environment (requires DOOD for container management)
+    # SECURITY WARNING: Docker socket mount grants full host Docker API access,
+    # equivalent to root on the host. In production deployments, replace direct
+    # socket mount with a Docker socket proxy (e.g., tecnativa/docker-socket-proxy)
+    # configured to allow only: containers/create, containers/start, containers/wait,
+    # containers/remove, images/pull. See: https://github.com/Tecnativa/docker-socket-proxy
     "swe-pro": EnvConfig(
         name="swe-pro",
         docker_image="affinefoundation/swebench:pro",
@@ -158,7 +163,7 @@ _ENV_CONFIGS_CANONICAL = {
         volumes={
             "/var/run/docker.sock": {
                 "bind": "/var/run/docker.sock",
-                "mode": "rw"
+                "mode": "rw"  # Required for DOOD — use socket proxy to restrict access
             }
         },
         eval_params={
@@ -169,6 +174,7 @@ _ENV_CONFIGS_CANONICAL = {
         proxy_timeout=2000,
     ),
     # SWE-bench Synth environment (requires R2 credentials for dataset/artifact access)
+    # SECURITY WARNING: See swe-pro comment above — use socket proxy in production.
     "swe-synth": EnvConfig(
         name="swe-synth",
         docker_image="affinefoundation/swebench:synth",
@@ -179,7 +185,7 @@ _ENV_CONFIGS_CANONICAL = {
         volumes={
             "/var/run/docker.sock": {
                 "bind": "/var/run/docker.sock",
-                "mode": "rw"
+                "mode": "rw"  # Required for DOOD — use socket proxy to restrict access
             }
         },
         eval_params={
@@ -190,6 +196,7 @@ _ENV_CONFIGS_CANONICAL = {
         proxy_timeout=7300,
     ),
     # SWE-bench Infinite environment (requires R2 credentials for dataset/artifact access)
+    # SECURITY WARNING: See swe-pro comment above — use socket proxy in production.
     "swe-infinite": EnvConfig(
         name="swe-infinite",
         docker_image="affinefoundation/swebench:infinite",
@@ -200,7 +207,7 @@ _ENV_CONFIGS_CANONICAL = {
         volumes={
             "/var/run/docker.sock": {
                 "bind": "/var/run/docker.sock",
-                "mode": "rw"
+                "mode": "rw"  # Required for DOOD — use socket proxy to restrict access
             }
         },
         eval_params={
