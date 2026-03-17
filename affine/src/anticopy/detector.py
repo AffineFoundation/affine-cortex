@@ -186,11 +186,15 @@ class AntiCopyDetector:
                     if med_cosine >= self.cosine_threshold:
                         votes += 1
 
-                # All available signals must agree; need at least 1
-                is_copy = total_votes >= 1 and votes == total_votes
-
-                # Confidence: fraction of votes
-                confidence = votes / max(total_votes, 1)
+                # Require both signals for a confident copy detection.
+                # Single-signal results are marked low-confidence to prevent
+                # attackers from stripping one signal to weaken detection.
+                if total_votes < 2:
+                    is_copy = False
+                    confidence = votes / max(total_votes, 1) * 0.5  # halved confidence
+                else:
+                    is_copy = votes == total_votes
+                    confidence = votes / max(total_votes, 1)
 
                 results.append(
                     CopyPair(

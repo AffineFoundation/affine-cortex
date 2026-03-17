@@ -247,6 +247,14 @@ class ValidatorService:
         else:
             burn_percentage = config.get("validator_burn_percentage", 0.0)
             burn_percentage = float(burn_percentage)
+            # Sanity-check: cap burn percentage to prevent catastrophic weight destruction
+            MAX_BURN_PERCENTAGE = 0.1  # 10% absolute maximum
+            if burn_percentage < 0 or burn_percentage > MAX_BURN_PERCENTAGE:
+                logger.warning(
+                    f"Burn percentage {burn_percentage} outside safe range [0, {MAX_BURN_PERCENTAGE}], "
+                    f"clamping to 0.0"
+                )
+                burn_percentage = 0.0
 
         # 3. Set weights using WeightSetter with timeout
         self.update_watchdog("setting weights")
