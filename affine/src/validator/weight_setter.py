@@ -137,6 +137,8 @@ class WeightSetter:
                 
                 if success:
                     logger.info("✅ Weights set successfully (chain confirmed)")
+                    # Verify weights were persisted correctly
+                    await self._verify_weights_on_chain(subtensor, uids, weights)
                     return True
                 else:
                     logger.error(f"❌ Chain rejected weight setting on attempt {attempt + 1}")
@@ -156,5 +158,60 @@ class WeightSetter:
                     continue
                 else:
                     return False
-        
+
         return False
+
+    async def _verify_weights_on_chain(
+        self,
+        subtensor,
+        submitted_uids: List[int],
+        submitted_weights: List[float],
+        tolerance: float = 0.01,
+    ):
+        """Read back weights from chain and warn on mismatches.
+
+        This is a best-effort verification — failures are logged as
+        warnings rather than raising, because the chain may apply its
+        own normalization (e.g. u16 quantisation).
+        """
+        try:
+            chain_weights = await subtensor.get_weights(
+                netuid=self.netuid,
+                wallet=self.wallet,
+            )
+            if chain_weights is None:
+                logger.warning(
+                    "⚠️ Weight verification: could not read back weights from chain"
+                )
+                return
+
+            # Build lookup from chain data
+            chain_map: Dict[int, float] = {}
+            if isinstance(chain_weights, dict):
+                chain_map = {int(k): float(v) for k, v in chain_weights.items()}
+            elif isinstance(chain_weights, (list, tuple)) and len(chain_weights) == 2:
+                for uid, w in zip(chain_weights[0], chain_weights[1]):
+                    chain_map[int(uid)] = float(w)
+
+            mismatches = []
+            for uid, expected in zip(submitted_uids, submitted_weights):
+                actual = chain_map.get(uid)
+                if actual is None:
+                    mismatches.append(
+                        f"UID {uid}: submitted={expected:.6f}, on-chain=MISSING"
+                    )
+                elif abs(actual - expected) > tolerance:
+                    mismatches.append(
+                        f"UID {uid}: submitted={expected:.6f}, on-chain={actual:.6f}"
+                    )
+
+            if mismatches:
+                logger.warning(
+                    f"⚠️ Weight verification: {len(mismatches)} mismatch(es) detected:\n"
+                    + "\n".join(f"  {m}" for m in mismatches)
+                )
+            else:
+                logger.info("✅ Weight verification: all weights match on-chain values")
+
+        except Exception as e:
+            logger.warning(f"⚠️ Weight verification failed (non-fatal): {e}")
