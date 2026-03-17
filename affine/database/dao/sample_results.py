@@ -12,6 +12,7 @@ from affine.database.base_dao import BaseDAO
 from affine.database.schema import get_table_name
 from affine.database.client import get_client
 from affine.core.setup import logger
+from affine.core.score_integrity import compute_score_hmac
 
 
 class SampleResultsDAO(BaseDAO):
@@ -105,7 +106,16 @@ class SampleResultsDAO(BaseDAO):
         
         # Calculate TTL: 30 days from now (in seconds)
         ttl_seconds = int(time.time()) + (30 * 86400)
-        
+
+        # Compute HMAC for score integrity verification (C-06 fix)
+        score_hmac = compute_score_hmac(
+            miner_hotkey=miner_hotkey,
+            model_revision=model_revision,
+            env=env,
+            task_id=task_id_int,
+            score=score,
+        )
+
         item = {
             'pk': self._make_pk(miner_hotkey, model_revision, env),
             'sk': self._make_sk(str(task_id_int)),
@@ -124,7 +134,11 @@ class SampleResultsDAO(BaseDAO):
             'signature': signature,
             'ttl': ttl_seconds,  # TTL: auto-delete after 30 days
         }
-        
+
+        # Include HMAC only when the secret is configured
+        if score_hmac is not None:
+            item['score_hmac'] = score_hmac
+
         return await self.put(item)
     
     async def get_sample_by_task_id(

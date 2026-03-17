@@ -15,6 +15,7 @@ from affine.src.scorer.config import ScorerConfig
 from affine.src.scorer.utils import calculate_required_score
 
 from affine.core.setup import logger
+from affine.core.score_integrity import verify_score_hmac
 
 
 class Stage1Collector:
@@ -157,11 +158,35 @@ class Stage1Collector:
                 completeness = env_info.get('completeness', 0.0)
 
                 # Build all_task_scores from all_samples (full partition)
+                # Verify HMAC integrity for each sample (C-06 fix)
                 all_task_scores: Dict[int, float] = {}
+                hmac_fail_count = 0
                 for s in all_samples:
                     tid = s.get('task_id')
                     if tid is not None:
-                        all_task_scores[int(tid)] = s.get('score', 0.0)
+                        sample_score = s.get('score', 0.0)
+                        sample_hmac = s.get('score_hmac')
+
+                        if not verify_score_hmac(
+                            miner_hotkey=hotkey,
+                            model_revision=model_revision,
+                            env=env_name,
+                            task_id=tid,
+                            score=sample_score,
+                            expected_hmac=sample_hmac,
+                        ):
+                            hmac_fail_count += 1
+                            logger.warning(
+                                f"UID {uid} {env_name}: Skipping task {tid} — HMAC verification failed"
+                            )
+                            continue
+
+                        all_task_scores[int(tid)] = sample_score
+
+                if hmac_fail_count > 0:
+                    logger.warning(
+                        f"UID {uid} {env_name}: {hmac_fail_count} sample(s) failed HMAC verification"
+                    )
 
                 # Derive task_scores by filtering all_task_scores with sampling_task_ids
                 task_scores = {

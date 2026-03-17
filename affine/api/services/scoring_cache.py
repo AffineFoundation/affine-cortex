@@ -342,7 +342,7 @@ class ScoringCacheManager:
             'TableName': sample_dao.table_name,
             'KeyConditionExpression': 'pk = :pk',
             'ExpressionAttributeValues': {':pk': {'S': pk}},
-            'ProjectionExpression': 'task_id,score,#ts',
+            'ProjectionExpression': 'task_id,score,#ts,score_hmac',
             'ExpressionAttributeNames': {'#ts': 'timestamp'},
         }
         raw_items = await sample_dao._query_all_pages(get_client(), params)
