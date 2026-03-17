@@ -24,10 +24,10 @@ class APIConfig:
     RATE_LIMIT_READ: int = int(os.getenv("API_RATE_LIMIT_READ", "10"))  # per min
     RATE_LIMIT_WRITE: int = int(os.getenv("API_RATE_LIMIT_WRITE", "10"))  # per min
 
-    # CORS
+    # CORS — default to empty list (no cross-origin access) unless explicitly configured
     CORS_ORIGINS: List[str] = [
         origin.strip()
-        for origin in os.getenv("API_CORS_ORIGINS", "*").split(",")
+        for origin in os.getenv("API_CORS_ORIGINS", "").split(",")
         if origin.strip()
     ]
 
