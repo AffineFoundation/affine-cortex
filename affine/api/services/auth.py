@@ -7,8 +7,9 @@ Uses Bittensor wallet signatures to verify that executors are authorized validat
 
 import logging
 import time
-from typing import Optional, Tuple, List, Set
-from dataclasses import dataclass
+import threading
+from typing import Optional, Tuple, List, Set, Dict
+from dataclasses import dataclass, field
 from bittensor import Keypair
 
 from affine.core.setup import logger
@@ -57,6 +58,8 @@ class AuthService:
             signature_expiry_seconds=signature_expiry_seconds,
             strict_mode=strict_mode
         )
+        self._used_nonces: Dict[str, float] = {}
+        self._nonce_lock = threading.Lock()
     
     def is_validator(self, hotkey: str) -> bool:
         """
@@ -126,6 +129,29 @@ class AuthService:
             logger.error(f"Error verifying signature: {signature}, error: {e}")
             return False
     
+    def _check_and_store_nonce(self, nonce: str) -> bool:
+        """
+        Check if a nonce has been used before and store it if not.
+        Evicts nonces older than signature_expiry_seconds.
+
+        Returns:
+            True if the nonce is fresh (not seen before), False if replayed.
+        """
+        current_time = time.time()
+        expiry = self.config.signature_expiry_seconds
+
+        with self._nonce_lock:
+            # Evict expired nonces
+            cutoff = current_time - expiry
+            expired = [k for k, ts in self._used_nonces.items() if ts < cutoff]
+            for k in expired:
+                del self._used_nonces[k]
+
+            if nonce in self._used_nonces:
+                return False
+            self._used_nonces[nonce] = current_time
+            return True
+
     def verify_request_signature(
         self,
         hotkey: str,
@@ -136,40 +162,44 @@ class AuthService:
     ) -> Tuple[bool, str]:
         """
         Verify a complete request signature.
-        
+
         The message format is: {hotkey}:{timestamp}:{nonce}[:additional_data]
-        
+
         Args:
             hotkey: Executor's hotkey
             timestamp: Unix timestamp of the request
             nonce: Random nonce to prevent replay attacks
             signature: Signature of the message
             additional_data: Optional additional data included in signature
-            
+
         Returns:
             Tuple of (is_valid, error_message)
         """
         # Check if hotkey is authorized
         if not self.is_validator(hotkey):
             return False, f"Hotkey {hotkey[:8]}... is not an authorized validator"
-        
+
         # Check timestamp expiry
         current_time = int(time.time())
         time_diff = abs(current_time - timestamp)
-        
+
         if time_diff > self.config.signature_expiry_seconds:
             return False, f"Request timestamp expired (diff={time_diff}s, max={self.config.signature_expiry_seconds}s)"
-        
+
+        # Check for nonce replay
+        if not self._check_and_store_nonce(nonce):
+            return False, f"Nonce already used (replay rejected)"
+
         # Construct message
         if additional_data:
             message = f"{hotkey}:{timestamp}:{nonce}:{additional_data}"
         else:
             message = f"{hotkey}:{timestamp}:{nonce}"
-        
+
         # Verify signature
         if not self.verify_signature(message, signature, hotkey):
             return False, "Invalid signature"
-        
+
         return True, ""
     
     def add_validator(self, hotkey: str):

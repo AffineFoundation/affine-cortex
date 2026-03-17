@@ -118,65 +118,101 @@ async def verify_executor_auth(
     auth_service: AuthService = Depends(get_auth_service),
 ) -> str:
     """
-    Verify executor authentication with timestamp-based message.
-    
+    Verify executor authentication with nonce-based message.
+
+    Expected message format: {hotkey}:{timestamp}:{nonce}
+    Falls back to legacy timestamp-only format for backwards compatibility.
+
     This dependency validates:
-    1. Message format is a valid timestamp (integer string)
-    2. Timestamp is within 60 seconds (prevents replay attacks)
-    3. Signature is valid for the message
-    
+    1. Message format contains hotkey, timestamp, and nonce
+    2. Timestamp is within 60 seconds
+    3. Nonce has not been used before (prevents replay attacks)
+    4. Signature is valid for the message
+
     Args:
         executor_hotkey: Executor's hotkey from header
         executor_signature: Signature from header
-        executor_message: Timestamp string from header
+        executor_message: Message string from header
         auth_service: Auth service instance
-    
+
     Returns:
         Validated executor hotkey
-        
+
     Raises:
         HTTPException: If validation fails
     """
-    # Validate message format (should be timestamp)
-    try:
-        timestamp = int(executor_message)
-    except ValueError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid message format: expected timestamp"
-        )
-    
-    # Check timestamp is within 60 seconds
-    current_time = int(time.time())
-    time_diff = abs(current_time - timestamp)
-    
-    if time_diff > 60:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=f"Message expired (timestamp diff: {time_diff}s, max: 60s)"
-        )
-    
-    # Verify signature
-    is_valid = auth_service.verify_signature(
-        hotkey=executor_hotkey,
-        message=executor_message,
-        signature=executor_signature
-    )
-    
-    if not is_valid:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid executor signature"
-        )
-    
-    # Check if authorized validator (optional in non-strict mode)
-    if not auth_service.is_authorized_validator(executor_hotkey):
-        if auth_service.strict_mode:
+    # Parse message — supports {hotkey}:{timestamp}:{nonce} format
+    parts = executor_message.split(":")
+    if len(parts) >= 3:
+        # New format: hotkey:timestamp:nonce[:additional_data]
+        msg_hotkey, msg_timestamp_str, nonce = parts[0], parts[1], parts[2]
+        additional_data = ":".join(parts[3:]) if len(parts) > 3 else None
+
+        if msg_hotkey != executor_hotkey:
             raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Executor not authorized"
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Message hotkey does not match X-Hotkey header"
             )
-    
+
+        try:
+            timestamp = int(msg_timestamp_str)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid timestamp in message"
+            )
+
+        is_valid, error = auth_service.verify_request_signature(
+            hotkey=executor_hotkey,
+            timestamp=timestamp,
+            nonce=nonce,
+            signature=executor_signature,
+            additional_data=additional_data,
+        )
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=error
+            )
+    else:
+        # Legacy format: timestamp only (no replay protection)
+        try:
+            timestamp = int(executor_message)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid message format: expected {hotkey}:{timestamp}:{nonce}"
+            )
+
+        current_time = int(time.time())
+        time_diff = abs(current_time - timestamp)
+
+        if time_diff > 60:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Message expired (timestamp diff: {time_diff}s, max: 60s)"
+            )
+
+        is_valid = auth_service.verify_signature(
+            hotkey=executor_hotkey,
+            message=executor_message,
+            signature=executor_signature
+        )
+
+        if not is_valid:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid executor signature"
+            )
+
+        # Check if authorized validator
+        if not auth_service.is_authorized_validator(executor_hotkey):
+            if auth_service.config.strict_mode:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Executor not authorized"
+                )
+
     return executor_hotkey
 
 _rate_limit_store: dict = {}
