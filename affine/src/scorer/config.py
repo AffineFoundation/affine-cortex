@@ -62,8 +62,9 @@ class ScorerConfig:
     """Number of decimal places for score comparison (avoid floating point issues)."""
     
     # Stage 3: Subset Scoring
-    MAX_LAYERS: int = 1
-    """Maximum number of layers to evaluate. Set to 1 to only evaluate the last layer (all environments combined)."""
+    MAX_LAYERS: int = 2
+    """Maximum number of layers to evaluate. Set to ≥2 so miners missing one environment
+    can still earn weight from (N-1)-environment subsets instead of being zeroed out."""
     
     SUBSET_WEIGHT_EXPONENT: int = 2
     """Exponent base for layer weights (layer_weight = N * base^(layer-1))."""

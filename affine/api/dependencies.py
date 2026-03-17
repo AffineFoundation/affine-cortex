@@ -4,10 +4,13 @@ FastAPI Dependencies
 Reusable dependencies for authentication, database access, etc.
 """
 
+import logging
 import time
 from typing import Optional
 from fastapi import Depends, HTTPException, Request, Header, status
 from affine.api.config import config
+
+logger = logging.getLogger(__name__)
 from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.task_pool import TaskPoolDAO
 from affine.database.dao.execution_logs import ExecutionLogsDAO
@@ -141,6 +144,10 @@ async def verify_executor_auth(
     try:
         timestamp = int(executor_message)
     except ValueError:
+        logger.warning(
+            "Auth failure: invalid message format (not a timestamp) "
+            f"hotkey={executor_hotkey[:16]}..."
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid message format: expected timestamp"
@@ -151,6 +158,10 @@ async def verify_executor_auth(
     time_diff = abs(current_time - timestamp)
     
     if time_diff > 60:
+        logger.warning(
+            f"Auth failure: expired timestamp (diff={time_diff}s) "
+            f"hotkey={executor_hotkey[:16]}..."
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=f"Message expired (timestamp diff: {time_diff}s, max: 60s)"
@@ -164,6 +175,9 @@ async def verify_executor_auth(
     )
     
     if not is_valid:
+        logger.warning(
+            f"Auth failure: invalid signature hotkey={executor_hotkey[:16]}..."
+        )
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid executor signature"
@@ -172,6 +186,10 @@ async def verify_executor_auth(
     # Check if authorized validator (optional in non-strict mode)
     if not auth_service.is_authorized_validator(executor_hotkey):
         if auth_service.strict_mode:
+            logger.warning(
+                f"Auth failure: unauthorized validator "
+                f"hotkey={executor_hotkey[:16]}..."
+            )
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Executor not authorized"
@@ -226,6 +244,7 @@ async def rate_limit_read(request: Request):
 
     identifier = request.client.host
     if not check_rate_limit(identifier, config.RATE_LIMIT_READ):
+        logger.warning(f"Rate limit exceeded (read): ip={identifier}")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded"
@@ -236,8 +255,9 @@ async def rate_limit_write(request: Request):
     """Dependency for write endpoint rate limiting."""
     if not config.RATE_LIMIT_ENABLED:
         return
-    
+
     if not check_rate_limit(request.client.host, config.RATE_LIMIT_WRITE):
+        logger.warning(f"Rate limit exceeded (write): ip={request.client.host}")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded"
@@ -252,6 +272,7 @@ async def rate_limit_scoring(request: Request):
     identifier = request.client.host
     # Hardcoded: 1 request per 60 seconds for scoring endpoint
     if not check_rate_limit(identifier, limit=1, window_seconds=60):
+        logger.warning(f"Rate limit exceeded (scoring): ip={identifier}")
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded for scoring endpoint (1 request per minute)"
