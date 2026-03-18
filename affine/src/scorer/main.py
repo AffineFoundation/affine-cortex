@@ -264,7 +264,7 @@ def main(sampling: bool):
     Configuration:
     - SCORER_SAVE_TO_DB: Enable database saving (default: false)
     - SERVICE_MODE: Run as continuous service (default: false)
-    - SCORER_INTERVAL_MINUTES: Minutes between runs in service mode (default: 10)
+    - SCORER_INTERVAL_MINUTES: Minutes between runs in service mode (default: 30)
     - All scoring parameters are constants in config.py
     
     Examples:
@@ -282,13 +282,13 @@ def main(sampling: bool):
     
     # Get interval in minutes (default: 10 minutes)
     try:
-        interval_minutes = int(os.getenv("SCORER_INTERVAL_MINUTES", "10"))
+        interval_minutes = int(os.getenv("SCORER_INTERVAL_MINUTES", "30"))
         if interval_minutes <= 0:
-            logger.warning(f"Invalid SCORER_INTERVAL_MINUTES={interval_minutes}, using default 10")
-            interval_minutes = 10
+            logger.warning(f"Invalid SCORER_INTERVAL_MINUTES={interval_minutes}, using default 30")
+            interval_minutes = 30
     except ValueError:
-        logger.warning(f"Invalid SCORER_INTERVAL_MINUTES value, using default 10")
-        interval_minutes = 10
+        logger.warning(f"Invalid SCORER_INTERVAL_MINUTES value, using default 30")
+        interval_minutes = 30
     
     if save_to_db:
         logger.info("Database saving enabled (SCORER_SAVE_TO_DB=true)")
