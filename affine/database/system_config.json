@@ -66,7 +66,8 @@
       "enabled_for_scoring": false,
       "min_completeness": 0.8,
       "sampling_config": {
-        "dataset_range": [[0, 15]],
+        "dataset_range": [[200, 300]],
+         "initial_range": [[200, 300]],   
         "dataset_range_source": {
           "url": "https://pub-7882418a56434a479bf9a7febd660b36.r2.dev/bugs/metadata.json",
           "field": "tasks.completed_up_to",
