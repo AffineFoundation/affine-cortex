@@ -443,6 +443,14 @@ Each environment runs as a Docker container with an `Actor.evaluate()` method re
 | **Game/Adversarial** | game | Game-theoretic, CPU-bound, 7200s |
 | **Tool-augmented** | navworld | MCP tools, external APIs, LLM-judge scoring |
 
+### Environment-Side Error Handling
+
+Environments that call external APIs (e.g., NavWorld → AMap, LiveWeb → CoinGecko) detect **API rate limits and quota exhaustion** during evaluation. When detected, the evaluation is **invalidated** (score=0, error recorded) rather than penalizing the model — these errors are the environment's fault, not the model's.
+
+Detected error patterns: `USER_DAILY_QUERY_OVER_LIMIT`, `QPS_OVER_LIMIT`, `CUOTA_PLAN_RUN_OUT`, `tool_call_timeout`, etc.
+
+This means miners won't be unfairly scored when external API quotas are hit. The invalidated evaluations are excluded from scoring aggregation.
+
 ---
 
 ## 5. Scoring Pipeline
