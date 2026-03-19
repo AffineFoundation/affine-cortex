@@ -443,6 +443,14 @@ Each environment runs as a Docker container with an `Actor.evaluate()` method re
 | **Game/Adversarial** | game | Game-theoretic, CPU-bound, 7200s |
 | **Tool-augmented** | navworld | MCP tools, external APIs, LLM-judge scoring |
 
+### Environment-Side Error Handling
+
+Environments that call external APIs (e.g., NavWorld → AMap, LiveWeb → CoinGecko) detect **API rate limits and quota exhaustion** during evaluation. When detected, the evaluation is **invalidated** (score=0, error recorded) rather than penalizing the model — these errors are the environment's fault, not the model's.
+
+Detected error patterns: `USER_DAILY_QUERY_OVER_LIMIT`, `QPS_OVER_LIMIT`, `CUOTA_PLAN_RUN_OUT`, `tool_call_timeout`, etc.
+
+This means miners won't be unfairly scored when external API quotas are hit. The invalidated evaluations are excluded from scoring aggregation.
+
 ---
 
 ## 5. Scoring Pipeline
@@ -829,7 +837,13 @@ afs validate my-env --num-tests 100
 | `liveweb_arena/core/gt_collector.py` | Ground truth collection |
 | `liveweb_arena/plugins/` | Plugin directory (openmeteo, openlibrary, etc.) |
 
-Liveweb-arena uses a **plugin architecture** — each plugin provides templates, an API client, and comparison logic. Current plugins: OpenMeteo (weather), OpenLibrary, CoinGecko.
+Liveweb-arena uses a **plugin architecture** — each plugin provides templates, an API client, and comparison logic. Current plugins: OpenMeteo (weather), OpenLibrary, CoinGecko, **ArXiv** (academic papers).
+
+**ArXiv plugin** (added 2026-03): Queries arxiv.org listing pages (`/list/<category>/new`). Supports templates for paper info, author extrema, category comparison, multi-author filter, and title length extrema. Blocks direct API/RSS access — agent must use the rendered listing page. GT is always collected from `/new` regardless of whether the agent visits `/new` or `/recent`.
+
+**OpenMeteo cache mode**: Plugins can inject pre-fetched API data as readable HTML tables via `setup_page_for_cache()`. In cache mode, the agent reads values from the DOM snapshot without needing JS hydration. This enables scoring in cache mode without live network access.
+
+**Validator model rotation**: The LLM validator uses round-robin rotation across available models (up to 20 attempts total) instead of exhausting retries on each model sequentially. Each individual model attempt uses `max_retries=1`, then immediately rotates to the next model on failure.
 
 ---
 
@@ -842,6 +856,8 @@ Liveweb-arena uses a **plugin architecture** — each plugin provides templates,
 | `HF_USER` | Monitor | HuggingFace username for naming checks |
 | `AMAP_MAPS_API_KEY` | NavWorld | AMap API for travel planning |
 | `COINGECKO_API_KEY` | LiveWeb | CoinGecko API for crypto tasks |
+| `VALIDATOR_API_KEY` | LiveWeb Validator | Separate API key for validation LLM calls (optional, falls back to evaluated model's key) |
+| `VALIDATOR_BASE_URL` | LiveWeb Validator | Separate base URL for validation LLM calls (optional) |
 | `DOCKER_HUB_USERNAME` | SWE-bench Synth/Infinite | Docker Hub for nested images |
 | `DOCKER_HUB_TOKEN` | SWE-bench Synth/Infinite | Docker Hub auth |
 | `AFFINETES_MODE` | SDK | `docker` or `basilica` |
