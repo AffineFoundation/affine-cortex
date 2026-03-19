@@ -9,13 +9,13 @@ import math
 import numpy as np
 import pytest
 
-from affine.src.anti_copy.metrics import (
+from affine.src.anticopy.metrics import (
     js_divergence_topk,
     token_agreement_rate,
 )
-from affine.src.anti_copy.models import MinerLogprobs
-from affine.src.anti_copy.detector import AntiCopyDetector
-from affine.src.anti_copy.loader import _parse_tokens, MIN_TOKENS, TOP_K
+from affine.src.anticopy.models import MinerLogprobs
+from affine.src.anticopy.detector import AntiCopyDetector
+from affine.src.anticopy.loader import _parse_tokens, MIN_TOKENS, TOP_K
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -323,15 +323,31 @@ class TestHiddenStatesVoting:
         assert pairs[0].total_votes == 1
 
     def test_cos_disagree_not_copy(self):
-        """hs agrees but cos disagrees → not copy (must be unanimous)."""
-        lps_b = {t: list(np.random.default_rng(t + 500).uniform(-5, 0, 20)) for t in range(20)}
-        m0 = make_miner_with_hs(0, BASE_LPS, BASE_HS)
-        m1 = make_miner_with_hs(1, lps_b, BASE_HS)
+        """hs agrees but cos disagrees → not copy (must be unanimous).
+
+        We manually set different logprob vectors while keeping same token names
+        so fork-point detection doesn't eliminate the cos signal.
+        """
+        m0 = MinerLogprobs(uid=0, hotkey="hk0")
+        m1 = MinerLogprobs(uid=1, hotkey="hk1")
+        shared_tokens = [f"tok{i}" for i in range(20)]
+        rng = np.random.default_rng(42)
+        for t in range(5):
+            # Same tokens so fork-point sees full prefix
+            m0.task_tokens[t] = shared_tokens
+            m1.task_tokens[t] = shared_tokens
+            # Completely different logprob vectors → cosine well below 0.93
+            m0.task_logprobs[t] = rng.uniform(-5, 0, 20 * TOP_K).astype(np.float32)
+            m1.task_logprobs[t] = rng.uniform(-5, 0, 20 * TOP_K).astype(np.float32)
+            # Same hidden states → hs votes copy
+            m0.task_hidden_states[t] = BASE_HS[t]
+            m1.task_hidden_states[t] = BASE_HS[t]
         pairs = self.detector.detect({0: m0, 1: m1})
         copies = [p for p in pairs if p.is_copy]
         assert len(copies) == 0
-        assert pairs[0].votes == 1   # only hs
+        # hs votes copy, cos votes not-copy → 1/2 → not copy
         assert pairs[0].total_votes == 2
+        assert pairs[0].votes < pairs[0].total_votes
 
     def test_hs_disagree_not_copy(self):
         """cos agrees but hs disagrees → not copy (must be unanimous)."""

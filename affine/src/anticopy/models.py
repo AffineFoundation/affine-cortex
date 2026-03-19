@@ -42,6 +42,7 @@ class CopyPair:
 
     cosine_similarity: float    # median logprob cosine across tasks; 1.0 = identical
     hs_cosine: float            # median hidden_states cosine; NaN if no data
+    tensor_cosine: float        # avg tensor fingerprint cosine; NaN if no data
     js_divergence: float        # median JS divergence; 0.0 = identical
     token_agreement: float      # median token agreement across tasks
 
@@ -57,10 +58,12 @@ class CopyPair:
     def __repr__(self) -> str:
         flag = "COPY" if self.is_copy else "ok"
         hs_str = f"{self.hs_cosine:.5f}" if not np.isnan(self.hs_cosine) else "N/A"
+        tc_str = f"{self.tensor_cosine:.7f}" if not np.isnan(self.tensor_cosine) else "N/A"
         return (
             f"[{flag}] uid={self.uid_a} vs uid={self.uid_b} | "
             f"cos={self.cosine_similarity:.5f} "
             f"hs={hs_str} "
+            f"tensor={tc_str} "
             f"js={self.js_divergence:.5f} "
             f"agree={self.token_agreement:.3f} "
             f"votes={self.votes}/{self.total_votes} "

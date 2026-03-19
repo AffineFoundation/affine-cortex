@@ -19,6 +19,8 @@ from affine.utils.subtensor import get_subtensor
 from affine.database.dao.anti_copy import AntiCopyDAO
 from .detector import AntiCopyDetector
 from .loader import LogprobsLoader
+from .models import MinerLogprobs
+from .tensor_fingerprint import TensorFingerprinter, HAS_DEPS as HAS_TENSOR_DEPS
 
 
 DEFAULT_INTERVAL = 86400  # 24 hours
@@ -112,6 +114,7 @@ class AntiCopyService:
                 for key, val in [
                     ("logprobs_cosine", earliest_pair.cosine_similarity),
                     ("hs_cosine", earliest_pair.hs_cosine),
+                    ("tensor_cosine", earliest_pair.tensor_cosine),
                     ("js_div", earliest_pair.js_divergence),
                 ]:
                     if val is not None and not (isinstance(val, float) and math.isnan(val)):
@@ -144,12 +147,34 @@ class AntiCopyService:
         miner_data = await loader.load_all_miners(miners)
         logger.info(f"[AntiCopy] Loaded logprobs for {len(miner_data)}/{len(miners)} miners")
 
-        if len(miner_data) < 2:
-            logger.warning("[AntiCopy] Not enough miners with logprob data, skipping")
+        # Tensor fingerprinting (runs independently of logprobs)
+        tensor_fingerprints = {}
+        if HAS_TENSOR_DEPS:
+            try:
+                fingerprinter = TensorFingerprinter()
+                tensor_fingerprints = fingerprinter.fingerprint_miners(miners)
+                logger.info(
+                    f"[AntiCopy] Tensor fingerprints for "
+                    f"{len(tensor_fingerprints)}/{len(miners)} miners"
+                )
+            except Exception as e:
+                logger.error(f"[AntiCopy] Tensor fingerprinting failed: {e}", exc_info=True)
+        else:
+            logger.info("[AntiCopy] Tensor fingerprinting unavailable (missing deps)")
+
+        if len(miner_data) < 2 and len(tensor_fingerprints) < 2:
+            logger.warning("[AntiCopy] Not enough miners with data, skipping")
             return
 
+        # Ensure all miners with tensor fingerprints are in miner_data
+        # (detector needs MinerLogprobs entries for pair enumeration)
+        for uid in tensor_fingerprints:
+            if uid not in miner_data:
+                info = miner_info[uid]
+                miner_data[uid] = MinerLogprobs(uid=uid, hotkey=info["hotkey"])
+
         detector = AntiCopyDetector()
-        results = detector.detect(miner_data)
+        results = detector.detect(miner_data, tensor_fingerprints=tensor_fingerprints)
 
         copy_pairs = [r for r in results if r.is_copy]
         logger.info(

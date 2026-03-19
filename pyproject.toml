@@ -20,6 +20,7 @@ dependencies = [
     "orjson",
     "aiofiles",
     "huggingface_hub",
+    "safetensors",
     "transformers",
     "datasets",
     "aiobotocore>=2.23.0",

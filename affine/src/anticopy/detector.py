@@ -1,11 +1,12 @@
 """
 Anti-Copy Detector
 
-Two-signal voting system for detecting model copies.
+Up to three independent signals for detecting model copies.
 
 Signals:
-  1. hidden_states cosine  – model internal representation (independent)
-  2. logprob top-3 cosine  – output distribution direction (independent)
+  1. hidden_states cosine   – model internal representation (behavioral)
+  2. logprob top-3 cosine   – output distribution direction (behavioral)
+  3. tensor fingerprint cos – direct weight comparison (structural)
 
 JS divergence and token agreement are computed for diagnostics but do NOT
 vote, because they are derived from the same logprob/topk data as cosine
@@ -15,7 +16,7 @@ Decision: is_copy when ALL available signals vote copy, with at least 1 signal.
 """
 
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from affine.core.setup import logger
 from affine.src.anticopy.loader import TOP_K
@@ -24,11 +25,12 @@ from affine.src.anticopy.models import CopyPair, MinerLogprobs
 
 
 class AntiCopyDetector:
-    """Detect model copies using two independent signals.
+    """Detect model copies using up to three independent signals.
 
     Args:
-        hs_threshold:      hidden_states cosine >= this → vote copy
+        hs_threshold:       hidden_states cosine >= this → vote copy
         cosine_threshold:   logprob cosine >= this → vote copy
+        tensor_threshold:   tensor fingerprint cosine >= this → vote copy
         min_tasks:          minimum shared tasks required for comparison
     """
 
@@ -36,10 +38,12 @@ class AntiCopyDetector:
         self,
         hs_threshold: float = 0.99,
         cosine_threshold: float = 0.99,
+        tensor_threshold: float = 0.99995,
         min_tasks: int = 30,
     ):
         self.hs_threshold = hs_threshold
         self.cosine_threshold = cosine_threshold
+        self.tensor_threshold = tensor_threshold
         self.min_tasks = min_tasks
 
     @staticmethod
@@ -84,8 +88,17 @@ class AntiCopyDetector:
         end = fork * TOP_K
         return self._cosine_pair(lp_a[:end], lp_b[:end])
 
-    def detect(self, miners: Dict[int, MinerLogprobs]) -> List[CopyPair]:
+    def detect(
+        self,
+        miners: Dict[int, MinerLogprobs],
+        tensor_fingerprints: Optional[Dict[int, Dict[str, "np.ndarray"]]] = None,
+    ) -> List[CopyPair]:
         """Run detection over all miner pairs.
+
+        Args:
+            miners: Dict mapping uid -> MinerLogprobs (behavioral signals)
+            tensor_fingerprints: Optional dict mapping uid -> tensor fingerprint.
+                Each fingerprint is {tensor_name: np.ndarray}.
 
         Returns:
             List of CopyPair, sorted by confidence descending
@@ -93,9 +106,14 @@ class AntiCopyDetector:
         if len(miners) < 2:
             return []
 
+        tensor_fingerprints = tensor_fingerprints or {}
+
         uid_list = sorted(miners.keys())
         n = len(uid_list)
-        logger.info(f"anti_copy: running detection on {n} miners ({n*(n-1)//2} pairs)")
+        logger.info(
+            f"anti_copy: running detection on {n} miners ({n*(n-1)//2} pairs), "
+            f"{len(tensor_fingerprints)} with tensor fingerprints"
+        )
 
         results: List[CopyPair] = []
 
@@ -168,11 +186,27 @@ class AntiCopyDetector:
                     # Use max task count
                     n_tasks = max(n_tasks, len(hs_common))
 
+                # ── Tensor fingerprint signal ─────────────────────
+                tensor_cos = float("nan")
+                fp_a = tensor_fingerprints.get(uid_a)
+                fp_b = tensor_fingerprints.get(uid_b)
+                has_tensor = fp_a is not None and fp_b is not None
+                if has_tensor:
+                    common_tensors = set(fp_a.keys()) & set(fp_b.keys())
+                    tensor_sims = []
+                    for t in common_tensors:
+                        if len(fp_a[t]) == len(fp_b[t]):
+                            tensor_sims.append(self._cosine_pair(fp_a[t], fp_b[t]))
+                    if tensor_sims:
+                        tensor_cos = float(np.mean(tensor_sims))
+                    else:
+                        has_tensor = False
+
                 # Need at least some data to compare
-                if not has_logprobs and not has_hs:
+                if not has_logprobs and not has_hs and not has_tensor:
                     continue
 
-                # ── Voting (2 independent signals) ─────────────────
+                # ── Voting (up to 3 independent signals) ───────────
                 votes = 0
                 total_votes = 0
 
@@ -184,6 +218,11 @@ class AntiCopyDetector:
                 if has_logprobs and not np.isnan(med_cosine):
                     total_votes += 1
                     if med_cosine >= self.cosine_threshold:
+                        votes += 1
+
+                if has_tensor and not np.isnan(tensor_cos):
+                    total_votes += 1
+                    if tensor_cos >= self.tensor_threshold:
                         votes += 1
 
                 # All available signals must agree; need at least 1
@@ -200,6 +239,7 @@ class AntiCopyDetector:
                         hotkey_b=mb.hotkey,
                         cosine_similarity=med_cosine,
                         hs_cosine=med_hs,
+                        tensor_cosine=tensor_cos,
                         js_divergence=med_js,
                         token_agreement=med_agree,
                         n_tasks=n_tasks,
