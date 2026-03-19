@@ -462,16 +462,25 @@ Each environment runs as a Docker container with an `Actor.evaluate()` method re
 - Miner B must beat threshold in **ALL** environments to dominate A
 - Dominated miners are filtered from subset
 
-### Stage 3: Subset Scoring (`stage3_subset.py`)
-- Geometric mean across environments (with epsilon=0.01 smoothing)
-- Rank-based decay: `adjusted = score × 0.5^(rank-1)`
-- Distribute subset weight proportionally
+### Stage 3: ELO Rating Update + Weight Distribution (`stage3_subset.py`, `elo.py`)
+
+Replaced the old subset/layer scoring with a **Codeforces-style ELO ladder**:
+
+1. **Compute round ranks**: geometric mean of env avg_scores (same as before), excluding Pareto-filtered miners
+2. **Load previous ratings** from `MINER_STATS` DynamoDB table (persisted per hotkey+revision)
+3. **ELO update** (`elo.py`): pairwise expected-vs-actual comparisons across all ranked miners
+   - New miners start at 1200 (below average) with provisional K=96 that decays linearly to K=32 over 48 rounds
+   - Seniority bonus (disabled by default, `alpha=0.0`): older models get asymmetric K scaling
+   - Rating floor at `ELO_BASE_RATING` (1200) — miners can't drop below
+   - Normalization: mean pairwise result (not sum), so total change bounded by K regardless of field size
+4. **Distribute weights** by ELO rating rank with decay: `weight = 0.5^(rank-1)`, then normalize
 
 ### Stage 4: Weight Normalization (`stage4_weights.py`)
 - Sum subset weights per miner
 - Remove miners below 1% threshold
 - Normalize to sum = 1.0
 - Redistribute sub-threshold to UID 0
+- Display table now shows ELO rating, Δ change, and rounds played (replaces old layer columns)
 
 ### Key Scoring Parameters (`scorer/config.py`)
 
@@ -484,6 +493,12 @@ Each environment runs as a Docker container with an `Actor.evaluate()` method re
 | `GEOMETRIC_MEAN_EPSILON` | 0.01 | Smoothing to prevent zero collapse |
 | `MIN_WEIGHT_THRESHOLD` | 0.01 | 1% minimum weight |
 | `MIN_COMPLETENESS` | 0.9 | 90% completeness required |
+| `ELO_D` | 400.0 | Rating difference scale (like chess) |
+| `ELO_K_BASE` | 32.0 | Base K-factor for established miners |
+| `ELO_K_PROVISIONAL` | 96.0 | Higher K for new miners (converge faster) |
+| `ELO_PROVISIONAL_ROUNDS` | 48 | Rounds until K decays to base (~1 day) |
+| `ELO_BASE_RATING` | 1200.0 | Initial rating (below avg, prevents hotkey spam) |
+| `ELO_SENIORITY_ALPHA` | 0.0 | Seniority advantage (disabled) |
 
 ---
 
@@ -779,9 +794,11 @@ afs validate my-env --num-tests 100
 | `affine/src/scorer/scorer.py` | 4-stage scoring orchestrator |
 | `affine/src/scorer/stage1_collector.py` | Stage 1: Data collection |
 | `affine/src/scorer/stage2_pareto.py` | Stage 2: Pareto filtering |
-| `affine/src/scorer/stage3_subset.py` | Stage 3: Subset scoring |
-| `affine/src/scorer/stage4_weights.py` | Stage 4: Normalization |
-| `affine/src/scorer/config.py` | Scoring parameters |
+| `affine/src/scorer/stage3_subset.py` | Stage 3: ELO update + weight distribution |
+| `affine/src/scorer/elo.py` | ELO rating engine (Codeforces-style with seniority) |
+| `affine/src/scorer/stage4_weights.py` | Stage 4: Normalization + display table |
+| `affine/src/scorer/config.py` | Scoring parameters (incl. ELO params) |
+| `affine/database/dao/miner_stats.py` | Persistent ELO ratings per hotkey+revision |
 | `affine/src/executor/main.py` | ExecutorManager (multiprocess) |
 | `affine/src/executor/worker.py` | Task execution worker |
 | `affine/src/anticopy/detector.py` | Copy detection (two-signal voting) |
@@ -808,7 +825,11 @@ afs validate my-env --num-tests 100
 
 | File | Purpose |
 |------|---------|
-| Browser-based web task evaluation | LiveWeb environment implementation |
+| `liveweb_arena/core/task_registry.py` | Plugin registration and task dispatch |
+| `liveweb_arena/core/gt_collector.py` | Ground truth collection |
+| `liveweb_arena/plugins/` | Plugin directory (openmeteo, openlibrary, etc.) |
+
+Liveweb-arena uses a **plugin architecture** — each plugin provides templates, an API client, and comparison logic. Current plugins: OpenMeteo (weather), OpenLibrary, CoinGecko.
 
 ---
 
@@ -833,7 +854,9 @@ afs validate my-env --num-tests 100
 | `BT_WALLET_HOT` | All | Bittensor hotkey name |
 | `NETUID` | Validator | Subnet ID (default: 120) |
 | `WEIGHT_SET_INTERVAL_BLOCKS` | Validator | Blocks between weight submissions (default: 180) |
-| `SERVICE_MODE` | Validator | Continuous operation (`true`) |
+| `SERVICE_MODE` | Validator/Scorer | Continuous operation (`true`) |
+| `SCORER_INTERVAL_MINUTES` | Scorer | Minutes between scoring runs in service mode (default: 30) |
+| `SCORER_SAVE_TO_DB` | Scorer | Enable database saving (default: false) |
 
 ---
 
