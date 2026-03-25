@@ -48,7 +48,7 @@ class WeightSetter:
                 if weight <= 0:
                     continue
 
-                if uid < 0 or uid > 1000:
+                if uid <= 0 or uid > 1000:
                     # System miner (uid <= 0 or uid > 1000): accumulate weight for UID 0
                     system_weight_total += weight
                 else:
