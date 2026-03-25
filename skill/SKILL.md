@@ -424,8 +424,8 @@ docker ps | grep affine
 | **Logic** (`lgc` / `lgc-v2`) | `affine:lgc-v2` | 1200-1800s | Logic |
 | **Game** (`game`) | `affine:game` | 7200s | Game (OpenSpiel) |
 | **SWE-Pro** (`swe-pro`) | `affine:swe-pro` | 1800s | Code (SWE-bench) |
-| **SWE-Synth** (`swe-synth`) | `affine:swe-synth` | 7200s | Code (SWE-bench) |
-| **SWE-Infinite** (`swe-infinite`) | `affine:swe-infinite` | 7200s | Code (SWE-bench) |
+| **SWE-Synth** (`swe-synth`) | `affine:swe-synth` | 7200s | Code (SWE-bench) — **DISABLED** |
+| **SWE-Infinite** (`swe-infinite`) | `affine:swe-infinite` | 7200s | Code (SWE-bench) — **primary SWE env** |
 | **LiveWeb** (`liveweb`) | `affine:liveweb` | 1200s | Web/Browser |
 | **NavWorld** (`navworld`) | `affine:navworld` | 7200s | Navigation (MCP tools) |
 | **ARC-GEN** (`arc-gen`) | `affine:arc-gen` | 600s | Pattern recognition |
@@ -442,6 +442,35 @@ Each environment runs as a Docker container with an `Actor.evaluate()` method re
 | **Agentic/Interactive** | swe-pro, liveweb | Multiple tool calls, Docker-in-Docker, 1800-7200s |
 | **Game/Adversarial** | game | Game-theoretic, CPU-bound, 7200s |
 | **Tool-augmented** | navworld | MCP tools, external APIs, LLM-judge scoring |
+
+### NavWorld (QQR) Tool Call Budget & Cache Optimization
+
+NavWorld enforces **per-episode tool call budgets** to prevent wasteful API calls:
+
+| Tool | Budget | Rationale |
+|------|--------|-----------|
+| `direction` | 10 | ~5 routes needed for a quality plan |
+| `poi_search` | 10 | ~5 POIs needed |
+| `around_search` | 6 | ~3 nearby searches |
+| `weather` | 3 | 1-2 weather checks |
+
+When a tool exceeds its budget, the model gets a text hint to use existing data (no API call made). This aligns with `MAX_TOOL_STEPS=15`.
+
+**Cache normalization** for better hit rates:
+- Coordinates rounded to **3 decimal places** (~111m precision) for both `direction` and `around_search`
+- `around_search` radius bucketed into tiers: ≤1500→1000, ≤4000→3000, >4000→5000
+- All string args whitespace-stripped
+- Cache TTL: **AMap tools → 30 days** (routes, POIs, weather are stable); **Transport tools → 48 hours** (data rotates with epoch salt)
+
+### Environment-Side Error Handling
+
+Environments that call external APIs (e.g., NavWorld → AMap, LiveWeb → CoinGecko) detect **API rate limits and quota exhaustion** during evaluation. When detected, the evaluation is **invalidated** (score=0, error recorded) rather than penalizing the model — these errors are the environment's fault, not the model's.
+
+Detected error patterns: `USER_DAILY_QUERY_OVER_LIMIT`, `QPS_OVER_LIMIT`, `CUOTA_PLAN_RUN_OUT`, `tool_call_timeout`, etc.
+
+**Early termination on env errors** (2026-03): The QQR environment now checks for API errors **after each tool call** during `step()`. If an error is detected (e.g., quota exhausted), the episode terminates immediately with `score=0` instead of continuing to waste remaining tool calls on broken data. This also short-circuits the outer evaluation loop — `step()` returns `done=True` and the caller stops.
+
+This means miners won't be unfairly scored when external API quotas are hit. The invalidated evaluations are excluded from scoring aggregation.
 
 ---
 
@@ -829,7 +858,17 @@ afs validate my-env --num-tests 100
 | `liveweb_arena/core/gt_collector.py` | Ground truth collection |
 | `liveweb_arena/plugins/` | Plugin directory (openmeteo, openlibrary, etc.) |
 
-Liveweb-arena uses a **plugin architecture** — each plugin provides templates, an API client, and comparison logic. Current plugins: OpenMeteo (weather), OpenLibrary, CoinGecko.
+Liveweb-arena uses a **plugin architecture** — each plugin provides templates, an API client, and comparison logic. Current plugins: OpenMeteo (weather), OpenLibrary, CoinGecko, **ArXiv** (academic papers).
+
+**ArXiv plugin** (added 2026-03): Queries arxiv.org listing pages (`/list/<category>/new`). Supports templates for paper info, author extrema, category comparison, multi-author filter, and title length extrema. Blocks direct API/RSS access — agent must use the rendered listing page. GT is always collected from `/new` regardless of whether the agent visits `/new` or `/recent`.
+
+**OpenMeteo cache mode**: Plugins can inject pre-fetched API data as readable HTML tables via `setup_page_for_cache()`. In cache mode, the agent reads values from the DOM snapshot without needing JS hydration. This enables scoring in cache mode without live network access.
+
+**Stale cache fallback** (2026-03): When a cache refresh fails (network error, API down), the cache manager now **serves the stale cached page** instead of deleting the cache entry. This prevents cascading failures where a temporary outage wipes out valid cached data.
+
+**Stooq symbol normalization** (2026-03): The Stooq plugin implements `normalize_url()` to canonicalize bare symbols to their suffixed form (e.g., `?s=aapl` → `?s=aapl.us`). This ensures a single cache entry per asset regardless of which URL variant the agent navigates to. Other plugins use the default URL normalization from `core/cache.py`.
+
+**Validator model rotation**: The LLM validator uses round-robin rotation across available models (up to 20 attempts total) instead of exhausting retries on each model sequentially. Each individual model attempt uses `max_retries=1`, then immediately rotates to the next model on failure.
 
 ---
 
@@ -840,8 +879,10 @@ Liveweb-arena uses a **plugin architecture** — each plugin provides templates,
 | `CHUTES_API_KEY` | All envs | Chutes.ai API authentication |
 | `HF_TOKEN` | Monitor, SWE-bench | HuggingFace model access |
 | `HF_USER` | Monitor | HuggingFace username for naming checks |
-| `AMAP_MAPS_API_KEY` | NavWorld | AMap API for travel planning |
+| `AMAP_MAPS_API_KEY` | NavWorld | AMap API key(s) — supports **multiple comma-separated keys** for quota pooling (e.g., `key1,key2,key3`). Each API call picks a random key; exhausted keys are auto-excluded |
 | `COINGECKO_API_KEY` | LiveWeb | CoinGecko API for crypto tasks |
+| `VALIDATOR_API_KEY` | LiveWeb Validator | Separate API key for validation LLM calls (optional, falls back to evaluated model's key) |
+| `VALIDATOR_BASE_URL` | LiveWeb Validator | Separate base URL for validation LLM calls (optional) |
 | `DOCKER_HUB_USERNAME` | SWE-bench Synth/Infinite | Docker Hub for nested images |
 | `DOCKER_HUB_TOKEN` | SWE-bench Synth/Infinite | Docker Hub auth |
 | `AFFINETES_MODE` | SDK | `docker` or `basilica` |
