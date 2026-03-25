@@ -125,7 +125,7 @@
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
         "sampling_count": 100,
-        "rotation_enabled": true,
+        "rotation_enabled": false,
         "rotation_count": 2,
         "rotation_interval": 7200,
         "scheduling_weight": 1.0
