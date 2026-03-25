@@ -265,6 +265,23 @@ _ENV_CONFIGS_CANONICAL = {
         },
     ),
 
+    # MemoryGym environment (LLM memory management evaluation)
+    # Evaluates: information intake, storage decisions, retrieval, change tracking, reasoning.
+    # Each evaluation runs a full episode (~10-40 min depending on model).
+    # task_id 0-9 maps to templates: company/research/city/hospital/sport/movie/university/codebase/project/agentteam
+    "memory": EnvConfig(
+        name="memory",
+        docker_image="affinefoundation/memorygym:latest",
+        env_vars={"UVICORN_WORKERS": "4"},
+        mem_limit="8g",
+        eval_params={
+            "tier": "standard",
+            "temperature": 0.0,
+            "timeout": 3600,
+        },
+        proxy_timeout=3660,
+    ),
+
     # NavWorld Travel Planning environment (anti-hack hardened scoring)
     # Uses MCP tool servers (AMap + Transport) for real tool invocation.
     # Scoring: 50/50 code-LLM split, 7 problem types, 15 tool steps max.
@@ -328,6 +345,12 @@ _ENV_ALIASES = {
     # LiveWeb Arena aliases
     "LIVEWEB": "liveweb",
     "liveweb-arena": "liveweb",
+
+    # Memory aliases
+    "MEMORY": "memory",
+    "Memory": "memory",
+    "memorygym": "memory",
+    "MemoryGym": "memory",
 
     # NavWorld aliases
     "NAVWORLD": "navworld",
@@ -739,3 +762,7 @@ NAVWORLD = NAVWORLD_factory
 # LogProbs factory
 LOGPROBS_factory = lambda mode=None: create_environment("logprobs", mode=mode)
 LOGPROBS = LOGPROBS_factory
+
+# Memory factory
+MEMORY_factory = lambda mode=None: create_environment("memory", mode=mode)
+MEMORY = MEMORY_factory

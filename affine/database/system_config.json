@@ -117,6 +117,19 @@
         "rotation_interval": 3600,
         "scheduling_weight": 1.0
       }
+    },
+    "MEMORY": {
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": false,
+      "min_completeness": 0.8,
+      "sampling_config": {
+        "dataset_range": [[0, 1000000000]],
+        "sampling_count": 100,
+        "rotation_enabled": true,
+        "rotation_count": 2,
+        "rotation_interval": 7200,
+        "scheduling_weight": 1.0
+      }
     }
   }
 }
