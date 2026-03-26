@@ -413,7 +413,7 @@ docker ps | grep affine
 
 ## 4. Environments
 
-13 containerized Docker environments managed by Affinetes:
+14 containerized Docker environments managed by Affinetes:
 
 | Environment | Docker Image | Timeout | Category |
 |-------------|-------------|---------|----------|
@@ -429,6 +429,7 @@ docker ps | grep affine
 | **LiveWeb** (`liveweb`) | `affine:liveweb` | 1200s | Web/Browser |
 | **NavWorld** (`navworld`) | `affine:navworld` | 7200s | Navigation (MCP tools) |
 | **ARC-GEN** (`arc-gen`) | `affine:arc-gen` | 600s | Pattern recognition |
+| **Memory** (`memory`) | `memorygym:latest` | 3600s | Memory management |
 | **LogProbs** (`logprobs`) | `affine:logprobs` | 600s | Calibration |
 
 Each environment runs as a Docker container with an `Actor.evaluate()` method returning `{"score": 0.0-1.0}`.
@@ -442,6 +443,11 @@ Each environment runs as a Docker container with an `Actor.evaluate()` method re
 | **Agentic/Interactive** | swe-pro, liveweb | Multiple tool calls, Docker-in-Docker, 1800-7200s |
 | **Game/Adversarial** | game | Game-theoretic, CPU-bound, 7200s |
 | **Tool-augmented** | navworld | MCP tools, external APIs, LLM-judge scoring |
+| **Memory management** | memory | Episode-based, 10-40 min, information intake/retrieval |
+
+### MemoryGym Environment (2026-03)
+
+New environment evaluating LLM memory management: information intake, storage decisions, retrieval, change tracking, and reasoning. Each episode runs 10-40 minutes depending on model. 10 task templates (company/research/city/hospital/sport/movie/university/codebase/project/agentteam) mapped by `task_id` 0-9. Docker image: `affinefoundation/memorygym:latest`, 8GB memory limit, 4 uvicorn workers. Enabled for sampling only (not scoring yet), 100 samples per rotation, 2-hour rotation interval.
 
 ### Environment-Side Error Handling
 
@@ -498,7 +504,7 @@ Replaced the old subset/layer scoring with a **Codeforces-style ELO ladder**:
 | `MIN_IMPROVEMENT` | 0.02 | 2% minimum gap for dominance |
 | `MAX_IMPROVEMENT` | 0.10 | 10% cap on dominance threshold |
 | `DECAY_FACTOR` | 0.5 | Rank decay — 50% per position |
-| `GEOMETRIC_MEAN_EPSILON` | 0.01 | Smoothing to prevent zero collapse |
+| `GEOMETRIC_MEAN_EPSILON` | 0.1 | Smoothing to prevent zero collapse (increased from 0.01 to reduce impact of single weak env) |
 | `MIN_WEIGHT_THRESHOLD` | 0.01 | 1% minimum weight |
 | `MIN_COMPLETENESS` | 0.9 | 90% completeness required |
 | `ELO_D` | 400.0 | Rating difference scale (like chess) |
