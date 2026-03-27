@@ -152,13 +152,28 @@ class ScorerConfig:
     rating decays each round. This ensures ranking stability — no sudden weight drops
     when a miner is temporarily unable to participate.
 
-    Applied as: rating = BASE_RATING + (rating - BASE_RATING) * DECAY_RATE^missed_rounds
+    Applied as: rating = BASE_RATING + excess * DECAY_RATE^(missed_rounds^POWER)
 
-    With 0.95 at 30-minute intervals:
-    - 1 round absent:  retains 95.0% of excess rating
-    - 12 hours (24 rnd): retains 29.2%
-    - 1 day (48 rnd):  retains  8.5% (near reset)
-    - 2 days (96 rnd): retains  0.7% (effectively reset)
+    Combined with ELO_ABSENCE_DECAY_POWER for accelerating decay:
+    gentle at first, aggressive over time. Guarantees convergence to BASE_RATING.
+
+    With 0.95 rate and 1.4 power at 30-minute intervals:
+    - 1 hour:   retains 87% (gentle)
+    - 3 hours:  retains 53%
+    - 6 hours:  retains 19%
+    - 12 hours: retains  1.3% (nearly gone)
+    - 18 hours: retains  0.05% (gone)
+    """
+
+    ELO_ABSENCE_DECAY_POWER: float = 1.4
+    """Power exponent for accelerating absence decay.
+
+    Makes decay gentle at first but increasingly aggressive over time.
+    The exponent is applied to missed_rounds: decay_rate^(missed_rounds^power).
+
+    power=1.0: constant decay rate (no acceleration, standard exponential)
+    power=1.4: accelerating decay, any rating reaches BASE within ~18 hours
+    power=2.0: very aggressive acceleration
     """
 
 
@@ -187,6 +202,7 @@ class ScorerConfig:
             'elo_base_rating': cls.ELO_BASE_RATING,
             'elo_seniority_alpha': cls.ELO_SENIORITY_ALPHA,
             'elo_absence_decay_rate': cls.ELO_ABSENCE_DECAY_RATE,
+            'elo_absence_decay_power': cls.ELO_ABSENCE_DECAY_POWER,
         }
     
     @classmethod

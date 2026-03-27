@@ -180,11 +180,24 @@ class Stage3SubsetScorer:
         if missed_rounds < 2.0:
             return rating
 
+        excess = rating - base
         decay_rate = self.config.ELO_ABSENCE_DECAY_RATE
-        decayed = base + (rating - base) * (decay_rate ** missed_rounds)
+        power = self.config.ELO_ABSENCE_DECAY_POWER
 
-        # Snap to BASE_RATING if decay brings it very close (avoid floating point dust)
-        if decayed - base < 0.5:
+        # Offset by grace period so the first effective round = 1.
+        # This ensures the first decay is exactly 5% (one round worth),
+        # then accelerates from there.
+        grace_rounds = 2.0
+        effective_rounds = max(1.0, missed_rounds - grace_rounds + 1.0)
+
+        # Accelerating decay: gentle at first, aggressive over time.
+        # effective_rounds^power makes the exponent grow super-linearly,
+        # guaranteeing convergence to BASE_RATING within ~18 hours.
+        decayed = base + excess * (decay_rate ** (effective_rounds ** power))
+
+        # Snap to BASE_RATING when excess is negligible (< 30 points).
+        # Avoids meaningless tail where rating is near-BASE but not exactly BASE.
+        if decayed - base < 30.0:
             decayed = base
 
         return decayed
