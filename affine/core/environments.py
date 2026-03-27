@@ -272,8 +272,8 @@ _ENV_CONFIGS_CANONICAL = {
     "memory": EnvConfig(
         name="memory",
         docker_image="affinefoundation/memorygym:latest",
-        env_vars={"UVICORN_WORKERS": "4"},
-        mem_limit="8g",
+        env_vars={"UVICORN_WORKERS": "8"},
+        mem_limit="12g",
         eval_params={
             "tier": "standard",
             "temperature": 0.0,
