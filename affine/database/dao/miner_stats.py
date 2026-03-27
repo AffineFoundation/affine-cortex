@@ -442,21 +442,29 @@ class MinerStatsDAO(BaseDAO):
         elo_rating: float,
         elo_rounds_played: int,
         elo_model_submit_block: Optional[int] = None,
+        participated: bool = True,
     ) -> None:
         """Update miner's ELO rating (authoritative data source).
 
-        elo_model_submit_block is only written on first call (when rounds_played == 1).
+        Only participating miners update elo_last_scored_at (resets the decay
+        clock). Non-participants should NOT call this method — their miner_stats
+        record is left untouched so the original rating + timestamp are preserved
+        for correct time-based decay accumulation.
+
+        elo_model_submit_block is only written on first call (rounds_played == 1).
         """
+        import time
         from affine.database.client import get_client
         client = get_client()
 
         pk = self._make_pk(hotkey)
         sk = self._make_sk(revision)
 
-        update_expr = "SET elo_rating = :r, elo_rounds_played = :rp"
+        update_expr = "SET elo_rating = :r, elo_rounds_played = :rp, elo_last_scored_at = :ts"
         expr_values = {
             ':r': {'N': str(elo_rating)},
             ':rp': {'N': str(elo_rounds_played)},
+            ':ts': {'N': str(int(time.time()))},
         }
 
         # First round: record model_submit_block

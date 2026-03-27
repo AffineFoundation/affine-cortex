@@ -144,6 +144,24 @@ class ScorerConfig:
     ELO_SENIORITY_ALPHA: float = 0.0
     """Seniority advantage factor. 0.0 disables seniority bonus."""
 
+    ELO_ABSENCE_DECAY_RATE: float = 0.95
+    """Per-round decay rate for miners not participating in scoring.
+
+    Miners that don't participate in a round (incomplete sampling, Pareto-filtered,
+    offline) still retain their weight position based on historical rating, but their
+    rating decays each round. This ensures ranking stability — no sudden weight drops
+    when a miner is temporarily unable to participate.
+
+    Applied as: rating = BASE_RATING + (rating - BASE_RATING) * DECAY_RATE^missed_rounds
+
+    With 0.95 at 30-minute intervals:
+    - 1 round absent:  retains 95.0% of excess rating
+    - 12 hours (24 rnd): retains 29.2%
+    - 1 day (48 rnd):  retains  8.5% (near reset)
+    - 2 days (96 rnd): retains  0.7% (effectively reset)
+    """
+
+
     # Database & Storage
     SCORE_RECORD_TTL_DAYS: int = 30
     """TTL for score_snapshots table (in days)."""
@@ -168,6 +186,7 @@ class ScorerConfig:
             'elo_provisional_rounds': cls.ELO_PROVISIONAL_ROUNDS,
             'elo_base_rating': cls.ELO_BASE_RATING,
             'elo_seniority_alpha': cls.ELO_SENIORITY_ALPHA,
+            'elo_absence_decay_rate': cls.ELO_ABSENCE_DECAY_RATE,
         }
     
     @classmethod

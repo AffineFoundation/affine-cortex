@@ -3,8 +3,13 @@ Stage 3: ELO Rating Update and Weight Distribution
 
 Uses per-round composite ranking (geometric mean of env avg_scores) to update
 ELO ratings, then distributes weights by rating rank with decay.
+
+Absence decay: miners that don't participate in a round have their rating
+decayed toward BASE_RATING. This prevents stale high ratings from dominating
+when a miner is Pareto-filtered, has incomplete data, or goes offline.
 """
 
+import time
 from typing import Dict, List, Any, Optional, Tuple
 from affine.src.scorer.models import (
     MinerData,
@@ -79,7 +84,11 @@ class Stage3SubsetScorer:
                 miners[uid].elo_rating_change = change
                 miners[uid].elo_rounds_played = new_rounds
 
-        # Non-ranked miners (absent/Pareto-filtered) keep previous rating unchanged
+        # Non-ranked miners: use time-decayed rating from _load_prev_ratings.
+        # No per-round decay here — time-based decay handles all cases:
+        # - In-line non-participants: timestamp NOT updated in save_results,
+        #   so time gap grows each round → increasing decay on next load.
+        # - Offline miners: not in save loop → time accumulates → big decay on return.
         for uid, miner in miners.items():
             if uid not in round_ranks:
                 miner.elo_rating = current_ratings.get(uid, self.config.ELO_BASE_RATING)
@@ -134,13 +143,63 @@ class Stage3SubsetScorer:
             ranks[uid] = prev_rank
         return ranks
 
+    def _apply_absence_decay(self, rating: float, last_scored_at: Optional[int]) -> float:
+        """Apply absence decay based on time since last scored.
+
+        Decays rating toward BASE_RATING proportionally to the number of
+        missed scoring rounds. Miners that haven't been scored recently
+        lose their accumulated rating advantage.
+
+        Args:
+            rating: Current stored rating
+            last_scored_at: Unix timestamp of last scoring, or None if never scored
+
+        Returns:
+            Decayed rating (never below BASE_RATING)
+        """
+        if last_scored_at is None:
+            # Never scored before — no decay needed, will start from BASE_RATING
+            return rating
+
+        base = self.config.ELO_BASE_RATING
+        if rating <= base:
+            return base
+
+        elapsed = time.time() - last_scored_at
+        if elapsed <= 0:
+            return rating
+
+        import os
+        interval_minutes = int(os.getenv("SCORER_INTERVAL_MINUTES", "30"))
+        interval = interval_minutes * 60
+        missed_rounds = elapsed / interval
+
+        # Only apply decay after missing 2+ rounds (1 hour+).
+        # This gives buffer for timing jitter and ensures miners that participated
+        # last round (~30min gap) are never decayed.
+        if missed_rounds < 2.0:
+            return rating
+
+        decay_rate = self.config.ELO_ABSENCE_DECAY_RATE
+        decayed = base + (rating - base) * (decay_rate ** missed_rounds)
+
+        # Snap to BASE_RATING if decay brings it very close (avoid floating point dust)
+        if decayed - base < 0.5:
+            decayed = base
+
+        return decayed
+
     def _load_prev_ratings(
         self,
         miners: Dict[int, MinerData],
         prev_ratings: Optional[Dict[str, Dict[str, Any]]],
         current_block: int,
     ) -> Tuple[Dict[int, float], Dict[int, int], Dict[int, int]]:
-        """Load ratings from MINER_STATS, matched by hotkey+revision."""
+        """Load ratings from MINER_STATS, matched by hotkey+revision.
+
+        Applies absence decay: if a miner hasn't been scored recently,
+        their rating decays toward BASE_RATING based on elapsed time.
+        """
         current_ratings = {}
         current_rounds = {}
         model_ages = {}
@@ -150,10 +209,23 @@ class Stage3SubsetScorer:
                 prev = prev_ratings[miner.hotkey]
                 # DynamoDB .get() returns None when key exists but value is None,
                 # so use `or` instead of default parameter
-                current_ratings[uid] = prev.get('elo_rating') or self.config.ELO_BASE_RATING
+                stored_rating = prev.get('elo_rating') or self.config.ELO_BASE_RATING
+                last_scored_at = prev.get('elo_last_scored_at')
+                if last_scored_at is not None:
+                    last_scored_at = int(last_scored_at)
+
+                # Apply absence decay based on time since last scored
+                current_ratings[uid] = self._apply_absence_decay(stored_rating, last_scored_at)
                 current_rounds[uid] = prev.get('elo_rounds_played') or 0
                 submit_block = prev.get('elo_model_submit_block') or current_block
                 model_ages[uid] = max(0, current_block - submit_block)
+
+                if current_ratings[uid] < stored_rating:
+                    logger.info(
+                        f"ELO absence decay: uid={uid} hotkey={miner.hotkey[:8]}.. "
+                        f"rating {stored_rating:.0f} -> {current_ratings[uid]:.0f} "
+                        f"(last scored {int(time.time() - last_scored_at)}s ago)"
+                    )
             else:
                 # New miner or new revision (no MINER_STATS record)
                 current_ratings[uid] = self.config.ELO_BASE_RATING
@@ -165,14 +237,23 @@ class Stage3SubsetScorer:
     def _distribute_weights_by_rating(self, miners: Dict[int, MinerData]):
         """Distribute weights by ELO rating rank with decay.
 
-        Excludes Pareto-filtered miners — they get weight=0 this round
-        but keep their rating for next round.
+        Intentionally includes ALL miners that have ever participated in ELO,
+        even if they didn't participate this round (incomplete sampling,
+        Pareto-filtered, etc.). These miners retain weight based on their
+        historical rating, which decays each round they don't participate.
+        This ensures ranking stability — no sudden weight drops from
+        temporary issues.
+
+        Only excludes:
+        - Miners with no valid environment scores at all
+        - Miners that have never participated in ELO (rounds_played == 0)
+        - Miners at or below BASE_RATING (fully decayed or never climbed)
         """
         rated_miners = [
             (uid, m) for uid, m in miners.items()
             if m.is_valid_for_scoring()
             and m.elo_rounds_played > 0
-            and not m.filtered_subsets  # Pareto-filtered get no weight
+            and m.elo_rating > self.config.ELO_BASE_RATING
         ]
         rated_miners.sort(key=lambda x: x[1].elo_rating, reverse=True)
 
