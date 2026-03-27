@@ -255,7 +255,12 @@ async def print_rank_table():
                 row_parts.append(f"{delta_str:>6s}")
                 row_parts.append(f"{elo_rounds_played:4d}")
                 row_parts.append(f"{overall_score:>10.6f}")
-                row_parts.append(f"{'✓':12s}")
+                # Show filter reason even for active miners (e.g. Pareto-filtered
+                # miners that retain weight while decaying)
+                if filter_reason:
+                    row_parts.append(f"{'↓' + filter_reason:12s}")
+                else:
+                    row_parts.append(f"{'✓':12s}")
             else:
                 row_parts.append(f"{'—':>6}")
                 row_parts.append(f"{'—':>6}")
