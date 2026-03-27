@@ -143,6 +143,7 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
                         'elo_rating': stats.get('elo_rating') or None,
                         'elo_rounds_played': stats.get('elo_rounds_played') or 0,
                         'elo_model_submit_block': stats.get('elo_model_submit_block') or None,
+                        'elo_last_scored_at': stats.get('elo_last_scored_at') or None,
                     }
         except Exception as e:
             logger.warning(f"Failed to load ELO ratings from MINER_STATS: {e}")
@@ -170,7 +171,8 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
                 result=result,
                 score_snapshots_dao=score_snapshots_dao,
                 scores_dao=scores_dao,
-                miner_stats_dao=miner_stats_dao
+                miner_stats_dao=miner_stats_dao,
+                prev_ratings=prev_ratings,
             )
             logger.info("Results saved successfully")
         

@@ -117,14 +117,17 @@ class Scorer:
         result: ScoringResult,
         score_snapshots_dao=None,
         scores_dao=None,
-        miner_stats_dao=None
+        miner_stats_dao=None,
+        prev_ratings: Optional[Dict[str, Any]] = None,
     ):
         """Save scoring results to database.
-        
+
         Args:
             result: ScoringResult to save
             score_snapshots_dao: ScoreSnapshotsDAO instance (optional)
             scores_dao: ScoresDAO instance (optional)
+            miner_stats_dao: MinerStatsDAO instance (optional)
+            prev_ratings: Previous ratings for determining participation
         """
         if not score_snapshots_dao or not scores_dao:
             logger.warning("DAO instances not provided, skipping database save")
@@ -224,15 +227,22 @@ class Scorer:
                 elo_rating_change=miner.elo_rating_change,
             )
 
-            # Update MINER_STATS (authoritative ELO data source)
+            # Update MINER_STATS only for miners that participated in ELO.
+            # Non-participants' miner_stats are left untouched — preserving their
+            # original rating + timestamp for correct time-based decay accumulation.
             if miner_stats_dao:
-                await miner_stats_dao.update_elo_rating(
-                    hotkey=miner.hotkey,
-                    revision=miner.model_revision,
-                    elo_rating=miner.elo_rating,
-                    elo_rounds_played=miner.elo_rounds_played,
-                    elo_model_submit_block=result.block_number if miner.elo_rounds_played == 1 else None,
-                )
+                prev = prev_ratings.get(miner.hotkey, {}) if prev_ratings else {}
+                prev_rounds = prev.get('elo_rounds_played') or 0
+                participated = miner.elo_rounds_played > prev_rounds
+
+                if participated:
+                    await miner_stats_dao.update_elo_rating(
+                        hotkey=miner.hotkey,
+                        revision=miner.model_revision,
+                        elo_rating=miner.elo_rating,
+                        elo_rounds_played=miner.elo_rounds_played,
+                        elo_model_submit_block=result.block_number if miner.elo_rounds_played == 1 else None,
+                    )
 
         logger.info(f"Successfully saved complete scoring results for {len(result.miners)} miners to scores table")
 

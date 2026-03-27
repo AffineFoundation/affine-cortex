@@ -144,6 +144,39 @@ class ScorerConfig:
     ELO_SENIORITY_ALPHA: float = 0.0
     """Seniority advantage factor. 0.0 disables seniority bonus."""
 
+    ELO_ABSENCE_DECAY_RATE: float = 0.95
+    """Per-round decay rate for miners not participating in scoring.
+
+    Miners that don't participate in a round (incomplete sampling, Pareto-filtered,
+    offline) still retain their weight position based on historical rating, but their
+    rating decays each round. This ensures ranking stability — no sudden weight drops
+    when a miner is temporarily unable to participate.
+
+    Applied as: rating = BASE_RATING + excess * DECAY_RATE^(missed_rounds^POWER)
+
+    Combined with ELO_ABSENCE_DECAY_POWER for accelerating decay:
+    gentle at first, aggressive over time. Guarantees convergence to BASE_RATING.
+
+    With 0.95 rate and 1.4 power at 30-minute intervals:
+    - 1 hour:   retains 87% (gentle)
+    - 3 hours:  retains 53%
+    - 6 hours:  retains 19%
+    - 12 hours: retains  1.3% (nearly gone)
+    - 18 hours: retains  0.05% (gone)
+    """
+
+    ELO_ABSENCE_DECAY_POWER: float = 1.4
+    """Power exponent for accelerating absence decay.
+
+    Makes decay gentle at first but increasingly aggressive over time.
+    The exponent is applied to missed_rounds: decay_rate^(missed_rounds^power).
+
+    power=1.0: constant decay rate (no acceleration, standard exponential)
+    power=1.4: accelerating decay, any rating reaches BASE within ~18 hours
+    power=2.0: very aggressive acceleration
+    """
+
+
     # Database & Storage
     SCORE_RECORD_TTL_DAYS: int = 30
     """TTL for score_snapshots table (in days)."""
@@ -168,6 +201,8 @@ class ScorerConfig:
             'elo_provisional_rounds': cls.ELO_PROVISIONAL_ROUNDS,
             'elo_base_rating': cls.ELO_BASE_RATING,
             'elo_seniority_alpha': cls.ELO_SENIORITY_ALPHA,
+            'elo_absence_decay_rate': cls.ELO_ABSENCE_DECAY_RATE,
+            'elo_absence_decay_power': cls.ELO_ABSENCE_DECAY_POWER,
         }
     
     @classmethod
