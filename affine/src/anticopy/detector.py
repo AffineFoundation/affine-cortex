@@ -125,7 +125,7 @@ class AntiCopyDetector:
                         )
                         for t in lp_common
                     ])
-                    med_cosine = float(np.nanquantile(cosines, 0.25))
+                    med_cosine = float(np.nanmean(cosines))
                     task_cosine_map = {
                         t: float(c) for t, c in zip(lp_common, cosines)
                     }
@@ -139,7 +139,7 @@ class AntiCopyDetector:
                         if topk_a and topk_b:
                             js_vals.append(js_divergence_topk(topk_a, topk_b))
                     if js_vals:
-                        med_js = float(np.nanquantile(js_vals, 0.25))
+                        med_js = float(np.nanmean(js_vals))
 
                     # Token agreement
                     agree_vals = []
@@ -149,7 +149,7 @@ class AntiCopyDetector:
                         if tok_a and tok_b:
                             agree_vals.append(token_agreement_rate(tok_a, tok_b))
                     if agree_vals:
-                        med_agree = float(np.nanquantile(agree_vals, 0.25))
+                        med_agree = float(np.nanmean(agree_vals))
 
                 # ── Hidden states signal ─────────────────────────────
                 hs_common = sorted(
@@ -164,7 +164,7 @@ class AntiCopyDetector:
                         self._cosine_pair(ma.task_hidden_states[t], mb.task_hidden_states[t])
                         for t in hs_common
                     ])
-                    med_hs = float(np.nanquantile(hs_cosines, 0.25))
+                    med_hs = float(np.nanmean(hs_cosines))
                     # Use max task count
                     n_tasks = max(n_tasks, len(hs_common))
 
