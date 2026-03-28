@@ -158,7 +158,10 @@ class Stage3SubsetScorer:
             Decayed rating (never below BASE_RATING)
         """
         if last_scored_at is None:
-            # Never scored before — no decay needed, will start from BASE_RATING
+            # No timestamp: either a brand new miner or a legacy miner from
+            # before elo_last_scored_at was introduced. Don't decay — the
+            # timestamp will be backfilled in save_results for non-participants,
+            # starting the decay clock from next round.
             return rating
 
         base = self.config.ELO_BASE_RATING

@@ -243,6 +243,17 @@ class Scorer:
                         elo_rounds_played=miner.elo_rounds_played,
                         elo_model_submit_block=result.block_number if miner.elo_rounds_played == 1 else None,
                     )
+                elif prev.get('elo_last_scored_at') is None and prev.get('elo_rounds_played', 0) > 0:
+                    # One-time backfill: set elo_last_scored_at for legacy miners
+                    # that have ELO history but no timestamp. This starts the decay
+                    # clock — they'll begin decaying from the next round.
+                    # Write original rating unchanged, only the timestamp is new.
+                    await miner_stats_dao.update_elo_rating(
+                        hotkey=miner.hotkey,
+                        revision=miner.model_revision,
+                        elo_rating=float(prev.get('elo_rating') or self.config.ELO_BASE_RATING),
+                        elo_rounds_played=int(prev.get('elo_rounds_played') or 0),
+                    )
 
         logger.info(f"Successfully saved complete scoring results for {len(result.miners)} miners to scores table")
 
