@@ -23,8 +23,8 @@ class OpenSkillConfig:
     """Miner must have completed at least this ratio of the sampling window tasks."""
 
     # Weight computation
-    ORDINAL_Z: float = 3.0
-    """ordinal = mu - ORDINAL_Z * sigma"""
+    ORDINAL_Z: float = 0.5
+    """ordinal = mu - ORDINAL_Z * sigma. Lower values favor actual ability over certainty."""
 
     # Match constraints
     MIN_PARTICIPANTS: int = 2
