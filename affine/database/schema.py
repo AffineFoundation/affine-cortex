@@ -323,6 +323,61 @@ ANTI_COPY_RESULTS_TTL = {
 }
 
 
+# OpenSkill Ratings Table
+# Stores per-(miner, env) OpenSkill ratings (mu, sigma).
+OPENSKILL_RATINGS_SCHEMA = {
+    "TableName": get_table_name("openskill_ratings"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},   # MINER#{hotkey}#REV#{revision}
+        {"AttributeName": "sk", "KeyType": "RANGE"},   # ENV#{env}
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+
+# OpenSkill Matches Table
+# Stores per-task match records for idempotency and audit trail.
+OPENSKILL_MATCHES_SCHEMA = {
+    "TableName": get_table_name("openskill_matches"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},   # ENV#{env}
+        {"AttributeName": "sk", "KeyType": "RANGE"},   # TASK#{task_id}
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+OPENSKILL_MATCHES_TTL = {
+    "AttributeName": "ttl",
+}
+
+
+# OpenSkill Weight Snapshots Table (shadow run analysis, can be deleted later)
+OPENSKILL_WEIGHTS_SCHEMA = {
+    "TableName": get_table_name("openskill_weights"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},   # SNAPSHOT
+        {"AttributeName": "sk", "KeyType": "RANGE"},   # TIME#{timestamp}
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+OPENSKILL_WEIGHTS_TTL = {
+    "AttributeName": "ttl",
+}
+
+
 # All table schemas
 ALL_SCHEMAS = [
     SAMPLE_RESULTS_SCHEMA,
@@ -334,4 +389,6 @@ ALL_SCHEMAS = [
     SCORE_SNAPSHOTS_SCHEMA,
     MINER_STATS_SCHEMA,
     ANTI_COPY_RESULTS_SCHEMA,
+    OPENSKILL_RATINGS_SCHEMA,
+    OPENSKILL_MATCHES_SCHEMA,
 ]
