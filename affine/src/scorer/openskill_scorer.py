@@ -184,9 +184,15 @@ class OpenSkillScorer:
             }
 
         # Update cache and build participant records
+        sigma_floor = self.config.SIGMA_INIT * self.config.SIGMA_FLOOR_RATIO
         participants = []
         for i, (miner_key, new_team) in enumerate(zip(keys, new_teams)):
             new_rating = new_team[0]
+            # Enforce sigma floor
+            if new_rating.sigma < sigma_floor:
+                new_rating = self.model.create_rating(
+                    [new_rating.mu, sigma_floor], name=new_rating.name
+                )
             self._cache[(miner_key, env)] = new_rating
             mu_before, sigma_before = before_states[i]
 

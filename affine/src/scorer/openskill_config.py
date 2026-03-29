@@ -26,6 +26,10 @@ class OpenSkillConfig:
     ORDINAL_Z: float = 0.5
     """ordinal = mu - ORDINAL_Z * sigma. Lower values favor actual ability over certainty."""
 
+    # Sigma floor: prevents old miners from locking in advantage via ultra-low sigma
+    SIGMA_FLOOR_RATIO: float = 0.5
+    """sigma cannot go below SIGMA_INIT * this ratio. 0.5 means floor ≈ 4.17."""
+
     # Match constraints
     MIN_PARTICIPANTS: int = 2
     """Skip tasks with fewer participants."""
