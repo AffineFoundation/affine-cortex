@@ -297,7 +297,7 @@ async def run_openskill_scoring(
             f"{len(current_window)} in current window"
         )
 
-    # Process tasks per env
+    # Process tasks per env (all miners participate in rating)
     total_processed = 0
     for env_name in environments:
         tasks = dict(env_task_scores[env_name])
@@ -305,11 +305,31 @@ async def run_openskill_scoring(
             count = await scorer.process_rotated_tasks(env_name, tasks)
             total_processed += count
 
-    # Compute weights
+    # Pareto filter: exclude dominated miners from weight computation
+    from affine.src.scorer.stage1_collector import Stage1Collector
+    from affine.src.scorer.stage2_pareto import Stage2ParetoFilter
+    from affine.src.scorer.utils import generate_all_subsets
+
+    scorer_config = ScorerConfig()
+    stage1 = Stage1Collector(scorer_config)
+    stage1_out = stage1.collect(scoring_data, environments, env_configs)
+    subsets_meta = generate_all_subsets(environments, max_layers=scorer_config.MAX_LAYERS)
+    stage2 = Stage2ParetoFilter(scorer_config)
+    stage2_out = stage2.filter(stage1_out.miners, subsets_meta)
+
+    filtered_miner_keys = set()
+    for uid, miner in stage2_out.miners.items():
+        if miner.filtered_subsets:
+            mk = f"{miner.hotkey}#{miner.model_revision}"
+            filtered_miner_keys.add(mk)
+            logger.info(f"OpenSkill Pareto: excluded UID {uid} ({miner.filter_reasons})")
+
+    # Compute weights (excluding Pareto-filtered miners)
     weights = await scorer.compute_weights(
         environments=environments,
         env_window_sizes=env_window_sizes,
         miner_task_counts=dict(miner_task_counts),
+        filtered_miner_keys=filtered_miner_keys,
     )
 
     # Print results

@@ -226,6 +226,7 @@ class OpenSkillScorer:
         environments: List[str],
         env_window_sizes: Dict[str, int],
         miner_task_counts: Dict[str, Dict[str, int]],
+        filtered_miner_keys: Optional[Set[str]] = None,
     ) -> Dict[str, float]:
         """Compute final weights from current ratings.
 
@@ -233,10 +234,14 @@ class OpenSkillScorer:
             environments: List of scoring environment names
             env_window_sizes: {env: sampling_list size}
             miner_task_counts: {hotkey#revision: {env: total_completed_tasks}}
+            filtered_miner_keys: Set of hotkey#revision to exclude (e.g. Pareto filtered)
 
         Returns:
             {hotkey#revision: normalized_weight}
         """
+        if filtered_miner_keys is None:
+            filtered_miner_keys = set()
+
         # Load all ratings
         all_ratings = await self.ratings_dao.get_all_ratings()
 
@@ -244,11 +249,16 @@ class OpenSkillScorer:
             logger.warning("OpenSkill: no ratings found")
             return {}
 
-        # Compute ordinals per env
+        if filtered_miner_keys:
+            logger.info(f"OpenSkill: excluding {len(filtered_miner_keys)} Pareto-filtered miners")
+
+        # Compute ordinals per env (excluding filtered miners)
         env_ordinals: Dict[str, Dict[str, float]] = {}
         for env in environments:
             env_ordinals[env] = {}
             for miner_key, env_ratings in all_ratings.items():
+                if miner_key in filtered_miner_keys:
+                    continue
                 if env in env_ratings:
                     r = env_ratings[env]
                     env_ordinals[env][miner_key] = (
