@@ -2,8 +2,8 @@
   "validator_burn_percentage": 0.0,
   "environments": {
     "PRINT": {
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
       "min_completeness": 0.9,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
@@ -16,8 +16,8 @@
     },
     "LGC-v2": {
       "display_name": "LGC",
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
       "min_completeness": 0.9,
       "sampling_config": {
         "dataset_range": [[0, 899999999]],
