@@ -1217,18 +1217,20 @@ async def cmd_get_pool():
         all_miner_stats = await miner_stats_dao.get_all_historical_miners()
         # For global view: use sampling_stats (global aggregated)
         # For per-env view: use env_stats (per-environment breakdown)
+        # Filter out records missing required keys
+        valid_miner_stats = [m for m in all_miner_stats if 'hotkey' in m and 'revision' in m]
         global_stats_by_miner = {
             (m['hotkey'], m['revision']): m.get('sampling_stats', {})
-            for m in all_miner_stats
+            for m in valid_miner_stats
         }
         env_stats_by_miner = {
             (m['hotkey'], m['revision']): m.get('env_stats', {})
-            for m in all_miner_stats
+            for m in valid_miner_stats
         }
         # Get slots for each miner
         slots_by_miner = {
             (m['hotkey'], m['revision']): m.get('sampling_slots', 6)
-            for m in all_miner_stats
+            for m in valid_miner_stats
         }
         
         # Get enabled environments from system config

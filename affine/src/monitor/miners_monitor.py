@@ -479,10 +479,19 @@ class MinersMonitor:
                     reason = template_result['reason']
                     info.is_valid = False
                     info.invalid_reason = f"malicious_template:{reason}"
-                    info.template_check_result = f"unsafe:{reason}"
-                    logger.warning(
-                        f"[MinersMonitor] Malicious template detected for uid={uid}: {reason}"
-                    )
+                    # Only cache deterministic failures; transient errors
+                    # (network/HF outages) should be retried next refresh
+                    transient = reason.startswith("template_fetch_failed:") or reason.startswith("check_error:")
+                    if transient:
+                        # Leave template_check_result as None so next refresh retries
+                        logger.warning(
+                            f"[MinersMonitor] Template check transient failure for uid={uid}: {reason}"
+                        )
+                    else:
+                        info.template_check_result = f"unsafe:{reason}"
+                        logger.warning(
+                            f"[MinersMonitor] Malicious template detected for uid={uid}: {reason}"
+                        )
                     return info
 
                 # Check if audit was skipped (no API key, error, etc.)
