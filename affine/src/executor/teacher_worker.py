@@ -143,13 +143,14 @@ class TeacherWorker:
             hosts, mode = tmp._get_hosts_and_mode()
 
             try:
-                # connect_only requires replicas=1, pick first host
+                # Container names are "{env}-{index}", e.g. game-0, navworld-0
+                base_name = env_name.lower().replace(":", "-")
                 env_instance = af_env.load_env(
                     image=config.docker_image,
                     mode=mode,
                     hosts=[hosts[0]] if hosts else None,
                     replicas=1,
-                    container_name=env_name.lower().replace(":", "-"),
+                    container_name=f"{base_name}-0",
                     connect_only=True,
                 )
                 self._env_instances[env_name] = env_instance
