@@ -143,11 +143,12 @@ class TeacherWorker:
             hosts, mode = tmp._get_hosts_and_mode()
 
             try:
+                # connect_only requires replicas=1, pick first host
                 env_instance = af_env.load_env(
                     image=config.docker_image,
                     mode=mode,
-                    hosts=hosts,
-                    replicas=len(hosts),
+                    hosts=[hosts[0]] if hosts else None,
+                    replicas=1,
                     container_name=env_name.lower().replace(":", "-"),
                     connect_only=True,
                 )
