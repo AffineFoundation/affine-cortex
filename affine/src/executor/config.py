@@ -6,7 +6,7 @@ Executor configuration for different environments
 ENV_MAX_CONCURRENT = {
     "GAME": 500,
     "LGC-v2": 300,
-    "LIVEWEB": 100,
+    "LIVEWEB": 50,
     "NAVWORLD": 100,
 }
 
