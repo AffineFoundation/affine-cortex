@@ -248,10 +248,10 @@ _ENV_CONFIGS_CANONICAL = {
         },
         eval_params={
             "temperature": 0.0,
-            "timeout": 7200,
-            "max_concurrency": 10,
+            "timeout": 3600,
+            "max_concurrency": 15,
         },
-        proxy_timeout=7300,
+        proxy_timeout=3660,
     ),
 
     # LogProbs evaluation environment
