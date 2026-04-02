@@ -275,6 +275,10 @@ def run_teacher_process(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # Initialize DynamoDB client in subprocess
+    from affine.database.client import init_client
+    loop.run_until_complete(init_client())
+
     worker = TeacherWorker(
         teacher_model=teacher_model,
         teacher_base_url=teacher_base_url,
