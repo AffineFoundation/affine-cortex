@@ -23,7 +23,7 @@ class PerMinerSamplingScheduler:
     """Per-miner sampling pool scheduler with weighted allocation.
 
     Architecture:
-    1. Each miner has dynamic slots (3-10, default 6), stored in MinerStats
+    1. Each miner has dynamic slots (3-12, default 6), stored in MinerStats
     2. Weighted allocation across environments based on scheduling_weight config
     3. Minimum guarantee: each env gets at least 1 slot
     4. Incremental scheduling every 10s
@@ -36,7 +36,7 @@ class PerMinerSamplingScheduler:
 
     DEFAULT_SLOTS = 6
     MIN_SLOTS = 3
-    MAX_SLOTS = 10
+    MAX_SLOTS = 12
 
     # Rate limiting: allow actual sampling rate to exceed rotation rate by this margin
     RATE_MARGIN = 1.2
@@ -194,7 +194,7 @@ class PerMinerSamplingScheduler:
             miner: Miner dict with hotkey, revision
 
         Returns:
-            Number of slots (3-10, default 6)
+            Number of slots (3-12, default 6)
         """
         try:
             hotkey = miner['hotkey']

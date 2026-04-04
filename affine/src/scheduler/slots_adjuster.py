@@ -21,7 +21,7 @@ class MinerSlotsAdjuster:
     
     Adjustment rules:
     - Only adjust miners with >10 samples in last 1 hour
-    - Success rate >= 90%: slots + 1 (max 10)
+    - Success rate >= 90%: slots + 1 (max 12)
     - Success rate < 50%: slots - 1 (min 3)
     - Adjustment runs every 2 hours
     
@@ -32,7 +32,7 @@ class MinerSlotsAdjuster:
     
     DEFAULT_SLOTS = 6
     MIN_SLOTS = 3
-    MAX_SLOTS = 10
+    MAX_SLOTS = 12
     ADJUSTMENT_INTERVAL = 21600  # 6 hours in seconds
     MIN_SAMPLES_FOR_ADJUSTMENT = 50
     HIGH_SUCCESS_THRESHOLD = 0.80
