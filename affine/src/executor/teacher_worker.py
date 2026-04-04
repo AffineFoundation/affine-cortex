@@ -129,21 +129,22 @@ class TeacherWorker:
         return sampling_config.get("sampling_list", [])
 
     async def _get_env(self, env_name: str):
-        """Get environment instance by connecting to existing containers.
+        """Get or create a dedicated teacher container for the environment.
 
-        Uses connect_only=True to attach to containers already started by
-        regular workers, without recreating them.
+        Creates its own container (1 replica on the first available host)
+        so the teacher runs independently from executor workers.
         """
         if env_name in self._env_instances:
             return self._env_instances[env_name]
 
         async with self._env_connect_lock:
-            # Double-check after acquiring lock
             if env_name in self._env_instances:
                 return self._env_instances[env_name]
 
             import affinetes as af_env
-            from affine.core.environments import SDKEnvironment, ENV_CONFIGS
+            from affine.core.environments import (
+                SDKEnvironment, ENV_CONFIGS, convert_memory_format,
+            )
 
             if env_name not in ENV_CONFIGS:
                 logger.error(f"[TEACHER] Unknown environment: {env_name}")
@@ -151,35 +152,51 @@ class TeacherWorker:
 
             config = ENV_CONFIGS[env_name]
 
-            # Discover hosts using the same config as regular workers
+            # Reuse host/mode discovery from SDKEnvironment
             tmp = SDKEnvironment.__new__(SDKEnvironment)
             tmp.config = config
             tmp._mode_override = None
             hosts, mode = tmp._get_hosts_and_mode()
 
-            # Retry connection — container may still be starting up
+            # Collect env vars the same way SDKEnvironment does
+            env_vars = dict(config.env_vars)
+            api_key = os.getenv("CHUTES_API_KEY", "")
+            if api_key:
+                env_vars.update({"CHUTES_API_KEY": api_key, "API_KEY": api_key})
+            if "task_type" in config.eval_params:
+                env_vars["ENV_NAME"] = config.eval_params["task_type"]
+            for key in config.required_env_vars:
+                val = os.getenv(key, "")
+                if val:
+                    env_vars[key] = val
+
+            mem_limit = convert_memory_format(config.mem_limit, mode)
             base_name = env_name.lower().replace(":", "-")
-            for attempt in range(6):
-                try:
-                    env_instance = af_env.load_env(
-                        image=config.docker_image,
-                        mode=mode,
-                        hosts=[hosts[0]] if hosts else None,
-                        replicas=1,
-                        container_name=f"{base_name}-0",
-                        connect_only=True,
-                    )
-                    self._env_instances[env_name] = env_instance
-                    logger.info(f"[TEACHER] Connected to {env_name} ({mode}, hosts={hosts})")
-                    break
-                except Exception as e:
-                    if attempt < 5:
-                        wait = 10 * (attempt + 1)
-                        logger.warning(f"[TEACHER] {env_name} not ready, retrying in {wait}s ({e})")
-                        await asyncio.sleep(wait)
-                    else:
-                        logger.error(f"[TEACHER] Failed to connect to {env_name} after 6 attempts: {e}")
-                        return None
+
+            load_kwargs = {
+                "image": config.docker_image,
+                "mode": mode,
+                "env_vars": env_vars,
+                "mem_limit": mem_limit,
+                "pull": True,
+                "replicas": 1,
+                "hosts": [hosts[0]] if hosts else None,
+                "container_name": f"teacher-{base_name}",
+                "force_recreate": True,
+            }
+            if config.volumes:
+                load_kwargs["volumes"] = config.volumes
+
+            try:
+                env_instance = af_env.load_env(**load_kwargs)
+                self._env_instances[env_name] = env_instance
+                logger.info(
+                    f"[TEACHER] Created container teacher-{base_name} "
+                    f"({mode}, host={hosts[0] if hosts else 'local'})"
+                )
+            except Exception as e:
+                logger.error(f"[TEACHER] Failed to create container for {env_name}: {e}")
+                return None
 
             return self._env_instances.get(env_name)
 
