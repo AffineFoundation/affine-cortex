@@ -158,8 +158,9 @@ class TeacherWorker:
             tmp._mode_override = None
             hosts, mode = tmp._get_hosts_and_mode()
 
-            # Collect env vars the same way SDKEnvironment does
+            # Collect env vars; override UVICORN_WORKERS=1 for teacher
             env_vars = dict(config.env_vars)
+            env_vars["UVICORN_WORKERS"] = "1"
             api_key = os.getenv("CHUTES_API_KEY", "")
             if api_key:
                 env_vars.update({"CHUTES_API_KEY": api_key, "API_KEY": api_key})
