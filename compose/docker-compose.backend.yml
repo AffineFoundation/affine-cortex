@@ -72,6 +72,7 @@ services:
       - .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.ssh:/root/.ssh
       - /var/log/affine/teacher:/var/log/affine/teacher
       - ./affinetes_hosts.json:/app/affinetes_hosts.json
     depends_on:
