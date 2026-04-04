@@ -61,6 +61,24 @@ services:
         condition: service_healthy
     command: ["-v", "servers", "executor"]
 
+  # Teacher Worker - Teacher rollout generation service
+  teacher:
+    image: affinefoundation/affine:latest
+    container_name: affine-teacher
+    restart: unless-stopped
+    mem_reservation: "2g"
+    mem_limit: "4g"
+    env_file:
+      - .env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/log/affine/teacher:/var/log/affine/teacher
+      - ./affinetes_hosts.json:/app/affinetes_hosts.json
+    depends_on:
+      executor:
+        condition: service_started
+    command: ["-v", "servers", "teacher"]
+
   # Miners Monitor - Miner synchronization service
   monitor:
     image: affinefoundation/affine:latest
@@ -111,7 +129,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 30 affine-api affine-scheduler affine-executor affine-monitor affine-anticopy affine-scorer
+    command: --interval 30 affine-api affine-scheduler affine-executor affine-teacher affine-monitor affine-anticopy affine-scorer
 
 networks:
   default:

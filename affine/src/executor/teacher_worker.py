@@ -21,7 +21,9 @@ import random
 import time
 from typing import Any, Dict, List, Optional
 
+import click
 import boto3
+from botocore.config import Config as BotoConfig
 
 from affine.core.setup import logger
 from affine.database.dao.system_config import SystemConfigDAO
@@ -70,6 +72,7 @@ class TeacherWorker:
         self._s3 = None
         self._next_id = 1
         self._env_instances = {}
+        self._env_connect_lock = asyncio.Lock()
         self.running = False
 
     def _init_s3(self):
@@ -84,6 +87,11 @@ class TeacherWorker:
             aws_access_key_id=R2_ACCESS_KEY,
             aws_secret_access_key=R2_SECRET_KEY,
             region_name="auto",
+            config=BotoConfig(
+                connect_timeout=10,
+                read_timeout=30,
+                retries={"max_attempts": 3, "mode": "adaptive"},
+            ),
         )
 
     async def _load_next_id(self) -> int:
@@ -126,7 +134,14 @@ class TeacherWorker:
         Uses connect_only=True to attach to containers already started by
         regular workers, without recreating them.
         """
-        if env_name not in self._env_instances:
+        if env_name in self._env_instances:
+            return self._env_instances[env_name]
+
+        async with self._env_connect_lock:
+            # Double-check after acquiring lock
+            if env_name in self._env_instances:
+                return self._env_instances[env_name]
+
             import affinetes as af_env
             from affine.core.environments import SDKEnvironment, ENV_CONFIGS
 
@@ -166,7 +181,7 @@ class TeacherWorker:
                         logger.error(f"[TEACHER] Failed to connect to {env_name} after 6 attempts: {e}")
                         return None
 
-        return self._env_instances[env_name]
+            return self._env_instances.get(env_name)
 
     async def _generate_one_rollout(self) -> Optional[Dict]:
         """Pick a random env + task_id, run teacher evaluation, return rollout."""
@@ -204,13 +219,27 @@ class TeacherWorker:
                     error = result.error
 
                 full_logprobs = extra.get("full_logprobs")
+                logger.info(
+                    f"[TEACHER-DEBUG] {env_name}/{task_id}: score={score} "
+                    f"logprobs type={type(full_logprobs).__name__} "
+                    f"len={len(full_logprobs) if isinstance(full_logprobs, (list, dict, str)) else full_logprobs} "
+                    f"usage={extra.get('usage')}"
+                )
 
                 if not full_logprobs:
                     logger.warning(
                         f"[TEACHER] No logprobs returned for {env_name}/{task_id}: "
-                        f"error={extra.get('logprobs_error', error)}"
+                        f"error={extra.get('logprobs_error', error)} "
+                        f"extra_keys={list(extra.keys())} score={score}"
                     )
-                    return None
+                    continue
+
+                if score <= 0:
+                    logger.info(
+                        f"[TEACHER] Skipping failed rollout: env={env_name} "
+                        f"task_id={task_id} score={score}"
+                    )
+                    continue
 
                 return {
                     "env": env_name,
@@ -223,7 +252,7 @@ class TeacherWorker:
 
             except Exception as e:
                 logger.error(f"[TEACHER] Failed {env_name}/{task_id}: {e}")
-                return None
+                continue
 
         logger.warning("[TEACHER] No environments with sampling_list available")
         return None
@@ -237,8 +266,8 @@ class TeacherWorker:
                 if rollout:
                     async with self._upload_lock:
                         tid = self._next_id
-                        self._upload_rollout(tid, rollout)
-                        self._update_metadata(tid)
+                        await asyncio.to_thread(self._upload_rollout, tid, rollout)
+                        await asyncio.to_thread(self._update_metadata, tid)
                         self._next_id += 1
                     logger.info(
                         f"[TEACHER-{worker_id}] Uploaded task_{tid:011d}.json "
@@ -317,3 +346,79 @@ def run_teacher_process(
         except Exception:
             pass
         loop.close()
+
+
+async def run_service(
+    teacher_model: str,
+    teacher_base_url: str,
+    api_key: str,
+    envs: List[str],
+    concurrency: int,
+):
+    """Run teacher worker as a standalone service."""
+    import signal
+
+    from affine.database.client import init_client
+    await init_client()
+
+    worker = TeacherWorker(
+        teacher_model=teacher_model,
+        teacher_base_url=teacher_base_url,
+        api_key=api_key,
+        envs=envs,
+        concurrency=concurrency,
+    )
+
+    shutdown_event = asyncio.Event()
+
+    def handle_shutdown(sig):
+        logger.info(f"[TEACHER] Received signal {sig}, shutting down...")
+        worker.stop()
+        shutdown_event.set()
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        loop.add_signal_handler(sig, lambda s=sig: handle_shutdown(s))
+
+    try:
+        await worker.run()
+    except Exception as e:
+        logger.error(f"[TEACHER] Fatal: {e}", exc_info=True)
+        raise
+    finally:
+        worker.stop()
+
+
+@click.command()
+@click.option("--model", envvar="TEACHER_MODEL", required=True, help="Teacher model name")
+@click.option("--base-url", envvar="TEACHER_BASE_URL", required=True, help="Teacher model API base URL")
+@click.option("--api-key", envvar="TEACHER_API_KEY", default="", help="Teacher model API key")
+@click.option("--envs", envvar="TEACHER_ENVS", default="GAME,SWE-INFINITE,NAVWORLD", help="Comma-separated environment list")
+@click.option("--concurrency", envvar="TEACHER_CONCURRENCY", default=2, type=int, help="Number of concurrent workers")
+@click.option("-v", "--verbosity", default=None, type=click.Choice(["0", "1", "2", "3"]), help="Logging verbosity")
+def main(model, base_url, api_key, envs, concurrency, verbosity):
+    """
+    Affine Teacher Worker - Generate teacher rollouts with logprobs.
+
+    Picks random tasks from environment sampling lists, evaluates with the
+    teacher model (collecting logprobs), and uploads results to R2.
+    """
+    from affine.core.setup import setup_logging
+
+    verbosity_val = int(verbosity) if verbosity is not None else 1
+    setup_logging(verbosity_val, component="teacher")
+
+    env_list = [e.strip() for e in envs.split(",") if e.strip()]
+    logger.info(f"[TEACHER] Starting standalone: model={model} envs={env_list} concurrency={concurrency}")
+
+    asyncio.run(run_service(
+        teacher_model=model,
+        teacher_base_url=base_url,
+        api_key=api_key,
+        envs=env_list,
+        concurrency=concurrency,
+    ))
+
+
+if __name__ == "__main__":
+    main()

@@ -102,6 +102,16 @@ def executor(ctx):
 
 @servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.pass_context
+def teacher(ctx):
+    """Start teacher worker service."""
+    from affine.src.executor.teacher_worker import main as teacher_main
+
+    sys.argv = ["teacher"] + ctx.args
+    teacher_main.main(standalone_mode=False)
+
+
+@servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.pass_context
 def monitor(ctx):
     """Start monitor service."""
     from affine.src.monitor.main import main as monitor_main

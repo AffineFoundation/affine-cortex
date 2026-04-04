@@ -138,23 +138,6 @@ class ExecutorManager:
         asyncio.create_task(self._stats_collector())
         asyncio.create_task(self._health_checker())
 
-        # Start teacher worker if configured
-        self.teacher_process = None
-        teacher_model = os.getenv("TEACHER_MODEL")
-        teacher_base_url = os.getenv("TEACHER_BASE_URL")
-        if teacher_model and teacher_base_url:
-            from affine.src.executor.teacher_worker import run_teacher_process
-            teacher_envs = os.getenv("TEACHER_ENVS", "GAME,SWE-INFINITE,NAVWORLD").split(",")
-            teacher_concurrency = int(os.getenv("TEACHER_CONCURRENCY", "2"))
-            teacher_api_key = os.getenv("TEACHER_API_KEY", "")
-            self.teacher_process = multiprocessing.Process(
-                target=run_teacher_process,
-                args=(teacher_model, teacher_base_url, teacher_api_key, teacher_envs, teacher_concurrency, self.verbosity),
-                name="Worker-Teacher",
-            )
-            self.teacher_process.start()
-            logger.info(f"Started teacher worker (model={teacher_model}, PID={self.teacher_process.pid})")
-
         logger.info(f"Started {len(self.worker_processes)} worker processes")
     
     async def _stats_collector(self):
@@ -185,23 +168,6 @@ class ExecutorManager:
                             "restarting..."
                         )
                         worker_proc.start()
-
-                # Check teacher process
-                if self.teacher_process and not self.teacher_process.is_alive():
-                    logger.warning("Teacher worker died, restarting...")
-                    teacher_model = os.getenv("TEACHER_MODEL")
-                    teacher_base_url = os.getenv("TEACHER_BASE_URL")
-                    if teacher_model and teacher_base_url:
-                        from affine.src.executor.teacher_worker import run_teacher_process
-                        teacher_envs = os.getenv("TEACHER_ENVS", "GAME,SWE-INFINITE,NAVWORLD").split(",")
-                        teacher_interval = float(os.getenv("TEACHER_INTERVAL", "60"))
-                        teacher_api_key = os.getenv("TEACHER_API_KEY", "")
-                        self.teacher_process = multiprocessing.Process(
-                            target=run_teacher_process,
-                            args=(teacher_model, teacher_base_url, teacher_api_key, teacher_envs, teacher_interval, self.verbosity),
-                            name="Worker-Teacher",
-                        )
-                        self.teacher_process.start()
 
                 await asyncio.sleep(10)
 

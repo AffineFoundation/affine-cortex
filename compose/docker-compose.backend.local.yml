@@ -18,6 +18,9 @@ services:
   executor:
     <<: *affine_image
   
+  teacher:
+    <<: *affine_image
+
   monitor:
     <<: *affine_image
   
