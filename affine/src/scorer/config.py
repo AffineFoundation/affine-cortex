@@ -12,7 +12,7 @@ class ScorerConfig:
     """Configuration for the four-stage scoring algorithm."""
     
     # Stage 2: Pareto Frontier Anti-Plagiarism
-    Z_SCORE: float = 1.5
+    Z_SCORE: float = 2.0
     """
     Z-score for statistical confidence interval in threshold calculation.
 
@@ -22,13 +22,13 @@ class ScorerConfig:
 
     Z-score values:
     - 1.0: ~68% confidence (more aggressive, smaller gaps)
-    - 1.5: ~87% confidence (balanced, recommended)
+    - 1.5: ~87% confidence (balanced)
     - 1.96: 95% confidence (more conservative, larger gaps)
 
     Higher sample counts → smaller SE → smaller gap → easier to beat.
     Lower sample counts → larger SE → larger gap → harder to beat.
 
-    Recommended value: 1.5
+    Recommended value: 2.0
     """
 
     MIN_IMPROVEMENT: float = 0.02
@@ -118,8 +118,8 @@ class ScorerConfig:
     # Lower values = easier to beat (lower difficulty)
     # Higher values = harder to beat (higher difficulty)
     ENV_THRESHOLD_CONFIGS: Dict[str, Dict[str, float]] = {
-        'GAME': {'z_score': 1},    # easier to beat (default 1.5)
-        'PRINT': {'z_score': 2.0},   # harder to beat (default 1.5)
+        'GAME': {'z_score': 2.0},
+        'PRINT': {'z_score': 2.0},
         'SWE-SYNTH': {'z_score': 2.0},
         'SWE-INFINITE': {'z_score': 2.0},
     }
