@@ -265,6 +265,21 @@ _ENV_CONFIGS_CANONICAL = {
         },
     ),
 
+    # Knowledge-eval — multi-benchmark (GPQA / MMLU-Pro / HLE / IFEval)
+    # environment used by the teacher worker to produce high-quality
+    # rollouts with logprobs. Not enabled for the regular executor
+    # sampling path; only teacher_worker loads it.
+    "knowledge-eval": EnvConfig(
+        name="knowledge-eval",
+        docker_image="affinefoundation/knowledge_eval:latest",
+        env_vars={"UVICORN_WORKERS": "4"},
+        mem_limit="4g",
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 600,
+        },
+    ),
+
     # MemoryGym environment (LLM memory management evaluation)
     # Evaluates: information intake, storage decisions, retrieval, change tracking, reasoning.
     # Each evaluation runs a full episode (~10-40 min depending on model).
@@ -359,6 +374,11 @@ _ENV_ALIASES = {
     # LogProbs aliases
     "LOGPROBS": "logprobs",
     "LogProbs": "logprobs",
+
+    # Knowledge-eval aliases (teacher_worker-only)
+    "KNOWLEDGE-EVAL": "knowledge-eval",
+    "knowledge_eval": "knowledge-eval",
+    "KNOWLEDGE_EVAL": "knowledge-eval",
 }
 
 # Build final ENV_CONFIGS with aliases

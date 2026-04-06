@@ -30,7 +30,14 @@ from affine.database.dao.system_config import SystemConfigDAO
 
 
 # Environments to generate teacher rollouts for
-TEACHER_ENVS = ["GAME", "SWE-INFINITE", "NAVWORLD"]
+TEACHER_ENVS = ["GAME", "SWE-INFINITE", "NAVWORLD", "KNOWLEDGE-EVAL"]
+
+# knowledge-eval supports a virtual task_id space (task_id % 12977
+# selects the canonical row, task_id // 12977 becomes the perturb seed),
+# so we can sample an arbitrarily large range and every id yields a
+# unique deterministic variant. This is the teacher-side fallback when
+# SystemConfig doesn't define a sampling_list for the environment.
+_KNOWLEDGE_EVAL_VIRTUAL_RANGE = 1_000_000
 
 # R2 configuration
 R2_ENDPOINT = os.getenv(
@@ -122,11 +129,22 @@ class TeacherWorker:
         self._s3.put_object(Bucket=R2_BUCKET, Key=key, Body=body)
 
     async def _get_sampling_list(self, env: str) -> List[int]:
-        """Get current sampling_list for an environment from SystemConfig."""
+        """Get current sampling_list for an environment from SystemConfig.
+
+        knowledge-eval has a virtual task_id space (see
+        ``knowledge_eval/env.py``), so when SystemConfig doesn't define
+        an explicit list we fall back to a large virtual range instead
+        of returning empty (which would make teacher_worker skip the
+        env). This is a teacher-only path; the regular executor never
+        goes through here.
+        """
         environments = await self._config_dao.get_param_value("environments", default={})
         env_config = environments.get(env, {})
         sampling_config = env_config.get("sampling_config", {})
-        return sampling_config.get("sampling_list", [])
+        lst = sampling_config.get("sampling_list", [])
+        if not lst and env.upper() == "KNOWLEDGE-EVAL":
+            return list(range(_KNOWLEDGE_EVAL_VIRTUAL_RANGE))
+        return lst
 
     async def _get_env(self, env_name: str):
         """Get or create a dedicated teacher container for the environment.
@@ -411,7 +429,7 @@ async def run_service(
 @click.option("--model", envvar="TEACHER_MODEL", required=True, help="Teacher model name")
 @click.option("--base-url", envvar="TEACHER_BASE_URL", required=True, help="Teacher model API base URL")
 @click.option("--api-key", envvar="TEACHER_API_KEY", default="", help="Teacher model API key")
-@click.option("--envs", envvar="TEACHER_ENVS", default="GAME,SWE-INFINITE,NAVWORLD", help="Comma-separated environment list")
+@click.option("--envs", envvar="TEACHER_ENVS", default="GAME,SWE-INFINITE,NAVWORLD,KNOWLEDGE-EVAL", help="Comma-separated environment list")
 @click.option("--concurrency", envvar="TEACHER_CONCURRENCY", default=2, type=int, help="Number of concurrent workers")
 @click.option("-v", "--verbosity", default=None, type=click.Choice(["0", "1", "2", "3"]), help="Logging verbosity")
 def main(model, base_url, api_key, envs, concurrency, verbosity):
