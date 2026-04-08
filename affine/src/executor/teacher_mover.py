@@ -2,17 +2,19 @@
 Teacher Mover - Promotes teacher rollouts from the private to public bucket.
 
 Runs alongside teacher_worker. Each tick:
-  1. Lists pending/{env}/* in the private bucket.
-  2. Builds a candidate pool that prefers non-KNOWLEDGE-EVAL envs but
+  1. Reads the DISTILL env config from SystemConfig (DynamoDB) to pick up
+     the current rotation_interval/rotation_count and enabled flag.
+  2. Lists pending/{env}/* in the private bucket.
+  3. Builds a candidate pool that prefers non-KNOWLEDGE-EVAL envs but
      falls back to KNOWLEDGE-EVAL when there are not enough non-knowledge
-     candidates to satisfy MOVER_COUNT.
-  3. Randomly samples MOVER_COUNT candidates without replacement.
-  4. For each: copies the rollout to public/task_{next_id:011d}.json,
+     candidates to satisfy the target batch size.
+  4. Randomly samples target_count candidates without replacement.
+  5. For each: copies the rollout to public/task_{next_id:011d}.json,
      moves the source from pending/ to promoted/, increments next_id.
-  5. Updates public/metadata.json with the new completed_up_to.
+  6. Updates public/metadata.json with the new completed_up_to.
 
 Failed individual moves are skipped and replaced with another random
-draw, so the batch always reaches MOVER_COUNT successful promotions
+draw, so the batch always reaches target_count successful promotions
 unless the candidate pool is exhausted.
 """
 
@@ -20,13 +22,13 @@ import asyncio
 import json
 import os
 import random
-import time
 from typing import Dict, List, Optional, Tuple
 
 import boto3
 from botocore.config import Config as BotoConfig
 
 from affine.core.setup import logger
+from affine.database.dao.system_config import SystemConfigDAO
 
 
 # R2 endpoint and credentials are shared with teacher_worker
@@ -47,31 +49,36 @@ R2_DISTILL_PUBLIC_BUCKET = os.getenv(
 PENDING_PREFIX = "pending"
 PROMOTED_PREFIX = "promoted"
 
-# Mover cadence
-MOVER_INTERVAL_SEC = int(os.getenv("MOVER_INTERVAL_SEC", "3600"))
-MOVER_COUNT = int(os.getenv("MOVER_COUNT", "1"))
-
 # Envs deprioritized in random selection
 LOW_PRIORITY_ENVS = {"KNOWLEDGE-EVAL"}
 
+# SystemConfig env key the mover tracks
+DISTILL_ENV_KEY = "DISTILL"
+
+# Fallback sleep when the config lookup fails, so we retry soon
+CONFIG_RETRY_SLEEP_SEC = 60
+
 
 class TeacherMover:
-    """Promotes random pending rollouts from private to public."""
+    """Promotes random pending rollouts from private to public.
+
+    Cadence and batch size are driven by the DISTILL entry in
+    SystemConfig (DynamoDB), not by environment variables, so operators
+    can retune the pipeline from the same place they tune the distill
+    env's rotation behavior.
+    """
 
     def __init__(
         self,
-        interval_sec: int = MOVER_INTERVAL_SEC,
-        count: int = MOVER_COUNT,
         private_bucket: str = R2_DISTILL_PRIVATE_BUCKET,
         public_bucket: str = R2_DISTILL_PUBLIC_BUCKET,
     ):
-        self.interval_sec = interval_sec
-        self.count = count
         self.private_bucket = private_bucket
         self.public_bucket = public_bucket
         self.pending_prefix = PENDING_PREFIX
         self.promoted_prefix = PROMOTED_PREFIX
         self._s3 = None
+        self._config_dao = SystemConfigDAO()
         self.running = False
 
     def _init_s3(self):
@@ -91,6 +98,36 @@ class TeacherMover:
                 retries={"max_attempts": 3, "mode": "adaptive"},
             ),
         )
+
+    # ---------------- SystemConfig lookup ----------------
+
+    async def _read_distill_config(self) -> Optional[Tuple[int, int, bool]]:
+        """Return (interval_sec, count, enabled) from DISTILL SystemConfig.
+
+        Returns None if the DISTILL entry is missing or malformed.
+        """
+        try:
+            environments = await self._config_dao.get_param_value(
+                "environments", default={}
+            )
+        except Exception as e:
+            logger.warning(f"[MOVER] Failed to read SystemConfig: {e}")
+            return None
+
+        distill = environments.get(DISTILL_ENV_KEY)
+        if not distill:
+            return None
+
+        enabled = bool(distill.get("enabled_for_sampling", False))
+        sampling_config = distill.get("sampling_config") or {}
+        try:
+            interval_sec = int(sampling_config.get("rotation_interval", 0))
+            count = int(sampling_config.get("rotation_count", 0))
+        except (TypeError, ValueError):
+            return None
+        if interval_sec <= 0 or count <= 0:
+            return None
+        return interval_sec, count, enabled
 
     # ---------------- Listing & metadata ----------------
 
@@ -202,7 +239,7 @@ class TeacherMover:
 
     # ---------------- One tick ----------------
 
-    def _tick(self) -> int:
+    def _tick(self, target_count: int) -> int:
         """Run one promotion batch. Returns number of successful moves."""
         try:
             by_env = self._list_pending()
@@ -224,9 +261,9 @@ class TeacherMover:
         next_id = self._load_public_next_id()
         promoted = 0
         attempts = 0
-        # Try up to count + total_pending so failed items can be replaced.
-        max_attempts = self.count + total_pending
-        while promoted < self.count and attempts < max_attempts:
+        # Try up to target_count + total_pending so failed items can be replaced.
+        max_attempts = target_count + total_pending
+        while promoted < target_count and attempts < max_attempts:
             src = self._draw_one(high, low)
             if src is None:
                 break
@@ -244,43 +281,62 @@ class TeacherMover:
                     f"metadata: {e}"
                 )
         logger.info(
-            f"[MOVER] Tick complete: promoted={promoted}/{self.count} "
+            f"[MOVER] Tick complete: promoted={promoted}/{target_count} "
             f"public_completed_up_to={next_id - 1}"
         )
         return promoted
 
     # ---------------- Main loop ----------------
 
+    async def _sleep_interruptible(self, seconds: int) -> None:
+        """Sleep in small chunks so stop() is responsive."""
+        slept = 0
+        while self.running and slept < seconds:
+            chunk = min(5, seconds - slept)
+            await asyncio.sleep(chunk)
+            slept += chunk
+
     async def run(self):
-        """Main loop: promote a fixed batch every interval_sec."""
+        """Main loop: read config each tick, promote a batch, sleep."""
         self._init_s3()
         logger.info(
-            f"[MOVER] Starting: interval={self.interval_sec}s "
-            f"count={self.count} private={self.private_bucket} "
-            f"public={self.public_bucket}"
+            f"[MOVER] Starting: private={self.private_bucket} "
+            f"public={self.public_bucket} (cadence driven by "
+            f"SystemConfig.{DISTILL_ENV_KEY}.sampling_config)"
         )
         self.running = True
         while self.running:
+            cfg = await self._read_distill_config()
+            if cfg is None:
+                logger.warning(
+                    f"[MOVER] {DISTILL_ENV_KEY} config missing or invalid, "
+                    f"retrying in {CONFIG_RETRY_SLEEP_SEC}s"
+                )
+                await self._sleep_interruptible(CONFIG_RETRY_SLEEP_SEC)
+                continue
+
+            interval_sec, target_count, enabled = cfg
+            if not enabled:
+                logger.info(
+                    f"[MOVER] {DISTILL_ENV_KEY}.enabled_for_sampling is "
+                    f"false, pausing for {interval_sec}s"
+                )
+                await self._sleep_interruptible(interval_sec)
+                continue
+
             try:
-                await asyncio.to_thread(self._tick)
+                await asyncio.to_thread(self._tick, target_count)
             except Exception as e:
                 logger.error(f"[MOVER] Tick error: {e}", exc_info=True)
-            # Sleep in small chunks so stop() is responsive
-            slept = 0
-            while self.running and slept < self.interval_sec:
-                await asyncio.sleep(min(5, self.interval_sec - slept))
-                slept += 5
+
+            await self._sleep_interruptible(interval_sec)
 
     def stop(self):
         self.running = False
 
 
-def run_mover_process(
-    interval_sec: int = MOVER_INTERVAL_SEC,
-    count: int = MOVER_COUNT,
-    verbosity: int = 1,
-):
-    """Entry point for the mover subprocess."""
+def run_mover_process(verbosity: int = 1):
+    """Entry point for running the mover as a standalone subprocess."""
     from affine.core.setup import setup_logging
 
     setup_logging(verbosity, component="mover")
@@ -288,7 +344,11 @@ def run_mover_process(
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    mover = TeacherMover(interval_sec=interval_sec, count=count)
+    # DynamoDB client has to be initialized inside the subprocess event loop
+    from affine.database.client import init_client
+    loop.run_until_complete(init_client())
+
+    mover = TeacherMover()
 
     try:
         loop.run_until_complete(mover.run())

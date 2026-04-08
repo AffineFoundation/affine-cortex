@@ -374,10 +374,12 @@ async def run_service(
     envs: List[str],
     concurrency: int,
 ):
-    """Run teacher worker (and optional mover) as a standalone service."""
+    """Run teacher worker and mover together as a standalone service."""
     import signal
 
     from affine.database.client import init_client
+    from affine.src.executor.teacher_mover import TeacherMover
+
     await init_client()
 
     worker = TeacherWorker(
@@ -387,30 +389,22 @@ async def run_service(
         envs=envs,
         concurrency=concurrency,
     )
-
-    # Optional in-process mover that promotes pending rollouts to public
-    mover = None
-    if os.getenv("TEACHER_MOVER_ENABLED", "1") not in ("0", "false", "False"):
-        from affine.src.executor.teacher_mover import TeacherMover
-
-        mover = TeacherMover()
-
-    shutdown_event = asyncio.Event()
+    # Mover self-pauses when DISTILL.enabled_for_sampling is false.
+    mover = TeacherMover()
 
     def handle_shutdown(sig):
         logger.info(f"[TEACHER] Received signal {sig}, shutting down...")
         worker.stop()
-        if mover is not None:
-            mover.stop()
-        shutdown_event.set()
+        mover.stop()
 
     loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, lambda s=sig: handle_shutdown(s))
 
-    tasks = [asyncio.create_task(worker.run(), name="teacher-worker")]
-    if mover is not None:
-        tasks.append(asyncio.create_task(mover.run(), name="teacher-mover"))
+    tasks = [
+        asyncio.create_task(worker.run(), name="teacher-worker"),
+        asyncio.create_task(mover.run(), name="teacher-mover"),
+    ]
 
     try:
         await asyncio.gather(*tasks)
@@ -419,8 +413,7 @@ async def run_service(
         raise
     finally:
         worker.stop()
-        if mover is not None:
-            mover.stop()
+        mover.stop()
 
 
 @click.command()
