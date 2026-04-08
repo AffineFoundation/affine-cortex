@@ -133,7 +133,7 @@
     },
     "DISTILL": {
       "enabled_for_sampling": true,
-      "enabled_for_scoring": false,
+      "enabled_for_scoring": true,
       "min_completeness": 0.9,
       "sampling_config": {
         "dataset_range": [[30, 50]],
