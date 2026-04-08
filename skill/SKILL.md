@@ -457,6 +457,25 @@ Detected error patterns: `USER_DAILY_QUERY_OVER_LIMIT`, `QPS_OVER_LIMIT`, `CUOTA
 
 This means miners won't be unfairly scored when external API quotas are hit. The invalidated evaluations are excluded from scoring aggregation.
 
+### NavWorld (QQR) Tool Call Budget & Cache Optimization
+
+NavWorld enforces **per-episode tool call budgets** to prevent wasteful API calls:
+
+| Tool | Budget | Rationale |
+|------|--------|-----------|
+| `direction` | 10 | ~5 routes needed for a quality plan |
+| `poi_search` | 10 | ~5 POIs needed |
+| `around_search` | 6 | ~3 nearby searches |
+| `weather` | 3 | 1-2 weather checks |
+
+When a tool exceeds its budget, the model gets a text hint to use existing data (no API call made). This aligns with `MAX_TOOL_STEPS=15`.
+
+**Cache normalization** for better hit rates:
+- Coordinates rounded to **3 decimal places** (~111m precision) for both `direction` and `around_search`
+- `around_search` radius bucketed into tiers: ≤1500→1000, ≤4000→3000, >4000→5000
+- All string args whitespace-stripped
+- Cache TTL: 48 hours (shared across AMap and Transport tools)
+
 ---
 
 ## 5. Scoring Pipeline
