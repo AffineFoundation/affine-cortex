@@ -37,10 +37,17 @@ class AntiCopyDetector:
         hs_threshold: float = 0.99,
         cosine_threshold: float = 0.99,
         min_tasks: int = 30,
+        hs_norm_deviation_max: float = 0.05,
     ):
         self.hs_threshold = hs_threshold
         self.cosine_threshold = cosine_threshold
         self.min_tasks = min_tasks
+        # Gate: reject hs vote if per-task ||h_a||/||h_b|| deviates too much
+        # from 1.0. True copies (even with added perturbation noise) keep
+        # norm ratio extremely stable across tasks (std < 0.03); same-base
+        # fine-tunes show much larger drift (std > 0.1). See analysis of
+        # uid 51 vs 47 (fine-tune) against 6 true copies.
+        self.hs_norm_deviation_max = hs_norm_deviation_max
 
     @staticmethod
     def _cosine_pair(a: np.ndarray, b: np.ndarray) -> float:
@@ -158,6 +165,7 @@ class AntiCopyDetector:
                 )
                 has_hs = len(hs_common) >= self.min_tasks
                 med_hs = float("nan")
+                hs_norm_deviation = float("nan")
 
                 if has_hs:
                     hs_cosines = np.array([
@@ -167,6 +175,26 @@ class AntiCopyDetector:
                     med_hs = float(np.nanmedian(hs_cosines))
                     # Use max task count
                     n_tasks = max(n_tasks, len(hs_common))
+
+                    # Per-task hidden_states L2 norm ratio. Copies keep this
+                    # ratio ≈ 1.0 and stable across tasks; fine-tunes drift.
+                    norms_a = np.array([
+                        float(np.linalg.norm(ma.task_hidden_states[t]))
+                        for t in hs_common
+                    ])
+                    norms_b = np.array([
+                        float(np.linalg.norm(mb.task_hidden_states[t]))
+                        for t in hs_common
+                    ])
+                    valid = (norms_a > 0) & (norms_b > 0)
+                    if valid.any():
+                        ratios = norms_a[valid] / norms_b[valid]
+                        hs_norm_deviation = float(
+                            max(
+                                abs(float(np.mean(ratios)) - 1.0),
+                                float(np.std(ratios)),
+                            )
+                        )
 
                 # Need at least some data to compare
                 if not has_logprobs and not has_hs:
@@ -178,7 +206,15 @@ class AntiCopyDetector:
 
                 if has_hs:
                     total_votes += 1
-                    if med_hs >= self.hs_threshold:
+                    hs_vote_copy = med_hs >= self.hs_threshold
+                    # Norm-ratio gate: if per-task ||h_a||/||h_b|| drifts
+                    # too much, this is fine-tune divergence, not copy.
+                    if (
+                        not np.isnan(hs_norm_deviation)
+                        and hs_norm_deviation > self.hs_norm_deviation_max
+                    ):
+                        hs_vote_copy = False
+                    if hs_vote_copy:
                         votes += 1
 
                 if has_logprobs and not np.isnan(med_cosine):
@@ -207,6 +243,7 @@ class AntiCopyDetector:
                         confidence=confidence,
                         votes=votes,
                         total_votes=total_votes,
+                        hs_norm_deviation=hs_norm_deviation,
                         task_cosines=task_cosine_map,
                     )
                 )

@@ -51,16 +51,22 @@ class CopyPair:
     votes: int = 0              # number of signals that voted "copy"
     total_votes: int = 0        # number of signals that participated
 
+    # max(|mean(norm_a/norm_b)-1|, std(norm_a/norm_b)); small for copies,
+    # large for same-base fine-tunes. NaN if no hs data.
+    hs_norm_deviation: float = float("nan")
+
     # Per-task cosine for debugging
     task_cosines: Dict[int, float] = field(default_factory=dict)
 
     def __repr__(self) -> str:
         flag = "COPY" if self.is_copy else "ok"
         hs_str = f"{self.hs_cosine:.5f}" if not np.isnan(self.hs_cosine) else "N/A"
+        nd_str = f"{self.hs_norm_deviation:.4f}" if not np.isnan(self.hs_norm_deviation) else "N/A"
         return (
             f"[{flag}] uid={self.uid_a} vs uid={self.uid_b} | "
             f"cos={self.cosine_similarity:.5f} "
             f"hs={hs_str} "
+            f"nd={nd_str} "
             f"js={self.js_divergence:.5f} "
             f"agree={self.token_agreement:.3f} "
             f"votes={self.votes}/{self.total_votes} "
