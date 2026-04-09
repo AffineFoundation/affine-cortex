@@ -34,9 +34,9 @@ class PerMinerSamplingScheduler:
        to ensure sampling completes within 2 days
     """
 
-    DEFAULT_SLOTS = 6
-    MIN_SLOTS = 3
-    MAX_SLOTS = 12
+    DEFAULT_SLOTS = 10
+    MIN_SLOTS = 10
+    MAX_SLOTS = 16
 
     # Rate limiting: allow actual sampling rate to exceed rotation rate by this margin
     RATE_MARGIN = 1.2
