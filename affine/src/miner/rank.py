@@ -114,42 +114,6 @@ async def fetch_scorer_config(client) -> dict:
         return {}
 
 
-def _get_filter_reason_from_api(score: dict, environments: list, env_configs: dict, scorer_config: dict) -> str:
-    """Get concise filter reason from API score data (max 12 chars)."""
-    filter_info = score.get("filter_info") or {}
-    filter_reasons = filter_info.get("filter_reasons", {})
-    filtered_subsets = filter_info.get("filtered_subsets", [])
-
-    # Pareto dominated
-    if filtered_subsets:
-        for reason in filter_reasons.values():
-            if isinstance(reason, str) and reason.startswith("dom>"):
-                return reason  # e.g. "dom>123"
-        return "pareto"
-
-    # Incomplete env
-    default_min_completeness = scorer_config.get("min_completeness", 0.9)
-    scores_by_env = score.get("scores_by_env", {})
-    for env in environments:
-        if env in scores_by_env:
-            env_data = scores_by_env[env]
-            completeness = env_data.get("completeness", 1.0)
-            env_config = env_configs.get(env, {})
-            env_min = env_config.get("min_completeness", default_min_completeness)
-            if completeness < env_min:
-                env_short = env.split(':')[-1][:10]
-                return f"!{env_short}"
-        else:
-            env_short = env.split(':')[-1][:10]
-            return f"!{env_short}"
-
-    # No valid data
-    total_samples = score.get("total_samples", 0)
-    if total_samples == 0:
-        return "no_data"
-    return ""
-
-
 async def print_rank_table():
     """Fetch and print miner ranking table in scorer format.
 
@@ -173,15 +137,19 @@ async def print_rank_table():
             print(f"No miners scored at block {block_number}")
             return
 
-        # Sort: weight>0 first (by rating desc), then filtered (by rating desc)
-        scores_list = sorted(
-            scores_list,
-            key=lambda s: (
-                (s.get("overall_score") or 0) > 0,
-                s.get("elo_rating") or 0,
-            ),
-            reverse=True
-        )
+        # Sort: champion first, then sampling by avg_score desc, then terminated
+        def sort_key(s):
+            ci = s.get("challenge_info") or {}
+            is_champ = ci.get("is_champion", False)
+            is_term = ci.get("status") == "terminated"
+            avg = s.get("average_score") or 0
+            return (not is_champ, is_term, -avg)
+
+        scores_list = sorted(scores_list, key=sort_key)
+
+        # Read champion challenge config for display
+        N = scorer_config.get("champion_consecutive_wins_required", 10)
+        M = scorer_config.get("champion_termination_total_losses", 3)
 
         # Build header
         header_parts = ["Hotkey  ", " UID", "Model                    "]
@@ -196,13 +164,13 @@ async def print_rank_table():
                 env_display = env
             header_parts.append(f"{env_display:>14}")
 
-        header_parts.extend(["Rating", "   Δ", " Rnd", "  Weight  ", "Status      "])
+        header_parts.extend(["  Status   ", " Challenge "])
 
         header_line = " | ".join(header_parts)
         table_width = len(header_line)
 
         print("=" * table_width, flush=True)
-        print(f"MINER RANKING TABLE - Block {block_number}", flush=True)
+        print(f"CHAMPION CHALLENGE RANKING - Block {block_number}", flush=True)
         print("=" * table_width, flush=True)
         print(header_line, flush=True)
         print("-" * table_width, flush=True)
@@ -211,15 +179,14 @@ async def print_rank_table():
             uid = score.get("uid")
             hotkey = score.get("miner_hotkey")
             model = score.get("model")
-            overall_score = score.get("overall_score") or 0
             scores_by_env = score.get("scores_by_env", {})
-            elo_rating = int(score.get("elo_rating") or 0)
-            elo_rounds_played = int(score.get("elo_rounds_played") or 0)
-            elo_rating_change = int(score.get("elo_rating_change") or 0)
-            is_active = overall_score > 0
+            ci = score.get("challenge_info") or {}
+            is_champion = ci.get("is_champion", False)
+            status = ci.get("status", "sampling")
+            wins = ci.get("consecutive_wins", 0)
+            total_losses = ci.get("total_losses", 0)
 
-            model_display = model[:25]
-            filter_reason = _get_filter_reason_from_api(score, environments, env_configs, scorer_config)
+            model_display = (model or "")[:25]
 
             row_parts = [
                 f"{hotkey[:8]:8s}",
@@ -249,31 +216,29 @@ async def print_rank_table():
                 else:
                     row_parts.append(f"{'  -  ':>14}")
 
-            if is_active:
-                delta_str = f"+{elo_rating_change}" if elo_rating_change >= 0 else str(elo_rating_change)
-                row_parts.append(f"{elo_rating:6d}")
-                row_parts.append(f"{delta_str:>6s}")
-                row_parts.append(f"{elo_rounds_played:4d}")
-                row_parts.append(f"{overall_score:>10.6f}")
-                # Show filter reason even for active miners (e.g. Pareto-filtered
-                # miners that retain weight while decaying)
-                if filter_reason:
-                    row_parts.append(f"{'↓' + filter_reason:12s}")
-                else:
-                    row_parts.append(f"{'✓':12s}")
+            # Status + Challenge columns
+            if is_champion:
+                row_parts.append(f"{'★ CHAMPION':>11}")
+                row_parts.append(f"{'—':>11}")
+            elif status == "terminated":
+                row_parts.append(f"{'TERMINATED':>11}")
+                row_parts.append(f"{'L:' + str(total_losses) + '/' + str(M):>11}")
             else:
-                row_parts.append(f"{'—':>6}")
-                row_parts.append(f"{'—':>6}")
-                row_parts.append(f"{'—':>4}")
-                row_parts.append(f"{'0':>10}")
-                row_parts.append(f"{filter_reason or '✗':12s}")
+                row_parts.append(f"{'sampling':>11}")
+                if wins > 0:
+                    row_parts.append(f"{'W:' + str(wins) + '/' + str(N):>11}")
+                elif total_losses > 0:
+                    row_parts.append(f"{'L:' + str(total_losses) + '/' + str(M):>11}")
+                else:
+                    row_parts.append(f"{'—':>11}")
 
             print(" | ".join(row_parts), flush=True)
 
         print("=" * table_width, flush=True)
-        print(f"Total miners: {len(scores_list)}", flush=True)
-        non_zero = len([s for s in scores_list if (s.get("overall_score") or 0) > 0])
-        print(f"Active miners (weight > 0): {non_zero}", flush=True)
+        terminated = len([s for s in scores_list if (s.get("challenge_info") or {}).get("status") == "terminated"])
+        sampling = len([s for s in scores_list if (s.get("challenge_info") or {}).get("status") == "sampling"
+                        and not (s.get("challenge_info") or {}).get("is_champion")])
+        print(f"Total: {len(scores_list)}  |  Champion: 1  |  Sampling: {sampling}  |  Terminated: {terminated}", flush=True)
         print("=" * table_width, flush=True)
 
 

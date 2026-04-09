@@ -378,6 +378,15 @@ class PerMinerSamplingScheduler:
         hotkey = miner['hotkey']
         revision = miner['revision']
 
+        # Skip miners terminated by champion challenge
+        try:
+            challenge_state = await self.miner_stats_dao.get_challenge_state(hotkey, revision)
+            if challenge_state.get('challenge_status') == 'terminated':
+                logger.debug(f"Skipping terminated miner {hotkey[:8]}...")
+                return
+        except Exception as e:
+            logger.debug(f"Error checking challenge state for {hotkey[:8]}...: {e}")
+
         # Get miner's total slots from MinerStats
         total_slots = await self._get_miner_slots(miner)
 

@@ -87,14 +87,9 @@ class MinerScore(BaseModel):
     first_block: int
     overall_score: float
     average_score: float
-    scores_by_layer: Dict[str, float]
-    scores_by_env: Dict[str, Dict[str, Any]]  # Changed to support {env: {score, sample_count}}
+    scores_by_env: Dict[str, Dict[str, Any]]
     total_samples: int
-    cumulative_weight: Optional[float] = None
-    elo_rating: Optional[float] = None
-    elo_rounds_played: Optional[int] = None
-    elo_rating_change: Optional[float] = None
-    filter_info: Optional[Dict[str, Any]] = None
+    challenge_info: Optional[Dict[str, Any]] = None
 
 
 class ScoresResponse(BaseModel):

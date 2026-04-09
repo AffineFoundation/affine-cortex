@@ -41,20 +41,12 @@ class ScoresDAO(BaseDAO):
         first_block: int,
         overall_score: float,
         average_score: float,
-        scores_by_layer: Dict[str, float],
         scores_by_env: Dict[str, Any],
         total_samples: int,
-        subset_contributions: Optional[Dict[str, Dict[str, Any]]] = None,
-        cumulative_weight: Optional[float] = None,
-        filter_info: Optional[Dict[str, Any]] = None,
-        elo_rating: Optional[float] = None,
-        elo_rounds_played: Optional[int] = None,
-        elo_rating_change: Optional[float] = None
+        challenge_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Save a score snapshot for a miner at a specific block.
-        
-        Merged from miner_scores table - now contains both summary and detailed data.
-        
+
         Args:
             block_number: Current block number
             miner_hotkey: Miner's hotkey
@@ -62,20 +54,17 @@ class ScoresDAO(BaseDAO):
             model_revision: Model revision
             model: Model repository identifier
             first_block: Block number when miner first registered
-            overall_score: Overall score (normalized weight)
+            overall_score: Overall score (normalized weight, 1.0 for champion, 0.0 for others)
             average_score: Average score across environments
-            scores_by_layer: Scores breakdown by layer
             scores_by_env: Detailed scores by environment (with score, sample_count, completeness)
             total_samples: Total number of samples
-            subset_contributions: Detailed subset contributions (optional, from miner_scores)
-            cumulative_weight: Cumulative weight before normalization (optional, from miner_scores)
-            filter_info: Filtering information (optional, from miner_scores)
-            
+            challenge_info: Champion challenge state (optional)
+
         Returns:
             Saved score item
         """
         calculated_at = int(time.time())
-        
+
         item = {
             'pk': self._make_pk(block_number),
             'sk': self._make_sk(miner_hotkey),
@@ -88,34 +77,18 @@ class ScoresDAO(BaseDAO):
             'calculated_at': calculated_at,
             'overall_score': overall_score,
             'average_score': average_score,
-            'scores_by_layer': scores_by_layer,
             'scores_by_env': scores_by_env,
             'total_samples': total_samples,
             'latest_marker': 'LATEST',  # For GSI
         }
-        
-        # Add optional detailed fields (from miner_scores)
-        if subset_contributions is not None:
-            item['subset_contributions'] = subset_contributions
-        
-        if cumulative_weight is not None:
-            item['cumulative_weight'] = cumulative_weight
-        
-        if filter_info is not None:
-            item['filter_info'] = filter_info
 
-        if elo_rating is not None:
-            item['elo_rating'] = elo_rating
-        if elo_rounds_played is not None:
-            item['elo_rounds_played'] = elo_rounds_played
-        if elo_rating_change is not None:
-            item['elo_rating_change'] = elo_rating_change
+        if challenge_info is not None:
+            item['challenge_info'] = challenge_info
 
         # Conditional TTL: only set TTL for miners with zero weight
         if overall_score == 0:
-            item['ttl'] = self.get_ttl(7)  # 30 days for inactive miners
-        # Miners with non-zero weight: no TTL (permanent storage)
-        
+            item['ttl'] = self.get_ttl(7)
+
         return await self.put(item)
     
     async def get_scores_at_block(
@@ -221,7 +194,6 @@ class ScoresDAO(BaseDAO):
                 'calculated_at': created_at,
                 'overall_score': weight,
                 'average_score': miner_details.get('average_score', weight),
-                'scores_by_layer': miner_details.get('scores_by_layer', {}),
                 'scores_by_env': miner_details.get('scores_by_env', {}),
                 'total_samples': miner_details.get('total_samples', 0),
                 'latest_marker': 'LATEST',
