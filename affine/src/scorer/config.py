@@ -61,13 +61,6 @@ class ScorerConfig:
     SCORE_PRECISION: int = 3
     """Number of decimal places for score comparison (avoid floating point issues)."""
     
-    # Stage 3: Subset Scoring
-    MAX_LAYERS: int = 1
-    """Maximum number of layers to evaluate. Set to 1 to only evaluate the last layer (all environments combined)."""
-    
-    SUBSET_WEIGHT_EXPONENT: int = 2
-    """Exponent base for layer weights (layer_weight = N * base^(layer-1))."""
-    
     GEOMETRIC_MEAN_EPSILON: float = 0.1
     """
     Smoothing epsilon for geometric mean calculation.
@@ -85,23 +78,6 @@ class ScorerConfig:
     Recommended value: 0.1
     """
 
-    DECAY_FACTOR: float = 0.5
-    """
-    Rank-based decay factor for score_proportional weighting.
-
-    Applied as: adjusted_score = score × decay_factor^(rank - 1)
-    - Rank 1: score × 1.0
-    - Rank 2: score × decay_factor^1
-    - Rank 3: score × decay_factor^2
-
-    Set to 1.0 to disable decay (all ranks weighted equally).
-    Set to 0.5 for exponential decay (each rank gets 50% of previous).
-    """
-    
-    # Stage 4: Weight Normalization
-    MIN_WEIGHT_THRESHOLD: float = 0.01
-    """Minimum weight threshold (1%). Miners below this are set to 0."""
-    
     # Stage 1: Data Collection
     MIN_COMPLETENESS: float = 0.9
     """Minimum sample completeness required."""
@@ -124,56 +100,36 @@ class ScorerConfig:
         'SWE-INFINITE': {'z_score': 2.0},
     }
     
-    # ELO Parameters
-    ELO_D: float = 400.0
-    """Rating difference scale factor for expected score calculation."""
+    # Champion Challenge Parameters
+    CHAMPION_WARMUP_CHECKPOINTS: int = 2
+    """Number of initial checkpoints that don't count toward wins/losses.
 
-    ELO_K_BASE: float = 32.0
-    """Base K-factor (update step size) for established miners."""
-
-    ELO_K_PROVISIONAL: float = 96.0
-    """Higher K-factor for new/provisional miners to converge faster."""
-
-    ELO_PROVISIONAL_ROUNDS: int = 48
-    """Number of rounds a miner is considered provisional (~1 day)."""
-
-    ELO_BASE_RATING: float = 1200.0
-    """Initial ELO rating for new miners. Set below average (1500) to prevent
-    new-hotkey spam attacks: miners must prove skill before climbing to top."""
-
-    ELO_SENIORITY_ALPHA: float = 0.0
-    """Seniority advantage factor. 0.0 disables seniority bonus."""
-
-    ELO_ABSENCE_DECAY_RATE: float = 0.95
-    """Per-round decay rate for miners not participating in scoring.
-
-    Miners that don't participate in a round (incomplete sampling, Pareto-filtered,
-    offline) still retain their weight position based on historical rating, but their
-    rating decays each round. This ensures ranking stability — no sudden weight drops
-    when a miner is temporarily unable to participate.
-
-    Applied as: rating = BASE_RATING + excess * DECAY_RATE^(missed_rounds^POWER)
-
-    Combined with ELO_ABSENCE_DECAY_POWER for accelerating decay:
-    gentle at first, aggressive over time. Guarantees convergence to BASE_RATING.
-
-    With 0.95 rate and 1.4 power at 30-minute intervals:
-    - 1 hour:   retains 87% (gentle)
-    - 3 hours:  retains 53%
-    - 6 hours:  retains 19%
-    - 12 hours: retains  1.3% (nearly gone)
-    - 18 hours: retains  0.05% (gone)
+    Early checkpoints have few common tasks, so thresholds are high and
+    results are noisy. During warmup, comparisons are logged but don't
+    affect win/loss counters or trigger termination.
     """
 
-    ELO_ABSENCE_DECAY_POWER: float = 1.4
-    """Power exponent for accelerating absence decay.
+    CHAMPION_CONSECUTIVE_WINS_REQUIRED: int = 10
+    """Number of consecutive checkpoint wins needed to dethrone champion (N).
 
-    Makes decay gentle at first but increasingly aggressive over time.
-    The exponent is applied to missed_rounds: decay_rate^(missed_rounds^power).
+    Counted only after warmup checkpoints. The challenger must dominate
+    at N consecutive post-warmup checkpoints.
+    """
 
-    power=1.0: constant decay rate (no acceleration, standard exponential)
-    power=1.4: accelerating decay, any rating reaches BASE within ~18 hours
-    power=2.0: very aggressive acceleration
+    CHAMPION_TERMINATION_TOTAL_LOSSES: int = 3
+    """Accumulated checkpoint losses to stop sampling a challenger (M)."""
+
+    CHAMPION_TERMINATION_CONSECUTIVE_LOSSES: int = 2
+    """Consecutive checkpoint losses to stop sampling a challenger (M-1)."""
+
+    PAIRWISE_MIN_WINDOWS: int = 3
+    """Minimum windows of common tasks before pairwise Pareto comparison fires.
+
+    Pairwise filter (anti-plagiarism): if miner A (older) and miner B (newer)
+    share at least PAIRWISE_MIN_WINDOWS × window_size common tasks, run Pareto
+    comparison. The dominated miner is terminated. A copy of an incumbent
+    cannot significantly beat the incumbent's threshold, so this filters
+    plagiarized models before they can challenge the champion.
     """
 
 
@@ -189,20 +145,13 @@ class ScorerConfig:
             'min_improvement': cls.MIN_IMPROVEMENT,
             'max_improvement': cls.MAX_IMPROVEMENT,
             'score_precision': cls.SCORE_PRECISION,
-            'max_layers': cls.MAX_LAYERS,
-            'subset_weight_exponent': cls.SUBSET_WEIGHT_EXPONENT,
-            'decay_factor': cls.DECAY_FACTOR,
-            'min_weight_threshold': cls.MIN_WEIGHT_THRESHOLD,
             'min_completeness': cls.MIN_COMPLETENESS,
             'geometric_mean_epsilon': cls.GEOMETRIC_MEAN_EPSILON,
-            'elo_d': cls.ELO_D,
-            'elo_k_base': cls.ELO_K_BASE,
-            'elo_k_provisional': cls.ELO_K_PROVISIONAL,
-            'elo_provisional_rounds': cls.ELO_PROVISIONAL_ROUNDS,
-            'elo_base_rating': cls.ELO_BASE_RATING,
-            'elo_seniority_alpha': cls.ELO_SENIORITY_ALPHA,
-            'elo_absence_decay_rate': cls.ELO_ABSENCE_DECAY_RATE,
-            'elo_absence_decay_power': cls.ELO_ABSENCE_DECAY_POWER,
+            'champion_warmup_checkpoints': cls.CHAMPION_WARMUP_CHECKPOINTS,
+            'champion_consecutive_wins_required': cls.CHAMPION_CONSECUTIVE_WINS_REQUIRED,
+            'champion_termination_total_losses': cls.CHAMPION_TERMINATION_TOTAL_LOSSES,
+            'champion_termination_consecutive_losses': cls.CHAMPION_TERMINATION_CONSECUTIVE_LOSSES,
+            'pairwise_min_windows': cls.PAIRWISE_MIN_WINDOWS,
         }
     
     @classmethod
@@ -212,17 +161,13 @@ class ScorerConfig:
         assert cls.MIN_IMPROVEMENT >= 0.0, "MIN_IMPROVEMENT must be non-negative"
         assert cls.MAX_IMPROVEMENT >= cls.MIN_IMPROVEMENT, "MAX_IMPROVEMENT must be >= MIN_IMPROVEMENT"
         assert cls.SCORE_PRECISION >= 0, "SCORE_PRECISION must be non-negative"
-        assert cls.SUBSET_WEIGHT_EXPONENT >= 2, "SUBSET_WEIGHT_EXPONENT must be >= 2"
-        assert 0.0 <= cls.DECAY_FACTOR <= 1.0, "DECAY_FACTOR must be in [0, 1]"
-        assert 0.0 <= cls.MIN_WEIGHT_THRESHOLD <= 1.0, "MIN_WEIGHT_THRESHOLD must be in [0, 1]"
         assert 0.0 <= cls.MIN_COMPLETENESS <= 1.0, "MIN_COMPLETENESS must be in [0, 1]"
         assert cls.GEOMETRIC_MEAN_EPSILON >= 0.0, "GEOMETRIC_MEAN_EPSILON must be non-negative"
-        assert cls.ELO_D > 0.0, "ELO_D must be positive"
-        assert cls.ELO_K_BASE > 0.0, "ELO_K_BASE must be positive"
-        assert cls.ELO_K_PROVISIONAL > 0.0, "ELO_K_PROVISIONAL must be positive"
-        assert cls.ELO_PROVISIONAL_ROUNDS >= 0, "ELO_PROVISIONAL_ROUNDS must be non-negative"
-        assert cls.ELO_BASE_RATING > 0.0, "ELO_BASE_RATING must be positive"
-        assert cls.ELO_SENIORITY_ALPHA >= 0.0, "ELO_SENIORITY_ALPHA must be non-negative"
+        assert cls.CHAMPION_WARMUP_CHECKPOINTS >= 0, "CHAMPION_WARMUP_CHECKPOINTS must be >= 0"
+        assert cls.CHAMPION_CONSECUTIVE_WINS_REQUIRED >= 1, "CHAMPION_CONSECUTIVE_WINS_REQUIRED must be >= 1"
+        assert cls.CHAMPION_TERMINATION_TOTAL_LOSSES >= 1, "CHAMPION_TERMINATION_TOTAL_LOSSES must be >= 1"
+        assert cls.CHAMPION_TERMINATION_CONSECUTIVE_LOSSES >= 1, "CHAMPION_TERMINATION_CONSECUTIVE_LOSSES must be >= 1"
+        assert cls.PAIRWISE_MIN_WINDOWS >= 1, "PAIRWISE_MIN_WINDOWS must be >= 1"
 
 
 # Validate configuration on import

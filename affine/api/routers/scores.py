@@ -63,24 +63,19 @@ async def get_latest_scores(
                 first_block=s.get("first_block"),
                 overall_score=s.get("overall_score"),
                 average_score=s.get("average_score"),
-                scores_by_layer=s.get("scores_by_layer"),
                 scores_by_env=s.get("scores_by_env"),
                 total_samples=s.get("total_samples"),
-                cumulative_weight=s.get("cumulative_weight"),
-                elo_rating=s.get("elo_rating"),
-                elo_rounds_played=s.get("elo_rounds_played"),
-                elo_rating_change=s.get("elo_rating_change"),
-                filter_info=s.get("filter_info"),
+                challenge_info=s.get("challenge_info"),
             )
             for s in scores_list
         ]
-        
+
         return ScoresResponse(
             block_number=block_number,
             calculated_at=calculated_at,
             scores=miner_scores,
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -144,16 +139,11 @@ async def get_score_by_uid(
             first_block=miner_score.get("first_block"),
             overall_score=miner_score.get("overall_score"),
             average_score=miner_score.get("average_score"),
-            scores_by_layer=miner_score.get("scores_by_layer"),
             scores_by_env=miner_score.get("scores_by_env"),
             total_samples=miner_score.get("total_samples"),
-            cumulative_weight=miner_score.get("cumulative_weight"),
-            elo_rating=miner_score.get("elo_rating"),
-            elo_rounds_played=miner_score.get("elo_rounds_played"),
-            elo_rating_change=miner_score.get("elo_rating_change"),
-            filter_info=miner_score.get("filter_info"),
+            challenge_info=miner_score.get("challenge_info"),
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:

@@ -1,7 +1,7 @@
 """
 Main Scorer Orchestrator
 
-Coordinates the four-stage scoring algorithm and manages result persistence.
+Coordinates the champion challenge scoring algorithm and manages result persistence.
 """
 
 import time
@@ -9,116 +9,134 @@ from typing import Dict, Any, Optional
 from .config import ScorerConfig
 from .models import ScoringResult
 from .stage1_collector import Stage1Collector
-from .stage2_pareto import Stage2ParetoFilter
-from .stage3_subset import Stage3SubsetScorer
-from .stage4_weights import Stage4WeightNormalizer
-from .utils import generate_all_subsets
+from .champion_challenge import ChampionChallenge
 
 from affine.core.setup import logger
 
 
 class Scorer:
     """Main scorer orchestrator.
-    
-    Coordinates the four-stage scoring algorithm:
+
+    Coordinates the two-stage champion challenge scoring algorithm:
     1. Data Collection: Collect and validate sample data
-    2. Pareto Filtering: Apply anti-plagiarism filtering
-    3. Subset Scoring: Calculate geometric mean scores and distribute weights
-    4. Weight Normalization: Apply threshold and normalization
-    
-    Optionally saves results to database.
+    2. Champion Challenge: Compare all miners against champion via Pareto dominance
+
+    The champion gets 100% weight. All other miners get 0%.
     """
-    
+
     def __init__(self, config: ScorerConfig = ScorerConfig):
-        """Initialize scorer with configuration.
-        
-        Args:
-            config: Scorer configuration (defaults to global config)
-        """
         self.config = config
-        
-        # Initialize stage processors
         self.stage1 = Stage1Collector(config)
-        self.stage2 = Stage2ParetoFilter(config)
-        self.stage3 = Stage3SubsetScorer(config)
-        self.stage4 = Stage4WeightNormalizer(config)
-    
+        self.champion_challenge = ChampionChallenge(config)
+
     def calculate_scores(
         self,
         scoring_data: Dict[str, Any],
         environments: list,
         env_configs: Dict[str, Any],
         block_number: int,
-        prev_ratings: Optional[Dict[str, Any]] = None,
+        champion_state: Optional[Dict[str, Any]] = None,
+        prev_challenge_states: Optional[Dict[str, Dict[str, Any]]] = None,
+        env_sampling_counts: Optional[Dict[str, int]] = None,
         print_summary: bool = True
     ) -> ScoringResult:
-        """Execute the four-stage scoring algorithm.
-        
+        """Execute the champion challenge scoring algorithm.
+
         Args:
             scoring_data: Response from /api/v1/samples/scoring
             environments: List of environment names participating in scoring
             env_configs: Dict mapping env_name -> env_config (including min_completeness)
             block_number: Current block number
+            champion_state: Current champion info from system_config, or None for cold start
+            prev_challenge_states: Previous challenge states per miner hotkey
+            env_sampling_counts: {env_name: sampling_count} window size per environment
             print_summary: Whether to print detailed summaries (default: True)
-            
+
         Returns:
             ScoringResult with complete scoring data
         """
         start_time = time.time()
         logger.info(f"Total Miners: {len(scoring_data)}")
-        
+
         # Stage 1: Data Collection
         stage1_output = self.stage1.collect(scoring_data, environments, env_configs)
-        
-        # Stage 2: Pareto Filtering
-        # Apply MAX_LAYERS limit: only evaluate top layers (e.g., L3-L8 if 8 envs and MAX_LAYERS=6)
-        subsets_meta = generate_all_subsets(environments, max_layers=self.config.MAX_LAYERS)
-        stage2_output = self.stage2.filter(stage1_output.miners, subsets_meta)
-        
-        # Stage 3: ELO Rating Update + Weight Distribution
-        stage3_output = self.stage3.score(
-            stage2_output.miners, environments,
-            prev_ratings=prev_ratings,
-            current_block=block_number,
+
+        # Stage 2: Champion Challenge
+        challenge_output = self.champion_challenge.run(
+            miners=stage1_output.miners,
+            environments=environments,
+            env_sampling_counts=env_sampling_counts or {},
+            champion_state=champion_state,
+            prev_challenge_states=prev_challenge_states or {},
         )
-        
-        # Stage 4: Weight Normalization
-        stage4_output = self.stage4.normalize(stage3_output.miners)
-        
+
         # Build final result
         result = ScoringResult(
             block_number=block_number,
             calculated_at=int(time.time()),
             environments=environments,
             config=self.config.to_dict(),
-            miners=stage3_output.miners,
-            pareto_comparisons=stage2_output.comparisons,
-            subsets=stage3_output.subsets,
-            final_weights=stage4_output.final_weights,
+            miners=challenge_output.miners,
+            pareto_comparisons=challenge_output.comparisons,
+            final_weights=challenge_output.final_weights,
+            champion_uid=challenge_output.champion_uid,
+            champion_hotkey=challenge_output.champion_hotkey,
             total_miners=len(scoring_data),
             valid_miners=stage1_output.valid_count,
             invalid_miners=stage1_output.invalid_count,
         )
-        
+
         elapsed_time = time.time() - start_time
-        non_zero = len([w for w in result.final_weights.values() if w > 0])
-        logger.info("=" * 80)
-        logger.info(f"SCORING COMPLETED - Time: {elapsed_time:.2f}s, Active: {non_zero}/{len(scoring_data)}")
-        logger.info("=" * 80)
-        
-        # Print detailed summary table
+        logger.info(f"SCORING COMPLETED - Time: {elapsed_time:.2f}s, Champion: UID {result.champion_uid}")
+
+        # Print detailed summary
         if print_summary:
-            self.stage4.print_detailed_table(stage3_output.miners, environments, env_configs)
-        
+            self._print_summary(challenge_output.miners, environments, challenge_output.champion_uid)
+
         return result
-    
+
+    def _print_summary(self, miners: Dict[int, Any], environments: list, champion_uid: Optional[int]):
+        """Print a summary table of all miners and their challenge status."""
+        logger.info("=" * 100)
+        logger.info(f"{'UID':>4} | {'Hotkey':12} | {'Status':11} | {'CP':>3} | {'Wins':>4} | {'TotL':>4} | {'Weight':>7} | Env Scores")
+        logger.info("-" * 100)
+
+        for uid in sorted(miners.keys()):
+            miner = miners[uid]
+            hotkey_short = f"{miner.hotkey[:8]}..."
+            if uid == champion_uid:
+                status = "CHAMPION"
+            elif miner.challenge_status == 'terminated':
+                status = "TERMINATED"
+            else:
+                status = "sampling"
+
+            env_strs = []
+            for env in sorted(environments):
+                if env in miner.env_scores and miner.env_scores[env].is_valid:
+                    env_strs.append(f"{miner.env_scores[env].avg_score:.3f}")
+                else:
+                    env_strs.append("  N/A")
+
+            logger.info(
+                f"{uid:4d} | {hotkey_short:12} | {status:11} | "
+                f"{miner.challenge_checkpoints_passed:3d} | "
+                f"{miner.challenge_consecutive_wins:4d} | "
+                f"{miner.challenge_total_losses:4d} | "
+                f"{miner.normalized_weight:7.4f} | "
+                f"{' '.join(env_strs)}"
+            )
+
+        logger.info("=" * 100)
+
     async def save_results(
         self,
         result: ScoringResult,
         score_snapshots_dao=None,
         scores_dao=None,
         miner_stats_dao=None,
-        prev_ratings: Optional[Dict[str, Any]] = None,
+        system_config_dao=None,
+        block_number: Optional[int] = None,
     ):
         """Save scoring results to database.
 
@@ -127,42 +145,43 @@ class Scorer:
             score_snapshots_dao: ScoreSnapshotsDAO instance (optional)
             scores_dao: ScoresDAO instance (optional)
             miner_stats_dao: MinerStatsDAO instance (optional)
-            prev_ratings: Previous ratings for determining participation
+            system_config_dao: SystemConfigDAO instance for champion state (optional)
+            block_number: Block number override (defaults to result.block_number)
         """
         if not score_snapshots_dao or not scores_dao:
             logger.warning("DAO instances not provided, skipping database save")
             return
-        
-        logger.info(f"Saving scoring results to database (block {result.block_number})")
-        
+
+        block = block_number or result.block_number
+        logger.info(f"Saving scoring results to database (block {block})")
+
         # Save snapshot metadata
         statistics = {
             "total_miners": result.total_miners,
             "valid_miners": result.valid_miners,
             "invalid_miners": result.invalid_miners,
+            "champion_uid": result.champion_uid,
+            "champion_hotkey": result.champion_hotkey,
             "miner_final_scores": {
                 str(uid): weight
                 for uid, weight in result.final_weights.items()
             }
         }
-        
+
         await score_snapshots_dao.save_snapshot(
-            block_number=result.block_number,
+            block_number=block,
             scorer_hotkey="scorer_service",
             config=result.config,
             statistics=statistics
         )
-        
-        # Save to scores table (now contains all data - merged with miner_scores)
-        logger.info(f"Saving complete scoring data to scores table...")
+
+        # Save per-miner scores
         for uid, miner in result.miners.items():
-            # Calculate total samples
             total_samples = sum(
                 env_score.sample_count
                 for env_score in miner.env_scores.values()
             )
-            
-            # Prepare detailed scores by environment (with completeness and threshold)
+
             scores_by_env = {
                 env: {
                     "score": score.avg_score,
@@ -172,41 +191,24 @@ class Scorer:
                 }
                 for env, score in miner.env_scores.items()
             }
-            
-            # Use normalized weight as overall score
+
             overall_score = miner.normalized_weight
-            
-            # Calculate average score from environments
-            if scores_by_env:
-                average_score = sum(env_data["score"] for env_data in scores_by_env.values()) / len(scores_by_env)
-            else:
-                average_score = 0.0
-            
-            # Convert layer_weights keys from int to str for DynamoDB
-            scores_by_layer = {
-                f"L{layer}": weight
-                for layer, weight in miner.layer_weights.items()
+            average_score = (
+                sum(d["score"] for d in scores_by_env.values()) / len(scores_by_env)
+                if scores_by_env else 0.0
+            )
+
+            challenge_info = {
+                "status": miner.challenge_status,
+                "consecutive_wins": miner.challenge_consecutive_wins,
+                "total_losses": miner.challenge_total_losses,
+                "consecutive_losses": miner.challenge_consecutive_losses,
+                "checkpoints_passed": miner.challenge_checkpoints_passed,
+                "is_champion": miner.is_champion,
             }
-            
-            # Prepare subset contributions (detailed)
-            subset_contributions = {
-                subset_key: {
-                    "score": miner.subset_scores.get(subset_key, 0.0),
-                    "rank": miner.subset_ranks.get(subset_key, 0),
-                    "weight": weight
-                }
-                for subset_key, weight in miner.subset_weights.items()
-            }
-            
-            # Prepare filter info
-            filter_info = {
-                "filtered_subsets": miner.filtered_subsets,
-                "filter_reasons": miner.filter_reasons
-            }
-            
-            # Save complete data to scores table (merged with miner_scores data)
+
             await scores_dao.save_score(
-                block_number=result.block_number,
+                block_number=block,
                 miner_hotkey=miner.hotkey,
                 uid=uid,
                 model_revision=miner.model_revision,
@@ -214,60 +216,55 @@ class Scorer:
                 first_block=miner.first_block,
                 overall_score=overall_score,
                 average_score=average_score,
-                scores_by_layer=scores_by_layer,
                 scores_by_env=scores_by_env,
                 total_samples=total_samples,
-                # Additional detailed fields (formerly in miner_scores)
-                subset_contributions=subset_contributions,
-                cumulative_weight=miner.cumulative_weight,
-                filter_info=filter_info,
-                # ELO fields (redundant copy for API display)
-                elo_rating=miner.elo_rating,
-                elo_rounds_played=miner.elo_rounds_played,
-                elo_rating_change=miner.elo_rating_change,
+                challenge_info=challenge_info,
             )
 
-            # Update MINER_STATS only for miners that participated in ELO.
-            # Non-participants' miner_stats are left untouched — preserving their
-            # original rating + timestamp for correct time-based decay accumulation.
-            if miner_stats_dao:
-                prev = prev_ratings.get(miner.hotkey, {}) if prev_ratings else {}
-                prev_rounds = prev.get('elo_rounds_played') or 0
-                participated = miner.elo_rounds_played > prev_rounds
+        # Save challenge state for each miner
+        if miner_stats_dao:
+            for uid, miner in result.miners.items():
+                await miner_stats_dao.update_challenge_state(
+                    hotkey=miner.hotkey,
+                    revision=miner.model_revision,
+                    consecutive_wins=miner.challenge_consecutive_wins,
+                    total_losses=miner.challenge_total_losses,
+                    consecutive_losses=miner.challenge_consecutive_losses,
+                    checkpoints_passed=miner.challenge_checkpoints_passed,
+                    status=miner.challenge_status,
+                )
 
-                if participated:
-                    await miner_stats_dao.update_elo_rating(
-                        hotkey=miner.hotkey,
-                        revision=miner.model_revision,
-                        elo_rating=miner.elo_rating,
-                        elo_rounds_played=miner.elo_rounds_played,
-                        elo_model_submit_block=result.block_number if miner.elo_rounds_played == 1 else None,
-                    )
-                elif prev.get('elo_last_scored_at') is None and prev.get('elo_rounds_played', 0) > 0:
-                    # One-time backfill: set elo_last_scored_at for legacy miners
-                    # that have ELO history but no timestamp. This starts the decay
-                    # clock — they'll begin decaying from the next round.
-                    # Write original rating unchanged, only the timestamp is new.
-                    await miner_stats_dao.update_elo_rating(
-                        hotkey=miner.hotkey,
-                        revision=miner.model_revision,
-                        elo_rating=float(prev.get('elo_rating') or self.config.ELO_BASE_RATING),
-                        elo_rounds_played=int(prev.get('elo_rounds_played') or 0),
-                    )
+        # Save champion state to system_config (only when champion is present this round)
+        # Champion offline does NOT update DB — original record stays intact
+        if system_config_dao and result.champion_uid is not None:
+            champion_miner = result.miners.get(result.champion_uid)
+            if champion_miner:
+                existing = await system_config_dao.get_param_value('champion')
+                # Preserve original since_block if champion identity unchanged
+                if (existing
+                        and existing.get('hotkey') == champion_miner.hotkey
+                        and existing.get('revision') == champion_miner.model_revision):
+                    since_block = existing.get('since_block', block)
+                else:
+                    since_block = block
 
-        logger.info(f"Successfully saved complete scoring results for {len(result.miners)} miners to scores table")
+                await system_config_dao.set_param(
+                    param_name='champion',
+                    param_value={
+                        'hotkey': champion_miner.hotkey,
+                        'revision': champion_miner.model_revision,
+                        'uid': result.champion_uid,
+                        'since_block': since_block,
+                    },
+                    param_type='dict',
+                    updated_by='scorer_service',
+                )
+
+        logger.info(f"Successfully saved scoring results for {len(result.miners)} miners")
 
 
 def create_scorer(config: Optional[ScorerConfig] = None) -> Scorer:
-    """Factory function to create a Scorer instance.
-    
-    Args:
-        config: Optional custom configuration
-        
-    Returns:
-        Configured Scorer instance
-    """
+    """Factory function to create a Scorer instance."""
     if config is None:
         config = ScorerConfig()
-    
     return Scorer(config)

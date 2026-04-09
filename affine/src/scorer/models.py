@@ -1,10 +1,10 @@
 """
 Scorer Data Models
 
-Data structures for the four-stage scoring algorithm.
+Data structures for the champion challenge scoring algorithm.
 """
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
 
 
@@ -37,23 +37,15 @@ class MinerData:
     # Stage 1: Environment scores
     env_scores: Dict[str, EnvScore] = field(default_factory=dict)
     
-    # Stage 2: Pareto filtering results
-    filtered_subsets: List[str] = field(default_factory=list)
-    filter_reasons: Dict[str, str] = field(default_factory=dict)
-    
-    # Stage 3: ELO
-    elo_rating: float = 1200.0
-    elo_rating_change: float = 0.0
-    elo_rounds_played: int = 0
+    # Champion challenge state
+    challenge_consecutive_wins: int = 0
+    challenge_total_losses: int = 0
+    challenge_consecutive_losses: int = 0
+    challenge_checkpoints_passed: int = 0  # Number of window-size boundaries crossed
+    challenge_status: str = 'sampling'  # 'sampling' | 'terminated'
+    is_champion: bool = False
 
-    # Stage 3: Subset scores
-    subset_scores: Dict[str, float] = field(default_factory=dict)
-    subset_ranks: Dict[str, int] = field(default_factory=dict)
-    subset_weights: Dict[str, float] = field(default_factory=dict)
-    
-    # Stage 4: Final weights
-    layer_weights: Dict[str, float] = field(default_factory=dict)
-    cumulative_weight: float = 0.0
+    # Final weight
     normalized_weight: float = 0.0
     
     def is_valid_for_scoring(self) -> bool:
@@ -67,24 +59,6 @@ class MinerData:
     def __repr__(self) -> str:
         valid_envs = len(self.get_valid_envs())
         return f"MinerData(uid={self.uid}, hotkey={self.hotkey[:8]}..., valid_envs={valid_envs})"
-
-
-@dataclass
-class SubsetInfo:
-    """Information about a subset (environment combination)."""
-    
-    key: str  # e.g., "L3_sat_abd_ded"
-    layer: int
-    envs: List[str]
-    layer_weight: float
-    subset_weight: float
-    
-    # Miners participating in this subset
-    valid_miners: List[int] = field(default_factory=list)
-    filtered_miners: List[int] = field(default_factory=list)
-    
-    def __repr__(self) -> str:
-        return f"SubsetInfo(key={self.key}, layer=L{self.layer}, envs={len(self.envs)}, weight={self.subset_weight:.3f})"
 
 
 @dataclass
@@ -114,41 +88,38 @@ class ParetoComparison:
 
 @dataclass
 class ScoringResult:
-    """Complete result from the four-stage scoring algorithm."""
-    
+    """Complete result from the champion challenge scoring algorithm."""
+
     # Metadata
     block_number: int
     calculated_at: int
     environments: List[str]
-    
+
     # Configuration snapshot
     config: Dict[str, Any] = field(default_factory=dict)
-    
-    # Stage 1: All miner data
+
+    # All miner data
     miners: Dict[int, MinerData] = field(default_factory=dict)
-    
-    # Stage 2: Pareto filtering
+
+    # Pareto comparisons (champion vs challengers)
     pareto_comparisons: List[ParetoComparison] = field(default_factory=list)
-    
-    # Stage 3: Subset information
-    subsets: Dict[str, SubsetInfo] = field(default_factory=dict)
-    
-    # Stage 4: Final weights
+
+    # Final weights (champion=1.0, others=0.0)
     final_weights: Dict[int, float] = field(default_factory=dict)
-    
+
+    # Champion info
+    champion_uid: Optional[int] = None
+    champion_hotkey: Optional[str] = None
+
     # Statistics
     total_miners: int = 0
     valid_miners: int = 0
     invalid_miners: int = 0
-    
+
     def get_weights_for_chain(self) -> Dict[int, float]:
-        """Get normalized weights suitable for setting on-chain.
-        
-        Returns:
-            Dict mapping UID to normalized weight (0.0 to 1.0)
-        """
+        """Get normalized weights suitable for setting on-chain."""
         return self.final_weights.copy()
-    
+
     def get_summary(self) -> Dict[str, Any]:
         """Get summary statistics for logging/display."""
         return {
@@ -157,16 +128,16 @@ class ScoringResult:
             'valid_miners': self.valid_miners,
             'invalid_miners': self.invalid_miners,
             'environments': len(self.environments),
-            'subsets': len(self.subsets),
-            'non_zero_weights': sum(1 for w in self.final_weights.values() if w > 0),
+            'champion_uid': self.champion_uid,
+            'champion_hotkey': self.champion_hotkey,
         }
-    
+
     def __repr__(self) -> str:
         return (
             f"ScoringResult(block={self.block_number}, "
             f"miners={self.total_miners}, "
             f"valid={self.valid_miners}, "
-            f"envs={len(self.environments)})"
+            f"champion={self.champion_uid})"
         )
 
 
@@ -181,25 +152,12 @@ class Stage1Output:
 
 
 @dataclass
-class Stage2Output:
-    """Output from Stage 2: Pareto Filtering."""
-    
+class ChampionChallengeOutput:
+    """Output from the champion challenge stage."""
+
     miners: Dict[int, MinerData]
     comparisons: List[ParetoComparison]
-    filtered_count: int
-
-
-@dataclass
-class Stage3Output:
-    """Output from Stage 3: Subset Scoring."""
-    
-    miners: Dict[int, MinerData]
-    subsets: Dict[str, SubsetInfo]
-
-
-@dataclass
-class Stage4Output:
-    """Output from Stage 4: Weight Normalization."""
-    
+    champion_uid: Optional[int]
+    champion_hotkey: Optional[str]
+    champion_changed: bool
     final_weights: Dict[int, float]
-    below_threshold_count: int

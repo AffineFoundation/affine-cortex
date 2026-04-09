@@ -435,46 +435,67 @@ class MinerStatsDAO(BaseDAO):
             logger.error(f"Failed to update sampling slots for {hotkey[:8]}...: {e}")
             return False
 
-    async def update_elo_rating(
+    async def get_challenge_state(
+        self,
+        hotkey: str,
+        revision: str
+    ) -> Dict[str, Any]:
+        """Get challenge state for a miner.
+
+        Returns challenge fields with defaults if not present (backward compatible).
+        """
+        stats = await self.get_miner_stats(hotkey, revision)
+        if not stats:
+            return {
+                'challenge_consecutive_wins': 0,
+                'challenge_total_losses': 0,
+                'challenge_consecutive_losses': 0,
+                'challenge_checkpoints_passed': 0,
+                'challenge_status': 'sampling',
+            }
+        return {
+            'challenge_consecutive_wins': stats.get('challenge_consecutive_wins', 0),
+            'challenge_total_losses': stats.get('challenge_total_losses', 0),
+            'challenge_consecutive_losses': stats.get('challenge_consecutive_losses', 0),
+            'challenge_checkpoints_passed': stats.get('challenge_checkpoints_passed', 0),
+            'challenge_status': stats.get('challenge_status', 'sampling'),
+        }
+
+    async def update_challenge_state(
         self,
         hotkey: str,
         revision: str,
-        elo_rating: float,
-        elo_rounds_played: int,
-        elo_model_submit_block: Optional[int] = None,
-        participated: bool = True,
+        consecutive_wins: int,
+        total_losses: int,
+        consecutive_losses: int,
+        checkpoints_passed: int,
+        status: str,
     ) -> None:
-        """Update miner's ELO rating (authoritative data source).
-
-        Only participating miners update elo_last_scored_at (resets the decay
-        clock). Non-participants should NOT call this method — their miner_stats
-        record is left untouched so the original rating + timestamp are preserved
-        for correct time-based decay accumulation.
-
-        elo_model_submit_block is only written on first call (rounds_played == 1).
-        """
-        import time
+        """Update miner's champion challenge state."""
         from affine.database.client import get_client
         client = get_client()
 
         pk = self._make_pk(hotkey)
         sk = self._make_sk(revision)
 
-        update_expr = "SET elo_rating = :r, elo_rounds_played = :rp, elo_last_scored_at = :ts"
-        expr_values = {
-            ':r': {'N': str(elo_rating)},
-            ':rp': {'N': str(elo_rounds_played)},
-            ':ts': {'N': str(int(time.time()))},
-        }
-
-        # First round: record model_submit_block
-        if elo_model_submit_block is not None and elo_rounds_played == 1:
-            update_expr += ", elo_model_submit_block = if_not_exists(elo_model_submit_block, :sb)"
-            expr_values[':sb'] = {'N': str(elo_model_submit_block)}
-
         await client.update_item(
             TableName=self.table_name,
             Key={'pk': {'S': pk}, 'sk': {'S': sk}},
-            UpdateExpression=update_expr,
-            ExpressionAttributeValues=expr_values,
+            UpdateExpression=(
+                'SET challenge_consecutive_wins = :cw, '
+                'challenge_total_losses = :tl, '
+                'challenge_consecutive_losses = :cl, '
+                'challenge_checkpoints_passed = :cp, '
+                'challenge_status = :cs, '
+                'last_updated_at = :ts'
+            ),
+            ExpressionAttributeValues={
+                ':cw': {'N': str(consecutive_wins)},
+                ':tl': {'N': str(total_losses)},
+                ':cl': {'N': str(consecutive_losses)},
+                ':cp': {'N': str(checkpoints_passed)},
+                ':cs': {'S': status},
+                ':ts': {'N': str(int(time.time()))},
+            },
         )
+
