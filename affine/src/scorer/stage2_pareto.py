@@ -1,14 +1,18 @@
 """
 Pareto Dominance Comparison
 
-Provides the _compare_miners method used by ChampionChallenge to determine
-if a challenger Pareto-dominates the champion across all environments.
+Single comparison primitive used by ChampionChallenge for both pairwise
+filtering and the champion-vs-challenger checks.
+
+Miner B wins environment E against miner A if B's score on common tasks
+exceeds A's score by more than PARETO_MARGIN. B dominates A iff B wins
+ALL environments. The margin is fixed — sample-size adequacy is enforced
+upstream by the checkpoint mechanism.
 """
 
 from typing import Dict, List
 from affine.src.scorer.models import MinerData, ParetoComparison
 from affine.src.scorer.config import ScorerConfig
-from affine.src.scorer.utils import calculate_required_score
 
 
 class Stage2ParetoFilter:
@@ -21,61 +25,49 @@ class Stage2ParetoFilter:
         miner_a: MinerData,
         miner_b: MinerData,
         envs: List[str],
-        subset_key: str
+        label: str,
     ) -> ParetoComparison:
-        """Compare two miners using Pareto dominance test.
-
-        A dominates B if A wins ALL environments.
-        B dominates A if B wins ALL environments.
-        B wins an environment if B's score exceeds threshold(A).
-        """
-        a_wins_count = 0
-        b_wins_count = 0
-        env_comparisons = {}
+        """Pareto comparison: A vs B across `envs`. A is the incumbent."""
+        margin = self.config.PARETO_MARGIN
+        a_wins = b_wins = 0
+        env_details: Dict[str, Dict] = {}
 
         for env in envs:
-            env_score_a = miner_a.env_scores[env]
-            env_score_b = miner_b.env_scores[env]
+            es_a = miner_a.env_scores.get(env)
+            es_b = miner_b.env_scores.get(env)
+            if not es_a or not es_b:
+                env_details[env] = {"winner": None, "reason": "missing_env"}
+                continue
 
-            # Align scores to common tasks
-            common_tasks = set(env_score_a.all_task_scores) & set(env_score_b.all_task_scores)
-            if common_tasks:
-                score_a = sum(env_score_a.all_task_scores[t] for t in common_tasks) / len(common_tasks)
-                score_b = sum(env_score_b.all_task_scores[t] for t in common_tasks) / len(common_tasks)
-                env_threshold_config = self.config.ENV_THRESHOLD_CONFIGS.get(env, {})
-                threshold = calculate_required_score(
-                    score_a,
-                    len(common_tasks),
-                    env_threshold_config.get('z_score', self.config.Z_SCORE),
-                    env_threshold_config.get('min_improvement', self.config.MIN_IMPROVEMENT),
-                    env_threshold_config.get('max_improvement', self.config.MAX_IMPROVEMENT),
-                )
+            common = set(es_a.all_task_scores) & set(es_b.all_task_scores)
+            if not common:
+                env_details[env] = {"winner": None, "reason": "no_common_tasks"}
+                continue
+
+            score_a = sum(es_a.all_task_scores[t] for t in common) / len(common)
+            score_b = sum(es_b.all_task_scores[t] for t in common) / len(common)
+            threshold = score_a + margin
+
+            if score_b > threshold + 1e-9:
+                b_wins += 1
+                winner = "B"
             else:
-                score_a = env_score_a.avg_score
-                score_b = env_score_b.avg_score
-                threshold = env_score_a.threshold
-
-            b_wins_env = score_b > (threshold + 1e-9)
-
-            if b_wins_env:
-                b_wins_count += 1
-            else:
-                a_wins_count += 1
-
-            env_comparisons[env] = {
+                a_wins += 1
+                winner = "A"
+            env_details[env] = {
                 "a_score": score_a,
                 "b_score": score_b,
                 "threshold": threshold,
-                "b_beats_threshold": b_wins_env,
-                "winner": "B" if b_wins_env else "A",
-                "aligned_tasks": len(common_tasks) if common_tasks else None,
+                "winner": winner,
+                "common_tasks": len(common),
             }
 
+        n = len(envs)
         return ParetoComparison(
             miner_a_uid=miner_a.uid,
             miner_b_uid=miner_b.uid,
-            subset_key=subset_key,
-            a_dominates_b=(a_wins_count == len(envs)),
-            b_dominates_a=(b_wins_count == len(envs)),
-            env_comparisons=env_comparisons
+            label=label,
+            a_dominates_b=(a_wins == n),
+            b_dominates_a=(b_wins == n),
+            env_comparisons=env_details,
         )

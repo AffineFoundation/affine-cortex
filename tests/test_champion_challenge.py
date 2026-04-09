@@ -36,8 +36,7 @@ def miner(uid, hotkey, revision="rev1", first_block=100, scores=None, n_tasks=WI
 def _env(avg, n):
     tasks = {i: avg for i in range(n)}
     return EnvScore(avg_score=avg, sample_count=n, completeness=1.0,
-                    is_valid=True, threshold=avg + 0.05,
-                    task_scores=tasks, all_task_scores=tasks)
+                    all_task_scores=tasks)
 
 
 def cs(hotkey="hk_champ", revision="rev1", uid=1):
@@ -235,6 +234,84 @@ class TestChampionStability:
             assert r.final_weights.get(1) == 1.0
 
 
+# ── Refactor: PARETO_MARGIN, low completeness participation ──────────────────
+
+class TestRefactorBehavior:
+
+    def test_terminated_cannot_dethrone(self):
+        """Bug 1 regression: a terminated miner with N wins cannot dethrone."""
+        N = 3
+        cc = ChampionChallenge(cfg(CHAMPION_CONSECUTIVE_WINS_REQUIRED=N))
+        miners = {
+            1: miner(1, "hk_champ", scores=[0.3, 0.3]),
+            2: miner(2, "hk_chal", scores=[0.7, 0.7]),
+        }
+        # Stale state: challenger has N wins but is terminated
+        r = run(cc, miners, cs(),
+                prev("hk_chal", wins=N, status="terminated", cp=N))
+        assert r.champion_uid == 1  # Champion unchanged
+        assert miners[2].challenge_status == "terminated"
+
+    def test_low_completeness_miner_participates(self):
+        """A miner with low completeness still participates in scoring
+        (no validity gate). The checkpoint mechanism handles data sufficiency."""
+        cc = ChampionChallenge(cfg())
+        # Build challenger with low completeness but sufficient task data
+        m_chal = MinerData(uid=2, hotkey="hk_chal", model_revision="r2",
+                           model_repo="m", first_block=200)
+        tasks = {i: 0.7 for i in range(WINDOW)}
+        m_chal.env_scores = {
+            env: EnvScore(avg_score=0.7, sample_count=WINDOW,
+                          completeness=0.5,  # Low completeness, but data exists
+                          all_task_scores=tasks)
+            for env in ENVS
+        }
+        miners = {
+            1: miner(1, "hk_champ", scores=[0.3, 0.3]),
+            2: m_chal,
+        }
+        r = run(cc, miners, cs())
+        # Challenger reaches checkpoint 1 despite low completeness
+        assert miners[2].challenge_checkpoints_passed == 1
+        assert len(r.comparisons) == 1
+
+    def test_cold_start_skips_no_data_miners(self):
+        """Cold start filters out miners with sample_count=0 in any env."""
+        cc = ChampionChallenge(cfg())
+        # Miner with no data
+        m_empty = MinerData(uid=1, hotkey="hk_empty", model_revision="r",
+                            model_repo="m", first_block=50)
+        m_empty.env_scores = {env: EnvScore(0.0, 0, 0.0) for env in ENVS}
+        # Miner with data
+        m_good = miner(2, "hk_good", scores=[0.5, 0.5])
+        miners = {1: m_empty, 2: m_good}
+        r = run(cc, miners)  # cold start
+        assert r.champion_uid == 2
+
+    def test_pareto_margin_strict(self):
+        """Challenger must beat by strictly more than PARETO_MARGIN."""
+        cc = ChampionChallenge(cfg())
+        # Champion 0.5, challenger 0.521 (margin=0.02 → threshold=0.52, 0.521 > 0.52)
+        miners = {
+            1: miner(1, "hk_champ", scores=[0.5, 0.5]),
+            2: miner(2, "hk_chal", scores=[0.521, 0.521]),
+        }
+        r = run(cc, miners, cs())
+        assert miners[2].challenge_consecutive_wins == 1
+
+    def test_pareto_margin_below_loses(self):
+        """Challenger below margin loses."""
+        cc = ChampionChallenge(cfg())
+        # Challenger 0.519 < 0.52 threshold
+        miners = {
+            1: miner(1, "hk_champ", scores=[0.5, 0.5]),
+            2: miner(2, "hk_chal", scores=[0.519, 0.519]),
+        }
+        r = run(cc, miners, cs())
+        assert miners[2].challenge_total_losses == 1
+        assert miners[2].challenge_consecutive_wins == 0
+
+
 # ── Pairwise Filter ──────────────────────────────────────────────────────────
 
 class TestPairwiseFilter:
@@ -318,24 +395,23 @@ class TestWeights:
         assert r.final_weights[1] == 1.0
         assert r.final_weights[2] == 0.0
 
-    def test_champion_present_but_incomplete_keeps_weight(self):
-        """Champion in miners dict but missing some env data → weight preserved on UID."""
+    def test_champion_with_partial_env_data_still_active(self):
+        """Champion missing some env data is still active (no validity gate).
+        Comparisons against them naturally fail to advance because min_common=0
+        for the missing env. Champion keeps weight."""
         cc = ChampionChallenge(cfg())
-        # Champion has env_a but not env_b
         m1 = MinerData(uid=1, hotkey="hk_champ", model_revision="rev1",
                        model_repo="m", first_block=50)
-        m1.env_scores = {"env_a": _env(0.5, WINDOW)}
+        m1.env_scores = {"env_a": _env(0.5, WINDOW)}  # Missing env_b
         miners = {
             1: m1,
             2: miner(2, "hk_chal", scores=[0.7, 0.7]),
         }
         r = run(cc, miners, cs())
-        # Champion uid=1 keeps weight even though incomplete
+        assert r.champion_uid == 1
         assert r.final_weights[1] == 1.0
         assert r.final_weights[2] == 0.0
-        # Not active this round
-        assert r.champion_uid is None
-        # Challenger does not advance any checkpoint (no champion to compare with)
+        # Challenger can't advance checkpoint (env_b common = 0)
         assert miners[2].challenge_checkpoints_passed == 0
 
 

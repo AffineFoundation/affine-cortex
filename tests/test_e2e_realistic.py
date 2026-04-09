@@ -127,7 +127,7 @@ async def run_round(scorer, db, miners_cfg, n_tasks, block_number):
 
     # Score
     result = scorer.calculate_scores(
-        scoring_data=sd, environments=ENVS, env_configs=ENV_CONFIGS,
+        scoring_data=sd, environments=ENVS,
         block_number=block_number, champion_state=champion_state,
         prev_challenge_states=prev_states, env_sampling_counts=ENV_SC,
         print_summary=False)

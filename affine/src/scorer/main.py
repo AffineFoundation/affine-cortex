@@ -216,12 +216,11 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
         result = scorer.calculate_scores(
             scoring_data=scoring_data,
             environments=environments,
-            env_configs=env_configs,
             block_number=block_number,
+            env_sampling_counts=env_sampling_counts,
             champion_state=champion_state,
             prev_challenge_states=prev_challenge_states,
-            env_sampling_counts=env_sampling_counts,
-            print_summary=True
+            print_summary=True,
         )
 
         # Save to database if requested

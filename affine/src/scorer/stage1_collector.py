@@ -1,252 +1,114 @@
 """
-Stage 1: Data Collection and Average Score Calculation
+Stage 1: Data Collection
 
-Collects sample data for all valid miners and calculates average scores
-per environment with completeness validation.
+Parses scoring data from the API into MinerData objects. Computes only the
+fields needed for downstream stages — no validity gates, no thresholds.
+The avg_score is computed from the current sampling window for display
+and cold-start ranking; all_task_scores stores the full historical data
+used by Pareto comparisons.
 """
 
 from typing import Dict, List, Any
-from affine.src.scorer.models import (
-    MinerData,
-    EnvScore,
-    Stage1Output,
-)
+from affine.src.scorer.models import MinerData, EnvScore, Stage1Output
 from affine.src.scorer.config import ScorerConfig
-from affine.src.scorer.utils import calculate_required_score
 
 from affine.core.setup import logger
 
 
 class Stage1Collector:
-    """Stage 1: Data Collection and Average Score Calculation.
-    
-    Responsibilities:
-    1. Parse scoring data from API response
-    2. Calculate average scores per environment for each miner
-    3. Validate sample completeness (must be >= 95% of required range)
-    4. Build MinerData objects with environment scores
-    """
-    
+
     def __init__(self, config: ScorerConfig = ScorerConfig):
-        """Initialize Stage 1 collector.
-        
-        Args:
-            config: Scorer configuration (defaults to global config)
-        """
         self.config = config
-        self.min_completeness = config.MIN_COMPLETENESS
-    
+
     def collect(
         self,
         scoring_data: Dict[str, Any],
         environments: List[str],
-        env_configs: Dict[str, Any] = None
     ) -> Stage1Output:
-        """Collect and process scoring data for all miners.
-        
-        Args:
-            scoring_data: Response from /api/v1/samples/scoring endpoint
-                Format: {
-                    "hotkey#revision": {
-                        "uid": 5,
-                        "hotkey": "5...",
-                        "model_revision": "...",
-                        "env": {
-                            "affine:sat": {
-                                "all_samples": [...],
-                                "sampling_task_ids": [...],
-                                "total_count": 500,
-                                "completed_count": 498,
-                                "completeness": 0.996
-                            }
-                        }
-                    }
-                }
-            environments: List of environment names participating in scoring
-            env_configs: Dict mapping env_name -> env_config (including min_completeness)
-            
-        Returns:
-            Stage1Output containing processed miner data
-            
-        Raises:
-            RuntimeError: If scoring_data is invalid or contains API error response
-        """
-        # Initialize env_configs if not provided
-        if env_configs is None:
-            env_configs = {}
-        # Validate scoring_data is not an error response
+        """Parse API scoring_data into MinerData objects."""
         if not isinstance(scoring_data, dict):
             raise RuntimeError(f"Invalid scoring_data type: {type(scoring_data)}")
-        
-        # Check for API error response format
+
         if "success" in scoring_data and scoring_data.get("success") is False:
             error_msg = scoring_data.get("error", "Unknown error")
-            status_code = scoring_data.get("status_code", "unknown")
-            logger.error(f"Received API error response: {error_msg} (status: {status_code})")
-            raise RuntimeError(f"Cannot process scoring data: API returned error: {error_msg}")
-        
+            raise RuntimeError(f"API error response: {error_msg}")
+
         if not scoring_data:
             logger.warning("Received empty scoring_data")
-            return Stage1Output(
-                miners={},
-                environments=environments,
-                valid_count=0,
-                invalid_count=0
-            )
-        
-        logger.info(f"Stage 1: Starting data collection for {len(scoring_data)} miners")
-        
+            return Stage1Output(miners={}, environments=environments)
+
+        logger.info(f"Stage 1: collecting data for {len(scoring_data)} miners")
         miners: Dict[int, MinerData] = {}
-        valid_count = 0
-        invalid_count = 0
-        
-        for key, miner_entry in scoring_data.items():
-            # Extract UID from miner_entry
-            uid = miner_entry.get('uid')
-            if uid is None:
-                logger.warning(f"Missing uid field in miner_entry for key {key}")
-                continue
-            
+
+        for key, entry in scoring_data.items():
+            uid = entry.get('uid')
             try:
-                uid = int(uid)
+                uid = int(uid) if uid is not None else None
             except (ValueError, TypeError):
-                logger.warning(f"Invalid UID value: {uid} for key {key}")
+                logger.warning(f"Invalid UID for key {key}: {uid}")
+                continue
+            if uid is None:
                 continue
 
-            # Extract miner metadata
-            hotkey = miner_entry.get('hotkey')
-            model_revision = miner_entry.get('model_revision')
-            model_repo = miner_entry.get('model_repo')
-            first_block = miner_entry.get('first_block')
-            env_data = miner_entry.get('env', {})
-            
+            hotkey = entry.get('hotkey')
+            model_revision = entry.get('model_revision')
+            model_repo = entry.get('model_repo')
+            first_block = entry.get('first_block')
             if not hotkey or not model_revision or not model_repo:
-                logger.warning(f"UID {uid}: Missing required field (hotkey={bool(hotkey)}, model_revision={bool(model_revision)}, model_repo={bool(model_repo)})")
-                invalid_count += 1
+                logger.warning(f"UID {uid}: missing required field")
                 continue
-            
-            # Create MinerData object
+
             miner = MinerData(
                 uid=uid,
                 hotkey=hotkey,
                 model_revision=model_revision,
                 model_repo=model_repo,
-                first_block=first_block
+                first_block=first_block,
             )
-            
-            # Process each environment
+
+            env_data = entry.get('env', {})
             for env_name in environments:
-                env_info = env_data.get(env_name, {})
-                
-                if not env_info:
-                    # Environment data missing
-                    miner.env_scores[env_name] = EnvScore(
-                        avg_score=0.0,
-                        sample_count=0,
-                        completeness=0.0,
-                        is_valid=False,
-                        threshold=0.0
-                    )
-                    continue
-                
-                # Extract environment data
-                all_samples = env_info.get('all_samples', [])
-                sampling_task_ids = set(env_info.get('sampling_task_ids', []))
-                total_count = env_info.get('total_count', 0)
-                completed_count = env_info.get('completed_count', 0)
-                completeness = env_info.get('completeness', 0.0)
+                miner.env_scores[env_name] = self._build_env_score(
+                    env_data.get(env_name, {}), env_name)
 
-                # Build all_task_scores from all_samples (full partition)
-                all_task_scores: Dict[int, float] = {}
-                for s in all_samples:
-                    tid = s.get('task_id')
-                    if tid is not None:
-                        all_task_scores[int(tid)] = s.get('score', 0.0)
-
-                # Derive task_scores by filtering all_task_scores with sampling_task_ids
-                task_scores = {
-                    tid: score for tid, score in all_task_scores.items()
-                    if tid in sampling_task_ids
-                }
-                raw_avg_score = (
-                    sum(task_scores.values()) / len(task_scores)
-                    if task_scores else 0.0
-                )
-
-                # Apply environment-specific normalization if configured
-                if env_name in self.config.ENV_SCORE_RANGES:
-                    min_score, max_score = self.config.ENV_SCORE_RANGES[env_name]
-                    avg_score = (raw_avg_score - min_score) / (max_score - min_score)
-                    task_scores = {
-                        tid: (s - min_score) / (max_score - min_score)
-                        for tid, s in task_scores.items()
-                    }
-                    all_task_scores = {
-                        tid: (s - min_score) / (max_score - min_score)
-                        for tid, s in all_task_scores.items()
-                    }
-                else:
-                    avg_score = raw_avg_score
-                
-                # Get environment-specific min_completeness or use default
-                env_config = env_configs.get(env_name, {})
-                env_min_completeness = env_config.get('min_completeness', self.min_completeness)
-                
-                # Validate completeness
-                is_valid = completeness >= env_min_completeness
-
-                # Calculate required score threshold (sample-size aware)
-                # Get environment-specific threshold config or use defaults
-                env_threshold_config = self.config.ENV_THRESHOLD_CONFIGS.get(env_name, {})
-                z_score = env_threshold_config.get('z_score', self.config.Z_SCORE)
-                min_improvement = env_threshold_config.get('min_improvement', self.config.MIN_IMPROVEMENT)
-                max_improvement = env_threshold_config.get('max_improvement', self.config.MAX_IMPROVEMENT)
-
-                threshold = calculate_required_score(
-                    avg_score,
-                    completed_count,
-                    z_score,
-                    min_improvement,
-                    max_improvement
-                )
-                
-                # Store environment score
-                miner.env_scores[env_name] = EnvScore(
-                    avg_score=avg_score,
-                    sample_count=completed_count,
-                    completeness=completeness,
-                    is_valid=is_valid,
-                    threshold=threshold,
-                    task_scores=task_scores,
-                    all_task_scores=all_task_scores,
-                )
-                
-                # Only log invalid environments in DEBUG mode
-                if not is_valid:
-                    logger.debug(
-                        f"UID {uid} {env_name}: completeness {completeness:.2%} < {env_min_completeness:.0%}"
-                    )
-            
-            # Check if miner has at least one valid environment
-            if miner.is_valid_for_scoring():
-                valid_count += 1
-            else:
-                invalid_count += 1
-                logger.debug(
-                    f"UID {uid} ({hotkey[:8]}...): No valid environments (< {self.min_completeness:.0%})"
-                )
-            
             miners[uid] = miner
-        
-        logger.info(
-            f"Stage 1: Completed data collection - "
-            f"Valid: {valid_count}, Invalid: {invalid_count}"
+
+        logger.info(f"Stage 1: collected {len(miners)} miners")
+        return Stage1Output(miners=miners, environments=environments)
+
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _build_env_score(self, env_info: Dict[str, Any], env_name: str) -> EnvScore:
+        """Build an EnvScore from one env's API data."""
+        if not env_info:
+            return EnvScore(avg_score=0.0, sample_count=0, completeness=0.0)
+
+        all_samples = env_info.get('all_samples', [])
+        sampling_ids = set(env_info.get('sampling_task_ids', []))
+        completed_count = env_info.get('completed_count', 0)
+        completeness = env_info.get('completeness', 0.0)
+
+        # Full historical task→score (used by Pareto comparisons)
+        all_task_scores: Dict[int, float] = {}
+        for s in all_samples:
+            tid = s.get('task_id')
+            if tid is not None:
+                all_task_scores[int(tid)] = s.get('score', 0.0)
+
+        # Current window average (display + cold start)
+        window_scores = [s for tid, s in all_task_scores.items() if tid in sampling_ids]
+        avg = sum(window_scores) / len(window_scores) if window_scores else 0.0
+
+        # Apply env-specific normalization if configured
+        ranges = self.config.ENV_SCORE_RANGES.get(env_name)
+        if ranges:
+            lo, hi = ranges
+            avg = (avg - lo) / (hi - lo)
+            all_task_scores = {tid: (s - lo) / (hi - lo) for tid, s in all_task_scores.items()}
+
+        return EnvScore(
+            avg_score=avg,
+            sample_count=completed_count,
+            completeness=completeness,
+            all_task_scores=all_task_scores,
         )
-        
-        return Stage1Output(
-            miners=miners,
-            environments=environments,
-            valid_count=valid_count,
-            invalid_count=invalid_count
-        )
-    

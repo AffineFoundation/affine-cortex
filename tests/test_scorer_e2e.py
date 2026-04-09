@@ -9,7 +9,7 @@ import pytest
 from unittest.mock import AsyncMock
 from affine.src.scorer.scorer import Scorer
 from affine.src.scorer.config import ScorerConfig
-from affine.src.scorer.utils import geometric_mean, calculate_required_score
+from affine.src.scorer.utils import geometric_mean
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
@@ -55,7 +55,7 @@ def run_rounds(config, miners_fn, n_rounds):
     for r in range(n_rounds):
         sd = scoring_data(miners_fn(r))
         result = scorer.calculate_scores(
-            scoring_data=sd, environments=ENVS, env_configs=ENV_CONFIGS,
+            scoring_data=sd, environments=ENVS,
             block_number=1000 + r, champion_state=champion_state,
             prev_challenge_states=challenge_states,
             env_sampling_counts=ENV_SC, print_summary=False)
@@ -93,7 +93,7 @@ class TestColdStart:
             {"uid": 2, "hotkey": "hk2", "envs": {"env_a": 0.8, "env_b": 0.7}},
         ])
         result = Scorer(config).calculate_scores(
-            scoring_data=sd, environments=ENVS, env_configs=ENV_CONFIGS,
+            scoring_data=sd, environments=ENVS,
             block_number=1000, env_sampling_counts=ENV_SC, print_summary=False)
         assert result.champion_uid == 2
         assert result.final_weights[2] == 1.0
@@ -154,7 +154,7 @@ class TestMultiRound:
                                      "model_repo": "test", "first_block": 100, "env": env_data}
 
             result = scorer.calculate_scores(
-                scoring_data=sd, environments=ENVS, env_configs=ENV_CONFIGS,
+                scoring_data=sd, environments=ENVS,
                 block_number=1000+r, champion_state=champion_state,
                 prev_challenge_states=challenge_states,
                 env_sampling_counts=ENV_SC, print_summary=False)
@@ -231,7 +231,7 @@ class TestSaveResults:
             {"uid": 2, "hotkey": "hk2", "envs": {"env_a": 0.3, "env_b": 0.3}},
         ])
         result = scorer.calculate_scores(
-            scoring_data=sd, environments=ENVS, env_configs=ENV_CONFIGS,
+            scoring_data=sd, environments=ENVS,
             block_number=5000, env_sampling_counts=ENV_SC, print_summary=False)
 
         scores = AsyncMock(spec=ScoresDAO)
@@ -256,7 +256,7 @@ class TestSaveResults:
         scorer = Scorer(ScorerConfig())
         sd = scoring_data([{"uid": 1, "hotkey": "hk1", "envs": {"env_a": 0.7, "env_b": 0.7}}])
         result = scorer.calculate_scores(
-            scoring_data=sd, environments=ENVS, env_configs=ENV_CONFIGS,
+            scoring_data=sd, environments=ENVS,
             block_number=9999, env_sampling_counts=ENV_SC,
             champion_state={"hotkey": "hk1", "revision": "rev1", "uid": 1,
                             "since_block": 5000},
@@ -283,17 +283,15 @@ class TestUtils:
         assert geometric_mean([0.0, 1.0], epsilon=0.1) > 0.0
         assert geometric_mean([]) == 0.0
 
-    def test_required_score(self):
-        assert calculate_required_score(0.5, 100) > 0.5
-        assert calculate_required_score(0.5, 0, max_improvement=0.10) == 0.6
-
-
 class TestConfig:
     def test_defaults_and_validation(self):
         c = ScorerConfig()
         assert c.CHAMPION_CONSECUTIVE_WINS_REQUIRED == 10
+        assert c.PARETO_MARGIN == 0.02
         assert not hasattr(c, 'ELO_D')
+        assert not hasattr(c, 'Z_SCORE')
+        assert not hasattr(c, 'MIN_IMPROVEMENT')
         ScorerConfig.validate()
         d = ScorerConfig.to_dict()
-        assert 'champion_consecutive_wins_required' in d
-        assert 'elo_d' not in d
+        assert 'pareto_margin' in d
+        assert 'z_score' not in d

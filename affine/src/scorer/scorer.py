@@ -33,33 +33,28 @@ class Scorer:
         self,
         scoring_data: Dict[str, Any],
         environments: list,
-        env_configs: Dict[str, Any],
         block_number: int,
+        env_sampling_counts: Optional[Dict[str, int]] = None,
         champion_state: Optional[Dict[str, Any]] = None,
         prev_challenge_states: Optional[Dict[str, Dict[str, Any]]] = None,
-        env_sampling_counts: Optional[Dict[str, int]] = None,
-        print_summary: bool = True
+        print_summary: bool = True,
     ) -> ScoringResult:
-        """Execute the champion challenge scoring algorithm.
+        """Run one scoring round.
 
         Args:
-            scoring_data: Response from /api/v1/samples/scoring
-            environments: List of environment names participating in scoring
-            env_configs: Dict mapping env_name -> env_config (including min_completeness)
-            block_number: Current block number
-            champion_state: Current champion info from system_config, or None for cold start
-            prev_challenge_states: Previous challenge states per miner hotkey
-            env_sampling_counts: {env_name: sampling_count} window size per environment
-            print_summary: Whether to print detailed summaries (default: True)
-
-        Returns:
-            ScoringResult with complete scoring data
+            scoring_data: API /samples/scoring response
+            environments: enabled scoring environments
+            block_number: current Bittensor block
+            env_sampling_counts: {env_name: window_size} per environment
+            champion_state: persisted champion info, or None for cold start
+            prev_challenge_states: persisted per-miner challenge state (keyed by hotkey)
+            print_summary: print the per-miner summary table
         """
         start_time = time.time()
         logger.info(f"Total Miners: {len(scoring_data)}")
 
         # Stage 1: Data Collection
-        stage1_output = self.stage1.collect(scoring_data, environments, env_configs)
+        stage1_output = self.stage1.collect(scoring_data, environments)
 
         # Stage 2: Champion Challenge
         challenge_output = self.champion_challenge.run(
@@ -70,20 +65,16 @@ class Scorer:
             prev_challenge_states=prev_challenge_states or {},
         )
 
-        # Build final result
         result = ScoringResult(
             block_number=block_number,
             calculated_at=int(time.time()),
             environments=environments,
             config=self.config.to_dict(),
             miners=challenge_output.miners,
-            pareto_comparisons=challenge_output.comparisons,
             final_weights=challenge_output.final_weights,
             champion_uid=challenge_output.champion_uid,
             champion_hotkey=challenge_output.champion_hotkey,
             total_miners=len(scoring_data),
-            valid_miners=stage1_output.valid_count,
-            invalid_miners=stage1_output.invalid_count,
         )
 
         elapsed_time = time.time() - start_time
@@ -113,7 +104,7 @@ class Scorer:
 
             env_strs = []
             for env in sorted(environments):
-                if env in miner.env_scores and miner.env_scores[env].is_valid:
+                if env in miner.env_scores and miner.env_scores[env].sample_count > 0:
                     env_strs.append(f"{miner.env_scores[env].avg_score:.3f}")
                 else:
                     env_strs.append("  N/A")
@@ -158,8 +149,6 @@ class Scorer:
         # Save snapshot metadata
         statistics = {
             "total_miners": result.total_miners,
-            "valid_miners": result.valid_miners,
-            "invalid_miners": result.invalid_miners,
             "champion_uid": result.champion_uid,
             "champion_hotkey": result.champion_hotkey,
             "miner_final_scores": {
@@ -187,7 +176,6 @@ class Scorer:
                     "score": score.avg_score,
                     "sample_count": score.sample_count,
                     "completeness": score.completeness,
-                    "threshold": score.threshold
                 }
                 for env, score in miner.env_scores.items()
             }
