@@ -280,6 +280,22 @@ _ENV_CONFIGS_CANONICAL = {
         },
     ),
 
+    # Corpus-eval — teacher-only prompt source backed by
+    # ``karpathy/climbmix-400b-shuffle``. Given a task_id, returns a
+    # deterministic raw-corpus prompt + teacher 512-token continuation
+    # with logprobs in a distill-compatible shape. Replaces knowledge-eval
+    # in the teacher pipeline to eliminate benchmark contamination.
+    "corpus-eval": EnvConfig(
+        name="corpus-eval",
+        docker_image="affinefoundation/corpus_eval:latest",
+        env_vars={"UVICORN_WORKERS": "4"},
+        mem_limit="4g",
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 600,
+        },
+    ),
+
     # Distill environment — evaluates student against teacher rollouts
     # (produced by teacher_worker) stored in R2. The student does a
     # /v1/completions forward pass with echo=True to get per-token logprobs,
@@ -394,6 +410,11 @@ _ENV_ALIASES = {
     "KNOWLEDGE-EVAL": "knowledge-eval",
     "knowledge_eval": "knowledge-eval",
     "KNOWLEDGE_EVAL": "knowledge-eval",
+
+    # Corpus-eval aliases (teacher_worker-only)
+    "CORPUS-EVAL": "corpus-eval",
+    "corpus_eval": "corpus-eval",
+    "CORPUS_EVAL": "corpus-eval",
 
     # Distill aliases
     "DISTILL": "distill",

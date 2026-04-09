@@ -5,9 +5,8 @@ Runs alongside teacher_worker. Each tick:
   1. Reads the DISTILL env config from SystemConfig (DynamoDB) to pick up
      the current rotation_interval/rotation_count and enabled flag.
   2. Lists pending/{env}/* in the private bucket.
-  3. Builds a candidate pool that prefers non-KNOWLEDGE-EVAL envs but
-     falls back to KNOWLEDGE-EVAL when there are not enough non-knowledge
-     candidates to satisfy the target batch size.
+  3. Builds a candidate pool from all pending envs (with optional
+     low-priority deprioritization via ``LOW_PRIORITY_ENVS``).
   4. Randomly samples target_count candidates without replacement.
   5. For each: copies the rollout to public/task_{next_id:011d}.json,
      moves the source from pending/ to promoted/, increments next_id.
@@ -49,8 +48,8 @@ R2_DISTILL_PUBLIC_BUCKET = os.getenv(
 PENDING_PREFIX = "pending"
 PROMOTED_PREFIX = "promoted"
 
-# Envs deprioritized in random selection
-LOW_PRIORITY_ENVS = {"KNOWLEDGE-EVAL"}
+# Envs deprioritized in random selection (empty = uniform over all envs)
+LOW_PRIORITY_ENVS: set = set()
 
 # SystemConfig env key the mover tracks
 DISTILL_ENV_KEY = "DISTILL"
