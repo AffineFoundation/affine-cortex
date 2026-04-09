@@ -37,6 +37,13 @@ TEACHER_ENVS = ["CORPUS-EVAL"]
 # never goes through here.
 _CORPUS_EVAL_VIRTUAL_RANGE = 1_000_000_000
 
+# corpus_eval's ROW_STRIDE — the number of consecutive task_ids that
+# share the same climbmix shard in the corpus_eval container's LRU
+# cache. Matching this on the teacher side lets us walk a random
+# segment sequentially so a burst of ~64 rollouts reuses the hot
+# shard instead of triggering a fresh ~92 MB download each time.
+_CORPUS_EVAL_SEGMENT_SIZE = 64
+
 # R2 configuration
 R2_ENDPOINT = os.getenv(
     "R2_ENDPOINT",
@@ -79,6 +86,11 @@ class TeacherWorker:
         self._s3 = None
         self._env_instances = {}
         self._env_connect_lock = asyncio.Lock()
+        # Per-env segment state for corpus_eval shard-locality sampling:
+        # env_name -> (segment_base, offset_within_segment). Protected
+        # by _sampling_lock so concurrent workers don't race on advance.
+        self._corpus_segment_state: Dict[str, tuple] = {}
+        self._sampling_lock = asyncio.Lock()
         self.running = False
 
     def _init_s3(self):
@@ -132,6 +144,44 @@ class TeacherWorker:
             # without materializing ~1B ints into memory.
             return range(_CORPUS_EVAL_VIRTUAL_RANGE)
         return lst
+
+    async def _pick_task_id(
+        self, env_name: str, sampling_list: Sequence[int]
+    ) -> int:
+        """Draw a task_id from ``sampling_list`` for ``env_name``.
+
+        For CORPUS-EVAL sampling over the virtual range, we do
+        segment-random selection: pick a random 64-aligned base once,
+        then walk ``_CORPUS_EVAL_SEGMENT_SIZE`` consecutive ids before
+        rerolling. Consecutive ids share a shard in the corpus_eval
+        container, so each segment gets served from the hot LRU entry
+        instead of forcing a ~92 MB download per rollout. For all
+        other envs (or for custom sampling_list overrides) fall back
+        to uniform random.choice.
+        """
+        is_corpus_range = (
+            env_name.upper() == "CORPUS-EVAL"
+            and isinstance(sampling_list, range)
+        )
+        if not is_corpus_range:
+            return random.choice(sampling_list)
+
+        async with self._sampling_lock:
+            state = self._corpus_segment_state.get(env_name)
+            if state is None or state[1] >= _CORPUS_EVAL_SEGMENT_SIZE:
+                n = len(sampling_list)
+                # Align segment base to the stride so (task_id // 64)
+                # matches corpus_eval's shard_idx computation exactly.
+                max_base = max(0, n - _CORPUS_EVAL_SEGMENT_SIZE)
+                base = random.randrange(
+                    0, max_base + 1, _CORPUS_EVAL_SEGMENT_SIZE
+                )
+                offset = 0
+            else:
+                base, offset = state
+            task_id = base + offset
+            self._corpus_segment_state[env_name] = (base, offset + 1)
+            return task_id
 
     async def _get_env(self, env_name: str):
         """Get or create a dedicated teacher container for the environment.
@@ -215,7 +265,7 @@ class TeacherWorker:
             if not sampling_list:
                 continue
 
-            task_id = random.choice(sampling_list)
+            task_id = await self._pick_task_id(env_name, sampling_list)
             logger.info(f"[TEACHER] Generating rollout: env={env_name} task_id={task_id}")
 
             try:
