@@ -1,33 +1,6 @@
 {
   "validator_burn_percentage": 0.0,
   "environments": {
-    "PRINT": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
-      "sampling_config": {
-        "dataset_range": [[0, 1000000000]],
-        "sampling_count": 200,
-        "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 3600,
-        "scheduling_weight": 1.0
-      }
-    },
-    "LGC-v2": {
-      "display_name": "LGC",
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.9,
-      "sampling_config": {
-        "dataset_range": [[0, 899999999]],
-        "sampling_count": 250,
-        "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 3600,
-        "scheduling_weight": 1.0
-      }
-    },
     "GAME": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
@@ -36,8 +9,8 @@
         "dataset_range": [[0, 500000000],[600000000, 800000000]],
         "sampling_count": 300,
         "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 3600,
+        "rotation_count": 1,
+        "rotation_interval": 1200,
         "scheduling_weight": 3.0
       }
     },
@@ -87,8 +60,8 @@
         "dataset_range": [[0, 78060000]],
         "sampling_count": 200,
         "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 3600,
+        "rotation_count": 1,
+        "rotation_interval": 1200,
         "scheduling_weight": 1.0
       }
     },
@@ -113,8 +86,8 @@
         "dataset_range": [[0, 1000000000]],
         "sampling_count": 200,
         "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 3600,
+        "rotation_count": 1,
+        "rotation_interval": 800,
         "scheduling_weight": 1.0
       }
     },
@@ -126,8 +99,8 @@
         "dataset_range": [[0, 1000000000]],
         "sampling_count": 200,
         "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 7200,
+        "rotation_count": 1,
+        "rotation_interval": 1200,
         "scheduling_weight": 1.0
       }
     },
