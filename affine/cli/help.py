@@ -83,7 +83,7 @@ class AffineHelpFormatter(click.HelpFormatter):
         self._color = _has_color()
         if self._modern:
             if not kwargs.get("width"):
-                kwargs["width"] = min(self._tw, 80)
+                kwargs["width"] = min(self._tw, 100)
         super().__init__(**kwargs)
 
     # ------------------------------------------------------------------
@@ -144,14 +144,24 @@ class AffineHelpFormatter(click.HelpFormatter):
             self._emit_box(name, content)
 
     def _emit_box(self, title: str, content: str) -> None:
-        w = self.width or 80
+        lines = content.splitlines()
 
-        # Top border:  ┌─ Title ──────────────────────────────┐
+        # Size the box to its content, not to the full formatter width.
+        # Add 2 chars of right-margin inside the box (before the │ border).
+        max_content_w = max((_visible_len(l) for l in lines), default=0)
+        right_margin  = 2
+        # Minimum width so the title always fits: ┌─ Title ──┐
+        title_min = len(f" {title} ") + 4
+        w = max(max_content_w + right_margin + 2, title_min)
+        # Hard cap at the formatter width so long descriptions still wrap
+        w = min(w, self.width or 80)
+
+        # Top border:  ┌─ Title ──────────────────┐
         label = f" {title} "
-        right = max(w - 3 - len(label), 2)   # 3 = ┌─ + ┐
+        right = max(w - 3 - len(label), 2)
         top = f"┌─{label}{'─' * right}┐"
 
-        # Bottom border: └──────────────────────────────────────┘
+        # Bottom border: └────────────────────────┘
         bot = f"└{'─' * (w - 2)}┘"
 
         # Blank separator — only when there is already preceding content
@@ -161,8 +171,8 @@ class AffineHelpFormatter(click.HelpFormatter):
         self.write(f"{self._ansi(top, _DIM)}\n")
 
         # Content lines: │<line padded to inner width>│
-        inner_w = w - 2   # chars between the two │ borders
-        for line in content.splitlines():
+        inner_w = w - 2
+        for line in lines:
             pad = " " * max(inner_w - _visible_len(line), 0)
             self.write(
                 f"{self._ansi('│', _DIM)}{line}{pad}{self._ansi('│', _DIM)}\n"
@@ -174,7 +184,7 @@ class AffineHelpFormatter(click.HelpFormatter):
     # Definition list — colors the first column (command / option names)
     # ------------------------------------------------------------------
 
-    def write_dl(self, rows, col_max: int = 30, col_spacing: int = 2) -> None:
+    def write_dl(self, rows, col_max: int = 30, col_spacing: int = 4) -> None:
         if not self._modern:
             super().write_dl(rows, col_max, col_spacing)
             return
