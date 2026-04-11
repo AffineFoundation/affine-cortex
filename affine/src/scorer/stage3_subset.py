@@ -173,7 +173,7 @@ class Stage3SubsetScorer:
             return rating
 
         import os
-        interval_minutes = int(os.getenv("SCORER_INTERVAL_MINUTES", "30"))
+        interval_minutes = int(os.getenv("SCORER_INTERVAL_MINUTES", "60"))
         interval = interval_minutes * 60
         missed_rounds = elapsed / interval
 

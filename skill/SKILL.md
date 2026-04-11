@@ -877,7 +877,7 @@ Liveweb-arena uses a **plugin architecture** — each plugin provides templates,
 | `NETUID` | Validator | Subnet ID (default: 120) |
 | `WEIGHT_SET_INTERVAL_BLOCKS` | Validator | Blocks between weight submissions (default: 180) |
 | `SERVICE_MODE` | Validator/Scorer | Continuous operation (`true`) |
-| `SCORER_INTERVAL_MINUTES` | Scorer | Minutes between scoring runs in service mode (default: 30) |
+| `SCORER_INTERVAL_MINUTES` | Scorer | Minutes between scoring runs in service mode (default: 60) |
 | `SCORER_SAVE_TO_DB` | Scorer | Enable database saving (default: false) |
 
 ---

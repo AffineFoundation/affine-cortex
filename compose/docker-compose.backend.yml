@@ -119,6 +119,8 @@ services:
       - API_URL=http://api:8000/api/v1
       - SCORER_SAVE_TO_DB=true
       - SERVICE_MODE=true
+    env_file:
+      - .env
     depends_on:
       api:
         condition: service_healthy
