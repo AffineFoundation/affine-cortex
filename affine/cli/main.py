@@ -37,12 +37,15 @@ import os
 import subprocess
 import click
 from affine.core.setup import setup_logging, logger
+from affine.cli.help import AffineHelpFormatter, AffineGroup, AffineContext
+
+click.Context.make_formatter = AffineContext.make_formatter 
 
 # Check if admin commands should be visible
 SHOW_ADMIN_COMMANDS = os.getenv("AFFINE_SHOW_ADMIN_COMMANDS", "").lower() in ("1", "true", "yes")
 
 
-@click.group()
+@click.group(cls=AffineGroup)
 @click.option(
     "-v", "--verbosity",
     count=True,
@@ -64,7 +67,7 @@ def cli(verbosity):
 # Server Services (Group)
 # ============================================================================
 
-@cli.group(hidden=not SHOW_ADMIN_COMMANDS)
+@cli.group(cls=AffineGroup, hidden=not SHOW_ADMIN_COMMANDS)
 def servers():
     """Start various backend server services."""
     pass
@@ -372,6 +375,7 @@ def miner_deploy(ctx):
 # Import and register the db group from database.cli
 from affine.database.cli import db
 db.hidden = not SHOW_ADMIN_COMMANDS
+db.context_class = AffineContext
 cli.add_command(db)
 
 
@@ -382,6 +386,7 @@ cli.add_command(db)
 # Import and register miner_stats commands
 from affine.cli.miner_stats import miner_stats
 miner_stats.hidden = not SHOW_ADMIN_COMMANDS
+miner_stats.context_class = AffineContext
 cli.add_command(miner_stats)
 
 
