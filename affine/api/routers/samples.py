@@ -17,6 +17,7 @@ from affine.api.dependencies import (
     get_system_config_dao,
     rate_limit_read,
     rate_limit_scoring,
+    require_full_data_enabled,
 )
 from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.miners import MinersDAO
@@ -199,7 +200,7 @@ async def get_sample_by_uid(
         )
 
 
-@router.get("/scoring", dependencies=[Depends(rate_limit_scoring)])
+@router.get("/scoring", dependencies=[Depends(require_full_data_enabled), Depends(rate_limit_scoring)])
 async def get_scoring_data(
     range_type: str = Query(
         "scoring",

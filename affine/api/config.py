@@ -45,6 +45,10 @@ class APIConfig:
         os.getenv("API_SERVICES_ENABLED", "false").lower() == "true"
     )
 
+    FULL_DATA_ENABLED: bool = (
+        os.getenv("API_FULL_DATA_ENABLED", "false").lower() == "true"
+    )
+
     # App metadata
     APP_NAME: str = "Affine API"
     APP_VERSION: str = "1.0.0"

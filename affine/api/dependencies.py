@@ -244,6 +244,14 @@ async def rate_limit_write(request: Request):
         )
 
 
+async def require_full_data_enabled():
+    if not config.FULL_DATA_ENABLED:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Endpoint disabled on this deployment.",
+        )
+
+
 async def rate_limit_scoring(request: Request):
     """Dependency for /scoring endpoint - strict rate limiting (1/min)."""
     if not config.RATE_LIMIT_ENABLED:
