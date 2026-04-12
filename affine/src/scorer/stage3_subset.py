@@ -143,25 +143,10 @@ class Stage3SubsetScorer:
             ranks[uid] = prev_rank
         return ranks
 
-    def _apply_absence_decay(self, rating: float, last_scored_at: Optional[int]) -> float:
-        """Apply absence decay based on time since last scored.
-
-        Decays rating toward BASE_RATING proportionally to the number of
-        missed scoring rounds. Miners that haven't been scored recently
-        lose their accumulated rating advantage.
-
-        Args:
-            rating: Current stored rating
-            last_scored_at: Unix timestamp of last scoring, or None if never scored
-
-        Returns:
-            Decayed rating (never below BASE_RATING)
-        """
+    def _apply_absence_decay(
+        self, rating: float, last_scored_at: Optional[int], is_dominated: bool = False,
+    ) -> float:
         if last_scored_at is None:
-            # No timestamp: either a brand new miner or a legacy miner from
-            # before elo_last_scored_at was introduced. Don't decay — the
-            # timestamp will be backfilled in save_results for non-participants,
-            # starting the decay clock from next round.
             return rating
 
         base = self.config.ELO_BASE_RATING
@@ -172,34 +157,27 @@ class Stage3SubsetScorer:
         if elapsed <= 0:
             return rating
 
+        # Grace: 1 scoring interval (no decay for consecutive participation)
         import os
-        interval_minutes = int(os.getenv("SCORER_INTERVAL_MINUTES", "60"))
-        interval = interval_minutes * 60
-        missed_rounds = elapsed / interval
-
-        # Only apply decay after missing 2+ rounds (1 hour+).
-        # This gives buffer for timing jitter and ensures miners that participated
-        # last round (~30min gap) are never decayed.
-        if missed_rounds < 2.0:
+        interval = int(os.getenv("SCORER_INTERVAL_MINUTES", "60")) * 60
+        if elapsed < 2 * interval:
             return rating
 
         excess = rating - base
+
+        # Decay speed: fixed time-unit based, independent of scorer interval.
+        # Normal → 1800s (30min) units → ~12h convergence
+        # Dominated → 900s (15min) units → ~6h convergence
+        decay_unit = (self.config.ELO_ABSENCE_DECAY_UNIT_DOMINATED
+                      if is_dominated else self.config.ELO_ABSENCE_DECAY_UNIT)
+        grace_seconds = 2 * interval
+        decay_elapsed = max(0, elapsed - grace_seconds)
+        effective_units = max(1.0, decay_elapsed / decay_unit + 1.0)
+
         decay_rate = self.config.ELO_ABSENCE_DECAY_RATE
         power = self.config.ELO_ABSENCE_DECAY_POWER
+        decayed = base + excess * (decay_rate ** (effective_units ** power))
 
-        # Offset by grace period so the first effective round = 1.
-        # This ensures the first decay is exactly 5% (one round worth),
-        # then accelerates from there.
-        grace_rounds = 2.0
-        effective_rounds = max(1.0, missed_rounds - grace_rounds + 1.0)
-
-        # Accelerating decay: gentle at first, aggressive over time.
-        # effective_rounds^power makes the exponent grow super-linearly,
-        # guaranteeing convergence to BASE_RATING within ~18 hours.
-        decayed = base + excess * (decay_rate ** (effective_rounds ** power))
-
-        # Snap to BASE_RATING when excess is negligible (< 30 points).
-        # Avoids meaningless tail where rating is near-BASE but not exactly BASE.
         if decayed - base < 30.0:
             decayed = base
 
@@ -230,8 +208,10 @@ class Stage3SubsetScorer:
                 if last_scored_at is not None:
                     last_scored_at = int(last_scored_at)
 
-                # Apply absence decay based on time since last scored
-                current_ratings[uid] = self._apply_absence_decay(stored_rating, last_scored_at)
+                is_dominated = bool(miner.filtered_subsets)
+                current_ratings[uid] = self._apply_absence_decay(
+                    stored_rating, last_scored_at, is_dominated=is_dominated,
+                )
                 current_rounds[uid] = prev.get('elo_rounds_played') or 0
                 submit_block = prev.get('elo_model_submit_block') or current_block
                 model_ages[uid] = max(0, current_block - submit_block)

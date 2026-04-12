@@ -145,36 +145,16 @@ class ScorerConfig:
     """Seniority advantage factor. 0.0 disables seniority bonus."""
 
     ELO_ABSENCE_DECAY_RATE: float = 0.95
-    """Per-round decay rate for miners not participating in scoring.
-
-    Miners that don't participate in a round (incomplete sampling, Pareto-filtered,
-    offline) still retain their weight position based on historical rating, but their
-    rating decays each round. This ensures ranking stability — no sudden weight drops
-    when a miner is temporarily unable to participate.
-
-    Applied as: rating = BASE_RATING + excess * DECAY_RATE^(missed_rounds^POWER)
-
-    Combined with ELO_ABSENCE_DECAY_POWER for accelerating decay:
-    gentle at first, aggressive over time. Guarantees convergence to BASE_RATING.
-
-    With 0.95 rate and 1.4 power at 30-minute intervals:
-    - 1 hour:   retains 87% (gentle)
-    - 3 hours:  retains 53%
-    - 6 hours:  retains 19%
-    - 12 hours: retains  1.3% (nearly gone)
-    - 18 hours: retains  0.05% (gone)
-    """
+    """Per-unit decay rate. Applied as: excess * rate^(units^power)."""
 
     ELO_ABSENCE_DECAY_POWER: float = 1.4
-    """Power exponent for accelerating absence decay.
+    """Power exponent for accelerating decay over time."""
 
-    Makes decay gentle at first but increasingly aggressive over time.
-    The exponent is applied to missed_rounds: decay_rate^(missed_rounds^power).
+    ELO_ABSENCE_DECAY_UNIT: int = 1800
+    """Time unit (seconds) for decay progression. 1800 = 30min → ~12h convergence."""
 
-    power=1.0: constant decay rate (no acceleration, standard exponential)
-    power=1.4: accelerating decay, any rating reaches BASE within ~18 hours
-    power=2.0: very aggressive acceleration
-    """
+    ELO_ABSENCE_DECAY_UNIT_DOMINATED: int = 900
+    """Faster decay unit for Pareto-dominated miners. 900 = 15min → ~6h convergence."""
 
 
     # Database & Storage
