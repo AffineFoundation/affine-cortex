@@ -62,6 +62,49 @@ async def get_miner_by_uid(
         )
 
 
+@router.get("/active", dependencies=[Depends(rate_limit_read)])
+async def get_active_miners():
+    """Get all active (valid) miners with challenge status.
+
+    Returns hotkey, revision, chute_id, chute_slug, chute_status,
+    and whether the miner is terminated in champion challenge.
+    """
+    try:
+        from affine.database.dao.miners import MinersDAO
+        from affine.database.dao.miner_stats import MinerStatsDAO
+
+        miners_dao = MinersDAO()
+        miner_stats_dao = MinerStatsDAO()
+
+        valid_miners = await miners_dao.get_valid_miners()
+
+        results = []
+        for m in valid_miners:
+            hotkey = m.get('hotkey', '')
+            revision = m.get('revision', '')
+
+            state = await miner_stats_dao.get_challenge_state(hotkey, revision)
+
+            results.append({
+                "uid": m.get('uid'),
+                "hotkey": hotkey,
+                "revision": revision,
+                "model": m.get('model', ''),
+                "chute_id": m.get('chute_id', ''),
+                "chute_slug": m.get('chute_slug', ''),
+                "chute_status": m.get('chute_status', ''),
+                "is_terminated": state.get('challenge_status') == 'terminated',
+            })
+
+        return {"miners": results, "total": len(results)}
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to retrieve active miners: {str(e)}"
+        )
+
+
 @router.get("/uid/{uid}/stats", dependencies=[Depends(rate_limit_read)])
 async def get_miner_stats_by_uid(
     uid: int,
