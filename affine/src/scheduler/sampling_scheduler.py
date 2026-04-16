@@ -989,11 +989,11 @@ class SamplingScheduler:
                 pass
     
     async def _rotation_loop(self):
-        """Rotation loop - checks every 5 minutes."""
+        """Rotation loop - checks every 60 seconds."""
         while self._running:
             try:
                 await self._check_and_rotate_all_envs()
-                await asyncio.sleep(300)
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 logger.info("Rotation loop cancelled")
                 break
