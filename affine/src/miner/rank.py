@@ -251,9 +251,10 @@ async def print_rank_table():
                 if env in m.scores_by_env:
                     env_data = m.scores_by_env[env]
                     env_score = env_data.get("score", 0.0)
-                    sample_count = env_data.get("sample_count", 0)
+                    historical = env_data.get("historical_count",
+                                              env_data.get("sample_count", 0))
                     score_percent = env_score * 100
-                    score_str = f"{score_percent:.2f}/{sample_count}"
+                    score_str = f"{score_percent:.2f}/{historical}"
                     row_parts.append(f"{score_str:>14}")
                 else:
                     row_parts.append(f"{'  -  ':>14}")
