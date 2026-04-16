@@ -763,6 +763,10 @@ class MinersMonitor:
                 )
                 miners.append(system_miner)
 
+            # Release chutes for terminated miners before persist,
+            # so the cold status is written to DB in the same round.
+            await self._release_terminated_chutes(miners)
+
             # Persist to database (including system miners)
             for miner in miners:
                 await self.dao.save_miner(
@@ -780,9 +784,6 @@ class MinersMonitor:
                     first_block=miner.block,
                     template_check_result=miner.template_check_result,
                 )
-
-            # Release chutes for terminated miners that still have hot instances
-            await self._release_terminated_chutes(miners)
 
             valid_miners = {m.key(): m for m in miners if m.is_valid}
 
