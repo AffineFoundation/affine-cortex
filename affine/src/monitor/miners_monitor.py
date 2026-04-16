@@ -605,10 +605,17 @@ class MinersMonitor:
                 logger.info(
                     f"[MinersMonitor] Releasing chute for terminated miner "
                     f"uid={miner.uid} chute_id={miner.chute_id}")
-                await delete_chute(miner.chute_id)
+                result = await delete_chute(miner.chute_id)
+                # Mark as cold so we don't retry next refresh
+                miner.chute_status = 'cold'
+                if result:
+                    logger.info(f"[MinersMonitor] Chute released for uid={miner.uid}")
+                else:
+                    logger.warning(f"[MinersMonitor] Chute release failed for uid={miner.uid}, marked cold to stop retrying")
             except Exception as e:
+                miner.chute_status = 'cold'
                 logger.warning(
-                    f"[MinersMonitor] Failed to release chute for uid={miner.uid}: {e}")
+                    f"[MinersMonitor] Failed to release chute for uid={miner.uid}: {e}, marked cold")
 
     async def refresh_miners(self) -> Dict[str, MinerInfo]:
         """Refresh and validate all miners
