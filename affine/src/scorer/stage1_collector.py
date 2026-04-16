@@ -3,12 +3,16 @@ Stage 1: Data Collection
 
 Parses scoring data from the API into MinerData objects. Computes only the
 fields needed for downstream stages — no validity gates, no thresholds.
-The avg_score is computed from the current sampling window for display
-and cold-start ranking; all_task_scores stores the full historical data
-used by Pareto comparisons.
+
+`avg_score` is computed from the most recent N×window samples (where
+N = CHAMPION_DETHRONE_MIN_CHECKPOINT). This caps how
+far back display scores can drift for long-running champions, while
+challengers — whose history never reaches that cap — naturally see the
+full set. `all_task_scores` keeps the full historical task→score map and
+is what Pareto comparisons use.
 """
 
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from affine.src.scorer.models import MinerData, EnvScore, Stage1Output
 from affine.src.scorer.config import ScorerConfig
 
@@ -24,8 +28,18 @@ class Stage1Collector:
         self,
         scoring_data: Dict[str, Any],
         environments: List[str],
+        env_sampling_counts: Optional[Dict[str, int]] = None,
     ) -> Stage1Output:
-        """Parse API scoring_data into MinerData objects."""
+        """Parse API scoring_data into MinerData objects.
+
+        Args:
+            scoring_data: API /samples/scoring response
+            environments: enabled environments
+            env_sampling_counts: {env_name: window_size}; used to cap
+                avg_score to the most recent N × window_size samples.
+                If missing for an env, avg_score uses full history.
+        """
+        env_sampling_counts = env_sampling_counts or {}
         if not isinstance(scoring_data, dict):
             raise RuntimeError(f"Invalid scoring_data type: {type(scoring_data)}")
 
@@ -68,8 +82,9 @@ class Stage1Collector:
 
             env_data = entry.get('env', {})
             for env_name in environments:
+                window_size = env_sampling_counts.get(env_name)
                 miner.env_scores[env_name] = self._build_env_score(
-                    env_data.get(env_name, {}), env_name)
+                    env_data.get(env_name, {}), env_name, window_size)
 
             miners[uid] = miner
 
@@ -78,26 +93,37 @@ class Stage1Collector:
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 
-    def _build_env_score(self, env_info: Dict[str, Any], env_name: str) -> EnvScore:
+    def _build_env_score(
+        self,
+        env_info: Dict[str, Any],
+        env_name: str,
+        window_size: Optional[int],
+    ) -> EnvScore:
         """Build an EnvScore from one env's API data."""
         if not env_info:
             return EnvScore(avg_score=0.0, sample_count=0, completeness=0.0)
 
         all_samples = env_info.get('all_samples', [])
-        sampling_ids = set(env_info.get('sampling_task_ids', []))
         completed_count = env_info.get('completed_count', 0)
         completeness = env_info.get('completeness', 0.0)
 
-        # Full historical task→score (used by Pareto comparisons)
+        # Full historical task→score (used by Pareto comparisons).
+        # If a task_id appears multiple times, the last one written wins —
+        # this is fine for Pareto since it only needs *some* score per task.
         all_task_scores: Dict[int, float] = {}
         for s in all_samples:
             tid = s.get('task_id')
             if tid is not None:
                 all_task_scores[int(tid)] = s.get('score', 0.0)
 
-        # Current window average (display + cold start)
-        window_scores = [s for tid, s in all_task_scores.items() if tid in sampling_ids]
-        avg = sum(window_scores) / len(window_scores) if window_scores else 0.0
+        historical_count = len(all_task_scores)
+
+        # Display avg: mean over the most recent N × window_size samples
+        # (deduped by task_id, keeping the newest score per task). For
+        # challengers historical_count < cap → recent == full history.
+        # For long-running champions this prevents stale early scores
+        # from dragging the displayed average.
+        avg = self._recent_avg(all_samples, window_size)
 
         # Apply env-specific normalization if configured
         ranges = self.config.ENV_SCORE_RANGES.get(env_name)
@@ -109,6 +135,50 @@ class Stage1Collector:
         return EnvScore(
             avg_score=avg,
             sample_count=completed_count,
+            historical_count=historical_count,
             completeness=completeness,
             all_task_scores=all_task_scores,
         )
+
+    def _recent_avg(
+        self,
+        all_samples: List[Dict[str, Any]],
+        window_size: Optional[int],
+    ) -> float:
+        """Mean score over the most recent N×window_size unique tasks.
+
+        - Sort samples by timestamp descending.
+        - Walk the list, keeping the first (newest) score per task_id.
+        - Stop once we've collected `cap` unique tasks (cap = N×window_size).
+        - If `window_size` is unknown, use the full history.
+        """
+        if not all_samples:
+            return 0.0
+
+        cap: Optional[int] = None
+        if window_size and window_size > 0:
+            cap = self.config.CHAMPION_DETHRONE_MIN_CHECKPOINT * window_size
+
+        sorted_samples = sorted(
+            all_samples,
+            key=lambda s: s.get('timestamp') or 0,
+            reverse=True,
+        )
+
+        seen: set = set()
+        recent_scores: List[float] = []
+        for s in sorted_samples:
+            tid = s.get('task_id')
+            if tid is None:
+                continue
+            tid = int(tid)
+            if tid in seen:
+                continue
+            seen.add(tid)
+            recent_scores.append(s.get('score', 0.0))
+            if cap is not None and len(recent_scores) >= cap:
+                break
+
+        if not recent_scores:
+            return 0.0
+        return sum(recent_scores) / len(recent_scores)

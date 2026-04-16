@@ -90,44 +90,6 @@ async def fetch_system_config(api_client, range_type: str = "scoring") -> dict:
         raise
 
 
-async def cold_start_from_elo(miner_stats_dao: MinerStatsDAO) -> dict:
-    """Find highest ELO-rated miner for cold start transition.
-
-    Scans miner_stats table for the miner with the highest ELO rating
-    to use as the initial champion when transitioning from ELO to
-    champion challenge system.
-
-    Returns:
-        Champion state dict, or None if no miners found
-    """
-    logger.info("Cold start: scanning miner_stats for highest ELO-rated miner...")
-    all_miners = await miner_stats_dao.get_all_historical_miners()
-
-    if not all_miners:
-        logger.warning("No miners found in miner_stats for cold start")
-        return None
-
-    # Find miner with highest ELO rating
-    best = max(all_miners, key=lambda m: float(m.get('elo_rating', 0) or 0))
-    elo_rating = float(best.get('elo_rating', 0) or 0)
-
-    if elo_rating <= 0:
-        logger.warning("No miners with positive ELO rating found")
-        return None
-
-    champion = {
-        'hotkey': best.get('hotkey', ''),
-        'revision': best.get('revision', ''),
-        'uid': None,  # Will be resolved from scoring_data
-        'since_block': 0,
-    }
-    logger.info(
-        f"Cold start: selected {champion['hotkey'][:8]}... "
-        f"(ELO: {elo_rating:.0f}) as initial champion"
-    )
-    return champion
-
-
 async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
     """Run scoring calculation once.
 
@@ -169,23 +131,13 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
                 f"(UID {champion_state.get('uid')})"
             )
         else:
-            # Cold start: try to inherit from ELO (one-time migration)
-            logger.info("No champion found, attempting cold start from ELO...")
-            champion_state = await cold_start_from_elo(miner_stats_dao)
-
-            if champion_state:
-                elo_hk = champion_state.get('hotkey', '')
-                elo_rev = champion_state.get('revision', '')
-                found = any(
-                    m.get('hotkey') == elo_hk and m.get('model_revision') == elo_rev
-                    for m in scoring_data.values()
-                )
-                if not found:
-                    logger.warning(
-                        f"ELO champion {elo_hk[:8]}... not in scoring data, "
-                        f"falling back to geometric mean selection"
-                    )
-                    champion_state = None
+            # No champion in DB → cold start: geometric mean selection.
+            # Use `af db set-champion` before the first run to pre-seed.
+            logger.warning(
+                "No champion found in system_config. "
+                "Cold start will select champion by geometric mean. "
+                "Use `af db set-champion` to pre-seed if needed."
+            )
 
         logger.info("Loading challenge states from miner_stats...")
         prev_challenge_states = {}

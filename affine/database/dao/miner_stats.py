@@ -452,6 +452,7 @@ class MinerStatsDAO(BaseDAO):
                 'challenge_consecutive_losses': 0,
                 'challenge_checkpoints_passed': 0,
                 'challenge_status': 'sampling',
+                'termination_reason': '',
             }
         return {
             'challenge_consecutive_wins': stats.get('challenge_consecutive_wins', 0),
@@ -459,6 +460,7 @@ class MinerStatsDAO(BaseDAO):
             'challenge_consecutive_losses': stats.get('challenge_consecutive_losses', 0),
             'challenge_checkpoints_passed': stats.get('challenge_checkpoints_passed', 0),
             'challenge_status': stats.get('challenge_status', 'sampling'),
+            'termination_reason': stats.get('termination_reason', ''),
         }
 
     async def update_challenge_state(
@@ -470,6 +472,7 @@ class MinerStatsDAO(BaseDAO):
         consecutive_losses: int,
         checkpoints_passed: int,
         status: str,
+        termination_reason: str = '',
     ) -> None:
         """Update miner's champion challenge state."""
         from affine.database.client import get_client
@@ -487,6 +490,7 @@ class MinerStatsDAO(BaseDAO):
                 'challenge_consecutive_losses = :cl, '
                 'challenge_checkpoints_passed = :cp, '
                 'challenge_status = :cs, '
+                'termination_reason = :tr, '
                 'last_updated_at = :ts'
             ),
             ExpressionAttributeValues={
@@ -495,6 +499,7 @@ class MinerStatsDAO(BaseDAO):
                 ':cl': {'N': str(consecutive_losses)},
                 ':cp': {'N': str(checkpoints_passed)},
                 ':cs': {'S': status},
+                ':tr': {'S': termination_reason},
                 ':ts': {'N': str(int(time.time()))},
             },
         )

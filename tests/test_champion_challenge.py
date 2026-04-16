@@ -14,7 +14,8 @@ ENVS = ["env_a", "env_b"]
 WINDOW = 50
 ENV_SC = {"env_a": WINDOW, "env_b": WINDOW}
 # Most tests use warmup=0 to test core logic directly
-NO_WARMUP = {"CHAMPION_WARMUP_CHECKPOINTS": 0}
+# Tests use 2 envs, so override MIN_DOMINANT_ENVS to 0 (strict Pareto)
+NO_WARMUP = {"CHAMPION_WARMUP_CHECKPOINTS": 0, "WIN_MIN_DOMINANT_ENVS": 0}
 
 
 def cfg(**kw):
@@ -60,7 +61,7 @@ def run(cc, miners, champion_state=None, prev_states=None):
 class TestCheckpointGate:
 
     def test_first_checkpoint_fires(self):
-        cc = ChampionChallenge(cfg(CHAMPION_CONSECUTIVE_WINS_REQUIRED=3))
+        cc = ChampionChallenge(cfg(CHAMPION_DETHRONE_MIN_CHECKPOINT=3))
         miners = {1: miner(1, "hk_champ", scores=[0.3, 0.3]),
                   2: miner(2, "hk_chal", scores=[0.6, 0.6])}
         r = run(cc, miners, cs())
@@ -141,7 +142,7 @@ class TestWarmup:
         """N wins must be post-warmup. Warmup checkpoint wins don't count."""
         N = 2
         cc = ChampionChallenge(cfg(CHAMPION_WARMUP_CHECKPOINTS=2,
-                                   CHAMPION_CONSECUTIVE_WINS_REQUIRED=N))
+                                   CHAMPION_DETHRONE_MIN_CHECKPOINT=N))
         # At checkpoint 4 (post-warmup=2), prev post-warmup wins=1
         miners = {1: miner(1, "hk_champ", scores=[0.3, 0.3], n_tasks=4 * WINDOW),
                   2: miner(2, "hk_chal", scores=[0.6, 0.6], n_tasks=4 * WINDOW)}
@@ -155,14 +156,14 @@ class TestChampionChange:
 
     def test_dethrone_after_n_checkpoints(self):
         N = 3
-        cc = ChampionChallenge(cfg(CHAMPION_CONSECUTIVE_WINS_REQUIRED=N))
+        cc = ChampionChallenge(cfg(CHAMPION_DETHRONE_MIN_CHECKPOINT=N))
         miners = {1: miner(1, "hk_champ", scores=[0.3, 0.3], n_tasks=N * WINDOW),
                   2: miner(2, "hk_chal", scores=[0.6, 0.6], n_tasks=N * WINDOW)}
         r = run(cc, miners, cs(), prev("hk_chal", wins=N - 1, cp=N - 1))
         assert r.champion_uid == 2
 
     def test_loss_resets_win_streak(self):
-        cc = ChampionChallenge(cfg(CHAMPION_CONSECUTIVE_WINS_REQUIRED=5,
+        cc = ChampionChallenge(cfg(CHAMPION_DETHRONE_MIN_CHECKPOINT=5,
                                    CHAMPION_TERMINATION_TOTAL_LOSSES=100,
                                    CHAMPION_TERMINATION_CONSECUTIVE_LOSSES=100))
         miners = {1: miner(1, "hk_champ", scores=[0.5, 0.5], n_tasks=5 * WINDOW),
@@ -172,7 +173,7 @@ class TestChampionChange:
         assert miners[2].challenge_consecutive_wins == 0
 
     def test_multiple_qualified_picks_best_geo_mean(self):
-        cc = ChampionChallenge(cfg(CHAMPION_CONSECUTIVE_WINS_REQUIRED=1))
+        cc = ChampionChallenge(cfg(CHAMPION_DETHRONE_MIN_CHECKPOINT=1))
         miners = {1: miner(1, "hk_champ", scores=[0.2, 0.2]),
                   3: miner(3, "hk_3", scores=[0.7, 0.7]),
                   5: miner(5, "hk_5", scores=[0.9, 0.9])}
@@ -205,12 +206,14 @@ class TestTermination:
 
 class TestChampionStability:
 
-    def test_cold_start_picks_best(self):
+    def test_no_champion_returns_zero_weights(self):
+        """Without champion_state, all weights are 0."""
         cc = ChampionChallenge(cfg())
         miners = {1: miner(1, "hk_a", scores=[0.4, 0.4]),
                   2: miner(2, "hk_b", scores=[0.8, 0.7])}
-        r = run(cc, miners)
-        assert r.champion_uid == 2
+        r = run(cc, miners)  # no champion_state
+        assert r.champion_uid is None
+        assert all(w == 0.0 for w in r.final_weights.values())
 
     def test_champion_absent_weight_preserved(self):
         """Champion not present this round → weight stays on champion UID, no replacement."""
@@ -241,7 +244,7 @@ class TestRefactorBehavior:
     def test_terminated_cannot_dethrone(self):
         """Bug 1 regression: a terminated miner with N wins cannot dethrone."""
         N = 3
-        cc = ChampionChallenge(cfg(CHAMPION_CONSECUTIVE_WINS_REQUIRED=N))
+        cc = ChampionChallenge(cfg(CHAMPION_DETHRONE_MIN_CHECKPOINT=N))
         miners = {
             1: miner(1, "hk_champ", scores=[0.3, 0.3]),
             2: miner(2, "hk_chal", scores=[0.7, 0.7]),
@@ -275,37 +278,34 @@ class TestRefactorBehavior:
         assert miners[2].challenge_checkpoints_passed == 1
         assert len(r.comparisons) == 1
 
-    def test_cold_start_skips_no_data_miners(self):
-        """Cold start filters out miners with sample_count=0 in any env."""
+    def test_no_champion_no_comparisons(self):
+        """Without champion, no challenges or comparisons happen."""
         cc = ChampionChallenge(cfg())
-        # Miner with no data
-        m_empty = MinerData(uid=1, hotkey="hk_empty", model_revision="r",
-                            model_repo="m", first_block=50)
-        m_empty.env_scores = {env: EnvScore(0.0, 0, 0.0) for env in ENVS}
-        # Miner with data
-        m_good = miner(2, "hk_good", scores=[0.5, 0.5])
-        miners = {1: m_empty, 2: m_good}
-        r = run(cc, miners)  # cold start
-        assert r.champion_uid == 2
+        miners = {1: miner(1, "hk_a", scores=[0.5, 0.5]),
+                  2: miner(2, "hk_b", scores=[0.8, 0.8])}
+        r = run(cc, miners)  # no champion_state
+        assert r.champion_uid is None
+        assert len(r.comparisons) == 0
 
-    def test_pareto_margin_strict(self):
-        """Challenger must beat by strictly more than PARETO_MARGIN."""
+    def test_margin_above_wins(self):
+        """Challenger exceeding margin wins.
+        At CP=1 (warmup=0), margin=WIN_MARGIN_START=0.02.
+        Gap 0.3 > 0.02 → wins."""
         cc = ChampionChallenge(cfg())
-        # Champion 0.5, challenger 0.521 (margin=0.02 → threshold=0.52, 0.521 > 0.52)
         miners = {
             1: miner(1, "hk_champ", scores=[0.5, 0.5]),
-            2: miner(2, "hk_chal", scores=[0.521, 0.521]),
+            2: miner(2, "hk_chal", scores=[0.8, 0.8]),
         }
         r = run(cc, miners, cs())
         assert miners[2].challenge_consecutive_wins == 1
 
-    def test_pareto_margin_below_loses(self):
-        """Challenger below margin loses."""
+    def test_margin_below_loses(self):
+        """Challenger within margin loses.
+        At CP=1, margin=0.02. Gap 0.01 < 0.02 → loses."""
         cc = ChampionChallenge(cfg())
-        # Challenger 0.519 < 0.52 threshold
         miners = {
             1: miner(1, "hk_champ", scores=[0.5, 0.5]),
-            2: miner(2, "hk_chal", scores=[0.519, 0.519]),
+            2: miner(2, "hk_chal", scores=[0.51, 0.51]),
         }
         r = run(cc, miners, cs())
         assert miners[2].challenge_total_losses == 1
@@ -318,7 +318,7 @@ class TestPairwiseFilter:
 
     def test_older_terminates_copy(self):
         """A copy with similar scores is terminated by the older original."""
-        cc = ChampionChallenge(cfg(PAIRWISE_MIN_WINDOWS=3))
+        cc = ChampionChallenge(cfg(PARETO_MIN_WINDOWS=3))
         n = 3 * WINDOW
         miners = {
             1: miner(1, "hk_champ", first_block=50, scores=[0.5, 0.5], n_tasks=n),
@@ -331,7 +331,7 @@ class TestPairwiseFilter:
 
     def test_genuine_improvement_terminates_older(self):
         """Significantly better newer miner terminates the older one."""
-        cc = ChampionChallenge(cfg(PAIRWISE_MIN_WINDOWS=3))
+        cc = ChampionChallenge(cfg(PARETO_MIN_WINDOWS=3))
         n = 3 * WINDOW
         miners = {
             1: miner(1, "hk_champ", first_block=50, scores=[0.4, 0.4], n_tasks=n),
@@ -344,7 +344,7 @@ class TestPairwiseFilter:
 
     def test_below_threshold_no_filter(self):
         """Pair with insufficient common tasks is not compared."""
-        cc = ChampionChallenge(cfg(PAIRWISE_MIN_WINDOWS=3))
+        cc = ChampionChallenge(cfg(PARETO_MIN_WINDOWS=3))
         n = 2 * WINDOW  # Below 3-window threshold
         miners = {
             1: miner(1, "hk_champ", first_block=50, scores=[0.5, 0.5], n_tasks=n),
@@ -357,7 +357,7 @@ class TestPairwiseFilter:
 
     def test_champion_excluded_from_filter(self):
         """Champion is never terminated by pairwise filter."""
-        cc = ChampionChallenge(cfg(PAIRWISE_MIN_WINDOWS=3))
+        cc = ChampionChallenge(cfg(PARETO_MIN_WINDOWS=3))
         n = 3 * WINDOW
         miners = {
             1: miner(1, "hk_champ", first_block=50, scores=[0.3, 0.3], n_tasks=n),
@@ -367,9 +367,29 @@ class TestPairwiseFilter:
         # Champion not terminated even though uid 2 dominates them
         assert miners[1].challenge_status == "sampling"
 
+    def test_pairwise_uses_strict_pareto(self):
+        """Pairwise must use strict Pareto regardless of WIN_MIN_DOMINANT_ENVS.
+        uid 2 is better in env_a, uid 3 is better in env_b — neither dominates
+        the other under strict Pareto, so neither should be pairwise-terminated."""
+        cc = ChampionChallenge(cfg(PARETO_MIN_WINDOWS=3,
+                                   WIN_MIN_DOMINANT_ENVS=1,
+                                   # Disable challenge termination for this test
+                                   CHAMPION_TERMINATION_TOTAL_LOSSES=999,
+                                   CHAMPION_TERMINATION_CONSECUTIVE_LOSSES=999))
+        n = 3 * WINDOW
+        miners = {
+            1: miner(1, "hk_champ", first_block=50, scores=[0.3, 0.3], n_tasks=n),
+            2: miner(2, "hk_old", first_block=100, scores=[0.8, 0.5], n_tasks=n),
+            3: miner(3, "hk_new", first_block=200, scores=[0.5, 0.8], n_tasks=n),
+        }
+        run(cc, miners, cs())
+        # Neither should be pairwise-terminated (mixed dominance)
+        assert miners[2].challenge_status == "sampling"
+        assert miners[3].challenge_status == "sampling"
+
     def test_terminated_peer_does_not_filter(self):
         """A terminated miner cannot be the basis for terminating others."""
-        cc = ChampionChallenge(cfg(PAIRWISE_MIN_WINDOWS=3))
+        cc = ChampionChallenge(cfg(PARETO_MIN_WINDOWS=3))
         n = 3 * WINDOW
         miners = {
             1: miner(1, "hk_champ", first_block=50, scores=[0.5, 0.5], n_tasks=n),
@@ -424,7 +444,7 @@ class TestEdgeCases:
         cc = ChampionChallenge(cfg())
         miners = {0: miner(0, "hk_zero", scores=[0.8, 0.8]),
                   1: miner(1, "hk_other", scores=[0.5, 0.5])}
-        r = run(cc, miners)  # cold start
+        r = run(cc, miners, cs(hotkey="hk_zero", uid=0))
         assert r.champion_uid == 0
         assert r.final_weights[0] == 1.0
         assert r.final_weights[1] == 0.0
@@ -458,7 +478,7 @@ class TestEdgeCases:
     def test_dethrone_does_not_revive_terminated(self):
         """Termination is permanent. Dethrone resets active miners but
         terminated miners stay terminated forever."""
-        cc = ChampionChallenge(cfg(CHAMPION_CONSECUTIVE_WINS_REQUIRED=1))
+        cc = ChampionChallenge(cfg(CHAMPION_DETHRONE_MIN_CHECKPOINT=1))
         miners = {1: miner(1, "hk_champ", scores=[0.2, 0.2]),
                   2: miner(2, "hk_strong", scores=[0.9, 0.9]),
                   3: miner(3, "hk_dead", scores=[0.3, 0.3])}
@@ -470,7 +490,7 @@ class TestEdgeCases:
 
     def test_dethrone_resets_then_termination_skipped(self):
         """After dethrone, all states reset, so terminations don't fire on same round."""
-        cc = ChampionChallenge(cfg(CHAMPION_CONSECUTIVE_WINS_REQUIRED=1,
+        cc = ChampionChallenge(cfg(CHAMPION_DETHRONE_MIN_CHECKPOINT=1,
                                    CHAMPION_TERMINATION_TOTAL_LOSSES=1))
         miners = {1: miner(1, "hk_champ", scores=[0.2, 0.2]),
                   2: miner(2, "hk_strong", scores=[0.9, 0.9]),
@@ -483,7 +503,7 @@ class TestEdgeCases:
 
     def test_terminated_miner_excluded_from_pairwise_basis(self):
         """A terminated miner cannot terminate others via pairwise."""
-        cc = ChampionChallenge(cfg(PAIRWISE_MIN_WINDOWS=3))
+        cc = ChampionChallenge(cfg(PARETO_MIN_WINDOWS=3))
         n = 3 * WINDOW
         miners = {
             1: miner(1, "hk_champ", first_block=50, scores=[0.5, 0.5], n_tasks=n),

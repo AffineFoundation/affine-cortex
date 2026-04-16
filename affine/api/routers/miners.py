@@ -122,12 +122,16 @@ async def get_miner_stats_by_uid(
                 for k, v in env_stats.items()
             }
 
+        # Include challenge state
+        challenge_state = await stats_dao.get_challenge_state(hotkey, revision)
+
         return {
             "uid": uid,
             "hotkey": hotkey,
             "revision": revision,
             "sampling_stats": stats.get('sampling_stats', {}),
-            "env_stats": env_stats
+            "env_stats": env_stats,
+            "challenge_state": challenge_state,
         }
         
     except HTTPException:

@@ -12,9 +12,10 @@ from dataclasses import dataclass, field
 class EnvScore:
     """Per-environment score data for one miner."""
 
-    avg_score: float                                    # Current window average (display + cold start)
-    sample_count: int                                   # Completed tasks in the current window
+    avg_score: float                                    # Mean over the most recent N×window samples (display only)
+    sample_count: int                                   # Completed tasks in the current sampling window
     completeness: float                                 # sample_count / window_size
+    historical_count: int = 0                           # Distinct tasks ever sampled (full lifetime)
     all_task_scores: Dict[int, float] = field(default_factory=dict)  # Full historical task→score (for Pareto)
 
     def __repr__(self) -> str:
@@ -40,6 +41,7 @@ class MinerData:
     challenge_consecutive_losses: int = 0
     challenge_checkpoints_passed: int = 0
     challenge_status: str = 'sampling'  # 'sampling' | 'terminated'
+    termination_reason: str = ''        # '' | 'challenge_loss' | 'pairwise'
     is_champion: bool = False
 
     # Final weight (set by champion challenge: 1.0 for champion, 0.0 for others)

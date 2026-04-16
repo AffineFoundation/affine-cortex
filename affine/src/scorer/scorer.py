@@ -54,7 +54,8 @@ class Scorer:
         logger.info(f"Total Miners: {len(scoring_data)}")
 
         # Stage 1: Data Collection
-        stage1_output = self.stage1.collect(scoring_data, environments)
+        stage1_output = self.stage1.collect(
+            scoring_data, environments, env_sampling_counts or {})
 
         # Stage 2: Champion Challenge
         challenge_output = self.champion_challenge.run(
@@ -175,16 +176,18 @@ class Scorer:
                 env: {
                     "score": score.avg_score,
                     "sample_count": score.sample_count,
+                    "historical_count": score.historical_count,
                     "completeness": score.completeness,
                 }
                 for env, score in miner.env_scores.items()
             }
 
             overall_score = miner.normalized_weight
-            average_score = (
-                sum(d["score"] for d in scores_by_env.values()) / len(scores_by_env)
-                if scores_by_env else 0.0
-            )
+            # Average only over envs that have actual data
+            data_scores = [
+                d["score"] for d in scores_by_env.values() if d["sample_count"] > 0
+            ]
+            average_score = sum(data_scores) / len(data_scores) if data_scores else 0.0
 
             challenge_info = {
                 "status": miner.challenge_status,
@@ -193,6 +196,7 @@ class Scorer:
                 "consecutive_losses": miner.challenge_consecutive_losses,
                 "checkpoints_passed": miner.challenge_checkpoints_passed,
                 "is_champion": miner.is_champion,
+                "termination_reason": miner.termination_reason,
             }
 
             await scores_dao.save_score(
@@ -220,6 +224,7 @@ class Scorer:
                     consecutive_losses=miner.challenge_consecutive_losses,
                     checkpoints_passed=miner.challenge_checkpoints_passed,
                     status=miner.challenge_status,
+                    termination_reason=miner.termination_reason,
                 )
 
         # Save champion state to system_config (only when champion is present this round)

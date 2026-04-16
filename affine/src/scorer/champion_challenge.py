@@ -4,17 +4,25 @@ Champion Challenge Scoring — Winner-takes-all.
 Pipeline (per scoring round):
   1. Load persisted challenge state for each miner
   2. Resolve champion (cold start by geo mean / locate by hotkey+revision)
-  3. Pairwise Pareto filter (anti-plagiarism): older incumbent terminates copies
+  3. Pairwise Pareto filter (Pareto dominance): older incumbent terminates copies
   4. Run challenges: each non-champion miner vs champion, gated by checkpoints
-  5. Dethrone check: any non-terminated challenger with N consecutive wins?
+  5. Dethrone check: challenger reached min CP and dominates champion?
   6. Termination check: M total or M-1 consecutive losses → terminated
   7. Assign weights: champion = 1.0, others = 0.0
+
+Dethrone requires:
+  - checkpoint_passed >= CHAMPION_DETHRONE_MIN_CHECKPOINT (data depth)
+  - The most recent comparison is a win (dominates champion)
+  Consecutive wins are NOT required. Each comparison uses the full common
+  task history, so a single comparison at high CP is statistically decisive.
+  The termination mechanism (M total / M-1 consecutive losses) handles
+  early pruning of hopeless challengers.
 
 Invariants:
 - The champion is never replaced for being temporarily absent.
 - Termination is permanent.
-- All comparisons use the same fixed-margin Pareto check (no validity gate).
-- Cold start is the only path that picks a champion without challenges.
+- Margin scales linearly from WIN_MARGIN_START to WIN_MARGIN_END as CP grows.
+- Champion must be pre-set via `af db set-champion` before first run.
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -52,8 +60,9 @@ class ChampionChallenge:
 
         window_size = self._window_size(environments, env_sampling_counts)
 
-        # Anti-plagiarism: terminate dominated non-champion miners
-        self._pairwise_filter(miners, environments, window_size, champion_uid)
+        # Pareto dominance: terminate dominated non-champion miners
+        self._pairwise_filter(
+            miners, environments, window_size, champion_uid, champion_miner)
 
         # Champion challenge (checkpoint-gated)
         comparisons = self._run_challenges(
@@ -100,6 +109,7 @@ class ChampionChallenge:
             miner.challenge_consecutive_losses = p.get('challenge_consecutive_losses', 0)
             miner.challenge_checkpoints_passed = p.get('challenge_checkpoints_passed', 0)
             miner.challenge_status = p.get('challenge_status', 'sampling')
+            miner.termination_reason = p.get('termination_reason', '')
 
     # ── Phase 2: Resolve champion ────────────────────────────────────────────
 
@@ -116,12 +126,11 @@ class ChampionChallenge:
         - changed: True only on cold start
         """
         if not champion_state:
-            uid, miner = self._best_by_geo_mean(miners, environments)
-            if miner:
-                miner.is_champion = True
-                self._reset_all_states(miners)
-                logger.info(f"New champion (cold start): UID {uid} ({miner.hotkey[:8]}...)")
-            return uid, miner, uid, miner is not None
+            logger.error(
+                "No champion in system_config. "
+                "Use `af db set-champion` to set one before starting the scorer."
+            )
+            return None, None, None, False
 
         hk = champion_state.get('hotkey')
         rev = champion_state.get('revision')
@@ -145,13 +154,35 @@ class ChampionChallenge:
         environments: List[str],
         window_size: int,
         champion_uid: Optional[int],
+        champion_miner: Optional[MinerData] = None,
     ):
         """Compare non-champion miner pairs with sufficient common data.
         The earlier-registered miner is the incumbent. Dominated → terminated."""
         if window_size <= 0:
             return
-        threshold_tasks = self.config.PAIRWISE_MIN_WINDOWS * window_size
+        threshold_tasks = self.config.PARETO_MIN_WINDOWS * window_size
 
+        # Phase 3a-1: Champion strict-dominates check.
+        # If champion exceeds a miner by margin in ALL envs, terminate
+        # immediately — no point continuing to challenge.
+        # Compare with miner as A (incumbent) and champion as B (challenger),
+        # so b_dominates_a means "champion beats miner by margin in every env".
+        if champion_miner and champion_uid is not None:
+            for uid, m in miners.items():
+                if uid == champion_uid or m.challenge_status == 'terminated':
+                    continue
+                if self._min_common_tasks(champion_miner, m, environments) < threshold_tasks:
+                    continue
+                cmp = self.pareto._compare_miners(
+                    m, champion_miner, environments, "champion_dominance",
+                    min_dominant_envs=0)  # strict: ALL envs
+                if cmp.b_dominates_a:  # champion actively beats miner in every env
+                    m.challenge_status = 'terminated'
+                    m.termination_reason = 'pairwise'
+                    logger.info(f"CHAMPION DOMINANCE: UID {uid} terminated "
+                                f"(champion exceeds by margin in all envs)")
+
+        # Phase 3a-2: Non-champion pairwise Pareto dominance.
         eligible = sorted(
             (
                 (uid, m) for uid, m in miners.items()
@@ -169,12 +200,16 @@ class ChampionChallenge:
                 if self._min_common_tasks(miner_a, miner_b, environments) < threshold_tasks:
                     continue
 
-                cmp = self.pareto._compare_miners(miner_a, miner_b, environments, "pairwise")
+                cmp = self.pareto._compare_miners(
+                    miner_a, miner_b, environments, "pairwise",
+                    min_dominant_envs=self.config.PARETO_MIN_DOMINANT_ENVS)
                 if cmp.a_dominates_b:
                     miner_b.challenge_status = 'terminated'
+                    miner_b.termination_reason = 'pairwise'
                     logger.info(f"PAIRWISE: UID {uid_b} terminated by older UID {uid_a}")
                 elif cmp.b_dominates_a:
                     miner_a.challenge_status = 'terminated'
+                    miner_a.termination_reason = 'pairwise'
                     logger.info(f"PAIRWISE: UID {uid_a} terminated by newer UID {uid_b}")
                     break
 
@@ -195,7 +230,7 @@ class ChampionChallenge:
             return []
 
         warmup = self.config.CHAMPION_WARMUP_CHECKPOINTS
-        N = self.config.CHAMPION_CONSECUTIVE_WINS_REQUIRED
+        dethrone_cp = self.config.CHAMPION_DETHRONE_MIN_CHECKPOINT
         M = self.config.CHAMPION_TERMINATION_TOTAL_LOSSES
         comparisons = []
 
@@ -203,16 +238,20 @@ class ChampionChallenge:
             if uid == champion_uid or miner.challenge_status == 'terminated':
                 continue
 
-            # Checkpoint gate: Kth comparison requires K × window_size common tasks
+            # Checkpoint gate: jump CP to the level supported by current data.
+            # Each CP requires CP × window_size common tasks.
             min_common = self._min_common_tasks(champion_miner, miner, environments)
-            if min_common < (miner.challenge_checkpoints_passed + 1) * window_size:
-                continue
+            new_cp = min_common // window_size if window_size > 0 else 0
+            if new_cp <= miner.challenge_checkpoints_passed:
+                continue  # No new checkpoint reached
 
-            miner.challenge_checkpoints_passed += 1
-            cp = miner.challenge_checkpoints_passed
+            miner.challenge_checkpoints_passed = new_cp
+            cp = new_cp
 
+            # Only one comparison per round per miner — uses all available data.
             cmp = self.pareto._compare_miners(
-                champion_miner, miner, environments, "champion_challenge")
+                champion_miner, miner, environments, "champion_challenge",
+                checkpoint=cp)
             comparisons.append(cmp)
 
             if cp <= warmup:
@@ -224,13 +263,19 @@ class ChampionChallenge:
                 miner.challenge_consecutive_wins += 1
                 miner.challenge_consecutive_losses = 0
                 logger.info(f"UID {uid} dominates at CP {cp} "
-                            f"(wins: {miner.challenge_consecutive_wins}/{N})")
+                            f"(wins: {miner.challenge_consecutive_wins})")
             else:
                 miner.challenge_total_losses += 1
                 miner.challenge_consecutive_losses += 1
                 miner.challenge_consecutive_wins = 0
-                logger.info(f"UID {uid} fails at CP {cp} "
-                            f"(losses: {miner.challenge_total_losses}/{M})")
+                # At dethrone CP or beyond, losing is decisive — terminate immediately
+                if cp >= dethrone_cp:
+                    miner.challenge_status = 'terminated'
+                    miner.termination_reason = 'challenge_loss'
+                    logger.info(f"UID {uid} fails at dethrone CP {cp} → terminated")
+                else:
+                    logger.info(f"UID {uid} fails at CP {cp} "
+                                f"(losses: {miner.challenge_total_losses}/{M})")
 
         return comparisons
 
@@ -244,19 +289,22 @@ class ChampionChallenge:
     ) -> Tuple[Optional[int], Optional[MinerData]]:
         """Pick a qualified challenger to take the crown.
 
-        Excludes terminated miners. If multiple qualify, picks the one with
-        highest geometric mean (tiebreaker: earlier first_block)."""
-        N = self.config.CHAMPION_CONSECUTIVE_WINS_REQUIRED
+        A challenger qualifies when it has reached CHAMPION_DETHRONE_MIN_CHECKPOINT
+        and dominates the champion (consecutive_wins > 0 means the most recent
+        comparison was a win). Excludes terminated miners. If multiple qualify,
+        picks the earliest registered (tiebreaker: highest geometric mean)."""
+        dethrone_cp = self.config.CHAMPION_DETHRONE_MIN_CHECKPOINT
         qualified = [
             (uid, self._geo_mean(miners[uid], environments), miners[uid].first_block)
             for uid, m in miners.items()
             if uid != champion_uid
             and m.challenge_status != 'terminated'
-            and m.challenge_consecutive_wins >= N
+            and m.challenge_checkpoints_passed >= dethrone_cp
+            and m.challenge_consecutive_wins > 0
         ]
         if not qualified:
             return None, None
-        qualified.sort(key=lambda x: (-x[1], x[2]))
+        qualified.sort(key=lambda x: (x[2], -x[1]))
         new_uid = qualified[0][0]
         return new_uid, miners[new_uid]
 
@@ -271,6 +319,7 @@ class ChampionChallenge:
             if (miner.challenge_total_losses >= M
                     or miner.challenge_consecutive_losses >= M_con):
                 miner.challenge_status = 'terminated'
+                miner.termination_reason = 'challenge_loss'
 
     # ── Phase 6: Assign weights ──────────────────────────────────────────────
 
@@ -296,30 +345,17 @@ class ChampionChallenge:
             return 0.0
         return geometric_mean(scores, epsilon=self.config.GEOMETRIC_MEAN_EPSILON)
 
-    def _best_by_geo_mean(
-        self, miners: Dict[int, MinerData], environments: List[str]
-    ) -> Tuple[Optional[int], Optional[MinerData]]:
-        """Pick miner with highest geometric mean.
-
-        Cold start requires actual data: each env must have sample_count > 0.
-        Tiebreaker: earlier first_block.
-        """
-        best_uid, best_miner, best_score = None, None, -1.0
-        for uid, miner in miners.items():
-            if not all(env in miner.env_scores
-                       and miner.env_scores[env].sample_count > 0
-                       for env in environments):
-                continue
-            score = self._geo_mean(miner, environments)
-            if (score > best_score
-                    or (score == best_score and best_miner
-                        and miner.first_block < best_miner.first_block)):
-                best_uid, best_miner, best_score = uid, miner, score
-        return best_uid, best_miner
-
     def _min_common_tasks(
         self, a: MinerData, b: MinerData, environments: List[str]
     ) -> int:
+        """Minimum common-task count across ALL environments.
+
+        Returns 0 if either miner is missing any environment. This is
+        intentional: a challenger must have data in every environment
+        to be fairly compared against the champion. Partial coverage
+        blocks challenges (conservative) rather than allowing dethrone
+        on incomplete evidence.
+        """
         counts = []
         for env in environments:
             es_a = a.env_scores.get(env)
@@ -332,6 +368,12 @@ class ChampionChallenge:
     def _window_size(
         self, environments: List[str], env_sampling_counts: Dict[str, int]
     ) -> int:
+        missing = [env for env in environments if not env_sampling_counts.get(env)]
+        if missing:
+            logger.warning(
+                f"Missing env_sampling_counts for {missing}; challenges disabled. "
+                f"Check environments config."
+            )
         counts = [env_sampling_counts.get(env, 0) for env in environments]
         return min(counts) if counts else 0
 
@@ -341,6 +383,7 @@ class ChampionChallenge:
         miner.challenge_consecutive_losses = 0
         miner.challenge_checkpoints_passed = 0
         miner.challenge_status = 'sampling'
+        miner.termination_reason = ''
 
     def _reset_all_states(self, miners: Dict[int, MinerData]):
         """Reset counters for non-terminated miners on champion change.

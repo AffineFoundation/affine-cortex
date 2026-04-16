@@ -987,6 +987,112 @@ def get_config():
     asyncio.run(cmd_get_config())
 
 
+async def cmd_set_champion(hotkey: str, revision: str):
+    """Write or overwrite the champion record in system_config."""
+    from affine.database.dao.miner_stats import MinerStatsDAO
+    from affine.database.dao.miners import MinersDAO
+    from affine.utils.subtensor import get_subtensor
+
+    await init_client()
+    try:
+        miner_stats_dao = MinerStatsDAO()
+        miners_dao = MinersDAO()
+        config_dao = SystemConfigDAO()
+
+        # Look up UID from Miners table by hotkey
+        all_miners = await miners_dao.get_all_miners()
+        matched = [m for m in all_miners
+                   if m.get('hotkey') == hotkey and m.get('revision') == revision]
+        if matched:
+            uid = matched[0].get('uid')
+            model = matched[0].get('model', 'unknown')
+            print(f"Found miner:")
+            print(f"  Hotkey:   {hotkey}")
+            print(f"  Revision: {revision}")
+            print(f"  UID:      {uid}")
+            print(f"  Model:    {model}")
+        else:
+            # Fallback: look up by hotkey only
+            by_hk = [m for m in all_miners if m.get('hotkey') == hotkey]
+            if by_hk:
+                uid = by_hk[0].get('uid')
+                print(f"Warning: hotkey found but revision mismatch")
+                print(f"  Hotkey:       {hotkey}")
+                print(f"  DB revision:  {by_hk[0].get('revision', '?')}")
+                print(f"  Your revision: {revision}")
+                print(f"  UID:          {uid}")
+            else:
+                print(f"Error: hotkey {hotkey[:16]}... not found in Miners table")
+                return
+
+        # Show miner_stats if available
+        stats = await miner_stats_dao.get_miner_stats(hotkey, revision)
+        if stats:
+            elo = stats.get('elo_rating')
+            if elo:
+                print(f"  ELO:      {elo}")
+
+        # Show existing champion if any
+        existing = await config_dao.get_param_value('champion', default=None)
+        if existing:
+            print(f"\nCurrent champion in DB:")
+            print(f"  Hotkey:   {existing.get('hotkey', '?')}")
+            print(f"  Revision: {existing.get('revision', '?')}")
+            print(f"  UID:      {existing.get('uid', '?')}")
+            print(f"  Since:    block {existing.get('since_block', '?')}")
+        else:
+            print(f"\nNo existing champion in DB.")
+
+        # Fetch current block for since_block
+        print("\nFetching current block number...")
+        subtensor = await get_subtensor()
+        current_block = await subtensor.get_current_block()
+
+        print(f"\nWill set champion to:")
+        print(f"  Hotkey:      {hotkey}")
+        print(f"  Revision:    {revision}")
+        print(f"  UID:         {uid}")
+        print(f"  Since block: {current_block} (current)")
+
+        confirm = input("\nConfirm? [y/N] ").strip().lower()
+        if confirm != 'y':
+            print("Aborted.")
+            return
+
+        await config_dao.set_param(
+            param_name='champion',
+            param_value={
+                'hotkey': hotkey,
+                'revision': revision,
+                'uid': uid,
+                'since_block': current_block,
+            },
+            param_type='dict',
+            updated_by='cli:set-champion',
+        )
+        print(f"Champion set successfully (UID {uid}, since block {current_block}).")
+
+    finally:
+        await close_client()
+
+
+@db.command("set-champion")
+@click.option("--hotkey", required=True, help="Champion miner's hotkey")
+@click.option("--revision", required=True, help="Champion model revision hash")
+def set_champion(hotkey, revision):
+    """Set the initial champion before the first scorer run.
+
+    UID is automatically looked up from the Miners table by hotkey.
+    since_block is set to the current chain block.
+
+    Requires interactive confirmation.
+
+    Example:
+        af db set-champion --hotkey 5FnfLT3n... --revision 925409eacac8...
+    """
+    asyncio.run(cmd_set_champion(hotkey, revision))
+
+
 @db.command("delete-samples-by-range")
 @click.option("--hotkey", default=None, help="Miner's hotkey (optional, if not provided will delete for all miners)")
 @click.option("--revision", default=None, help="Model revision hash (optional, if not provided will delete for all revisions)")

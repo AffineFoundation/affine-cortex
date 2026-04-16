@@ -499,6 +499,27 @@ async def get_miner_command(uid: int):
             stats_endpoint = f"/miners/uid/{uid}/stats"
             stats_data = await client.get(stats_endpoint)
             
+            # Display challenge state
+            cs = stats_data.get('challenge_state') if stats_data else None
+            if cs:
+                print("\n" + "="*80)
+                print("CHAMPION CHALLENGE STATE")
+                print("="*80)
+                status = cs.get('challenge_status', 'sampling')
+                print(f"  Status:              {status}")
+                print(f"  Checkpoints passed:  {cs.get('challenge_checkpoints_passed', 0)}")
+                print(f"  Consecutive wins:    {cs.get('challenge_consecutive_wins', 0)}")
+                print(f"  Total losses:        {cs.get('challenge_total_losses', 0)}")
+                print(f"  Consecutive losses:  {cs.get('challenge_consecutive_losses', 0)}")
+                if status == 'terminated':
+                    reason = cs.get('termination_reason', 'unknown')
+                    if reason == 'challenge_loss':
+                        print(f"  Termination reason:  Challenge loss (accumulated too many losses vs champion)")
+                    elif reason == 'pairwise':
+                        print(f"  Termination reason:  Pairwise filter (dominated by an older miner)")
+                    else:
+                        print(f"  Termination reason:  {reason}")
+
             if stats_data and stats_data.get('sampling_stats'):
                 print("\n" + "="*80)
                 print("GLOBAL SAMPLING STATISTICS")
