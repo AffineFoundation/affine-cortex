@@ -7,10 +7,10 @@
       "min_completeness": 0.85,
       "sampling_config": {
         "dataset_range": [[0, 500000000],[600000000, 800000000]],
-        "sampling_count": 300,
+        "sampling_count": 100,
         "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 1200,
+        "rotation_count": 2,
+        "rotation_interval": 900,
         "scheduling_weight": 3.0
       }
     },
@@ -45,10 +45,10 @@
           "field": "tasks.completed_up_to",
           "range_type": "zero_to_value"
         },
-        "sampling_count": 130,
+        "sampling_count": 50,
         "rotation_enabled": true,
-        "rotation_count": 4,
-        "rotation_interval": 3600,
+        "rotation_count": 1,
+        "rotation_interval": 900,
         "scheduling_weight": 1.0
       }
     },
@@ -58,10 +58,10 @@
       "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 78060000]],
-        "sampling_count": 200,
+        "sampling_count": 100,
         "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 1200,
+        "rotation_count": 2,
+        "rotation_interval": 900,
         "scheduling_weight": 1.0
       }
     },
@@ -84,10 +84,10 @@
       "min_completeness": 0.85,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
-        "sampling_count": 200,
+        "sampling_count": 100,
         "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 800,
+        "rotation_count": 2,
+        "rotation_interval": 900,
         "scheduling_weight": 1.0
       }
     },
@@ -97,10 +97,10 @@
       "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
-        "sampling_count": 200,
+        "sampling_count": 100,
         "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 1200,
+        "rotation_count": 2,
+        "rotation_interval": 900,
         "scheduling_weight": 1.0
       }
     },
@@ -115,10 +115,10 @@
           "field": "completed_up_to",
           "range_type": "zero_to_value"
         },
-        "sampling_count": 80,
+        "sampling_count": 40,
         "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 3600,
+        "rotation_count": 1,
+        "rotation_interval": 900,
         "scheduling_weight": 1.0
       }
     }

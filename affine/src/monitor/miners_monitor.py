@@ -583,6 +583,33 @@ class MinersMonitor:
         
         return miners
     
+    async def _release_terminated_chutes(self, miners: list):
+        """Release chute deployments for miners terminated by champion challenge."""
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        from affine.utils.api_client import delete_chute
+
+        miner_stats_dao = MinerStatsDAO()
+
+        for miner in miners:
+            if not miner.chute_id or miner.chute_status != 'hot':
+                continue
+            if miner.uid == 0 or miner.uid > 1000:
+                continue
+
+            try:
+                state = await miner_stats_dao.get_challenge_state(
+                    miner.hotkey, miner.revision)
+                if state.get('challenge_status') != 'terminated':
+                    continue
+
+                logger.info(
+                    f"[MinersMonitor] Releasing chute for terminated miner "
+                    f"uid={miner.uid} chute_id={miner.chute_id}")
+                await delete_chute(miner.chute_id)
+            except Exception as e:
+                logger.warning(
+                    f"[MinersMonitor] Failed to release chute for uid={miner.uid}: {e}")
+
     async def refresh_miners(self) -> Dict[str, MinerInfo]:
         """Refresh and validate all miners
         
@@ -746,6 +773,9 @@ class MinersMonitor:
                     first_block=miner.block,
                     template_check_result=miner.template_check_result,
                 )
+
+            # Release chutes for terminated miners that still have hot instances
+            await self._release_terminated_chutes(miners)
 
             valid_miners = {m.key(): m for m in miners if m.is_valid}
 

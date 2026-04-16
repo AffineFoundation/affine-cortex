@@ -32,7 +32,7 @@ class MinerSlotsAdjuster:
     
     DEFAULT_SLOTS = 10
     MIN_SLOTS = 10
-    MAX_SLOTS = 16
+    MAX_SLOTS = 50
     ADJUSTMENT_INTERVAL = 21600  # 6 hours in seconds
     MIN_SAMPLES_FOR_ADJUSTMENT = 50
     HIGH_SUCCESS_THRESHOLD = 0.80

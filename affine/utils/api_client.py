@@ -324,6 +324,36 @@ class APIClient:
             logger.debug(f"Failed to fetch chute {chute_id}: {e}")
             return None
 
+    async def delete_chute(self, chute_id: str) -> bool:
+        """Delete a chute deployment via Chutes API.
+
+        Args:
+            chute_id: Chute deployment ID
+
+        Returns:
+            True if deleted successfully, False otherwise
+        """
+        url = f"https://api.chutes.ai/chutes/{chute_id}"
+        token = os.getenv("CHUTES_API_KEY", "")
+
+        if not token:
+            logger.warning("CHUTES_API_KEY not configured, cannot delete chute")
+            return False
+
+        headers = {"Authorization": token}
+
+        try:
+            async with self._session.delete(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    logger.info(f"Deleted chute {chute_id}")
+                    return True
+                body = await resp.text()
+                logger.warning(f"Failed to delete chute {chute_id}: HTTP {resp.status} {body[:200]}")
+                return False
+        except Exception as e:
+            logger.error(f"Error deleting chute {chute_id}: {e}")
+            return False
+
 
 def cli_api_client(base_url: Optional[str] = None) -> CLIAPIClient:
     """Create CLI-specific API client context manager.
@@ -349,6 +379,12 @@ async def get_chute_info(chute_id: str) -> Optional[Dict]:
     """
     async with cli_api_client() as client:
         return await client.get_chute_info(chute_id)
+
+
+async def delete_chute(chute_id: str) -> bool:
+    """Delete a chute deployment via Chutes API."""
+    async with cli_api_client() as client:
+        return await client.delete_chute(chute_id)
 
 
 async def create_api_client(base_url: Optional[str] = None) -> APIClient:

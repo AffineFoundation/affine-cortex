@@ -30,13 +30,12 @@ class PerMinerSamplingScheduler:
     5. Priority-based task selection from sampling list tail
     6. Rate limiting: actual sampling rate is limited to rotation_rate * RATE_MARGIN
        to prevent answer memorization attacks (independent of rotation_enabled)
-    7. Minimum rate guarantee: allowed rate is at least sampling_count/48 per hour
-       to ensure sampling completes within 2 days
+    7. Rate is based on rotation rate only — no minimum guarantee
     """
 
     DEFAULT_SLOTS = 10
     MIN_SLOTS = 10
-    MAX_SLOTS = 16
+    MAX_SLOTS = 50
 
     # Rate limiting: allow actual sampling rate to exceed rotation rate by this margin
     RATE_MARGIN = 1.2
@@ -329,11 +328,7 @@ class PerMinerSamplingScheduler:
         else:
             rotation_rate = 0
 
-        # Minimum rate guarantee: ensure sampling can complete within 48 hours
-        min_rate = sampling_count / 48 if sampling_count > 0 else 0
-
-        # Use the higher of rotation rate and minimum rate
-        allowed_per_hour = max(rotation_rate, min_rate)
+        allowed_per_hour = rotation_rate
 
         # If no valid rate can be calculated, don't limit
         if allowed_per_hour <= 0:
@@ -994,11 +989,11 @@ class SamplingScheduler:
                 pass
     
     async def _rotation_loop(self):
-        """Rotation loop - checks every 5 minutes."""
+        """Rotation loop - checks every 60 seconds."""
         while self._running:
             try:
                 await self._check_and_rotate_all_envs()
-                await asyncio.sleep(300)
+                await asyncio.sleep(60)
             except asyncio.CancelledError:
                 logger.info("Rotation loop cancelled")
                 break
