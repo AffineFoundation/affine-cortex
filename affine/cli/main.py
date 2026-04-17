@@ -155,9 +155,22 @@ def scheduler(ctx):
 def validator(ctx):
     """Start validator service."""
     from affine.src.validator.main import main as validator_main
-    
+
     sys.argv = ["validator"] + ctx.args
     validator_main.main(standalone_mode=False)
+
+
+@servers.command(
+    "targon-deployer",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.pass_context
+def targon_deployer(ctx):
+    """Start Targon deployer reconciler service."""
+    from affine.src.targon_deployer.__main__ import main as targon_main
+
+    sys.argv = ["targon-deployer"] + ctx.args
+    targon_main.main(standalone_mode=False)
 
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -383,6 +396,12 @@ cli.add_command(db)
 from affine.cli.miner_stats import miner_stats
 miner_stats.hidden = not SHOW_ADMIN_COMMANDS
 cli.add_command(miner_stats)
+
+
+# Targon provider management commands
+from affine.cli.targon import targon as targon_group
+targon_group.hidden = not SHOW_ADMIN_COMMANDS
+cli.add_command(targon_group)
 
 
 # ============================================================================

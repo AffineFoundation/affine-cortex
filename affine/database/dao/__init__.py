@@ -11,6 +11,7 @@ from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
+from affine.database.dao.targon_deployments import TargonDeploymentsDAO
 
 __all__ = [
     "SampleResultsDAO",
@@ -20,4 +21,5 @@ __all__ = [
     "SystemConfigDAO",
     "MinersDAO",
     "MinerStatsDAO",
+    "TargonDeploymentsDAO",
 ]

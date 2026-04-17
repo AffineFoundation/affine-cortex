@@ -190,29 +190,38 @@ class ExecutorWorker:
             task_id = int(task["task_id"])
             task_uuid = task.get("task_uuid", "")
             miner_hotkey = task["miner_hotkey"]
-            chute_slug = task.get("chute_slug", "")
-            
+            chute_slug = task.get("chute_slug", "") or ""
+            base_url = task.get("base_url")
+            public_base_url = task.get("public_base_url")
+            inference_model = task.get("inference_model")
+            provider = task.get("provider", "chutes" if chute_slug else "unknown")
+
             safe_log(
                 f"[{self.env}] Executing task: "
-                f"uuid={task_uuid[:8]}... miner={miner_hotkey[:12]}... model={model} task_id={task_id}",
+                f"uuid={task_uuid[:8]}... miner={miner_hotkey[:12]}... model={model} "
+                f"task_id={task_id} provider={provider}",
                 "DEBUG"
             )
-            
-            if not chute_slug:
+
+            if not base_url and not chute_slug:
                 raise ValueError(
-                    f"chute_slug is required but missing for task {task_uuid[:8]}... "
+                    f"neither base_url nor chute_slug present for task {task_uuid[:8]}... "
                     f"miner={miner_hotkey[:12]}..."
                 )
-            
+
             # Create a minimal miner object for evaluate()
             class MinimalMiner:
-                def __init__(self, model, slug, hotkey):
+                def __init__(self, model, slug, hotkey, base_url, public_base_url, inference_model):
                     self.model = model
-                    self.slug = chute_slug.replace('.chutes.ai', '').replace('https://', '')
+                    self.slug = (slug.replace('.chutes.ai', '').replace('https://', '')
+                                 if slug else None)
                     self.hotkey = hotkey
                     self.revision = ""
-            
-            miner = MinimalMiner(model, chute_slug, miner_hotkey)
+                    self.base_url = base_url
+                    self.public_base_url = public_base_url
+                    self.inference_model = inference_model
+
+            miner = MinimalMiner(model, chute_slug, miner_hotkey, base_url, public_base_url, inference_model)
             
             # Call SDKEnvironment.evaluate() which returns a Result object
             result = await self.env_executor.evaluate(
