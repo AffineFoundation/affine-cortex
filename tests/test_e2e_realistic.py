@@ -179,6 +179,8 @@ class TestFullLifecycle:
         """Challenge counters survive round-trip through DB mocks."""
         config = ScorerConfig()
         config.CHAMPION_WARMUP_CHECKPOINTS = 0
+        config.CHAMPION_TERMINATION_CONSECUTIVE_LOSSES = 2
+        config.CHAMPION_TERMINATION_TOTAL_LOSSES = 2
         scorer = Scorer(config)
         db = MockedDB()
 
@@ -196,7 +198,7 @@ class TestFullLifecycle:
         assert s1['challenge_total_losses'] == 1
         assert s1['challenge_status'] == 'sampling'
 
-        # Round 2: more data, checkpoint 2 fires, 2 consecutive losses → terminated
+        # Round 2: more data, 2 consecutive losses → terminated
         await run_round(scorer, db, miners, n_tasks=2 * WINDOW, block_number=1100)
         s2 = db.challenge_states['hk_weak']
         assert s2['challenge_checkpoints_passed'] == 2
