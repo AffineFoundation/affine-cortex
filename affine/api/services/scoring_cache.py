@@ -182,16 +182,28 @@ class ScoringCacheManager:
         # 2. Detect miner changes
         previous_miner_keys = getattr(self, '_previous_miner_keys', set())
         removed_miners = previous_miner_keys - current_miner_keys
-        
-        # 3. Remove invalid miner cache (from both scoring and sampling)
+
+        # 3. Remove invalid miner cache, but keep terminated miners
+        # so their last known scores are preserved in scoring_data
         if removed_miners:
+            from affine.database.dao.miner_stats import MinerStatsDAO
+            miner_stats_dao = MinerStatsDAO()
             for hotkey, revision in removed_miners:
                 key = f"{hotkey}#{revision}"
-                
+
+                # Check if this miner is terminated — if so, keep cache
+                try:
+                    state = await miner_stats_dao.get_challenge_state(hotkey, revision)
+                    if state.get('challenge_status') == 'terminated':
+                        logger.debug(f"Keeping cache for terminated miner {hotkey[:8]}...")
+                        continue
+                except Exception:
+                    pass
+
                 # Remove from both caches
                 self._scoring_data.pop(key, None)
                 self._sampling_data.pop(key, None)
-                
+
                 logger.info(f"Removed cache for invalid miner {hotkey[:8]}...#{revision[:8]}...")
         
         # 4. Get environment configurations

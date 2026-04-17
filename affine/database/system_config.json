@@ -10,7 +10,7 @@
         "sampling_count": 100,
         "rotation_enabled": true,
         "rotation_count": 2,
-        "rotation_interval": 900,
+        "rotation_interval": 540,
         "scheduling_weight": 3.0
       }
     },
@@ -48,7 +48,7 @@
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 900,
+        "rotation_interval": 540,
         "scheduling_weight": 1.0
       }
     },
@@ -61,7 +61,7 @@
         "sampling_count": 100,
         "rotation_enabled": true,
         "rotation_count": 2,
-        "rotation_interval": 900,
+        "rotation_interval": 540,
         "scheduling_weight": 1.0
       }
     },
@@ -87,7 +87,7 @@
         "sampling_count": 100,
         "rotation_enabled": true,
         "rotation_count": 2,
-        "rotation_interval": 900,
+        "rotation_interval": 540,
         "scheduling_weight": 1.0
       }
     },
@@ -100,7 +100,7 @@
         "sampling_count": 100,
         "rotation_enabled": true,
         "rotation_count": 2,
-        "rotation_interval": 900,
+        "rotation_interval": 540,
         "scheduling_weight": 1.0
       }
     },
@@ -118,7 +118,7 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 900,
+        "rotation_interval": 540,
         "scheduling_weight": 1.0
       }
     }

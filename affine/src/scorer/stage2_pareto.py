@@ -51,8 +51,10 @@ class Stage2ParetoFilter:
             else:
                 t = 1.0
             margin = m_start + t * (m_end - m_start)
+            not_worse_tol = self.config.WIN_NOT_WORSE_TOLERANCE
         else:
             margin = self.config.PARETO_MARGIN
+            not_worse_tol = 1e-9  # No tolerance for pairwise
         b_dominant = 0   # envs where B beats A by margin
         b_not_worse = 0  # envs where B >= A (no margin required)
         a_dominant = 0
@@ -81,8 +83,8 @@ class Stage2ParetoFilter:
                 b_dominant += 1
                 b_not_worse += 1
                 winner = "B"
-            elif score_b >= score_a - 1e-9:
-                # B is not worse (at least tied)
+            elif score_b >= score_a * (1 - not_worse_tol) - 1e-9:
+                # B is not worse (within tolerance of champion's score)
                 b_not_worse += 1
                 a_not_worse += 1
                 winner = "A"  # incumbent advantage: tie goes to A

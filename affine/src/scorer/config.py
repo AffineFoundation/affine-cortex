@@ -30,11 +30,20 @@ class ScorerConfig:
 
     WIN_MIN_DOMINANT_ENVS: int = 3
     """Champion challenge: minimum environments where the challenger must
-    exceed by PARETO_MARGIN. Remaining environments must not be worse
-    (score_b >= score_a).
+    exceed by margin. Remaining environments must not be worse than
+    score_a - WIN_NOT_WORSE_TOLERANCE.
 
     0 = strict: must exceed in ALL environments.
     N > 0 = partial: exceed in at least N, not lose in any other.
+    """
+
+    WIN_NOT_WORSE_TOLERANCE: float = 0.015
+    """Tolerance ratio for "not worse" check in champion challenge.
+
+    Challenger is considered "not worse" in an env if
+    score_b >= score_a * (1 - tolerance). E.g., if champion scores
+    0.45 and tolerance is 0.015, challenger needs >= 0.45 * 0.985 = 0.443.
+    Accounts for random noise in non-dominant environments.
     """
 
     PARETO_MIN_DOMINANT_ENVS: int = 0
@@ -84,10 +93,10 @@ class ScorerConfig:
     take the crown. CP=10 means 10×window_size common tasks
     (e.g., window=100 → 1000 tasks)."""
 
-    CHAMPION_TERMINATION_TOTAL_LOSSES: int = 3
+    CHAMPION_TERMINATION_TOTAL_LOSSES: int = 4
     """Accumulated post-warmup losses → terminate sampling."""
 
-    CHAMPION_TERMINATION_CONSECUTIVE_LOSSES: int = 2
+    CHAMPION_TERMINATION_CONSECUTIVE_LOSSES: int = 3
     """Consecutive post-warmup losses → terminate sampling."""
 
     PARETO_MIN_WINDOWS: int = 3
