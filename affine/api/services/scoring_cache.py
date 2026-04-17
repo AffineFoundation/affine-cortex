@@ -182,16 +182,28 @@ class ScoringCacheManager:
         # 2. Detect miner changes
         previous_miner_keys = getattr(self, '_previous_miner_keys', set())
         removed_miners = previous_miner_keys - current_miner_keys
-        
-        # 3. Remove invalid miner cache (from both scoring and sampling)
+
+        # 3. Remove invalid miner cache, but keep terminated miners
+        # so their last known scores are preserved in scoring_data
         if removed_miners:
+            from affine.database.dao.miner_stats import MinerStatsDAO
+            miner_stats_dao = MinerStatsDAO()
             for hotkey, revision in removed_miners:
                 key = f"{hotkey}#{revision}"
-                
+
+                # Check if this miner is terminated — if so, keep cache
+                try:
+                    state = await miner_stats_dao.get_challenge_state(hotkey, revision)
+                    if state.get('challenge_status') == 'terminated':
+                        logger.debug(f"Keeping cache for terminated miner {hotkey[:8]}...")
+                        continue
+                except Exception:
+                    pass
+
                 # Remove from both caches
                 self._scoring_data.pop(key, None)
                 self._sampling_data.pop(key, None)
-                
+
                 logger.info(f"Removed cache for invalid miner {hotkey[:8]}...#{revision[:8]}...")
         
         # 4. Get environment configurations
@@ -243,6 +255,41 @@ class ScoringCacheManager:
                 # Update UID if it changed
                 self._sampling_data[key]['uid'] = uid
         
+        # 5b. Also include terminated miners not in valid_miners,
+        # so their last known scores remain visible in af get-rank.
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        miner_stats_dao = MinerStatsDAO()
+        all_db_miners = await miners_dao.get_all_miners()
+        terminated_added = 0
+        for miner in all_db_miners:
+            hotkey = miner.get('hotkey', '')
+            revision = miner.get('revision', '')
+            if not hotkey or not revision:
+                continue
+            if (hotkey, revision) in current_miner_keys:
+                continue  # Already in valid_miners
+            key = f"{hotkey}#{revision}"
+            try:
+                state = await miner_stats_dao.get_challenge_state(hotkey, revision)
+                if state.get('challenge_status') != 'terminated':
+                    continue
+            except Exception:
+                continue
+            if key not in self._scoring_data:
+                self._scoring_data[key] = {
+                    'uid': miner.get('uid', 0),
+                    'hotkey': hotkey,
+                    'model_revision': revision,
+                    'model_repo': miner.get('model', ''),
+                    'first_block': miner.get('first_block', 0),
+                    'env': {}
+                }
+                # Add to valid_miners list so step 6 queries their samples
+                valid_miners.append(miner)
+                terminated_added += 1
+        if terminated_added:
+            logger.info(f"Added {terminated_added} terminated miners to scoring cache")
+
         # 6. Build concurrent query tasks for ALL miner×env combinations
         async def query_and_populate(miner: dict, env_name: str, env_config: dict):
             """Query a single miner×env and populate caches."""
