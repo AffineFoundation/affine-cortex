@@ -255,6 +255,41 @@ class ScoringCacheManager:
                 # Update UID if it changed
                 self._sampling_data[key]['uid'] = uid
         
+        # 5b. Also include terminated miners not in valid_miners,
+        # so their last known scores remain visible in af get-rank.
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        miner_stats_dao = MinerStatsDAO()
+        all_db_miners = await miners_dao.get_all_miners()
+        terminated_added = 0
+        for miner in all_db_miners:
+            hotkey = miner.get('hotkey', '')
+            revision = miner.get('revision', '')
+            if not hotkey or not revision:
+                continue
+            if (hotkey, revision) in current_miner_keys:
+                continue  # Already in valid_miners
+            key = f"{hotkey}#{revision}"
+            try:
+                state = await miner_stats_dao.get_challenge_state(hotkey, revision)
+                if state.get('challenge_status') != 'terminated':
+                    continue
+            except Exception:
+                continue
+            if key not in self._scoring_data:
+                self._scoring_data[key] = {
+                    'uid': miner.get('uid', 0),
+                    'hotkey': hotkey,
+                    'model_revision': revision,
+                    'model_repo': miner.get('model', ''),
+                    'first_block': miner.get('first_block', 0),
+                    'env': {}
+                }
+                # Add to valid_miners list so step 6 queries their samples
+                valid_miners.append(miner)
+                terminated_added += 1
+        if terminated_added:
+            logger.info(f"Added {terminated_added} terminated miners to scoring cache")
+
         # 6. Build concurrent query tasks for ALL miner×env combinations
         async def query_and_populate(miner: dict, env_name: str, env_config: dict):
             """Query a single miner×env and populate caches."""
