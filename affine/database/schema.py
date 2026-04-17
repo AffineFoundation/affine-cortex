@@ -324,6 +324,51 @@ ANTI_COPY_RESULTS_TTL = {
 
 
 
+# Targon Deployments Table
+# Tracks Targon GPU deployments managed by the validator for champion (and
+# future) models. Read by ProviderRouter on every fetch_task, written by the
+# targon_deployer reconciler.
+#
+# Schema design:
+# - PK: DEPLOYMENT#{deployment_id} - each Targon deployment is a single row
+# - SK: META
+# - GSI1: hotkey-revision-index for "does the current champion already have a
+#         live deployment?" lookups
+# - GSI2: status-index for "give me all active / rebuilding deployments" sweeps
+TARGON_DEPLOYMENTS_SCHEMA = {
+    "TableName": get_table_name("targon_deployments"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},
+        {"AttributeName": "sk", "KeyType": "RANGE"},
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+        {"AttributeName": "gsi1_pk", "AttributeType": "S"},
+        {"AttributeName": "gsi1_sk", "AttributeType": "S"},
+        {"AttributeName": "gsi2_pk", "AttributeType": "S"},
+    ],
+    "GlobalSecondaryIndexes": [
+        {
+            "IndexName": "hotkey-revision-index",
+            "KeySchema": [
+                {"AttributeName": "gsi1_pk", "KeyType": "HASH"},
+                {"AttributeName": "gsi1_sk", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        },
+        {
+            "IndexName": "status-index",
+            "KeySchema": [
+                {"AttributeName": "gsi2_pk", "KeyType": "HASH"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        },
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+
 # All table schemas
 ALL_SCHEMAS = [
     SAMPLE_RESULTS_SCHEMA,
@@ -335,4 +380,5 @@ ALL_SCHEMAS = [
     SCORE_SNAPSHOTS_SCHEMA,
     MINER_STATS_SCHEMA,
     ANTI_COPY_RESULTS_SCHEMA,
+    TARGON_DEPLOYMENTS_SCHEMA,
 ]
