@@ -6,6 +6,21 @@ import math
 from typing import List
 
 
+def _safe_log_geometric_mean(values: List[float]) -> float:
+    """Compute the geometric mean in log-space.
+
+    Returns 0.0 for any non-positive input or if the computation fails.
+    """
+    if not values or any(v <= 0 for v in values):
+        return 0.0
+
+    try:
+        log_mean = sum(math.log(v) for v in values) / len(values)
+        return math.exp(log_mean)
+    except (ValueError, OverflowError):
+        return 0.0
+
+
 def geometric_mean(values: List[float], epsilon: float = 0.0) -> float:
     """Geometric mean with optional epsilon smoothing.
 
@@ -23,24 +38,8 @@ def geometric_mean(values: List[float], epsilon: float = 0.0) -> float:
     if not values:
         return 0.0
 
-    n = len(values)
-
     if epsilon > 0:
         adjusted_values = [v + epsilon for v in values]
-        if any(v <= 0 for v in adjusted_values):
-            return 0.0
+        return max(_safe_log_geometric_mean(adjusted_values) - epsilon, 0.0)
 
-        try:
-            log_mean = sum(math.log(v) for v in adjusted_values) / n
-            return max(math.exp(log_mean) - epsilon, 0.0)
-        except (ValueError, OverflowError):
-            return 0.0
-
-    if any(v <= 0 for v in values):
-        return 0.0
-
-    try:
-        log_mean = sum(math.log(v) for v in values) / n
-        return math.exp(log_mean)
-    except (ValueError, OverflowError):
-        return 0.0
+    return _safe_log_geometric_mean(values)
