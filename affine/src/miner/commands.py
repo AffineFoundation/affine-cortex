@@ -513,12 +513,7 @@ async def get_miner_command(uid: int):
                 print(f"  Consecutive losses:  {cs.get('challenge_consecutive_losses', 0)}")
                 if status == 'terminated':
                     reason = cs.get('termination_reason', 'unknown')
-                    if reason == 'challenge_loss':
-                        print(f"  Termination reason:  Challenge loss (accumulated too many losses vs champion)")
-                    elif reason == 'pairwise':
-                        print(f"  Termination reason:  Pairwise filter (dominated by an older miner)")
-                    else:
-                        print(f"  Termination reason:  {reason}")
+                    print(f"  Termination reason:  {reason}")
 
             if stats_data and stats_data.get('sampling_stats'):
                 print("\n" + "="*80)

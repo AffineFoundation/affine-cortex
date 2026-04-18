@@ -512,7 +512,8 @@ class TestProductionSimulation:
         # After 6 rounds: hk_weak (0.30) terminated — either by challenge
         # losses or pairwise filter (dominated by stronger miners in all envs)
         assert db.challenge_states['hk_weak']['challenge_status'] == 'terminated'
-        assert db.challenge_states['hk_weak']['termination_reason'] in ('challenge_loss', 'pairwise')
+        reason = db.challenge_states['hk_weak']['termination_reason']
+        assert 'dominated_by' in reason or 'lost_to_champion' in reason
         # Champion unchanged (nobody beats alpha)
         assert db.champion['hotkey'] == 'hk_alpha'
 
@@ -541,7 +542,8 @@ class TestProductionSimulation:
         # Copycat terminated — either by pairwise (identical scores to an older
         # miner) or by challenge losses (can't exceed champion by margin)
         assert db.challenge_states['hk_copycat']['challenge_status'] == 'terminated'
-        assert db.challenge_states['hk_copycat']['termination_reason'] in ('pairwise', 'challenge_loss')
+        reason = db.challenge_states['hk_copycat']['termination_reason']
+        assert 'dominated_by' in reason or 'lost_to_champion' in reason
         # Champion still hk_strong
         assert db.champion['hotkey'] == 'hk_strong'
 

@@ -41,7 +41,7 @@ class MinerData:
     challenge_consecutive_losses: int = 0
     challenge_checkpoints_passed: int = 0
     challenge_status: str = 'sampling'  # 'sampling' | 'terminated'
-    termination_reason: str = ''        # '' | 'challenge_loss' | 'pairwise'
+    termination_reason: str = ''        # Detailed reason with hotkey and per-env scores
     is_champion: bool = False
 
     # Final weight (set by champion challenge: 1.0 for champion, 0.0 for others)

@@ -116,13 +116,15 @@ class ScorerConfig:
             'win_margin_start': cls.WIN_MARGIN_START,
             'win_margin_end': cls.WIN_MARGIN_END,
             'win_min_dominant_envs': cls.WIN_MIN_DOMINANT_ENVS,
+            'win_not_worse_tolerance': cls.WIN_NOT_WORSE_TOLERANCE,
+            'pareto_margin': cls.PARETO_MARGIN,
             'pareto_min_dominant_envs': cls.PARETO_MIN_DOMINANT_ENVS,
+            'pareto_min_windows': cls.PARETO_MIN_WINDOWS,
             'geometric_mean_epsilon': cls.GEOMETRIC_MEAN_EPSILON,
             'champion_warmup_checkpoints': cls.CHAMPION_WARMUP_CHECKPOINTS,
             'champion_dethrone_min_checkpoint': cls.CHAMPION_DETHRONE_MIN_CHECKPOINT,
             'champion_termination_total_losses': cls.CHAMPION_TERMINATION_TOTAL_LOSSES,
             'champion_termination_consecutive_losses': cls.CHAMPION_TERMINATION_CONSECUTIVE_LOSSES,
-            'pareto_min_windows': cls.PARETO_MIN_WINDOWS,
         }
 
     @classmethod
