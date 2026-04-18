@@ -2,6 +2,7 @@
 Scorer Utility Functions
 """
 
+import math
 from typing import List
 
 
@@ -10,7 +11,7 @@ def geometric_mean(values: List[float], epsilon: float = 0.0) -> float:
 
     When epsilon > 0, applies smoothing to prevent zero scores from
     collapsing the result to 0:
-        GM_smoothed = ((v1+e) * (v2+e) * ... * (vn+e))^(1/n) - e
+        GM_smoothed = exp((log(v1+e) + log(v2+e) + ... + log(vn+e)) / n) - e
 
     Args:
         values: list of numeric values (typically in [0, 1])
@@ -21,17 +22,25 @@ def geometric_mean(values: List[float], epsilon: float = 0.0) -> float:
     """
     if not values:
         return 0.0
+
     n = len(values)
 
     if epsilon > 0:
-        product = 1.0
-        for v in values:
-            product *= (v + epsilon)
-        return max(product ** (1.0 / n) - epsilon, 0.0)
+        adjusted_values = [v + epsilon for v in values]
+        if any(v <= 0 for v in adjusted_values):
+            return 0.0
+
+        try:
+            log_mean = sum(math.log(v) for v in adjusted_values) / n
+            return max(math.exp(log_mean) - epsilon, 0.0)
+        except (ValueError, OverflowError):
+            return 0.0
 
     if any(v <= 0 for v in values):
         return 0.0
-    product = 1.0
-    for v in values:
-        product *= v
-    return product ** (1.0 / n)
+
+    try:
+        log_mean = sum(math.log(v) for v in values) / n
+        return math.exp(log_mean)
+    except (ValueError, OverflowError):
+        return 0.0
