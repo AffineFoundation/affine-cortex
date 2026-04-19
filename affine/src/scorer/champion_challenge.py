@@ -178,8 +178,9 @@ class ChampionChallenge:
                     min_dominant_envs=0)  # strict: ALL envs
                 if cmp.b_dominates_a:  # champion actively beats miner in every env
                     m.challenge_status = 'terminated'
-                    detail = ','.join(f'{e}:{d.get("a_score",0):.3f}<{d.get("b_score",0):.3f}'
-                                     for e, d in cmp.env_comparisons.items() if d.get("winner"))
+                    detail = ','.join(
+                        f'{e}:{d.get("a_score",0):.3f}vs{d.get("b_score",0):.3f}{"✗" if d.get("winner")!="A" else "✓"}'
+                        for e, d in cmp.env_comparisons.items() if d.get("winner"))
                     m.termination_reason = f'dominated_by_champion:{champion_miner.hotkey[:10]}|{detail}'
                     logger.info(f"CHAMPION DOMINANCE: UID {uid} terminated "
                                 f"(champion exceeds by margin in all envs)")
@@ -207,14 +208,16 @@ class ChampionChallenge:
                     min_dominant_envs=self.config.PARETO_MIN_DOMINANT_ENVS)
                 if cmp.a_dominates_b:
                     miner_b.challenge_status = 'terminated'
-                    detail = ','.join(f'{e}:{d.get("b_score",0):.3f}<{d.get("a_score",0):.3f}'
-                                     for e, d in cmp.env_comparisons.items() if d.get("winner"))
+                    detail = ','.join(
+                        f'{e}:{d.get("b_score",0):.3f}vs{d.get("a_score",0):.3f}{"✗" if d.get("winner")=="A" else "✓"}'
+                        for e, d in cmp.env_comparisons.items() if d.get("winner"))
                     miner_b.termination_reason = f'dominated_by:{miner_a.hotkey[:10]}|{detail}'
                     logger.info(f"PAIRWISE: UID {uid_b} terminated by older UID {uid_a}")
                 elif cmp.b_dominates_a:
                     miner_a.challenge_status = 'terminated'
-                    detail = ','.join(f'{e}:{d.get("a_score",0):.3f}<{d.get("b_score",0):.3f}'
-                                     for e, d in cmp.env_comparisons.items() if d.get("winner"))
+                    detail = ','.join(
+                        f'{e}:{d.get("a_score",0):.3f}vs{d.get("b_score",0):.3f}{"✗" if d.get("winner")=="B" else "✓"}'
+                        for e, d in cmp.env_comparisons.items() if d.get("winner"))
                     miner_a.termination_reason = f'dominated_by:{miner_b.hotkey[:10]}|{detail}'
                     logger.info(f"PAIRWISE: UID {uid_a} terminated by newer UID {uid_b}")
                     break
