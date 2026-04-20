@@ -7,30 +7,11 @@
       "min_completeness": 0.85,
       "sampling_config": {
         "dataset_range": [[0, 500000000],[600000000, 800000000]],
-        "sampling_count": 100,
-        "rotation_enabled": true,
-        "rotation_count": 2,
-        "rotation_interval": 540,
-        "scheduling_weight": 3.0
-      }
-    },
-    "SWE-SYNTH": {
-      "display_name": "SWE-SYNTH",
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "min_completeness": 0.8,
-      "sampling_config": {
-        "dataset_range": [[300, 400]],
-        "dataset_range_source": {
-          "url": "https://pub-4b43a94ed07d4ac38fae3f4cb5070d6c.r2.dev/bugs/metadata.json",
-          "field": "tasks.completed_up_to",
-          "range_type": "zero_to_value"
-        },
-        "sampling_count": 100,
+        "sampling_count": 80,
         "rotation_enabled": true,
         "rotation_count": 3,
-        "rotation_interval": 3600,
-        "scheduling_weight": 1.0
+        "rotation_interval": 680,
+        "scheduling_weight": 3.0
       }
     },
     "SWE-INFINITE": {
@@ -48,7 +29,7 @@
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 540,
+        "rotation_interval": 360,
         "scheduling_weight": 1.0
       }
     },
@@ -58,10 +39,10 @@
       "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 78060000]],
-        "sampling_count": 100,
+        "sampling_count": 80,
         "rotation_enabled": true,
-        "rotation_count": 2,
-        "rotation_interval": 540,
+        "rotation_count": 3,
+        "rotation_interval": 680,
         "scheduling_weight": 1.0
       }
     },
@@ -84,10 +65,10 @@
       "min_completeness": 0.85,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
-        "sampling_count": 100,
+        "sampling_count": 80,
         "rotation_enabled": true,
-        "rotation_count": 2,
-        "rotation_interval": 540,
+        "rotation_count": 3,
+        "rotation_interval": 680,
         "scheduling_weight": 1.0
       }
     },
@@ -97,10 +78,10 @@
       "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
-        "sampling_count": 100,
+        "sampling_count": 80,
         "rotation_enabled": true,
-        "rotation_count": 2,
-        "rotation_interval": 540,
+        "rotation_count": 3,
+        "rotation_interval": 680,
         "scheduling_weight": 1.0
       }
     },
@@ -118,7 +99,7 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 540,
+        "rotation_interval": 450,
         "scheduling_weight": 1.0
       }
     }
