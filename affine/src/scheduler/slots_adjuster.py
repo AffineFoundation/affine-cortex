@@ -180,12 +180,16 @@ class MinerSlotsAdjuster:
         if success_rate is None:
             success_rate = successful_samples / total_samples if total_samples > 0 else 0
         
+        # Enforce MIN_SLOTS for miners with stale low values
+        if current_slots < self.MIN_SLOTS:
+            current_slots = self.MIN_SLOTS
+
         # Determine adjustment
         new_slots = current_slots
         action = "unchanged"
-        
+
         if success_rate >= self.HIGH_SUCCESS_THRESHOLD:
-            new_slots = min(current_slots + 1, self.MAX_SLOTS)
+            new_slots = min(current_slots + 3, self.MAX_SLOTS)
             if new_slots > current_slots:
                 action = "increased"
         elif success_rate < self.LOW_SUCCESS_THRESHOLD:

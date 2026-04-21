@@ -98,7 +98,7 @@ class MinerStatsDAO(BaseDAO):
                 'is_currently_online': is_online,
                 'sampling_stats': {},
                 'env_stats': {},
-                'sampling_slots': 6,  # Default slots
+                'sampling_slots': 15,  # Default slots (1.5x MIN_SLOTS)
                 'slots_last_adjusted_at': 0  # Never adjusted
             }
         
@@ -197,7 +197,7 @@ class MinerStatsDAO(BaseDAO):
                 'is_currently_online': True,
                 'sampling_stats': global_stats,
                 'env_stats': env_stats,
-                'sampling_slots': 6,  # Default slots
+                'sampling_slots': 15,  # Default slots (1.5x MIN_SLOTS)
                 'slots_last_adjusted_at': 0  # Never adjusted
             }
             await self.put(updated_item)
