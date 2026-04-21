@@ -277,7 +277,10 @@ class TargonClient:
         commands: Optional[List[str]] = (
             ["python", "-m", "sglang.launch_server"] if eng == "sglang" else None
         )
-        max_model_len = os.getenv("TARGON_MAX_MODEL_LEN") or os.getenv("TARGON_VLLM_MAX_MODEL_LEN", "16384")
+        # Default 65536: SWE/agent envs send ~20k+ input often; 16k was too
+        # tight. With 2×H100 (160 GB) this fits comfortably for typical
+        # Affine miner models (14-32B fp16) after weights + activations.
+        max_model_len = os.getenv("TARGON_MAX_MODEL_LEN") or os.getenv("TARGON_VLLM_MAX_MODEL_LEN", "65536")
         # Default 0.8 is conservative enough to avoid KV cache OOM across the
         # diverse miner models (Qwen / Llama / Mistral). Operator overrides
         # win via env.
