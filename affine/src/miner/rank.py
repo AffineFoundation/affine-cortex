@@ -322,12 +322,14 @@ async def print_rank_table():
             else:
                 status_str = "sampling"
                 cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"
+                parts = []
                 if m.checkpoints_passed >= dethrone_cp and m.consecutive_wins > 0:
-                    challenge_str = "READY"
-                elif m.total_losses > 0:
-                    challenge_str = f"L:{m.total_losses}/{M}"
-                else:
-                    challenge_str = "—"
+                    parts.append("READY")
+                elif m.consecutive_wins > 0:
+                    parts.append(f"W:{m.consecutive_wins}")
+                if m.total_losses > 0:
+                    parts.append(f"L:{m.total_losses}/{M}")
+                challenge_str = " ".join(parts) if parts else "—"
 
             row_parts.append(f"{status_str:>11}")
             row_parts.append(f"{cp_str:>5}")
