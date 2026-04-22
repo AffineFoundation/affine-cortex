@@ -178,6 +178,10 @@ class Scorer:
                     "sample_count": score.sample_count,
                     "historical_count": score.historical_count,
                     "completeness": score.completeness,
+                    # Real per-challenger vs-champion numbers, populated by
+                    # champion_challenge. Absent when miner is champion or
+                    # shares no tasks with champion in this env.
+                    **miner.vs_champion_per_env.get(env, {}),
                 }
                 for env, score in miner.env_scores.items()
             }

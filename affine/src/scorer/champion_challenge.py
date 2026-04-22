@@ -85,6 +85,12 @@ class ChampionChallenge:
         # Termination check (after dethrone — its reset wipes counters first)
         self._check_terminations(miners, champion_uid)
 
+        # Per-challenger vs-champion snapshot for UI/diagnostics. Populates
+        # miner.vs_champion_per_env for every non-champion miner with the
+        # real common-task data that Pareto would use. Not CP-gated — every
+        # round, so rank display always has a current threshold.
+        self._populate_vs_champion_per_env(miners, environments, champion_miner)
+
         final_weights = self._assign_weights(miners, weight_uid)
         self._log_summary(miners, champion_uid, champion_changed)
 
@@ -333,6 +339,52 @@ class ChampionChallenge:
                     or miner.challenge_consecutive_losses >= M_con):
                 miner.challenge_status = 'terminated'
                 # termination_reason already set by _run_challenges with last loss detail
+
+    # ── Phase 5b: Per-challenger vs-champion snapshot ────────────────────────
+
+    def _populate_vs_champion_per_env(
+        self,
+        miners: Dict[int, MinerData],
+        environments: List[str],
+        champion_miner: Optional[MinerData],
+    ) -> None:
+        """Fill miner.vs_champion_per_env for every non-champion miner.
+
+        For each (challenger, env) this records the exact numbers the Pareto
+        comparison uses: champion's avg on common tasks, challenger's avg on
+        common tasks, and the dethrone threshold (champion_on_common +
+        WIN_MARGIN_END). Runs regardless of checkpoint so downstream UIs
+        always have the current real threshold, not a historical-avg proxy.
+        """
+        if not champion_miner:
+            return
+
+        margin = self.config.WIN_MARGIN_END
+        for uid, miner in miners.items():
+            if miner.is_champion:
+                continue
+            per_env: Dict[str, Dict[str, Any]] = {}
+            for env in environments:
+                es_champ = champion_miner.env_scores.get(env)
+                es_chall = miner.env_scores.get(env)
+                if not es_champ or not es_chall:
+                    continue
+                common = set(es_champ.all_task_scores) & set(es_chall.all_task_scores)
+                if not common:
+                    continue
+                champ_on_common = sum(
+                    es_champ.all_task_scores[t] for t in common
+                ) / len(common)
+                chall_on_common = sum(
+                    es_chall.all_task_scores[t] for t in common
+                ) / len(common)
+                per_env[env] = {
+                    "common_tasks": len(common),
+                    "score_on_common": chall_on_common,
+                    "champion_score_on_common": champ_on_common,
+                    "dethrone_threshold": champ_on_common + margin,
+                }
+            miner.vs_champion_per_env = per_env
 
     # ── Phase 6: Assign weights ──────────────────────────────────────────────
 
