@@ -14,6 +14,15 @@ from .champion_challenge import ChampionChallenge
 from affine.core.setup import logger
 
 
+# First-challenge slots bonus — +10 slots the first time a miner's CP
+# crosses CHAMPION_WARMUP_CHECKPOINTS+1 within a reign. Capped at 30;
+# miners already at/above the cap get no DB write (no-op, not retried
+# later because CP monotonicity blocks re-triggering within the reign).
+FIRST_CHALLENGE_SLOTS_BONUS = 10
+FIRST_CHALLENGE_SLOTS_CAP = 30
+FIRST_CHALLENGE_DEFAULT_SLOTS = 15  # Matches MinerStatsDAO's init default
+
+
 class Scorer:
     """Main scorer orchestrator.
 
@@ -230,6 +239,43 @@ class Scorer:
                     status=miner.challenge_status,
                     termination_reason=miner.termination_reason,
                 )
+
+            # First-challenge slots bonus: one-time boost when a miner's
+            # CP first crosses warmup this reign. Flag was set in
+            # _run_challenges at the exact transition; we skip champion
+            # (promoted same round) and terminated miners as a safety
+            # belt. Miners already at or above the cap need no DB write.
+            now = int(time.time())
+            for uid, miner in result.miners.items():
+                if not miner.should_grant_first_challenge_bonus:
+                    continue
+                if miner.is_champion or miner.challenge_status == 'terminated':
+                    continue
+
+                current_slots = await miner_stats_dao.get_miner_slots(
+                    miner.hotkey, miner.model_revision
+                )
+                if current_slots is None:
+                    current_slots = FIRST_CHALLENGE_DEFAULT_SLOTS
+                if current_slots >= FIRST_CHALLENGE_SLOTS_CAP:
+                    continue  # Already at/above cap — leave alone
+
+                new_slots = min(
+                    current_slots + FIRST_CHALLENGE_SLOTS_BONUS,
+                    FIRST_CHALLENGE_SLOTS_CAP,
+                )
+                ok = await miner_stats_dao.update_sampling_slots(
+                    hotkey=miner.hotkey,
+                    revision=miner.model_revision,
+                    slots=new_slots,
+                    adjusted_at=now,
+                )
+                if ok:
+                    logger.info(
+                        f"First-challenge bonus: UID {uid} ({miner.hotkey[:8]}...) "
+                        f"slots {current_slots} -> {new_slots} "
+                        f"(CP={miner.challenge_checkpoints_passed})"
+                    )
 
         # Save champion state to system_config (only when champion is present this round)
         # Champion offline does NOT update DB — original record stays intact
