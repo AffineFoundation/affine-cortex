@@ -44,6 +44,19 @@ class MinerData:
     termination_reason: str = ''        # Detailed reason with hotkey and per-env scores
     is_champion: bool = False
 
+    # Per-env comparison against the current champion, populated by
+    # champion_challenge. Each env dict has:
+    #   common_tasks: int                  — size of overlap with champion
+    #   score_on_common: float             — this miner's avg on common tasks
+    #   champion_score_on_common: float    — champion's avg on common tasks
+    #   dethrone_threshold: float          — upper: win env if score_on_common > this
+    #                                        (champion_score_on_common + WIN_MARGIN_END)
+    #   not_worse_threshold: float         — lower: lose env if score_on_common < this
+    #                                        (champion_score_on_common × (1 − WIN_NOT_WORSE_TOLERANCE))
+    # Between lower and upper = tie (not-worse but not dominant).
+    # Missing envs = no common tasks with champion (or champion absent).
+    vs_champion_per_env: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
     # Final weight (set by champion challenge: 1.0 for champion, 0.0 for others)
     normalized_weight: float = 0.0
 

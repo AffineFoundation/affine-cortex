@@ -988,18 +988,24 @@ class SamplingScheduler:
             except asyncio.CancelledError:
                 pass
     
+    ROTATION_POLL_INTERVAL = 10
+    """Seconds between rotation checks. Lower = tighter alignment to
+    configured rotation_interval (at the cost of extra HTTP fetches for
+    envs with dataset_range_source). With 10s, actual rotation cadence
+    drifts by at most 10s from the configured value."""
+
     async def _rotation_loop(self):
-        """Rotation loop - checks every 60 seconds."""
+        """Rotation loop — polls every ROTATION_POLL_INTERVAL seconds."""
         while self._running:
             try:
                 await self._check_and_rotate_all_envs()
-                await asyncio.sleep(60)
+                await asyncio.sleep(self.ROTATION_POLL_INTERVAL)
             except asyncio.CancelledError:
                 logger.info("Rotation loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Rotation loop error: {e}", exc_info=True)
-                await asyncio.sleep(60)
+                await asyncio.sleep(self.ROTATION_POLL_INTERVAL)
     
     async def _check_and_rotate_all_envs(self):
         """Check all environments and rotate if needed."""

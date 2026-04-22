@@ -196,12 +196,17 @@ async def print_rank_table():
 
         dethrone_cp = scorer_config.get("champion_dethrone_min_checkpoint", 10)
         M = scorer_config.get("champion_termination_total_losses", 3)
+        # Bounds shown in legend only. Actual per-cell thresholds come
+        # from the scorer's real common-task computation (both bounds
+        # stored in scores_by_env[env]), which differs per challenger.
+        dethrone_margin = scorer_config.get("win_margin_end", 0.03)
+        not_worse_tol = scorer_config.get("win_not_worse_tolerance", 0.015)
 
         # ── Header ────────────────────────────────────────────────────────
         header_parts = ["Hotkey  ", " UID", "Model                    "]
         for env in environments:
             disp = env_display_name(env, env_configs.get(env, {}))
-            header_parts.append(f"{disp:>14}")
+            header_parts.append(f"{disp:>26}")
         header_parts.extend(["  Status   ", "  CP ", " Challenge "])
         header_line = " | ".join(header_parts)
         table_width = len(header_line)
@@ -237,6 +242,18 @@ async def print_rank_table():
 
         print("=" * table_width, flush=True)
         print(header_line, flush=True)
+        # Legend: each env cell is score% [lose-below, win-above] / samples.
+        # Both bounds are vs champion on this miner's common tasks.
+        # Lose < champion_on_common×(1−{tol}%); Win > champion_on_common+{margin}%.
+        # Between bounds = tie (not worse, but not dominant).
+        # "★" = this miner is champion; "—" = no common tasks with champion.
+        legend = (
+            f"Env cells: score% [lose-below, win-above] / samples "
+            f"(lose < champ×(1-{not_worse_tol * 100:.1f}%), "
+            f"win > champ+{dethrone_margin * 100:.1f}%, per-challenger; "
+            f"dethrone at CP {dethrone_cp})"
+        )
+        print(legend, flush=True)
         print("-" * table_width, flush=True)
 
         # ── Rows ──────────────────────────────────────────────────────────
@@ -254,10 +271,20 @@ async def print_rank_table():
                     historical = env_data.get("historical_count",
                                               env_data.get("sample_count", 0))
                     score_percent = env_score * 100
-                    score_str = f"{score_percent:.2f}/{historical}"
-                    row_parts.append(f"{score_str:>14}")
+                    if m.is_champion:
+                        bounds_str = "[★]"
+                    else:
+                        lower = env_data.get("not_worse_threshold")
+                        upper = env_data.get("dethrone_threshold")
+                        if (isinstance(lower, (int, float))
+                                and isinstance(upper, (int, float))):
+                            bounds_str = f"[{lower * 100:.2f},{upper * 100:.2f}]"
+                        else:
+                            bounds_str = "[—]"
+                    score_str = f"{score_percent:.2f}{bounds_str}/{historical}"
+                    row_parts.append(f"{score_str:>26}")
                 else:
-                    row_parts.append(f"{'  -  ':>14}")
+                    row_parts.append(f"{'  -  ':>26}")
 
             # Status / CP / Challenge
             if m.is_champion:
