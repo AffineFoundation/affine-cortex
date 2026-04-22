@@ -196,12 +196,27 @@ async def print_rank_table():
 
         dethrone_cp = scorer_config.get("champion_dethrone_min_checkpoint", 10)
         M = scorer_config.get("champion_termination_total_losses", 3)
+        # Dethrone margin: strictest bar applied at CP = dethrone_cp.
+        # Threshold shown in each env column is the score the challenger
+        # must exceed to dethrone the champion in that env.
+        dethrone_margin = scorer_config.get("win_margin_end", 0.03)
+
+        # Champion per-env scores for threshold rendering. Empty if champion
+        # is absent from this snapshot (cold start or champion offline).
+        champion_row = next((m for m in miners if m.is_champion), None)
+        env_dethrone_threshold: Dict[str, float] = {}
+        if champion_row:
+            for env in environments:
+                es = champion_row.scores_by_env.get(env) or {}
+                s = es.get("score")
+                if isinstance(s, (int, float)):
+                    env_dethrone_threshold[env] = s + dethrone_margin
 
         # ── Header ────────────────────────────────────────────────────────
         header_parts = ["Hotkey  ", " UID", "Model                    "]
         for env in environments:
             disp = env_display_name(env, env_configs.get(env, {}))
-            header_parts.append(f"{disp:>14}")
+            header_parts.append(f"{disp:>18}")
         header_parts.extend(["  Status   ", "  CP ", " Challenge "])
         header_line = " | ".join(header_parts)
         table_width = len(header_line)
@@ -237,6 +252,15 @@ async def print_rank_table():
 
         print("=" * table_width, flush=True)
         print(header_line, flush=True)
+        # Legend: each env cell is score% / dethrone-threshold% / samples.
+        # Threshold = champion env score + win_margin_end ({margin}%), i.e.
+        # what a challenger must exceed at CP={dethrone_cp} to dethrone.
+        legend = (
+            f"Env cells: score% / dethrone-threshold% / samples "
+            f"(threshold = champion + {dethrone_margin * 100:.1f}%, "
+            f"applied at CP {dethrone_cp})"
+        )
+        print(legend, flush=True)
         print("-" * table_width, flush=True)
 
         # ── Rows ──────────────────────────────────────────────────────────
@@ -254,10 +278,16 @@ async def print_rank_table():
                     historical = env_data.get("historical_count",
                                               env_data.get("sample_count", 0))
                     score_percent = env_score * 100
-                    score_str = f"{score_percent:.2f}/{historical}"
-                    row_parts.append(f"{score_str:>14}")
+                    if m.is_champion:
+                        thresh_str = "★"
+                    elif env in env_dethrone_threshold:
+                        thresh_str = f"{env_dethrone_threshold[env] * 100:.2f}"
+                    else:
+                        thresh_str = "—"
+                    score_str = f"{score_percent:.2f}/{thresh_str}/{historical}"
+                    row_parts.append(f"{score_str:>18}")
                 else:
-                    row_parts.append(f"{'  -  ':>14}")
+                    row_parts.append(f"{'  -  ':>18}")
 
             # Status / CP / Challenge
             if m.is_champion:

@@ -10,7 +10,7 @@
         "sampling_count": 80,
         "rotation_enabled": true,
         "rotation_count": 3,
-        "rotation_interval": 680,
+        "rotation_interval": 390,
         "scheduling_weight": 3.0
       }
     },
@@ -26,10 +26,10 @@
           "field": "tasks.completed_up_to",
           "range_type": "zero_to_value"
         },
-        "sampling_count": 50,
+        "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 360,
+        "rotation_interval": 260,
         "scheduling_weight": 1.0
       }
     },
@@ -42,7 +42,7 @@
         "sampling_count": 80,
         "rotation_enabled": true,
         "rotation_count": 3,
-        "rotation_interval": 680,
+        "rotation_interval": 390,
         "scheduling_weight": 1.0
       }
     },
@@ -68,7 +68,7 @@
         "sampling_count": 80,
         "rotation_enabled": true,
         "rotation_count": 3,
-        "rotation_interval": 680,
+        "rotation_interval": 390,
         "scheduling_weight": 1.0
       }
     },
@@ -81,7 +81,7 @@
         "sampling_count": 80,
         "rotation_enabled": true,
         "rotation_count": 3,
-        "rotation_interval": 680,
+        "rotation_interval": 390,
         "scheduling_weight": 1.0
       }
     },
@@ -99,7 +99,7 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 450,
+        "rotation_interval": 260,
         "scheduling_weight": 1.0
       }
     }
