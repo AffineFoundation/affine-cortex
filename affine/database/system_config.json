@@ -9,8 +9,8 @@
         "dataset_range": [[0, 500000000],[600000000, 800000000]],
         "sampling_count": 50,
         "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 620,
+        "rotation_count": 1,
+        "rotation_interval": 170,
         "scheduling_weight": 3.0
       }
     },
@@ -41,8 +41,8 @@
         "dataset_range": [[0, 78060000]],
         "sampling_count": 50,
         "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 620,
+        "rotation_count": 1,
+        "rotation_interval": 170,
         "scheduling_weight": 1.0
       }
     },
@@ -67,8 +67,8 @@
         "dataset_range": [[0, 1000000000]],
         "sampling_count": 50,
         "rotation_enabled": true,
-        "rotation_count": 3,
-        "rotation_interval": 620,
+        "rotation_count": 1,
+        "rotation_interval": 170,
         "scheduling_weight": 1.0
       }
     },
@@ -81,7 +81,7 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 260,
+        "rotation_interval": 220,
         "scheduling_weight": 3.0
       }
     },
