@@ -78,10 +78,10 @@
       "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
-        "sampling_count": 50,
+        "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 3,
-        "rotation_interval": 620,
+        "rotation_interval": 780,
         "scheduling_weight": 1.0
       }
     },
