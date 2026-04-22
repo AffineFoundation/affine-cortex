@@ -211,16 +211,17 @@ async def print_rank_table():
         header_line = " | ".join(header_parts)
         table_width = len(header_line)
 
-        # Legend: each env cell is score% [lose-below, win-above] / samples.
-        # Both bounds are vs champion on this miner's common tasks.
-        # Lose < champion_on_common×(1−{tol}%); Win > champion_on_common+{margin}%.
-        # Between bounds = tie (not worse, but not dominant).
-        # "★" = this miner is champion; "—" = no common tasks with champion.
+        # Legend: every number in an env cell is on the *common-task*
+        # basis with the current champion — the exact data Pareto uses.
+        # This keeps score, lower, and upper directly comparable.
+        # Champion row shows its historical average as a reference with [★].
+        # "—" means no common tasks with the champion yet (new miner or
+        # champion missing).
         legend = (
-            f"Env cells: score% [lose-below, win-above] / samples "
-            f"(lose < champ×(1-{not_worse_tol * 100:.1f}%), "
-            f"win > champ+{dethrone_margin * 100:.1f}%, per-challenger; "
-            f"dethrone at CP {dethrone_cp})"
+            f"Env cells: common-task-score% [lose-below, win-above] / common-tasks "
+            f"(lose < champ_on_common×(1-{not_worse_tol * 100:.1f}%), "
+            f"win > champ_on_common+{dethrone_margin * 100:.1f}%; "
+            f"dethrone at CP {dethrone_cp}; champion row [★] shows historical avg)"
         )
 
         # ── Title block ───────────────────────────────────────────────────
@@ -267,26 +268,44 @@ async def print_rank_table():
             ]
 
             for env in environments:
-                if env in m.scores_by_env:
-                    env_data = m.scores_by_env[env]
-                    env_score = env_data.get("score", 0.0)
-                    historical = env_data.get("historical_count",
-                                              env_data.get("sample_count", 0))
-                    score_percent = env_score * 100
-                    if m.is_champion:
-                        bounds_str = "[★]"
-                    else:
-                        lower = env_data.get("not_worse_threshold")
-                        upper = env_data.get("dethrone_threshold")
-                        if (isinstance(lower, (int, float))
-                                and isinstance(upper, (int, float))):
-                            bounds_str = f"[{lower * 100:.2f},{upper * 100:.2f}]"
-                        else:
-                            bounds_str = "[—]"
-                    score_str = f"{score_percent:.2f}{bounds_str}/{historical}"
-                    row_parts.append(f"{score_str:>26}")
-                else:
+                if env not in m.scores_by_env:
                     row_parts.append(f"{'  -  ':>26}")
+                    continue
+
+                env_data = m.scores_by_env[env]
+
+                if m.is_champion:
+                    # Champion is the reference. No self-comparison, so
+                    # fall back to historical average + total samples.
+                    score_val = env_data.get("score", 0.0)
+                    samples = env_data.get("historical_count",
+                                            env_data.get("sample_count", 0))
+                    score_str = f"{score_val * 100:.2f}[★]/{samples}"
+                    row_parts.append(f"{score_str:>26}")
+                    continue
+
+                # Challenger: show numbers on the common-task basis only,
+                # matching what Pareto actually evaluates.
+                score_on_common = env_data.get("score_on_common")
+                common_tasks = env_data.get("common_tasks")
+                lower = env_data.get("not_worse_threshold")
+                upper = env_data.get("dethrone_threshold")
+
+                if (isinstance(score_on_common, (int, float))
+                        and isinstance(common_tasks, int)
+                        and common_tasks > 0
+                        and isinstance(lower, (int, float))
+                        and isinstance(upper, (int, float))):
+                    score_str = (
+                        f"{score_on_common * 100:.2f}"
+                        f"[{lower * 100:.2f},{upper * 100:.2f}]"
+                        f"/{common_tasks}"
+                    )
+                else:
+                    # No overlap with champion (champion offline, brand-new
+                    # miner, or old snapshot without vs_champion fields).
+                    score_str = "—[—]/—"
+                row_parts.append(f"{score_str:>26}")
 
             # Status / CP / Challenge
             if m.is_champion:
