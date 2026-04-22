@@ -44,6 +44,16 @@ class MinerData:
     termination_reason: str = ''        # Detailed reason with hotkey and per-env scores
     is_champion: bool = False
 
+    # Transient per-round signal set by _run_challenges when this miner's
+    # CP crosses CHAMPION_WARMUP_CHECKPOINTS+1 this round (prev<threshold
+    # → new>=threshold). Survives _reset_all_states so a miner that
+    # crossed CP=3 and then dethroned the champion in the same round
+    # still gets evaluated (save_results filters out the new champion).
+    # Not persisted — monotonic CP means re-triggering within a reign is
+    # impossible; only dethrone-reset re-opens the gate, which is a
+    # legitimate "new reign" challenge deserving a fresh bonus.
+    should_grant_first_challenge_bonus: bool = False
+
     # Per-env comparison against the current champion, populated by
     # champion_challenge. Each env dict has:
     #   common_tasks: int                  — size of overlap with champion

@@ -260,8 +260,17 @@ class ChampionChallenge:
             if new_cp <= miner.challenge_checkpoints_passed:
                 continue  # No new checkpoint reached
 
+            prev_cp = miner.challenge_checkpoints_passed
             miner.challenge_checkpoints_passed = new_cp
             cp = new_cp
+
+            # First-challenge slots bonus trigger: the moment a miner's CP
+            # crosses warmup for the first time this reign (prev<warmup+1<=new).
+            # CP is monotonic within a reign, so this fires at most once
+            # per (miner, reign). Champion is already filtered above.
+            first_real_cp = warmup + 1
+            if prev_cp < first_real_cp <= new_cp:
+                miner.should_grant_first_challenge_bonus = True
 
             # Only one comparison per round per miner — uses all available data.
             cmp = self.pareto._compare_miners(

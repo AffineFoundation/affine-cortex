@@ -211,6 +211,18 @@ async def print_rank_table():
         header_line = " | ".join(header_parts)
         table_width = len(header_line)
 
+        # Legend: each env cell is score% [lose-below, win-above] / samples.
+        # Both bounds are vs champion on this miner's common tasks.
+        # Lose < champion_on_common×(1−{tol}%); Win > champion_on_common+{margin}%.
+        # Between bounds = tie (not worse, but not dominant).
+        # "★" = this miner is champion; "—" = no common tasks with champion.
+        legend = (
+            f"Env cells: score% [lose-below, win-above] / samples "
+            f"(lose < champ×(1-{not_worse_tol * 100:.1f}%), "
+            f"win > champ+{dethrone_margin * 100:.1f}%, per-challenger; "
+            f"dethrone at CP {dethrone_cp})"
+        )
+
         # ── Title block ───────────────────────────────────────────────────
         print("=" * table_width, flush=True)
         print(f"CHAMPION CHALLENGE RANKING — Block {block_number}", flush=True)
@@ -240,20 +252,10 @@ async def print_rank_table():
         else:
             print("Champion:   (none — cold start)", flush=True)
 
+        print(legend, flush=True)
+
         print("=" * table_width, flush=True)
         print(header_line, flush=True)
-        # Legend: each env cell is score% [lose-below, win-above] / samples.
-        # Both bounds are vs champion on this miner's common tasks.
-        # Lose < champion_on_common×(1−{tol}%); Win > champion_on_common+{margin}%.
-        # Between bounds = tie (not worse, but not dominant).
-        # "★" = this miner is champion; "—" = no common tasks with champion.
-        legend = (
-            f"Env cells: score% [lose-below, win-above] / samples "
-            f"(lose < champ×(1-{not_worse_tol * 100:.1f}%), "
-            f"win > champ+{dethrone_margin * 100:.1f}%, per-challenger; "
-            f"dethrone at CP {dethrone_cp})"
-        )
-        print(legend, flush=True)
         print("-" * table_width, flush=True)
 
         # ── Rows ──────────────────────────────────────────────────────────
