@@ -25,7 +25,7 @@ Invariants:
 - Champion must be pre-set via `af db set-champion` before first run.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from affine.src.scorer.config import ScorerConfig
 from affine.src.scorer.models import MinerData, ParetoComparison, ChampionChallengeOutput
