@@ -49,7 +49,11 @@ class MinerData:
     #   common_tasks: int                  — size of overlap with champion
     #   score_on_common: float             — this miner's avg on common tasks
     #   champion_score_on_common: float    — champion's avg on common tasks
-    #   dethrone_threshold: float          — champion_score_on_common + WIN_MARGIN_END
+    #   dethrone_threshold: float          — upper: win env if score_on_common > this
+    #                                        (champion_score_on_common + WIN_MARGIN_END)
+    #   not_worse_threshold: float         — lower: lose env if score_on_common < this
+    #                                        (champion_score_on_common × (1 − WIN_NOT_WORSE_TOLERANCE))
+    # Between lower and upper = tie (not-worse but not dominant).
     # Missing envs = no common tasks with champion (or champion absent).
     vs_champion_per_env: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 

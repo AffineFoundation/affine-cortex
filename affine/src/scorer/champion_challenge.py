@@ -360,6 +360,7 @@ class ChampionChallenge:
             return
 
         margin = self.config.WIN_MARGIN_END
+        not_worse_tol = self.config.WIN_NOT_WORSE_TOLERANCE
         for uid, miner in miners.items():
             if miner.is_champion:
                 continue
@@ -382,7 +383,13 @@ class ChampionChallenge:
                     "common_tasks": len(common),
                     "score_on_common": chall_on_common,
                     "champion_score_on_common": champ_on_common,
+                    # Upper bound: if challenger's score-on-common exceeds
+                    # this, they WIN this env in Pareto comparison.
                     "dethrone_threshold": champ_on_common + margin,
+                    # Lower bound: if challenger's score-on-common drops
+                    # below this, they LOSE this env (fails "not worse"
+                    # check, blocking dethrone). Between the two → tie.
+                    "not_worse_threshold": champ_on_common * (1 - not_worse_tol),
                 }
             miner.vs_champion_per_env = per_env
 
