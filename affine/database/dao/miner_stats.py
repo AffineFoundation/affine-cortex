@@ -435,6 +435,49 @@ class MinerStatsDAO(BaseDAO):
             logger.error(f"Failed to update sampling slots for {hotkey[:8]}...: {e}")
             return False
 
+    # Fields that make up a miner's challenge state (loss/win counters etc.)
+    _CHALLENGE_FIELDS = (
+        'challenge_consecutive_wins',
+        'challenge_total_losses',
+        'challenge_consecutive_losses',
+        'challenge_checkpoints_passed',
+        'challenge_status',
+        'termination_reason',
+    )
+
+    @staticmethod
+    def _challenge_defaults() -> Dict[str, Any]:
+        return {
+            'challenge_consecutive_wins': 0,
+            'challenge_total_losses': 0,
+            'challenge_consecutive_losses': 0,
+            'challenge_checkpoints_passed': 0,
+            'challenge_status': 'sampling',
+            'termination_reason': '',
+        }
+
+    @classmethod
+    def _extract_challenge_state(cls, stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Pick only the challenge_* fields out of a stats row."""
+        defaults = cls._challenge_defaults()
+        return {k: stats.get(k, defaults[k]) for k in cls._CHALLENGE_FIELDS}
+
+    @staticmethod
+    def _has_challenge_state(stats: Dict[str, Any]) -> bool:
+        """True if the stats row actually has any challenge_* counter set
+        (not just defaults from a freshly-initialised sampling record).
+        We ignore the default 'sampling' status + zero counters case, since
+        that means the scorer has never written to this row yet."""
+        if not stats:
+            return False
+        for k in ('challenge_total_losses', 'challenge_consecutive_losses',
+                  'challenge_consecutive_wins', 'challenge_checkpoints_passed'):
+            if stats.get(k, 0):
+                return True
+        if stats.get('challenge_status') == 'terminated':
+            return True
+        return False
+
     async def get_challenge_state(
         self,
         hotkey: str,
@@ -442,26 +485,47 @@ class MinerStatsDAO(BaseDAO):
     ) -> Dict[str, Any]:
         """Get challenge state for a miner.
 
-        Returns challenge fields with defaults if not present (backward compatible).
+        Identity is hotkey: a miner that redeploys (revision change) or
+        bounces cold/hot should not lose accumulated losses, wins, CP, or
+        terminated status. Priority order:
+
+        1. Direct row at (hotkey, revision) with real challenge state → use it.
+        2. Fallback: most recently-updated row for this hotkey that carries
+           real challenge state → inherit it (losses persist across
+           revisions, terminated stays terminated forever).
+        3. Nothing found → fresh defaults (brand-new hotkey).
         """
-        stats = await self.get_miner_stats(hotkey, revision)
-        if not stats:
-            return {
-                'challenge_consecutive_wins': 0,
-                'challenge_total_losses': 0,
-                'challenge_consecutive_losses': 0,
-                'challenge_checkpoints_passed': 0,
-                'challenge_status': 'sampling',
-                'termination_reason': '',
-            }
-        return {
-            'challenge_consecutive_wins': stats.get('challenge_consecutive_wins', 0),
-            'challenge_total_losses': stats.get('challenge_total_losses', 0),
-            'challenge_consecutive_losses': stats.get('challenge_consecutive_losses', 0),
-            'challenge_checkpoints_passed': stats.get('challenge_checkpoints_passed', 0),
-            'challenge_status': stats.get('challenge_status', 'sampling'),
-            'termination_reason': stats.get('termination_reason', ''),
-        }
+        direct = await self.get_miner_stats(hotkey, revision)
+        if self._has_challenge_state(direct):
+            return self._extract_challenge_state(direct)
+
+        # Fallback: scan all revisions for this hotkey and pick the freshest
+        # row that actually carries challenge state. DynamoDB PK query, not
+        # a table scan, so this is an O(revisions-per-hotkey) operation.
+        try:
+            all_rows = await self.query(pk=self._make_pk(hotkey))
+        except Exception as e:
+            logger.warning(
+                f"get_challenge_state fallback query failed for {hotkey[:8]}...: {e}"
+            )
+            all_rows = []
+
+        candidates = [r for r in all_rows if self._has_challenge_state(r)]
+        if candidates:
+            latest = max(candidates, key=lambda r: r.get('last_updated_at', 0))
+            logger.debug(
+                f"get_challenge_state inherited state for {hotkey[:8]}... "
+                f"(target rev={revision[:8]}..., source rev={latest.get('revision','?')[:8]}..., "
+                f"losses={latest.get('challenge_total_losses', 0)}, "
+                f"status={latest.get('challenge_status', 'sampling')})"
+            )
+            return self._extract_challenge_state(latest)
+
+        # Direct row exists but has no challenge state (e.g., freshly created
+        # by update_sampling_stats). Return its fields (all zeros/sampling).
+        if direct:
+            return self._extract_challenge_state(direct)
+        return self._challenge_defaults()
 
     async def update_challenge_state(
         self,
