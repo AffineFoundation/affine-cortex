@@ -28,7 +28,7 @@ class ScorerConfig:
     as checkpoints progress.
     """
 
-    WIN_MIN_DOMINANT_ENVS: int = 3
+    WIN_MIN_DOMINANT_ENVS: int = 2
     """Champion challenge: minimum environments where the challenger must
     exceed by margin. Remaining environments must not be worse than
     score_a - WIN_NOT_WORSE_TOLERANCE.
@@ -37,7 +37,7 @@ class ScorerConfig:
     N > 0 = partial: exceed in at least N, not lose in any other.
     """
 
-    WIN_NOT_WORSE_TOLERANCE: float = 0.015
+    WIN_NOT_WORSE_TOLERANCE: float = 0.02
     """Tolerance ratio for "not worse" check in champion challenge.
 
     Challenger is considered "not worse" in an env if
@@ -99,7 +99,7 @@ class ScorerConfig:
     CHAMPION_TERMINATION_CONSECUTIVE_LOSSES: int = 3
     """Consecutive post-warmup losses → terminate sampling."""
 
-    PARETO_MIN_WINDOWS: int = 3
+    PARETO_MIN_WINDOWS: int = 5
     """Minimum windows of common tasks before pairwise Pareto fires.
 
     Pairwise filter terminates plagiarized models: when two non-champion
