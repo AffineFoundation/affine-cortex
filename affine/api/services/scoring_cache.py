@@ -183,28 +183,23 @@ class ScoringCacheManager:
         previous_miner_keys = getattr(self, '_previous_miner_keys', set())
         removed_miners = previous_miner_keys - current_miner_keys
 
-        # 3. Remove invalid miner cache, but keep terminated miners
-        # so their last known scores are preserved in scoring_data
+        # 3. Handle invalid miners (cold or terminated):
+        # - Drop them from SAMPLING cache so the sampler stops scheduling
+        #   new tasks for miners that can't respond.
+        # - Keep them in SCORING cache so the champion-challenge Pareto
+        #   can still evaluate them on their historical common-task data.
+        #   Otherwise a miner could go cold to freeze its loss counter
+        #   and escape termination.
         if removed_miners:
-            from affine.database.dao.miner_stats import MinerStatsDAO
-            miner_stats_dao = MinerStatsDAO()
             for hotkey, revision in removed_miners:
                 key = f"{hotkey}#{revision}"
-
-                # Check if this miner is terminated — if so, keep cache
-                try:
-                    state = await miner_stats_dao.get_challenge_state(hotkey, revision)
-                    if state.get('challenge_status') == 'terminated':
-                        logger.debug(f"Keeping cache for terminated miner {hotkey[:8]}...")
-                        continue
-                except Exception:
-                    pass
-
-                # Remove from both caches
-                self._scoring_data.pop(key, None)
+                # Stop scheduling new samples for cold/terminated miners.
                 self._sampling_data.pop(key, None)
-
-                logger.info(f"Removed cache for invalid miner {hotkey[:8]}...#{revision[:8]}...")
+                # Scoring cache stays; section 5b below refreshes it
+                # with the latest DB row so env data/UID are current.
+                logger.debug(
+                    f"Miner {hotkey[:8]}...#{revision[:8]}... no longer valid; "
+                    f"keeping in scoring cache, dropped from sampling cache")
         
         # 4. Get environment configurations
         environments = await system_config_dao.get_param_value('environments', {})
@@ -255,12 +250,15 @@ class ScoringCacheManager:
                 # Update UID if it changed
                 self._sampling_data[key]['uid'] = uid
         
-        # 5b. Also include terminated miners not in valid_miners,
-        # so their last known scores remain visible in af get-rank.
-        from affine.database.dao.miner_stats import MinerStatsDAO
-        miner_stats_dao = MinerStatsDAO()
+        # 5b. Also include every DB miner not already in valid_miners
+        # (cold, terminated, or otherwise invalid) in the SCORING cache
+        # only. These miners don't sample new tasks, but the scorer
+        # still Pareto-evaluates them against the champion using their
+        # historical common-task data — so going cold no longer freezes
+        # the loss counter and doesn't let a terminated miner evade
+        # termination by dropping out.
         all_db_miners = await miners_dao.get_all_miners()
-        terminated_added = 0
+        extra_added = 0
         for miner in all_db_miners:
             hotkey = miner.get('hotkey', '')
             revision = miner.get('revision', '')
@@ -269,12 +267,9 @@ class ScoringCacheManager:
             if (hotkey, revision) in current_miner_keys:
                 continue  # Already in valid_miners
             key = f"{hotkey}#{revision}"
-            try:
-                state = await miner_stats_dao.get_challenge_state(hotkey, revision)
-                if state.get('challenge_status') != 'terminated':
-                    continue
-            except Exception:
-                continue
+            # Only add to scoring (not sampling). Samples won't be
+            # requested; the env data below reflects whatever is still
+            # in sample_results (within its 30-day TTL).
             if key not in self._scoring_data:
                 self._scoring_data[key] = {
                     'uid': miner.get('uid', 0),
@@ -284,11 +279,23 @@ class ScoringCacheManager:
                     'first_block': miner.get('first_block', 0),
                     'env': {}
                 }
-                # Add to valid_miners list so step 6 queries their samples
-                valid_miners.append(miner)
-                terminated_added += 1
-        if terminated_added:
-            logger.info(f"Added {terminated_added} terminated miners to scoring cache")
+            else:
+                # Keep the entry but refresh top-level fields in case
+                # model/UID/first_block moved.
+                self._scoring_data[key].update({
+                    'uid': miner.get('uid', 0),
+                    'model_repo': miner.get('model',
+                                            self._scoring_data[key].get('model_repo', '')),
+                    'first_block': miner.get('first_block',
+                                             self._scoring_data[key].get('first_block', 0)),
+                })
+            # Add to valid_miners list so step 6 re-queries their samples.
+            valid_miners.append(miner)
+            extra_added += 1
+        if extra_added:
+            logger.info(
+                f"Added {extra_added} non-valid miners (cold/terminated) to scoring cache "
+                f"for continued Pareto evaluation")
 
         # 6. Build concurrent query tasks for ALL miner×env combinations
         async def query_and_populate(miner: dict, env_name: str, env_config: dict):

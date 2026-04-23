@@ -19,19 +19,20 @@ class MinerSlotsAdjuster:
     Uses sampling_stats from MinerStats table (last_1hour window) to determine
     success rate. No need to query sample_results table.
     
-    Adjustment rules:
-    - Only adjust miners with >10 samples in last 1 hour
-    - Success rate >= 90%: slots + 1 (max 16)
-    - Success rate < 50%: slots - 1 (min 10)
-    - Adjustment runs every 2 hours
-    
+    Adjustment rules (see constants below for current values):
+    - Only adjust miners with >= MIN_SAMPLES_FOR_ADJUSTMENT samples
+      in the last 6 hours.
+    - Success rate >= HIGH_SUCCESS_THRESHOLD: slots += 6 (cap MAX_SLOTS).
+    - Success rate <  LOW_SUCCESS_THRESHOLD:  slots -= 1 (floor MIN_SLOTS).
+    - Adjustment loop runs every ADJUSTMENT_INTERVAL seconds.
+
     Persistence:
     - sampling_slots stored in MinerStats table
     - slots_last_adjusted_at tracks last adjustment time
     """
-    
-    DEFAULT_SLOTS = 10
-    MIN_SLOTS = 10
+
+    DEFAULT_SLOTS = 20
+    MIN_SLOTS = 20
     MAX_SLOTS = 50
     ADJUSTMENT_INTERVAL = 21600  # 6 hours in seconds
     MIN_SAMPLES_FOR_ADJUSTMENT = 50
@@ -189,7 +190,7 @@ class MinerSlotsAdjuster:
         action = "unchanged"
 
         if success_rate >= self.HIGH_SUCCESS_THRESHOLD:
-            new_slots = min(current_slots + 3, self.MAX_SLOTS)
+            new_slots = min(current_slots + 6, self.MAX_SLOTS)
             if new_slots > current_slots:
                 action = "increased"
         elif success_rate < self.LOW_SUCCESS_THRESHOLD:
