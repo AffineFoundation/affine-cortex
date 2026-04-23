@@ -58,15 +58,17 @@ class ChampionChallenge:
         champion_uid, champion_miner, weight_uid, champion_changed = \
             self._resolve_champion(miners, environments, champion_state)
 
-        window_size = self._window_size(environments, env_sampling_counts)
+        # Log config validity; CP & pairwise thresholds now use per-env counts
+        # so heterogeneous sampling_counts are handled correctly.
+        self._assert_env_counts(environments, env_sampling_counts)
 
         # Pareto dominance: terminate dominated non-champion miners
         self._pairwise_filter(
-            miners, environments, window_size, champion_uid, champion_miner)
+            miners, environments, env_sampling_counts, champion_uid, champion_miner)
 
         # Champion challenge (checkpoint-gated)
         comparisons = self._run_challenges(
-            miners, environments, window_size, champion_uid, champion_miner)
+            miners, environments, env_sampling_counts, champion_uid, champion_miner)
 
         # Dethrone
         new_uid, new_miner = self._check_dethrone(miners, environments, champion_uid)
@@ -158,15 +160,19 @@ class ChampionChallenge:
         self,
         miners: Dict[int, MinerData],
         environments: List[str],
-        window_size: int,
+        env_sampling_counts: Dict[str, int],
         champion_uid: Optional[int],
         champion_miner: Optional[MinerData] = None,
     ):
         """Compare non-champion miner pairs with sufficient common data.
-        The earlier-registered miner is the incumbent. Dominated → terminated."""
-        if window_size <= 0:
-            return
-        threshold_tasks = self.config.PARETO_MIN_WINDOWS * window_size
+        The earlier-registered miner is the incumbent. Dominated → terminated.
+
+        Threshold is per-env: every env must have at least
+        PARETO_MIN_WINDOWS × env_sampling_count common tasks. Using a
+        single global window_size would mix min_common from one env with
+        the window of another and give an inflated measure.
+        """
+        min_windows = self.config.PARETO_MIN_WINDOWS
 
         # Phase 3a-1: Champion strict-dominates check.
         # If champion exceeds a miner by margin in ALL envs, terminate
@@ -177,7 +183,9 @@ class ChampionChallenge:
             for uid, m in miners.items():
                 if uid == champion_uid or m.challenge_status == 'terminated':
                     continue
-                if self._min_common_tasks(champion_miner, m, environments) < threshold_tasks:
+                if not self._meets_per_env_threshold(
+                        champion_miner, m, environments,
+                        env_sampling_counts, min_windows):
                     continue
                 cmp = self.pareto._compare_miners(
                     m, champion_miner, environments, "champion_dominance",
@@ -206,7 +214,9 @@ class ChampionChallenge:
             for uid_b, miner_b in eligible[i + 1:]:
                 if miner_b.challenge_status == 'terminated':
                     continue
-                if self._min_common_tasks(miner_a, miner_b, environments) < threshold_tasks:
+                if not self._meets_per_env_threshold(
+                        miner_a, miner_b, environments,
+                        env_sampling_counts, min_windows):
                     continue
 
                 cmp = self.pareto._compare_miners(
@@ -234,12 +244,14 @@ class ChampionChallenge:
         self,
         miners: Dict[int, MinerData],
         environments: List[str],
-        window_size: int,
+        env_sampling_counts: Dict[str, int],
         champion_uid: Optional[int],
         champion_miner: Optional[MinerData],
     ) -> List[ParetoComparison]:
-        if window_size <= 0:
-            logger.warning("window_size=0 (missing sampling_config?), no challenges")
+        if not env_sampling_counts or any(
+                env_sampling_counts.get(e, 0) <= 0 for e in environments):
+            logger.warning(
+                "env_sampling_counts missing/zero for some env, no challenges")
             return []
         if not champion_miner:
             return []
@@ -253,10 +265,12 @@ class ChampionChallenge:
             if uid == champion_uid or miner.challenge_status == 'terminated':
                 continue
 
-            # Checkpoint gate: jump CP to the level supported by current data.
-            # Each CP requires CP × window_size common tasks.
-            min_common = self._min_common_tasks(champion_miner, miner, environments)
-            new_cp = min_common // window_size if window_size > 0 else 0
+            # Checkpoint gate: per-env CP = common[env] // sampling_count[env],
+            # overall CP = min across envs. This honors each env's window size
+            # independently; mixing min_common from one env with the divisor
+            # of another would inflate CP when sampling_counts differ.
+            new_cp = self._per_env_cp(
+                champion_miner, miner, environments, env_sampling_counts)
             if new_cp <= miner.challenge_checkpoints_passed:
                 continue  # No new checkpoint reached
 
@@ -426,37 +440,68 @@ class ChampionChallenge:
             return 0.0
         return geometric_mean(scores, epsilon=self.config.GEOMETRIC_MEAN_EPSILON)
 
-    def _min_common_tasks(
-        self, a: MinerData, b: MinerData, environments: List[str]
+    def _per_env_cp(
+        self,
+        a: MinerData,
+        b: MinerData,
+        environments: List[str],
+        env_sampling_counts: Dict[str, int],
     ) -> int:
-        """Minimum common-task count across ALL environments.
+        """Overall CP = min over envs of (common[env] // sampling_count[env]).
 
-        Returns 0 if either miner is missing any environment. This is
-        intentional: a challenger must have data in every environment
-        to be fairly compared against the champion. Partial coverage
-        blocks challenges (conservative) rather than allowing dethrone
-        on incomplete evidence.
+        Each env's CP is measured against its own window size, so heterogeneous
+        sampling_counts are handled correctly. Returns 0 if any env is missing
+        from either miner or has a non-positive sampling_count.
         """
-        counts = []
+        per_env_cp = []
         for env in environments:
             es_a = a.env_scores.get(env)
             es_b = b.env_scores.get(env)
             if not es_a or not es_b:
                 return 0
-            counts.append(len(set(es_a.all_task_scores) & set(es_b.all_task_scores)))
-        return min(counts) if counts else 0
+            count = env_sampling_counts.get(env, 0)
+            if count <= 0:
+                return 0
+            common = len(set(es_a.all_task_scores) & set(es_b.all_task_scores))
+            per_env_cp.append(common // count)
+        return min(per_env_cp) if per_env_cp else 0
 
-    def _window_size(
+    def _meets_per_env_threshold(
+        self,
+        a: MinerData,
+        b: MinerData,
+        environments: List[str],
+        env_sampling_counts: Dict[str, int],
+        min_windows: int,
+    ) -> bool:
+        """True iff common[env] >= min_windows × sampling_count[env] for every env.
+
+        Per-env threshold (instead of a single global min×count) so an env
+        with fewer common tasks can't be masked by another env with many.
+        """
+        for env in environments:
+            es_a = a.env_scores.get(env)
+            es_b = b.env_scores.get(env)
+            if not es_a or not es_b:
+                return False
+            count = env_sampling_counts.get(env, 0)
+            if count <= 0:
+                return False
+            common = len(set(es_a.all_task_scores) & set(es_b.all_task_scores))
+            if common < min_windows * count:
+                return False
+        return True
+
+    def _assert_env_counts(
         self, environments: List[str], env_sampling_counts: Dict[str, int]
-    ) -> int:
+    ) -> None:
+        """Log once if any env is missing from the sampling counts map."""
         missing = [env for env in environments if not env_sampling_counts.get(env)]
         if missing:
             logger.warning(
                 f"Missing env_sampling_counts for {missing}; challenges disabled. "
                 f"Check environments config."
             )
-        counts = [env_sampling_counts.get(env, 0) for env in environments]
-        return min(counts) if counts else 0
 
     def _reset_state(self, miner: MinerData):
         miner.challenge_consecutive_wins = 0
