@@ -9,13 +9,13 @@ import math
 import numpy as np
 import pytest
 
-from affine.src.anti_copy.metrics import (
+from affine.src.anticopy.metrics import (
     js_divergence_topk,
     token_agreement_rate,
 )
-from affine.src.anti_copy.models import MinerLogprobs
-from affine.src.anti_copy.detector import AntiCopyDetector
-from affine.src.anti_copy.loader import _parse_tokens, MIN_TOKENS, TOP_K
+from affine.src.anticopy.models import MinerLogprobs
+from affine.src.anticopy.detector import AntiCopyDetector
+from affine.src.anticopy.loader import _parse_tokens, MIN_TOKENS, TOP_K
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -194,6 +194,7 @@ class TestAntiCopyDetector:
     def setup_method(self):
         self.detector = AntiCopyDetector(
             cosine_threshold=0.93,
+            cosine_cheat_threshold=1.1,
             min_tasks=3,
         )
 
@@ -203,13 +204,16 @@ class TestAntiCopyDetector:
         m1 = make_miner(1, BASE_LPS)
         pairs = self.detector.detect({0: m0, 1: m1})
         copies = [p for p in pairs if p.is_copy]
-        assert len(copies) == 1
-        pair = copies[0]
+        suspicious = [p for p in pairs if p.verdict == "suspicious"]
+        assert len(copies) == 0
+        assert len(suspicious) == 1
+        pair = suspicious[0]
         # Cosine is high but not exactly 1.0 because p2 split varies by uid
         assert pair.cosine_similarity > self.detector.cosine_threshold
         # Only cos signal (no hs), votes 1/1
         assert pair.votes == 1
         assert pair.total_votes == 1
+        assert pair.verdict == "suspicious"
 
     def test_independent_models_not_flagged(self):
         """Models with different logprobs should not be flagged."""
@@ -226,8 +230,8 @@ class TestAntiCopyDetector:
         m0 = make_miner(0, BASE_LPS)
         m1 = make_miner(1, BASE_LPS, noise_std=1e-4)
         pairs = self.detector.detect({0: m0, 1: m1})
-        copies = [p for p in pairs if p.is_copy]
-        assert len(copies) == 1
+        suspicious = [p for p in pairs if p.verdict == "suspicious"]
+        assert len(suspicious) == 1
 
     def test_heavily_noised_not_flagged(self):
         """A model fine-tuned enough to have different logprobs should not be flagged."""
@@ -244,9 +248,9 @@ class TestAntiCopyDetector:
         m1 = make_miner(1, BASE_LPS)
         m2 = make_miner(2, lps_c)
         pairs = self.detector.detect({0: m0, 1: m1, 2: m2})
-        copies = [p for p in pairs if p.is_copy]
-        assert len(copies) == 1
-        assert set([copies[0].uid_a, copies[0].uid_b]) == {0, 1}
+        suspicious = [p for p in pairs if p.verdict == "suspicious"]
+        assert len(suspicious) == 1
+        assert set([suspicious[0].uid_a, suspicious[0].uid_b]) == {0, 1}
 
     def test_insufficient_tasks_skipped(self):
         """Pairs with fewer than min_tasks shared tasks are skipped."""
@@ -278,6 +282,7 @@ class TestAntiCopyDetector:
         pairs = self.detector.detect({0: m0, 1: m1})
         assert len(pairs) == 1
         assert pairs[0].is_copy is False
+        assert pairs[0].verdict == "clean"
 
     def test_confidence_range(self):
         """All confidence values must be in [0, 1]."""
@@ -301,13 +306,21 @@ class TestHiddenStatesVoting:
 
     def test_both_signals_identical(self):
         """With both cos and hs identical, should get 2/2 votes."""
+        detector = AntiCopyDetector(
+            hs_threshold=0.99,
+            cosine_threshold=0.93,
+            hs_cheat_threshold=0.99,
+            cosine_cheat_threshold=0.93,
+            min_tasks=3,
+        )
         m0 = make_miner_with_hs(0, BASE_LPS, BASE_HS)
         m1 = make_miner_with_hs(1, BASE_LPS, BASE_HS)
-        pairs = self.detector.detect({0: m0, 1: m1})
+        pairs = detector.detect({0: m0, 1: m1})
         copies = [p for p in pairs if p.is_copy]
         assert len(copies) == 1
         assert copies[0].votes == 2
         assert copies[0].total_votes == 2
+        assert copies[0].verdict == "cheat"
 
     def test_hs_only_copy(self):
         """With only hidden_states data, 1 signal is enough."""
@@ -319,14 +332,23 @@ class TestHiddenStatesVoting:
         pairs = self.detector.detect({0: m0, 1: m1})
         assert len(pairs) == 1
         assert pairs[0].is_copy is True
+        assert pairs[0].verdict == "cheat"
         assert pairs[0].votes == 1
         assert pairs[0].total_votes == 1
 
     def test_cos_disagree_not_copy(self):
         """hs agrees but cos disagrees → not copy (must be unanimous)."""
-        lps_b = {t: list(np.random.default_rng(t + 500).uniform(-5, 0, 20)) for t in range(20)}
-        m0 = make_miner_with_hs(0, BASE_LPS, BASE_HS)
-        m1 = make_miner_with_hs(1, lps_b, BASE_HS)
+        m0 = MinerLogprobs(uid=0, hotkey="hk0")
+        m1 = MinerLogprobs(uid=1, hotkey="hk1")
+        for t in range(5):
+            m0.task_hidden_states[t] = BASE_HS[t]
+            m1.task_hidden_states[t] = BASE_HS[t]
+            # Same tokens so logprob signal participates, but orthogonal
+            # vectors so cosine stays below threshold.
+            m0.task_tokens[t] = ["x", "y"]
+            m1.task_tokens[t] = ["x", "y"]
+            m0.task_logprobs[t] = np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+            m1.task_logprobs[t] = np.array([0.0, 1.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float32)
         pairs = self.detector.detect({0: m0, 1: m1})
         copies = [p for p in pairs if p.is_copy]
         assert len(copies) == 0

@@ -511,7 +511,10 @@ class MinersMonitor:
         if uid != 0:
             try:
                 ac_result = await self.anticopy_dao.get_latest(model, revision)
-                if ac_result and ac_result.get("is_copy"):
+                ac_status = ""
+                if ac_result:
+                    ac_status = ac_result.get("status") or ("cheat" if ac_result.get("is_copy") else "clean")
+                if ac_result and ac_status in ("cheat", "suspicious"):
                     copy_of = ac_result.get("copy_of", [])
                     orig = copy_of[0] if copy_of else {}
                     orig_model = orig.get("model", "unknown")
@@ -523,16 +526,23 @@ class MinersMonitor:
                     if hs_cos:
                         sim_parts.append(f"hs={hs_cos:.4f}" if isinstance(hs_cos, (int, float)) else f"hs={hs_cos}")
                     sim_str = ",".join(sim_parts)
-                    reason = f"anticopy:high_similarity_with={orig_model}"
+                    reason_prefix = "anticopy:high_similarity_with" if ac_status == "cheat" else "anticopy:suspicious_similarity_with"
+                    reason = f"{reason_prefix}={orig_model}"
                     if sim_str:
                         reason += f"({sim_str})"
-                    info.is_valid = False
+                    if ac_status == "cheat":
+                        info.is_valid = False
+                        info.invalid_reason = reason
+                        logger.info(
+                            f"[MinersMonitor] Anti-copy flagged uid={uid}: "
+                            f"model={model} high similarity with {orig_model} [{sim_str}]"
+                        )
+                        return info
                     info.invalid_reason = reason
                     logger.info(
-                        f"[MinersMonitor] Anti-copy flagged uid={uid}: "
+                        f"[MinersMonitor] Anti-copy suspicious uid={uid}: "
                         f"model={model} high similarity with {orig_model} [{sim_str}]"
                     )
-                    return info
             except Exception as e:
                 logger.debug(f"[MinersMonitor] Anti-copy check failed for uid={uid}: {e}")
 

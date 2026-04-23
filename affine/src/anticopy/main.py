@@ -27,6 +27,8 @@ DEFAULT_INTERVAL = 86400  # 24 hours
 class AntiCopyService:
     """Periodic anti-copy detection service."""
 
+    _SEVERITY_RANK = {"clean": 0, "suspicious": 1, "cheat": 2}
+
     def __init__(self, interval: int = DEFAULT_INTERVAL):
         self.interval = interval
         self._running = False
@@ -63,20 +65,20 @@ class AntiCopyService:
         return miners
 
     def _build_copy_records(
-        self, copy_pairs, miner_info: Dict[int, dict]
+        self, flagged_pairs, miner_info: Dict[int, dict]
     ) -> List[dict]:
-        """Build per-model copy records.
+        """Build per-model anti-copy records.
 
-        For each miner, find the earliest-block miner among all its
-        direct similar pairs. If that miner committed earlier, the
-        current miner is a copier pointing to it as the original.
+        For each miner, find the strongest direct flagged relation that points
+        to an earlier miner. Severity wins over recency; within the same
+        severity, the earliest block wins.
 
         Returns:
-            List of dicts ready for DAO.save_round() (only copiers)
+            List of dicts ready for DAO.save_round() (only suspicious/cheat miners)
         """
         # Build adjacency: uid -> [(other_uid, CopyPair)]
         neighbors: Dict[int, list] = defaultdict(list)
-        for pair in copy_pairs:
+        for pair in flagged_pairs:
             neighbors[pair.uid_a].append((pair.uid_b, pair))
             neighbors[pair.uid_b].append((pair.uid_a, pair))
 
@@ -86,37 +88,60 @@ class AntiCopyService:
             my_block = info["block"]
 
             # Find the peer with the earliest block
-            earliest_uid = None
-            earliest_block = my_block
-            earliest_pair = None
+            chosen_uid = None
+            chosen_block = my_block
+            chosen_pair = None
+            chosen_severity = "clean"
             for peer_uid, pair in peers:
                 peer_block = miner_info[peer_uid]["block"]
-                if peer_block < earliest_block or (
-                    peer_block == earliest_block and peer_uid < uid
+                if not (
+                    peer_block < my_block or (peer_block == my_block and peer_uid < uid)
                 ):
-                    earliest_block = peer_block
-                    earliest_uid = peer_uid
-                    earliest_pair = pair
+                    continue
+
+                if (
+                    self._SEVERITY_RANK.get(pair.verdict, 0)
+                    > self._SEVERITY_RANK.get(chosen_severity, 0)
+                ):
+                    chosen_uid = peer_uid
+                    chosen_block = peer_block
+                    chosen_pair = pair
+                    chosen_severity = pair.verdict
+                    continue
+
+                if (
+                    pair.verdict == chosen_severity
+                    and (
+                        peer_block < chosen_block
+                        or (
+                            peer_block == chosen_block
+                            and (chosen_uid is None or peer_uid < chosen_uid)
+                        )
+                    )
+                ):
+                    chosen_uid = peer_uid
+                    chosen_block = peer_block
+                    chosen_pair = pair
 
             # If no peer is earlier, this miner is an original
-            if earliest_uid is None:
+            if chosen_uid is None:
                 continue
 
-            orig_info = miner_info[earliest_uid]
+            orig_info = miner_info[chosen_uid]
             copy_entry = {
-                "uid": earliest_uid,
+                "uid": chosen_uid,
                 "hotkey": orig_info["hotkey"],
                 "model": orig_info["model"],
             }
-            if earliest_pair:
+            if chosen_pair:
                 for key, val in [
-                    ("logprobs_cosine", earliest_pair.cosine_similarity),
-                    ("hs_cosine", earliest_pair.hs_cosine),
-                    ("js_div", earliest_pair.js_divergence),
+                    ("logprobs_cosine", chosen_pair.cosine_similarity),
+                    ("hs_cosine", chosen_pair.hs_cosine),
+                    ("js_div", chosen_pair.js_divergence),
                 ]:
                     if val is not None and not (isinstance(val, float) and math.isnan(val)):
                         copy_entry[key] = val
-                copy_entry["n_tasks"] = earliest_pair.n_tasks
+                copy_entry["n_tasks"] = chosen_pair.n_tasks
 
             results.append({
                 "uid": uid,
@@ -124,7 +149,8 @@ class AntiCopyService:
                 "model": info["model"],
                 "revision": info["revision"],
                 "block": info["block"],
-                "is_copy": True,
+                "status": chosen_severity,
+                "is_copy": chosen_severity == "cheat",
                 "copy_of": [copy_entry],
             })
 
@@ -151,23 +177,23 @@ class AntiCopyService:
         detector = AntiCopyDetector()
         results = detector.detect(miner_data)
 
-        copy_pairs = [r for r in results if r.is_copy]
+        flagged_pairs = [r for r in results if r.verdict != "clean"]
         logger.info(
-            f"[AntiCopy] Detection complete: {len(copy_pairs)} copy pairs "
+            f"[AntiCopy] Detection complete: {len(flagged_pairs)} flagged pairs "
             f"out of {len(results)} pairs evaluated"
         )
-        for r in copy_pairs:
+        for r in flagged_pairs:
             logger.warning(f"[AntiCopy] {r}")
 
         # Save to DB: write results for ALL evaluated miners
         # so that previously-flagged miners get cleared when no longer copy
-        copy_records = self._build_copy_records(copy_pairs, miner_info) if copy_pairs else []
-        copy_uids = {r["uid"] for r in copy_records}
+        flagged_records = self._build_copy_records(flagged_pairs, miner_info) if flagged_pairs else []
+        flagged_uids = {r["uid"] for r in flagged_records}
 
         # Build clean records for non-copy miners that were evaluated
         clean_records = []
         for uid in miner_data:
-            if uid not in copy_uids:
+            if uid not in flagged_uids:
                 info = miner_info[uid]
                 clean_records.append({
                     "uid": uid,
@@ -175,19 +201,21 @@ class AntiCopyService:
                     "model": info["model"],
                     "revision": info["revision"],
                     "block": info["block"],
+                    "status": "clean",
                     "is_copy": False,
                     "copy_of": [],
                 })
 
-        all_records = copy_records + clean_records
+        all_records = flagged_records + clean_records
         if all_records:
             dao = AntiCopyDAO()
             round_ts = int(time.time())
             await dao.save_round(all_records, round_timestamp=round_ts)
-            copy_count = sum(1 for r in all_records if r["is_copy"])
+            cheat_count = sum(1 for r in all_records if r["status"] == "cheat")
+            suspicious_count = sum(1 for r in all_records if r["status"] == "suspicious")
             logger.info(
                 f"[AntiCopy] Saved {len(all_records)} records "
-                f"({copy_count} copies, {len(clean_records)} clean) to DB"
+                f"({cheat_count} cheats, {suspicious_count} suspicious, {len(clean_records)} clean) to DB"
             )
 
     async def _loop(self):

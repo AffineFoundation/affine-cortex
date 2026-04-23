@@ -14,6 +14,7 @@ from affine.core.setup import logger
 from affine.database import init_client, close_client
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.scores import ScoresDAO
+from affine.database.dao.anti_copy import AntiCopyDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scorer.scorer import Scorer
@@ -101,6 +102,7 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
 
     config = ScorerConfig()
     scorer = Scorer(config)
+    anticopy_dao = AntiCopyDAO()
 
     async with cli_api_client() as api_client:
         # Fetch data
@@ -155,6 +157,26 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
                 # Default: fresh state for this miner only, others unaffected
         logger.info(f"Loaded challenge states for {len(prev_challenge_states)} miners")
 
+        anticopy_records = {}
+        for _, miner_info in scoring_data.items():
+            model = miner_info.get('model_repo', '')
+            revision = miner_info.get('model_revision', '')
+            if not model or not revision:
+                continue
+            try:
+                ac = await anticopy_dao.get_latest(model, revision)
+                if ac:
+                    copy_of = ac.get("copy_of", [])
+                    orig = copy_of[0] if copy_of else {}
+                    anticopy_records[f"{model}#{revision}"] = {
+                        "status": ac.get("status")
+                        or ("cheat" if ac.get("is_copy") else "clean"),
+                        "copy_of_uid": orig.get("uid"),
+                    }
+            except Exception as e:
+                logger.warning(f"Failed to load anti-copy status for {model}@{revision[:8]}: {e}")
+        logger.info(f"Loaded anti-copy records for {len(anticopy_records)} miners")
+
         # Extract sampling_count per environment for checkpoint calculation
         env_sampling_counts = {}
         for env_name, ec in env_configs.items():
@@ -172,6 +194,7 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
             env_sampling_counts=env_sampling_counts,
             champion_state=champion_state,
             prev_challenge_states=prev_challenge_states,
+            anticopy_records=anticopy_records,
             print_summary=True,
         )
 

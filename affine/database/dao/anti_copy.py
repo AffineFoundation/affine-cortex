@@ -23,12 +23,21 @@ class AntiCopyDAO(BaseDAO):
     def _make_sk(self, timestamp: int) -> str:
         return f"ROUND#{timestamp}"
 
+    @staticmethod
+    def _normalize_result(result: Optional[Dict]) -> Optional[Dict]:
+        if not result:
+            return result
+        if "status" not in result:
+            result = result.copy()
+            result["status"] = "cheat" if result.get("is_copy") else "clean"
+        return result
+
     async def save_round(self, results: List[Dict], round_timestamp: int = None):
         """Save one round of detection results.
 
         Args:
             results: List of dicts, one per model:
-                {uid, hotkey, model, revision, block, is_copy,
+                {uid, hotkey, model, revision, block, status, is_copy,
                  copy_of: [{uid, hotkey, model, logprobs_cosine, hs_cosine,
                             js_div, n_tasks}]}
             round_timestamp: Unix timestamp for this round (default: now)
@@ -46,6 +55,7 @@ class AntiCopyDAO(BaseDAO):
                 "model": r["model"],
                 "revision": r["revision"],
                 "block": r["block"],
+                "status": r.get("status", "cheat" if r.get("is_copy") else "clean"),
                 "is_copy": r["is_copy"],
                 "copy_of": r.get("copy_of", []),
                 "timestamp": ts,
@@ -67,8 +77,11 @@ class AntiCopyDAO(BaseDAO):
             limit=1,
             reverse=True,
         )
-        return results[0] if results else None
+        return self._normalize_result(results[0]) if results else None
 
     async def get_history(self, model: str, revision: str) -> List[Dict]:
         """Get all detection results for a model."""
-        return await self.query(pk=self._make_pk(model, revision))
+        return [
+            self._normalize_result(result)
+            for result in await self.query(pk=self._make_pk(model, revision))
+        ]

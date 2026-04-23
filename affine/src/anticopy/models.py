@@ -46,6 +46,7 @@ class CopyPair:
     token_agreement: float      # median token agreement across tasks
 
     n_tasks: int                # shared tasks used
+    verdict: str                # "clean" | "suspicious" | "cheat"
     is_copy: bool
     confidence: float           # 0.0 - 1.0
     votes: int = 0              # number of signals that voted "copy"
@@ -59,7 +60,7 @@ class CopyPair:
     task_cosines: Dict[int, float] = field(default_factory=dict)
 
     def __repr__(self) -> str:
-        flag = "COPY" if self.is_copy else "ok"
+        flag = self.verdict.upper()
         hs_str = f"{self.hs_cosine:.5f}" if not np.isnan(self.hs_cosine) else "N/A"
         nd_str = f"{self.hs_norm_deviation:.4f}" if not np.isnan(self.hs_norm_deviation) else "N/A"
         return (

@@ -55,6 +55,19 @@ class Stage2ParetoFilter:
         else:
             margin = self.config.PARETO_MARGIN
             not_worse_tol = 1e-9  # No tolerance for pairwise
+
+        suspicious_multiplier = self.config.PARETO_SUSPICIOUS_MARGIN_MULTIPLIER
+
+        def _effective_margin(actor: MinerData, target: MinerData) -> float:
+            if (
+                getattr(actor, "anticopy_status", "clean") == "suspicious"
+                and getattr(actor, "anticopy_target_uid", None) == target.uid
+            ):
+                return margin * suspicious_multiplier
+            return margin
+
+        margin_b_over_a = _effective_margin(miner_b, miner_a)
+        margin_a_over_b = _effective_margin(miner_a, miner_b)
         b_dominant = 0   # envs where B beats A by margin
         b_not_worse = 0  # envs where B >= A (no margin required)
         a_dominant = 0
@@ -79,7 +92,7 @@ class Stage2ParetoFilter:
             n_compared += 1
 
             # B exceeds A by margin → B dominant in this env
-            if score_b > score_a + margin + 1e-9:
+            if score_b > score_a + margin_b_over_a + 1e-9:
                 b_dominant += 1
                 b_not_worse += 1
                 winner = "B"
@@ -94,14 +107,15 @@ class Stage2ParetoFilter:
                 winner = "A"
 
             # A exceeds B by margin → A dominant in this env
-            if score_a > score_b + margin + 1e-9:
+            if score_a > score_b + margin_a_over_b + 1e-9:
                 a_dominant += 1
 
             env_details[env] = {
                 "a_score": score_a,
                 "b_score": score_b,
-                "margin": round(margin, 4),
-                "threshold": score_a + margin,
+                "margin_b_over_a": round(margin_b_over_a, 4),
+                "margin_a_over_b": round(margin_a_over_b, 4),
+                "threshold": score_a + margin_b_over_a,
                 "winner": winner,
                 "common_tasks": len(common),
             }

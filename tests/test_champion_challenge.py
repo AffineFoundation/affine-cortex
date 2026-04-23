@@ -52,8 +52,15 @@ def prev(hotkey, wins=0, tl=0, cl=0, cp=0, status="sampling", revision="rev1"):
                      "challenge_status": status, "revision": revision}}
 
 
-def run(cc, miners, champion_state=None, prev_states=None):
-    return cc.run(miners, ENVS, ENV_SC, champion_state, prev_states or {})
+def run(cc, miners, champion_state=None, prev_states=None, anticopy_records=None):
+    return cc.run(
+        miners,
+        ENVS,
+        ENV_SC,
+        champion_state,
+        prev_states or {},
+        anticopy_records=anticopy_records or {},
+    )
 
 
 # ── Checkpoint Gate ──────────────────────────────────────────────────────────
@@ -435,6 +442,70 @@ class TestWeights:
         assert miners[2].challenge_checkpoints_passed == 0
 
 
+class TestAntiCopyBias:
+
+    def test_suspicious_miner_needs_higher_margin_against_copied_champion(self):
+        cc = ChampionChallenge(cfg(
+            CHAMPION_DETHRONE_MIN_CHECKPOINT=1,
+            WIN_MARGIN_START=0.02,
+            WIN_MARGIN_END=0.02,
+            PARETO_SUSPICIOUS_MARGIN_MULTIPLIER=1.5,
+        ))
+        miners = {
+            1: miner(1, "hk_champ", revision="champ", scores=[0.50, 0.50]),
+            2: miner(2, "hk_susp", revision="susp", scores=[0.525, 0.525]),
+        }
+        r = run(
+            cc,
+            miners,
+            cs(revision="champ"),
+            anticopy_records={"test/model#susp": {"status": "suspicious", "copy_of_uid": 1}},
+        )
+        assert r.champion_uid == 1
+        assert miners[2].challenge_consecutive_wins == 0
+
+    def test_suspicious_miner_keeps_normal_margin_against_unrelated_target(self):
+        cc = ChampionChallenge(cfg(
+            CHAMPION_DETHRONE_MIN_CHECKPOINT=1,
+            WIN_MARGIN_START=0.02,
+            WIN_MARGIN_END=0.02,
+            PARETO_SUSPICIOUS_MARGIN_MULTIPLIER=1.5,
+        ))
+        miners = {
+            1: miner(1, "hk_champ", revision="champ", scores=[0.50, 0.50]),
+            2: miner(2, "hk_susp", revision="susp", scores=[0.525, 0.525]),
+        }
+        r = run(
+            cc,
+            miners,
+            cs(revision="champ"),
+            anticopy_records={"test/model#susp": {"status": "suspicious", "copy_of_uid": 99}},
+        )
+        assert r.champion_uid == 2
+        assert miners[2].challenge_consecutive_wins == 0
+
+    def test_pairwise_filter_uses_higher_margin_only_against_copied_uid(self):
+        cc = ChampionChallenge(cfg(
+            PARETO_MIN_WINDOWS=3,
+            PARETO_MARGIN=0.04,
+            PARETO_SUSPICIOUS_MARGIN_MULTIPLIER=1.5,
+        ))
+        n = 3 * WINDOW
+        miners = {
+            1: miner(1, "hk_champ", revision="champ", first_block=50, scores=[0.2, 0.2], n_tasks=n),
+            2: miner(2, "hk_old", revision="old", first_block=100, scores=[0.70, 0.70], n_tasks=n),
+            3: miner(3, "hk_new", revision="new", first_block=200, scores=[0.735, 0.735], n_tasks=n),
+        }
+        run(
+            cc,
+            miners,
+            cs(revision="champ"),
+            anticopy_records={"test/model#new": {"status": "suspicious", "copy_of_uid": 2}},
+        )
+        assert miners[2].challenge_status == "sampling"
+        assert miners[3].challenge_status == "terminated"
+
+
 # ── Edge Cases ───────────────────────────────────────────────────────────────
 
 class TestEdgeCases:
@@ -515,4 +586,3 @@ class TestEdgeCases:
             prev("hk_dead", status="terminated", tl=5, cl=5, cp=5))
         assert miners[2].challenge_status == "terminated"
         assert miners[3].challenge_status == "sampling"
-

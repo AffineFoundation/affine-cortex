@@ -46,6 +46,7 @@ class Scorer:
         env_sampling_counts: Optional[Dict[str, int]] = None,
         champion_state: Optional[Dict[str, Any]] = None,
         prev_challenge_states: Optional[Dict[str, Dict[str, Any]]] = None,
+        anticopy_records: Optional[Dict[str, Dict[str, Any]]] = None,
         print_summary: bool = True,
     ) -> ScoringResult:
         """Run one scoring round.
@@ -73,6 +74,7 @@ class Scorer:
             env_sampling_counts=env_sampling_counts or {},
             champion_state=champion_state,
             prev_challenge_states=prev_challenge_states or {},
+            anticopy_records=anticopy_records or {},
         )
 
         result = ScoringResult(

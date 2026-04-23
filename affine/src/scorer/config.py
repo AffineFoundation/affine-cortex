@@ -63,6 +63,14 @@ class ScorerConfig:
     dynamic margin — it's always this fixed value.
     """
 
+    PARETO_SUSPICIOUS_MARGIN_MULTIPLIER: float = 1.5
+    """Anti-copy margin multiplier for suspicious miners.
+
+    When the current miner is suspicious and the comparison target is the
+    model it copied from, the required dominance margin is multiplied by
+    this factor. Example: 0.04 -> 0.06 when multiplier=1.5.
+    """
+
     # ── Geometric Mean ────────────────────────────────────────────────────
 
     GEOMETRIC_MEAN_EPSILON: float = 0.1
@@ -118,6 +126,7 @@ class ScorerConfig:
             'win_min_dominant_envs': cls.WIN_MIN_DOMINANT_ENVS,
             'win_not_worse_tolerance': cls.WIN_NOT_WORSE_TOLERANCE,
             'pareto_margin': cls.PARETO_MARGIN,
+            'pareto_suspicious_margin_multiplier': cls.PARETO_SUSPICIOUS_MARGIN_MULTIPLIER,
             'pareto_min_dominant_envs': cls.PARETO_MIN_DOMINANT_ENVS,
             'pareto_min_windows': cls.PARETO_MIN_WINDOWS,
             'geometric_mean_epsilon': cls.GEOMETRIC_MEAN_EPSILON,
@@ -132,6 +141,7 @@ class ScorerConfig:
         assert 0.0 < cls.WIN_MARGIN_START < 1.0, "WIN_MARGIN_START must be in (0, 1)"
         assert 0.0 < cls.WIN_MARGIN_END < 1.0, "WIN_MARGIN_END must be in (0, 1)"
         assert cls.WIN_MARGIN_END >= cls.WIN_MARGIN_START, "WIN_MARGIN_END must be >= START"
+        assert cls.PARETO_SUSPICIOUS_MARGIN_MULTIPLIER >= 1.0, "PARETO_SUSPICIOUS_MARGIN_MULTIPLIER must be >= 1"
         assert cls.GEOMETRIC_MEAN_EPSILON >= 0.0, "GEOMETRIC_MEAN_EPSILON must be non-negative"
         assert cls.CHAMPION_WARMUP_CHECKPOINTS >= 0, "CHAMPION_WARMUP_CHECKPOINTS must be >= 0"
         assert cls.CHAMPION_DETHRONE_MIN_CHECKPOINT >= 1, "CHAMPION_DETHRONE_MIN_CHECKPOINT must be >= 1"

@@ -49,10 +49,12 @@ class ChampionChallenge:
         env_sampling_counts: Dict[str, int],
         champion_state: Optional[Dict],
         prev_challenge_states: Dict[str, Dict],
+        anticopy_records: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> ChampionChallengeOutput:
         if not environments or not miners:
             return self._empty_output(miners)
 
+        self._load_anticopy_records(miners, anticopy_records or {})
         self._load_states(miners, prev_challenge_states)
 
         champion_uid, champion_miner, weight_uid, champion_changed = \
@@ -118,6 +120,12 @@ class ChampionChallenge:
             miner.challenge_checkpoints_passed = p.get('challenge_checkpoints_passed', 0)
             miner.challenge_status = p.get('challenge_status', 'sampling')
             miner.termination_reason = p.get('termination_reason', '')
+
+    def _load_anticopy_records(self, miners: Dict[int, MinerData], records: Dict[str, Dict[str, Any]]):
+        for miner in miners.values():
+            record = records.get(f"{miner.model_repo}#{miner.model_revision}", {})
+            miner.anticopy_status = record.get('status', 'clean')
+            miner.anticopy_target_uid = record.get('copy_of_uid')
 
     # ── Phase 2: Resolve champion ────────────────────────────────────────────
 

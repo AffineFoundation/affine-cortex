@@ -34,6 +34,8 @@ class MinerData:
     first_block: int
 
     env_scores: Dict[str, EnvScore] = field(default_factory=dict)
+    anticopy_status: str = 'clean'      # 'clean' | 'suspicious' | 'cheat'
+    anticopy_target_uid: Optional[int] = None
 
     # Champion challenge state
     challenge_consecutive_wins: int = 0
