@@ -57,9 +57,12 @@ class Stage2ParetoFilter:
             not_worse_tol = 1e-9  # No tolerance for pairwise
 
         suspicious_multiplier = self.config.PARETO_SUSPICIOUS_MARGIN_MULTIPLIER
+        # Anti-copy bias only applies to pairwise elimination, not champion
+        # challenges or champion-dominance checks.
+        apply_anticopy_bias = (label == "pairwise")
 
         def _effective_margin(actor: MinerData, target: MinerData) -> float:
-            if (
+            if apply_anticopy_bias and (
                 getattr(actor, "anticopy_status", "clean") == "suspicious"
                 and getattr(actor, "anticopy_target_uid", None) == target.uid
             ):
@@ -113,8 +116,7 @@ class Stage2ParetoFilter:
             env_details[env] = {
                 "a_score": score_a,
                 "b_score": score_b,
-                "margin_b_over_a": round(margin_b_over_a, 4),
-                "margin_a_over_b": round(margin_a_over_b, 4),
+                "margin": round(margin_b_over_a, 4),
                 "threshold": score_a + margin_b_over_a,
                 "winner": winner,
                 "common_tasks": len(common),

@@ -444,7 +444,10 @@ class TestWeights:
 
 class TestAntiCopyBias:
 
-    def test_suspicious_miner_needs_higher_margin_against_copied_champion(self):
+    def test_suspicious_bias_does_not_apply_to_champion_challenge(self):
+        # Gap 0.025 > WIN_MARGIN_END 0.02 but < margin*1.5=0.03.
+        # If anti-copy bias applied to challenges, 2 would be blocked;
+        # since bias is pairwise-only, 2 dethrones 1 normally.
         cc = ChampionChallenge(cfg(
             CHAMPION_DETHRONE_MIN_CHECKPOINT=1,
             WIN_MARGIN_START=0.02,
@@ -461,8 +464,7 @@ class TestAntiCopyBias:
             cs(revision="champ"),
             anticopy_records={"test/model#susp": {"status": "suspicious", "copy_of_uid": 1}},
         )
-        assert r.champion_uid == 1
-        assert miners[2].challenge_consecutive_wins == 0
+        assert r.champion_uid == 2
 
     def test_suspicious_miner_keeps_normal_margin_against_unrelated_target(self):
         cc = ChampionChallenge(cfg(
