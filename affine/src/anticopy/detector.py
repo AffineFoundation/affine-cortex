@@ -18,7 +18,7 @@ Decision:
 """
 
 import numpy as np
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from affine.core.setup import logger
 from affine.src.anticopy.loader import TOP_K
@@ -30,24 +30,41 @@ class AntiCopyDetector:
     """Detect model copies using two independent signals.
 
     Args:
-        hs_threshold:      hidden_states cosine >= this → vote copy
-        cosine_threshold:   logprob cosine >= this → vote copy
-        min_tasks:          minimum shared tasks required for comparison
+        hs_suspicious_threshold: hidden_states cosine >= this → vote suspicious
+        logprob_suspicious_threshold: logprob cosine >= this → vote suspicious
+        hs_cheat_threshold: hidden_states cosine >= this → vote cheat
+        logprob_cheat_threshold: logprob cosine >= this → vote cheat
+        min_tasks: minimum shared tasks required for comparison
     """
 
     def __init__(
         self,
-        hs_threshold: float = 0.99,
-        cosine_threshold: float = 0.99,
+        hs_suspicious_threshold: float = 0.99,
+        logprob_suspicious_threshold: float = 0.99,
         hs_cheat_threshold: float = 0.995,
-        cosine_cheat_threshold: float = 0.995,
+        logprob_cheat_threshold: float = 0.995,
         min_tasks: int = 30,
         hs_norm_deviation_max: float = 0.05,
+        *,
+        hs_threshold: Optional[float] = None,
+        cosine_threshold: Optional[float] = None,
+        cosine_cheat_threshold: Optional[float] = None,
     ):
-        self.hs_threshold = hs_threshold
-        self.cosine_threshold = cosine_threshold
+        if hs_threshold is not None:
+            hs_suspicious_threshold = hs_threshold
+        if cosine_threshold is not None:
+            logprob_suspicious_threshold = cosine_threshold
+        if cosine_cheat_threshold is not None:
+            logprob_cheat_threshold = cosine_cheat_threshold
+
+        self.hs_suspicious_threshold = hs_suspicious_threshold
+        self.logprob_suspicious_threshold = logprob_suspicious_threshold
         self.hs_cheat_threshold = hs_cheat_threshold
-        self.cosine_cheat_threshold = cosine_cheat_threshold
+        self.logprob_cheat_threshold = logprob_cheat_threshold
+        # Backward-compatible aliases for older tests/callers.
+        self.hs_threshold = self.hs_suspicious_threshold
+        self.cosine_threshold = self.logprob_suspicious_threshold
+        self.cosine_cheat_threshold = self.logprob_cheat_threshold
         self.min_tasks = min_tasks
         # Gate: reject hs vote if per-task ||h_a||/||h_b|| deviates too much
         # from 1.0. True copies (even with added perturbation noise) keep
@@ -214,7 +231,7 @@ class AntiCopyDetector:
 
                 if has_hs:
                     total_votes += 1
-                    hs_vote_suspicious = med_hs >= self.hs_threshold
+                    hs_vote_suspicious = med_hs >= self.hs_suspicious_threshold
                     hs_vote_cheat = med_hs >= self.hs_cheat_threshold
                     # Norm-ratio gate: if per-task ||h_a||/||h_b|| drifts
                     # too much, this is fine-tune divergence, not copy.
@@ -231,9 +248,9 @@ class AntiCopyDetector:
 
                 if has_logprobs and not np.isnan(med_cosine):
                     total_votes += 1
-                    if med_cosine >= self.cosine_threshold:
+                    if med_cosine >= self.logprob_suspicious_threshold:
                         suspicious_votes += 1
-                    if med_cosine >= self.cosine_cheat_threshold:
+                    if med_cosine >= self.logprob_cheat_threshold:
                         cheat_votes += 1
 
                 is_cheat = total_votes >= 1 and cheat_votes == total_votes

@@ -193,8 +193,8 @@ class TestTokenAgreement:
 class TestAntiCopyDetector:
     def setup_method(self):
         self.detector = AntiCopyDetector(
-            cosine_threshold=0.93,
-            cosine_cheat_threshold=1.1,
+            logprob_suspicious_threshold=0.93,
+            logprob_cheat_threshold=1.1,
             min_tasks=3,
         )
 
@@ -209,7 +209,7 @@ class TestAntiCopyDetector:
         assert len(suspicious) == 1
         pair = suspicious[0]
         # Cosine is high but not exactly 1.0 because p2 split varies by uid
-        assert pair.cosine_similarity > self.detector.cosine_threshold
+        assert pair.cosine_similarity > self.detector.logprob_suspicious_threshold
         # Only cos signal (no hs), votes 1/1
         assert pair.votes == 1
         assert pair.total_votes == 1
@@ -299,18 +299,18 @@ class TestAntiCopyDetector:
 class TestHiddenStatesVoting:
     def setup_method(self):
         self.detector = AntiCopyDetector(
-            hs_threshold=0.99,
-            cosine_threshold=0.93,
+            hs_suspicious_threshold=0.99,
+            logprob_suspicious_threshold=0.93,
             min_tasks=3,
         )
 
     def test_both_signals_identical(self):
         """With both cos and hs identical, should get 2/2 votes."""
         detector = AntiCopyDetector(
-            hs_threshold=0.99,
-            cosine_threshold=0.93,
+            hs_suspicious_threshold=0.99,
+            logprob_suspicious_threshold=0.93,
             hs_cheat_threshold=0.99,
-            cosine_cheat_threshold=0.93,
+            logprob_cheat_threshold=0.93,
             min_tasks=3,
         )
         m0 = make_miner_with_hs(0, BASE_LPS, BASE_HS)
