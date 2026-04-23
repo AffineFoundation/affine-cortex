@@ -136,6 +136,7 @@ async def resolve_dataset_range_source(
     source: Dict[str, str],
     old_range: Optional[List[List[int]]] = None,
     timeout: float = 10.0,
+    min_segment_size: int = 100,
 ) -> Optional[List[List[int]]]:
     """Resolve dataset_range from a remote metadata source.
 
@@ -147,6 +148,12 @@ async def resolve_dataset_range_source(
         source: Dict with keys: url, field, range_type
         old_range: Current dataset_range to expand (None for fresh build)
         timeout: HTTP request timeout in seconds
+        min_segment_size: When the tail reaches this size, start a new
+            tail segment. Caller should typically pass the env's
+            sampling_count so the active tail never exceeds the list
+            window — keeps every new task immediately visible in the
+            sampling list and lets rotation fall back to older segments
+            for broader coverage.
 
     Returns:
         Resolved dataset_range, or None if resolution fails / no change
@@ -174,7 +181,8 @@ async def resolve_dataset_range_source(
         value = int(value)
 
         if old_range:
-            resolved_range = expand_dataset_range(old_range, value, range_type)
+            resolved_range = expand_dataset_range(
+                old_range, value, range_type, min_segment_size=min_segment_size)
         else:
             resolved_range = _build_range(value, range_type)
 

@@ -1020,12 +1020,19 @@ class SamplingScheduler:
                 if not sampling_config:
                     continue
 
-                # Re-resolve dynamic dataset_range from remote source
+                # Re-resolve dynamic dataset_range from remote source.
+                # Cap tail segment size at this env's sampling_count so
+                # the rotation tail always fits inside the sampling list
+                # (every new task immediately visible, older segments
+                # accessible for miners who haven't seen them yet).
                 range_source = sampling_config.get('dataset_range_source')
                 if range_source:
                     old_range = sampling_config.get('dataset_range')
+                    tail_cap = sampling_config.get('sampling_count')
                     resolved_range = await resolve_dataset_range_source(
-                        range_source, old_range=old_range
+                        range_source,
+                        old_range=old_range,
+                        min_segment_size=tail_cap if tail_cap else 100,
                     )
                     if resolved_range is not None:
                         sampling_config['dataset_range'] = resolved_range

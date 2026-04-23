@@ -96,10 +96,10 @@
           "field": "completed_up_to",
           "range_type": "zero_to_value"
         },
-        "sampling_count": 40,
+        "sampling_count": 30,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 260,
+        "rotation_interval": 290,
         "scheduling_weight": 1.0
       }
     }
