@@ -403,62 +403,41 @@ class TaskPoolDAO(BaseDAO):
         task: Dict[str, Any],
         error_message: str,
         error_code: str = 'EXECUTION_ERROR'
-    ) -> Dict[str, Any]:
+    ) -> Optional[Dict[str, Any]]:
         """Record task failure and handle retry logic.
-        
-        If retry_count < max_retries, reset status to 'pending'.
-        Otherwise, set status to 'paused'.
-        
-        Strategy: Create new task first, then delete old task to avoid race condition.
-        
+
+        If retry_count < max_retries, reset status to 'pending' (the
+        scheduler will re-assign it). Otherwise DELETE the task and
+        return None — the scheduler will either recreate it next cycle
+        (if the sampling list still contains this task_id) or simply
+        move on (rotation removes it within minutes). This replaces
+        the old 4-hour 'paused' DB state, unnecessary given the small
+        sampling windows and short rotation cycles.
+
         Args:
             task: Task dict
             error_message: Error description
             error_code: Error classification code
-            
+
         Returns:
-            Updated task (or task with status='paused' if max retries reached)
+            Updated task if still retryable; None if deleted on max retries.
         """
         # Save old PK/SK for deletion
         old_pk = task['pk']
         old_sk = task['sk']
-        
+
         retry_count = task.get('retry_count', 0) + 1
         max_retries = task.get('max_retries')
-        
+
         if retry_count >= max_retries:
             logger.info(
-                f"Task paused after {retry_count} retries: "
+                f"Task deleted after {retry_count} retries: "
                 f"miner={task['miner_hotkey'][:12]}... env={task['env']} "
                 f"task_id={task['task_id']} error={error_message[:100]}"
             )
-            
-            new_status = 'paused'
-            new_sk = self._make_sk(task['env'], new_status, task['task_id'])
-            new_gsi1_pk = self._make_gsi1_pk(task['env'], new_status)
-            new_gsi1_sk = self._make_gsi1_sk(
-                task['miner_hotkey'],
-                task['model_revision'],
-                task['task_id']
-            )
-            
-            task['sk'] = new_sk
-            task['status'] = new_status
-            task['retry_count'] = retry_count
-            task['last_error'] = error_message
-            task['last_error_code'] = error_code
-            task['last_failed_at'] = int(time.time())
-            task['assigned_to'] = None
-            task['assigned_at'] = None
-            task['gsi1_pk'] = new_gsi1_pk
-            task['gsi1_sk'] = new_gsi1_sk
-            task['ttl'] = int(time.time()) + 3600 * 4
-            
-            await self.put(task)
             await self.delete(old_pk, old_sk)
-            
-            return task
-        
+            return None
+
         # Still have retries left, reset to pending
         new_status = 'pending'
         new_sk = self._make_sk(task['env'], new_status, task['task_id'])
@@ -491,28 +470,20 @@ class TaskPoolDAO(BaseDAO):
         miner_hotkey: str,
         model_revision: str,
         env: str,
-        include_paused: bool = True
     ) -> Set[int]:
         """Get set of task_ids in queue for a miner's env.
-        
-        Used by task generator to avoid creating duplicate tasks.
-        
-        Args:
-            miner_hotkey: Miner's hotkey
-            model_revision: Model revision
-            env: Environment name
-            include_paused: Whether to include paused tasks (default: True)
-                - True: Include paused tasks (for duplicate detection)
-                - False: Exclude paused tasks (for concurrency control)
-            
-        Returns:
-            Set of task_ids (integers)
+
+        Used by task generator to avoid creating duplicate tasks, and
+        by the scheduler to count active tasks against the miner's slot
+        budget. Only `pending` and `assigned` statuses are ever present
+        since `fail_task` now deletes on max retries instead of marking
+        tasks `paused`.
         """
         from affine.database.client import get_client
         client = get_client()
-        
+
         pk = self._make_pk(miner_hotkey, model_revision)
-        
+
         params = {
             'TableName': self.table_name,
             'KeyConditionExpression': 'pk = :pk AND begins_with(sk, :sk_prefix)',
@@ -523,30 +494,25 @@ class TaskPoolDAO(BaseDAO):
             'ProjectionExpression': 'task_id, #status',
             'ExpressionAttributeNames': {'#status': 'status'}
         }
-        
+
         all_items = []
         last_key = None
-        
+
         while True:
             if last_key:
                 params['ExclusiveStartKey'] = last_key
-            
+
             response = await client.query(**params)
             items = response.get('Items', [])
             all_items.extend([self._deserialize(item) for item in items])
-            
+
             last_key = response.get('LastEvaluatedKey')
             if not last_key:
                 break
-        
-        # Filter by status based on include_paused parameter
-        valid_statuses = ['pending', 'assigned']
-        if include_paused:
-            valid_statuses.append('paused')
-        
+
         return {
             item['task_id'] for item in all_items
-            if item.get('status') in valid_statuses
+            if item.get('status') in ('pending', 'assigned')
         }
     
     async def cleanup_invalid_tasks(
@@ -939,76 +905,3 @@ class TaskPoolDAO(BaseDAO):
         logger.info(f"Deleted {deleted_count} assigned tasks on startup")
         return deleted_count
     
-    async def get_all_paused_tasks(self) -> List[Dict[str, Any]]:
-        """Get all paused tasks across all environments.
-        
-        Uses FilterExpression to scan only paused tasks.
-        Used by cleanup loop to remove expired tasks.
-        
-        Returns:
-            List of paused tasks with full attributes including ttl
-        """
-        from affine.database.client import get_client
-        client = get_client()
-        
-        params = {
-            'TableName': self.table_name,
-            'FilterExpression': '#status = :status',
-            'ExpressionAttributeNames': {'#status': 'status'},
-            'ExpressionAttributeValues': {':status': {'S': 'paused'}}
-        }
-        
-        all_tasks = []
-        last_key = None
-        
-        while True:
-            if last_key:
-                params['ExclusiveStartKey'] = last_key
-            
-            response = await client.scan(**params)
-            items = response.get('Items', [])
-            
-            for item in items:
-                all_tasks.append(self._deserialize(item))
-            
-            last_key = response.get('LastEvaluatedKey')
-            if not last_key:
-                break
-        
-        return all_tasks
-    
-    async def cleanup_expired_paused_tasks(self) -> int:
-        """Clean up paused tasks that have exceeded their TTL.
-        
-        This handles cases where DynamoDB TTL deletion is delayed.
-        
-        Returns:
-            Number of expired tasks deleted
-        """
-        current_time = int(time.time())
-        
-        # Get all paused tasks
-        paused_tasks = await self.get_all_paused_tasks()
-        
-        if not paused_tasks:
-            return 0
-        
-        # Filter tasks that have exceeded TTL
-        expired_tasks = [
-            task for task in paused_tasks
-            if task.get('ttl', 0) > 0 and task['ttl'] <= current_time
-        ]
-        
-        if not expired_tasks:
-            logger.debug(f"Found {len(paused_tasks)} paused tasks, none expired")
-            return 0
-        
-        # Batch delete expired tasks
-        deleted_count = await self._batch_delete_tasks(expired_tasks)
-        
-        logger.info(
-            f"Cleaned up {deleted_count} expired paused tasks "
-            f"(out of {len(paused_tasks)} total paused tasks)"
-        )
-        
-        return deleted_count

@@ -53,7 +53,7 @@ async def fetch_system_config(api_client, range_type: str = "scoring") -> dict:
     Returns:
         System config dict with:
         - 'environments': list of enabled environment names
-        - 'env_configs': dict mapping env_name -> env_config (including min_completeness)
+        - 'env_configs': dict mapping env_name -> env_config
     """
     try:
         config = await api_client.get("/config/environments")

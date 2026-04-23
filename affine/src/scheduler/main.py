@@ -5,7 +5,6 @@ Runs the TaskScheduler as an independent background service.
 This service generates sampling tasks for all miners periodically.
 """
 
-import os
 import asyncio
 import signal
 import click
@@ -16,7 +15,7 @@ from .sampling_scheduler import SamplingScheduler, PerMinerSamplingScheduler
 from .slots_adjuster import MinerSlotsAdjuster
 
 
-async def run_service(cleanup_interval: int):
+async def run_service():
     """Run the task scheduler service."""
     logger.info("Starting Task Scheduler Service")
     
@@ -125,12 +124,8 @@ def main(verbosity):
     # Setup logging if verbosity specified
     if verbosity is not None:
         setup_logging(int(verbosity))
-    
-    # Cleanup interval for expired paused tasks
-    cleanup_interval = int(os.getenv("SCHEDULER_CLEANUP_INTERVAL", "300"))
 
-    # Run service
-    asyncio.run(run_service(cleanup_interval=cleanup_interval))
+    asyncio.run(run_service())
 
 
 if __name__ == "__main__":

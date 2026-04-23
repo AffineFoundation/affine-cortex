@@ -4,21 +4,18 @@
     "GAME": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.85,
       "sampling_config": {
         "dataset_range": [[0, 500000000],[600000000, 800000000]],
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 170,
-        "scheduling_weight": 3.0
+        "rotation_interval": 170
       }
     },
     "SWE-INFINITE": {
       "display_name": "SWE",
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.6,
       "sampling_config": {
         "dataset_range": [[1616, 1716]],
         "dataset_range_source": {
@@ -29,66 +26,56 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 260,
-        "scheduling_weight": 1.0
+        "rotation_interval": 260
       }
     },
     "LIVEWEB": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 78060000]],
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 170,
-        "scheduling_weight": 1.0
+        "rotation_interval": 170
       }
     },
     "LOGPROBS": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": false,
-      "min_completeness": 0.9,
       "sampling_config": {
         "dataset_range": [[100000000, 400000000]],
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 21600,
-        "scheduling_weight": 1.0
+        "rotation_interval": 21600
       }
     },
     "NAVWORLD": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.85,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 170,
-        "scheduling_weight": 1.0
+        "rotation_interval": 170
       }
     },
     "MEMORY": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.8,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 220,
-        "scheduling_weight": 3.0
+        "rotation_interval": 220
       }
     },
     "DISTILL": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
-      "min_completeness": 0.6,
       "sampling_config": {
         "dataset_range": [[30, 110]],
         "dataset_range_source": {
@@ -99,8 +86,7 @@
         "sampling_count": 30,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 290,
-        "scheduling_weight": 1.0
+        "rotation_interval": 290
       }
     }
   }

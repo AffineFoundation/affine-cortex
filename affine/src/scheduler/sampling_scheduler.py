@@ -23,14 +23,19 @@ class PerMinerSamplingScheduler:
     """Per-miner sampling pool scheduler with weighted allocation.
 
     Architecture:
-    1. Each miner has dynamic slots (3-12, default 6), stored in MinerStats
-    2. Weighted allocation across environments based on scheduling_weight config
-    3. Minimum guarantee: each env gets at least 1 slot
-    4. Incremental scheduling every 10s
-    5. Priority-based task selection from sampling list tail
-    6. Rate limiting: actual sampling rate is limited to rotation_rate * RATE_MARGIN
-       to prevent answer memorization attacks (independent of rotation_enabled)
-    7. Rate is based on rotation rate only — no minimum guarantee
+    1. Each miner has dynamic slots (MIN_SLOTS-MAX_SLOTS), stored in MinerStats
+    2. Per-miner dynamic env weights derived from each env's window
+       completeness (laggard envs get more slots; saturated envs trickle)
+    3. Anti-starvation: envs with no active but missing tasks are reserved
+       one slot before weighted fairness allocation
+    4. Head-first task selection within each env (Earliest Deadline First —
+       oldest tasks are closest to rotating out of the sampling list)
+    5. Rate limiting: actual sampling rate is limited to rotation_rate *
+       RATE_MARGIN to prevent answer memorization attacks
+    6. Failed tasks: max retries → deleted. Sampling-list rotation
+       (minutes to hours, depending on env) naturally retires the task
+       ID so a persistently-failing task self-limits; no paused state or
+       cooldown needed.
     """
 
     DEFAULT_SLOTS = 10
@@ -39,7 +44,7 @@ class PerMinerSamplingScheduler:
 
     # Rate limiting: allow actual sampling rate to exceed rotation rate by this margin
     RATE_MARGIN = 1.2
-    
+
     def __init__(
         self,
         system_config_dao: Optional[SystemConfigDAO] = None,
@@ -204,22 +209,81 @@ class PerMinerSamplingScheduler:
             logger.debug(f"Error getting miner slots, using default: {e}")
             return self.DEFAULT_SLOTS
     
-    def _get_env_weights(self, environments: Dict[str, Any]) -> Dict[str, float]:
-        """Extract scheduling weights from environment configurations.
+    # Floor weight for envs at 100 % completeness. Keeps a trickle of
+    # slots flowing into saturated envs so newly rotated-in tasks still
+    # get sampled promptly; too low and the tail-end rotation would
+    # starve, too high and laggard envs lose their priority advantage.
+    ENV_WEIGHT_FLOOR = 0.1
 
-        Args:
-            environments: Full environment configurations
+    def _compute_env_completeness(
+        self,
+        sampling_envs: List[str],
+        environments: Dict[str, Any],
+        env_missing_tasks: Dict[str, List[int]],
+        env_active_counts: Dict[str, int],
+    ) -> Dict[str, float]:
+        """How much of each env's current sampling window this miner has
+        already covered, in [0.0, 1.0].
 
-        Returns:
-            Dict mapping env name to weight (default 1.0 if not configured)
+        completed ≈ window_size - |missing| - active
+        completeness = completed / window_size, clamped to [0, 1].
         """
-        weights = {}
-        for env_name, env_config in environments.items():
-            if not env_config.get('enabled_for_sampling', False):
-                continue
-            sampling_config = env_config.get('sampling_config', {})
-            # Default weight is 1.0 if not specified
-            weights[env_name] = float(sampling_config.get('scheduling_weight', 1.0))
+        out: Dict[str, float] = {}
+        for env in sampling_envs:
+            cfg = environments.get(env, {}).get('sampling_config', {}) or {}
+            window = max(1, int(cfg.get('sampling_count', 0) or 1))
+            missing = len(env_missing_tasks.get(env, []))
+            active = int(env_active_counts.get(env, 0))
+            completed = window - missing - active
+            if completed < 0:
+                completed = 0
+            out[env] = min(1.0, completed / window)
+        return out
+
+    def _get_env_weights_for_miner(
+        self,
+        sampling_envs: List[str],
+        environments: Dict[str, Any],
+        completeness_map: Dict[str, float],
+    ) -> Dict[str, float]:
+        """Per-miner dynamic env weights.
+
+        weight[env] = rotation_rate[env] × deficit_factor[env]
+
+          rotation_rate  = rotation_count / rotation_interval (tasks/sec)
+          deficit_factor = max(ENV_WEIGHT_FLOOR, 1 - completeness[env])
+
+        Rationale. Each env needs a miner to sample at its own rotation
+        rate to keep the window populated. Slot share should therefore
+        track rotation_rate, not be uniform.
+
+        - Fully keeping up: every env saturates, deficit_factor collapses
+          to FLOOR for all, so slot shares still sit in rotation_rate
+          proportions — just at trickle level, enough to accept newly
+          rotated-in tasks.
+        - Falling behind uniformly: all envs unsaturated, deficit_factor
+          ≈ 1 for all, so shares ∝ rotation_rate. Each env lags its
+          rotation at the same fraction — nothing is singled out.
+        - Mixed: saturated envs drop to FLOOR trickle; the freed slots
+          go to laggard envs still in rotation_rate proportion.
+
+        rotation_count == 0 (rotation disabled) falls back to base 1.0
+        so the env still gets a share.
+        """
+        weights: Dict[str, float] = {}
+        for env in sampling_envs:
+            cfg = environments.get(env, {}).get('sampling_config', {}) or {}
+            rot_interval = float(cfg.get('rotation_interval', 0) or 0)
+            rot_count = float(cfg.get('rotation_count', 0) or 0)
+            if rot_count > 0 and rot_interval > 0:
+                base = rot_count / rot_interval
+            else:
+                base = 1.0
+            deficit_factor = max(
+                self.ENV_WEIGHT_FLOOR,
+                1.0 - completeness_map.get(env, 0.0),
+            )
+            weights[env] = base * deficit_factor
         return weights
 
     def _get_allocation_count(
@@ -385,7 +449,7 @@ class PerMinerSamplingScheduler:
         # Get miner's total slots from MinerStats
         total_slots = await self._get_miner_slots(miner)
 
-        # Get current active task count per env (exclude paused tasks)
+        # Get current active task count per env (pending + assigned)
         env_active_counts: Dict[str, int] = {}
         total_pool_count = 0
 
@@ -394,7 +458,6 @@ class PerMinerSamplingScheduler:
                 miner_hotkey=hotkey,
                 model_revision=revision,
                 env=env,
-                include_paused=False
             )
             env_active_counts[env] = len(active_task_ids)
             total_pool_count += len(active_task_ids)
@@ -453,10 +516,18 @@ class PerMinerSamplingScheduler:
             return
         
         slots_available = allowed_total - total_pool_count
-        
-        # Get env weights for weighted allocation
-        env_weights = self._get_env_weights(environments)
-        
+
+        # Per-miner dynamic env weights: laggard envs (low window
+        # completeness) get the bulk of this miner's slots; near-
+        # saturated envs drop to a floor so they still accept a trickle
+        # for newly rotated-in tasks.
+        env_completeness = self._compute_env_completeness(
+            sampling_envs, environments, env_missing_tasks, env_active_counts
+        )
+        env_weights = self._get_env_weights_for_miner(
+            sampling_envs, environments, env_completeness
+        )
+
         # Select tasks to create with weighted allocation strategy
         tasks_to_create = self._select_tasks_to_create(
             env_missing_tasks=env_missing_tasks,
@@ -480,7 +551,8 @@ class PerMinerSamplingScheduler:
     ) -> List[int]:
         """Get missing task IDs for a miner in an environment.
         
-        Prioritizes tasks from the tail of sampling list.
+        Prioritizes tasks from the head of the sampling list (Earliest
+        Deadline First — head tasks are closest to being rotated out).
         
         Returns:
             List of missing task IDs, ordered by priority (tail first)
@@ -522,13 +594,17 @@ class PerMinerSamplingScheduler:
         if not missing_ids:
             return []
         
-        # Prioritize tasks from tail (reverse order)
-        # Tasks at the tail are less likely to be rotated out
+        # Head-first (Earliest Deadline First): tasks at the head are
+        # closest to being rotated out. If a miner doesn't sample them
+        # before rotation, that (miner, task) data point is lost forever.
+        # With small windows (40-50 tasks) and per-miner rate limits barely
+        # matching rotation rate, every task is on a tight deadline.
+        # Prioritising by rotation proximity minimises lost coverage.
         priority_order = []
-        for task_id in reversed(sampling_list):
+        for task_id in sampling_list:
             if task_id in missing_ids:
                 priority_order.append(task_id)
-        
+
         return priority_order
     
     async def _handle_sampling_list_change(
@@ -809,23 +885,18 @@ class PerMinerSamplingScheduler:
             logger.info(f"Total cleanup: removed {total_deleted} tasks for {len(removed_miners)} miners")
     
     async def _cleanup_loop(self):
-        """Cleanup loop - runs every 5 minutes for all cleanup tasks.
-        
-        Handles:
-        1. Invalid sampling tasks (env disabled or task_id not in sampling_list)
-        2. Expired paused tasks (TTL exceeded)
+        """Cleanup loop — runs every 5 minutes.
+
+        Removes tasks whose env got disabled or whose task_id dropped
+        out of the sampling_list. Failed tasks are already deleted
+        inline by fail_task, so no separate cleanup is needed.
         """
         # Wait 60s before first cleanup (let scheduler stabilize)
         await asyncio.sleep(60)
-        
+
         while self._running:
             try:
-                # Cleanup invalid sampling tasks
                 await self._cleanup_invalid_sampling_tasks()
-                
-                # Cleanup expired paused tasks
-                await self.task_pool_dao.cleanup_expired_paused_tasks()
-                
                 await asyncio.sleep(300)  # Run every 5 minutes
             except asyncio.CancelledError:
                 logger.info("Cleanup loop cancelled")

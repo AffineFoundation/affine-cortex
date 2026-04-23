@@ -662,19 +662,22 @@ class TaskPoolManager:
                 error_code
             )
 
-            # fail_task() returns either 'paused' or 'pending' status
-            if updated_task['status'] == 'paused':
-                # Max retries reached, paused
+            # fail_task returns None on max retries: the task record
+            # has been deleted. The scheduler may recreate it next
+            # cycle if the task_id is still in the sampling list;
+            # otherwise rotation will move on from it.
+            if updated_task is None:
                 async with self._cache_lock:
                     self._uuid_cache.pop(task_uuid, None)
-                
+                retries = task.get('retry_count', 0) + 1
+                max_retries = task.get('max_retries')
                 logger.warning(
-                    f"Task {task_uuid} paused"
-                    f"{updated_task['retry_count']} retries (max={updated_task['max_retries']})"
+                    f"Task {task_uuid} dropped after "
+                    f"{retries} retries (max={max_retries})"
                 )
                 return {
-                    'status': 'paused',
-                    'message': f"Task paused after {updated_task['retry_count']} retries"
+                    'status': 'dropped',
+                    'message': f"Task dropped after {retries} retries"
                 }
             
             # Status is 'pending', will retry (assigned_at is None for pending)

@@ -1408,7 +1408,7 @@ async def cmd_get_pool():
                 # Get completed task IDs and pool task IDs concurrently
                 completed_taskids, pool_taskids = await asyncio.gather(
                     sample_dao.get_completed_task_ids(hotkey, revision, env),
-                    task_dao.get_pending_task_ids_for_miner(hotkey, revision, env, include_paused=True)
+                    task_dao.get_pending_task_ids_for_miner(hotkey, revision, env)
                 )
                 
                 # Calculate missing tasks
