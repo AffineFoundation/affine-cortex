@@ -101,6 +101,18 @@ class RankedMiner:
     total_losses: int
     consecutive_losses: int
     checkpoints_passed: int
+    total_samples: int             # Samples produced in current scoring cycle
+
+    @property
+    def is_cold(self) -> bool:
+        # Challenge state preserved across cold/hot cycles, so a miner can sit
+        # in 'sampling' indefinitely without producing samples. Flag that as
+        # cold so operators can tell it apart from actively-sampled miners.
+        return (
+            not self.is_champion
+            and self.status == "sampling"
+            and self.total_samples == 0
+        )
 
 
 def parse_ranked_miners(scores_list: List[Dict[str, Any]]) -> List[RankedMiner]:
@@ -119,16 +131,19 @@ def parse_ranked_miners(scores_list: List[Dict[str, Any]]) -> List[RankedMiner]:
             total_losses=int(ci.get("total_losses", 0) or 0),
             consecutive_losses=int(ci.get("consecutive_losses", 0) or 0),
             checkpoints_passed=int(ci.get("checkpoints_passed", 0) or 0),
+            total_samples=int(s.get("total_samples", 0) or 0),
         ))
     return out
 
 
 def sort_key(m: RankedMiner) -> tuple:
-    """Champion → active sampling (highest CP first) → terminated."""
+    """Champion → active sampling (highest CP first) → cold → terminated."""
     if m.is_champion:
         return (0,)
     if m.status == "terminated":
-        return (2, -m.total_losses, -m.checkpoints_passed)
+        return (3, -m.total_losses, -m.checkpoints_passed)
+    if m.is_cold:
+        return (2, -m.checkpoints_passed, -m.average_score)
     # Active sampling: closeness to dethrone, then checkpoint depth, then avg
     # Sort by checkpoint progress (closest to dethrone first), then avg score
     return (1, -m.checkpoints_passed, -m.average_score)
@@ -319,6 +334,10 @@ async def print_rank_table():
                     challenge_str = "pairwise"
                 else:
                     challenge_str = f"L:{m.total_losses}/{M}"
+            elif m.is_cold:
+                status_str = "cold"
+                cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"
+                challenge_str = "—"
             else:
                 status_str = "sampling"
                 cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"
@@ -339,7 +358,11 @@ async def print_rank_table():
 
         # ── Footer ────────────────────────────────────────────────────────
         print("=" * table_width, flush=True)
-        sampling_count = sum(1 for m in miners if m.status == "sampling" and not m.is_champion)
+        cold_count = sum(1 for m in miners if m.is_cold)
+        sampling_count = sum(
+            1 for m in miners
+            if m.status == "sampling" and not m.is_champion and not m.is_cold
+        )
         terminated_count = sum(1 for m in miners if m.status == "terminated")
 
         if champion_present_uid is not None:
@@ -351,7 +374,8 @@ async def print_rank_table():
 
         print(
             f"Total: {len(miners)}  |  {champ_summary}  |  "
-            f"Sampling: {sampling_count}  |  Terminated: {terminated_count}",
+            f"Sampling: {sampling_count}  |  Cold: {cold_count}  |  "
+            f"Terminated: {terminated_count}",
             flush=True,
         )
         print("=" * table_width, flush=True)
