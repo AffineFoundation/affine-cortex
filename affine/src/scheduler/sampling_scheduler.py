@@ -38,8 +38,8 @@ class PerMinerSamplingScheduler:
        cooldown needed.
     """
 
-    DEFAULT_SLOTS = 10
-    MIN_SLOTS = 10
+    DEFAULT_SLOTS = 20
+    MIN_SLOTS = 20
     MAX_SLOTS = 50
 
     # Rate limiting: allow actual sampling rate to exceed rotation rate by this margin
@@ -198,7 +198,7 @@ class PerMinerSamplingScheduler:
             miner: Miner dict with hotkey, revision
 
         Returns:
-            Number of slots (3-12, default 6)
+            Number of slots (MIN_SLOTS–MAX_SLOTS, default DEFAULT_SLOTS)
         """
         try:
             hotkey = miner['hotkey']
