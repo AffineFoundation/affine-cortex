@@ -291,6 +291,15 @@ class TestUtils:
         assert geometric_mean([0.0, 1.0], epsilon=0.1) > 0.0
         assert geometric_mean([]) == 0.0
 
+    def test_geometric_mean_small_values(self):
+        result = geometric_mean([1e-200] * 1000)
+        assert result > 0.0
+        assert abs(result - 1e-200) / 1e-200 < 1e-9
+
+    def test_geometric_mean_returns_zero_for_non_positive_values(self):
+        assert geometric_mean([0.0, 1.0]) == 0.0
+        assert geometric_mean([-1.0, 2.0]) == 0.0
+
 # ── Stage1: historical_count + recent-N×window avg ──────────────────────────
 
 class TestStage1RecentAvg:
