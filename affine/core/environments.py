@@ -72,7 +72,7 @@ class EnvConfig:
         "timeout": 600,
     })
     proxy_timeout: int = 600
-    
+
     # Basilica mode configuration (optional)
     cpu_limit: Optional[str] = None  # e.g., "4000m" for basilica mode
 
@@ -328,6 +328,25 @@ _ENV_CONFIGS_CANONICAL = {
         proxy_timeout=7260,
     ),
 
+    "terminal": EnvConfig(
+        name="terminal",
+        docker_image="affinefoundation/terminal:latest",
+        env_type="terminal",
+        mem_limit="8g",
+        env_vars={"UVICORN_WORKERS": "4"},
+        volumes={
+            "/var/run/docker.sock": {
+                "bind": "/var/run/docker.sock",
+                "mode": "rw",
+            },
+        },
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 3600,
+        },
+        proxy_timeout=3720,
+    ),
+
     # NavWorld Travel Planning environment (anti-hack hardened scoring)
     # Uses MCP tool servers (AMap + Transport) for real tool invocation.
     # Scoring: 50/50 code-LLM split, 7 problem types, 15 tool steps max.
@@ -401,6 +420,13 @@ _ENV_ALIASES = {
     # NavWorld aliases
     "NAVWORLD": "navworld",
     "NavWorld": "navworld",
+
+    # Terminel aliases
+    "TERMINAL": "terminal",
+    "Terminal": "terminal",
+    "terminel": "terminal",
+    "Terminel": "terminal",
+    "TERMINEL": "terminal",
 
     # LogProbs aliases
     "LOGPROBS": "logprobs",
@@ -826,3 +852,7 @@ LOGPROBS = LOGPROBS_factory
 # Memory factory
 MEMORY_factory = lambda mode=None: create_environment("memory", mode=mode)
 MEMORY = MEMORY_factory
+
+# Terminel factory
+TERMINAL_factory = lambda mode=None: create_environment("terminal", mode=mode)
+TERMINAL = TERMINAL_factory
