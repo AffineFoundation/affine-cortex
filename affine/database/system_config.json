@@ -9,7 +9,7 @@
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 260
+        "rotation_interval": 350
       }
     },
     "SWE-INFINITE": {
@@ -26,7 +26,7 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 330
+        "rotation_interval": 430
       }
     },
     "LIVEWEB": {
@@ -37,7 +37,7 @@
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 260
+        "rotation_interval": 350
       }
     },
     "LOGPROBS": {
@@ -59,7 +59,7 @@
         "sampling_count": 50,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 260
+        "rotation_interval": 350
       }
     },
     "MEMORY": {
@@ -70,7 +70,7 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 330
+        "rotation_interval": 430
       }
     },
     "DISTILL": {
@@ -86,7 +86,7 @@
         "sampling_count": 30,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 440
+        "rotation_interval": 580
       }
     }
   }
