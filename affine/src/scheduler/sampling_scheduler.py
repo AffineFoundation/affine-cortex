@@ -450,14 +450,6 @@ class PerMinerSamplingScheduler:
         if miner.get('uid', 0) == 0 or miner.get('uid', 0) > 1000:
             return False
 
-        # Models submitting for more than 48 hours (~14400 blocks at 12s/block)
-        # are exempt from rate limiting. By then, sampling has completed at least
-        # one full cycle (guaranteed by min_rate = sampling_count/48).
-        first_block = miner.get('first_block', 0)
-        block_number = miner.get('block_number', 0)
-        if first_block > 0 and block_number - first_block > 14400:
-            return False
-
         # Get config parameters (rate limiting is independent of rotation_enabled)
         rotation_count = sampling_config.get('rotation_count', 0)
         rotation_interval = sampling_config.get('rotation_interval', 0)
