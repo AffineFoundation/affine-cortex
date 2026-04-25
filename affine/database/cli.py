@@ -1333,9 +1333,12 @@ async def cmd_get_pool():
             (m['hotkey'], m['revision']): m.get('env_stats', {})
             for m in valid_miner_stats
         }
-        # Get slots for each miner
+        # Get slots for each miner. Leave missing as None so the display
+        # shows "-" rather than a fake number, making it obvious which
+        # miners have no stats record (likely chute hot per Chutes API
+        # but not actually serving).
         slots_by_miner = {
-            (m['hotkey'], m['revision']): m.get('sampling_slots', 6)
+            (m['hotkey'], m['revision']): m.get('sampling_slots')
             for m in valid_miner_stats
         }
         
@@ -1460,7 +1463,7 @@ async def cmd_get_pool():
                 stats_24h = sampling_stats.get('last_24hours', {})
                 
                 # Get slots
-                slots = slots_by_miner.get((hotkey, revision), 6)
+                slots = slots_by_miner.get((hotkey, revision))
                 
                 miner_totals.append((
                     uid, hotkey, revision, pending, assigned, paused, missing, total,
@@ -1501,7 +1504,7 @@ async def cmd_get_pool():
                 print(
                     f"{str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
                     f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} "
-                    f"{slots:<6} "
+                    f"{(slots if slots is not None else '-'):<6} "
                     f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
                     f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
                 )
@@ -1542,7 +1545,7 @@ async def cmd_get_pool():
                 stats_24h = env_specific_stats.get('last_24hours', {})
                 
                 # Get slots
-                slots = slots_by_miner.get((hotkey, revision), 6)
+                slots = slots_by_miner.get((hotkey, revision))
                 
                 env_totals.append((
                     uid, hotkey, revision, pending, assigned, paused, missing, total,
@@ -1581,7 +1584,7 @@ async def cmd_get_pool():
                 print(
                     f"  {str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
                     f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} "
-                    f"{slots:<6} "
+                    f"{(slots if slots is not None else '-'):<6} "
                     f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
                     f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
                 )
@@ -1864,9 +1867,9 @@ async def cmd_get_miner(hotkey: str, revision: Optional[str]):
             
             # Slots Info
             print("\n[SAMPLING SLOTS]")
-            slots = stats.get('sampling_slots', 6)
+            slots = stats.get('sampling_slots')
             slots_last_adjusted = stats.get('slots_last_adjusted_at', 0)
-            print(f"  Current slots: {slots}")
+            print(f"  Current slots: {slots if slots is not None else '-'}")
             
             if slots_last_adjusted > 0:
                 adjusted_dt = datetime.fromtimestamp(slots_last_adjusted)
