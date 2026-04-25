@@ -180,10 +180,10 @@ class MinerStatsDAO(BaseDAO):
         except client.exceptions.ConditionalCheckFailedException:
             # Record doesn't exist, create it with calculated global stats
             logger.warning(f"Miner stats not found: {hotkey}#{revision}, creating new record")
-            
+
             # Calculate global stats from new env_stats before creating record
             global_stats = self._calculate_global_stats(env_stats)
-            
+
             updated_item = {
                 'pk': pk,
                 'sk': sk,
@@ -202,6 +202,43 @@ class MinerStatsDAO(BaseDAO):
             }
             await self.put(updated_item)
             return  # Exit early, no need for second update
+        except client.exceptions.ClientError as e:
+            # Heal records that were created by update_challenge_state
+            # before the if_not_exists initializers were added. Those
+            # rows have challenge_* fields but no env_stats map, so the
+            # nested `SET env_stats.GAME = ...` above fails with
+            # ValidationException. Bootstrap the missing parent maps
+            # with a single atomic update_item (no read, no race with
+            # concurrent scorer writes), then retry the original SET.
+            if e.response.get('Error', {}).get('Code') != 'ValidationException':
+                raise
+            logger.warning(
+                f"Initializing miner_stats parent maps for "
+                f"{hotkey[:8]}...#{revision[:7]} and retrying"
+            )
+            await client.update_item(
+                TableName=self.table_name,
+                Key={'pk': {'S': pk}, 'sk': {'S': sk}},
+                UpdateExpression=(
+                    'SET env_stats = if_not_exists(env_stats, :empty_map), '
+                    'sampling_stats = if_not_exists(sampling_stats, :empty_map), '
+                    'sampling_slots = if_not_exists(sampling_slots, :default_slots)'
+                ),
+                ExpressionAttributeValues={
+                    ':empty_map': {'M': {}},
+                    ':default_slots': {'N': '20'},
+                },
+            )
+            response = await client.update_item(
+                TableName=self.table_name,
+                Key={'pk': {'S': pk}, 'sk': {'S': sk}},
+                UpdateExpression=update_expr,
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
+                ConditionExpression='attribute_exists(pk)',
+                ReturnValues='ALL_NEW',
+            )
+            updated_item = self._deserialize(response['Attributes'])
         
         # Calculate global aggregated statistics from updated env_stats
         global_stats = self._calculate_global_stats(updated_item.get('env_stats', {}))
@@ -538,12 +575,28 @@ class MinerStatsDAO(BaseDAO):
         status: str,
         termination_reason: str = '',
     ) -> None:
-        """Update miner's champion challenge state."""
+        """Update miner's champion challenge state.
+
+        Uses an upsert (update_item with no condition) — when a (hotkey,
+        revision) pair has not been seen before, this is the very first
+        write, so the record needs to be created.
+
+        Initialize the rest of the schema with `if_not_exists` so a brand
+        new record is created complete: empty env_stats / sampling_stats
+        maps, default sampling_slots, etc. Without these initializers,
+        the partial record breaks update_sampling_stats — its nested
+        path update `SET env_stats.GAME = ...` raises
+        ValidationException when env_stats does not exist, so per-window
+        sampling stats never land in the row even though the underlying
+        sample_results are written.
+        """
         from affine.database.client import get_client
         client = get_client()
 
         pk = self._make_pk(hotkey)
         sk = self._make_sk(revision)
+
+        now = int(time.time())
 
         await client.update_item(
             TableName=self.table_name,
@@ -555,7 +608,18 @@ class MinerStatsDAO(BaseDAO):
                 'challenge_checkpoints_passed = :cp, '
                 'challenge_status = :cs, '
                 'termination_reason = :tr, '
-                'last_updated_at = :ts'
+                'last_updated_at = :ts, '
+                'hotkey = if_not_exists(hotkey, :hk), '
+                'revision = if_not_exists(revision, :rev), '
+                'model = if_not_exists(model, :empty_str), '
+                'first_seen_at = if_not_exists(first_seen_at, :ts), '
+                'best_rank = if_not_exists(best_rank, :default_rank), '
+                'best_weight = if_not_exists(best_weight, :zero_f), '
+                'is_currently_online = if_not_exists(is_currently_online, :true_b), '
+                'env_stats = if_not_exists(env_stats, :empty_map), '
+                'sampling_stats = if_not_exists(sampling_stats, :empty_map), '
+                'sampling_slots = if_not_exists(sampling_slots, :default_slots), '
+                'slots_last_adjusted_at = if_not_exists(slots_last_adjusted_at, :zero)'
             ),
             ExpressionAttributeValues={
                 ':cw': {'N': str(consecutive_wins)},
@@ -564,7 +628,16 @@ class MinerStatsDAO(BaseDAO):
                 ':cp': {'N': str(checkpoints_passed)},
                 ':cs': {'S': status},
                 ':tr': {'S': termination_reason},
-                ':ts': {'N': str(int(time.time()))},
+                ':ts': {'N': str(now)},
+                ':hk': {'S': hotkey},
+                ':rev': {'S': revision},
+                ':empty_str': {'S': ''},
+                ':default_rank': {'N': '999'},
+                ':zero_f': {'N': '0.0'},
+                ':true_b': {'BOOL': True},
+                ':empty_map': {'M': {}},
+                ':default_slots': {'N': '20'},
+                ':zero': {'N': '0'},
             },
         )
 
