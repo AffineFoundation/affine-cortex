@@ -88,6 +88,17 @@
         "rotation_count": 1,
         "rotation_interval": 580
       }
+    },
+    "TERMINAL": {
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": false,
+      "sampling_config": {
+        "dataset_range": [[0, 132000000]],
+        "sampling_count": 10,
+        "rotation_enabled": false,
+        "rotation_count": 1,
+        "rotation_interval": 1730
+      }
     }
   }
 }
