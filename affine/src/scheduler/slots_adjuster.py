@@ -148,7 +148,25 @@ class MinerSlotsAdjuster:
             last_adjusted = stats.get('slots_last_adjusted_at', 0)
             if last_adjusted is None:
                 last_adjusted = 0
-        
+
+        # Always bump stale low slots up to MIN_SLOTS, regardless of cadence
+        # or sample volume. Without this, legacy records with slots below the
+        # current floor (e.g., values written before MIN_SLOTS was raised)
+        # could stay stuck — they don't run enough samples to clear the
+        # MIN_SAMPLES_FOR_ADJUSTMENT gate below, so the success-rate path
+        # never reaches them.
+        if current_slots < self.MIN_SLOTS:
+            await self.miner_stats_dao.update_sampling_slots(
+                hotkey=hotkey,
+                revision=revision,
+                slots=self.MIN_SLOTS,
+                adjusted_at=current_time,
+            )
+            logger.info(
+                f"Miner {hotkey[:8]}... slots floored: {current_slots} -> {self.MIN_SLOTS}"
+            )
+            return True
+
         # Check if adjustment is due (every 6 hours)
         # If last_adjusted is 0 (never adjusted), skip this check and allow first adjustment
         # Otherwise, enforce 6-hour interval strictly
@@ -158,15 +176,15 @@ class MinerSlotsAdjuster:
                 f"skipping (interval={self.ADJUSTMENT_INTERVAL}s)"
             )
             return False
-        
+
         # Get sampling stats from MinerStats.sampling_stats.last_6hours
         sampling_stats = {}
         if stats:
             sampling_stats = stats.get('sampling_stats', {}).get('last_6hours', {})
-        
+
         total_samples = sampling_stats.get('samples', 0)
         successful_samples = sampling_stats.get('success', 0)
-        
+
         # Skip if not enough samples - don't update timestamp so we can check again next cycle
         # This ensures low-activity miners eventually get adjusted when they have enough samples
         if total_samples < self.MIN_SAMPLES_FOR_ADJUSTMENT:
@@ -175,15 +193,11 @@ class MinerSlotsAdjuster:
                 f"skipping adjustment (need >= {self.MIN_SAMPLES_FOR_ADJUSTMENT})"
             )
             return False
-        
+
         # Use pre-calculated success_rate if available, otherwise calculate
         success_rate = sampling_stats.get('success_rate')
         if success_rate is None:
             success_rate = successful_samples / total_samples if total_samples > 0 else 0
-        
-        # Enforce MIN_SLOTS for miners with stale low values
-        if current_slots < self.MIN_SLOTS:
-            current_slots = self.MIN_SLOTS
 
         # Determine adjustment
         new_slots = current_slots
