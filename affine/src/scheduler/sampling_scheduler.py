@@ -45,6 +45,12 @@ class PerMinerSamplingScheduler:
     # Rate limiting: allow actual sampling rate to exceed rotation rate by this margin
     RATE_MARGIN = 1.2
 
+    # Fairness gate: an env is paused for the current tick when its
+    # progress (actual / target) leads the slowest env by more than
+    # this fraction. Keeps envs converging to the same fraction of
+    # rotation rate even when per-env execution speed varies.
+    PROGRESS_LEADER_BUFFER = 0.10
+
     def __init__(
         self,
         system_config_dao: Optional[SystemConfigDAO] = None,
@@ -208,7 +214,45 @@ class PerMinerSamplingScheduler:
         except Exception as e:
             logger.debug(f"Error getting miner slots, using default: {e}")
             return self.DEFAULT_SLOTS
-    
+
+    async def _get_miner_actual_rates(
+        self,
+        hotkey: str,
+        revision: str,
+        sampling_envs: List[str],
+    ) -> Dict[str, float]:
+        """Per-env actual sample rate (samples/hour) for one miner.
+
+        Reads the rolling `last_1hour.samples` aggregated by the
+        sampling-stats sync loop (5 min cadence). Used to drive the
+        throughput-based completeness signal in
+        `_compute_env_completeness`.
+
+        Returns 0 for any env without a record — that ensures new or
+        cold miners look fully under-target and get the highest
+        scheduling priority for that env. Any read error degrades to 0
+        for the same reason; never fail-closed.
+        """
+        out: Dict[str, float] = {env: 0.0 for env in sampling_envs}
+        try:
+            stats = await self.miner_stats_dao.get_miner_stats(hotkey, revision)
+        except Exception as e:
+            logger.debug(
+                f"Error reading miner_stats for {hotkey[:8]}...#{revision[:7]}: {e}"
+            )
+            return out
+        if not stats:
+            return out
+        env_stats = stats.get("env_stats") or {}
+        for env in sampling_envs:
+            window = (env_stats.get(env) or {}).get("last_1hour") or {}
+            samples = window.get("samples", 0)
+            try:
+                out[env] = float(samples or 0)
+            except (TypeError, ValueError):
+                out[env] = 0.0
+        return out
+
     # Floor weight for envs at 100 % completeness. Keeps a trickle of
     # slots flowing into saturated envs so newly rotated-in tasks still
     # get sampled promptly; too low and the tail-end rotation would
@@ -219,25 +263,42 @@ class PerMinerSamplingScheduler:
         self,
         sampling_envs: List[str],
         environments: Dict[str, Any],
-        env_missing_tasks: Dict[str, List[int]],
-        env_active_counts: Dict[str, int],
+        actual_samples_per_hour: Dict[str, float],
     ) -> Dict[str, float]:
-        """How much of each env's current sampling window this miner has
-        already covered, in [0.0, 1.0].
+        """Per-(miner, env) progress vs the env's rotation rate, in [0.0, 1.0].
 
-        completed ≈ window_size - |missing| - active
-        completeness = completed / window_size, clamped to [0, 1].
+        completeness = actual_samples_per_hour / target_samples_per_hour
+          target = rotation_count * 3600 / rotation_interval
+
+        This is throughput-driven, not pool-state-driven. Earlier the
+        formula was `(window - missing - active) / window`, which only
+        reflected whether the miner had been *assigned* tasks. That made
+        every env look "fairly complete" once the scheduler had filled
+        the pool, so deficit_factor barely differentiated between an env
+        with fast completions (over-sampling rotation) and one with slow
+        completions (falling behind). Result in prod: GAME hit ~200% of
+        rotation rate while LIVEWEB and SWE sat at 50–75% — scheduling
+        was not actually catching up the lagging envs.
+
+        Now completeness measures real per-miner sample throughput, so
+        deficit_factor reliably routes more slots to envs the miner is
+        underproducing, and trickles down envs that already match or
+        exceed rotation.
         """
         out: Dict[str, float] = {}
         for env in sampling_envs:
             cfg = environments.get(env, {}).get('sampling_config', {}) or {}
-            window = max(1, int(cfg.get('sampling_count', 0) or 1))
-            missing = len(env_missing_tasks.get(env, []))
-            active = int(env_active_counts.get(env, 0))
-            completed = window - missing - active
-            if completed < 0:
-                completed = 0
-            out[env] = min(1.0, completed / window)
+            rot_count = float(cfg.get('rotation_count', 0) or 0)
+            rot_interval = float(cfg.get('rotation_interval', 0) or 0)
+            if rot_count <= 0 or rot_interval <= 0:
+                # Rotation disabled / misconfigured — treat as fully covered
+                # so this env settles to FLOOR weight rather than dominating
+                # the slot budget.
+                out[env] = 1.0
+                continue
+            target_per_hour = rot_count * 3600 / rot_interval
+            actual = float(actual_samples_per_hour.get(env, 0) or 0)
+            out[env] = min(1.0, actual / target_per_hour) if target_per_hour > 0 else 1.0
         return out
 
     def _get_env_weights_for_miner(
@@ -489,7 +550,62 @@ class PerMinerSamplingScheduler:
         
         if not env_missing_tasks:
             return
-        
+
+        # Min-progress fairness gate.
+        #
+        # Goal: every env should reach the rotation target at the same
+        # wall-clock time. If the miner's executor can only sustain 50%
+        # of total target throughput, each env should sit at ~50% of its
+        # rotation rate, not "GAME 100%, SWE 20%".
+        #
+        # The fix: pause envs that are running ahead of the slowest one
+        # by more than PROGRESS_LEADER_BUFFER. While paused, the freed
+        # slot budget flows to laggards (which are the bottleneck) until
+        # they catch up. Then everyone advances together.
+        #
+        # progress[env] = actual_samples_per_hour / target_samples_per_hour
+        actual_samples_per_hour = await self._get_miner_actual_rates(
+            hotkey, revision, sampling_envs
+        )
+        progress: Dict[str, float] = {}
+        for env in list(env_missing_tasks.keys()):
+            cfg = environments.get(env, {}).get('sampling_config', {}) or {}
+            rot_count = float(cfg.get('rotation_count', 0) or 0)
+            rot_interval = float(cfg.get('rotation_interval', 0) or 0)
+            if rot_count > 0 and rot_interval > 0:
+                target_per_hour = rot_count * 3600 / rot_interval
+                progress[env] = (
+                    actual_samples_per_hour.get(env, 0) / target_per_hour
+                    if target_per_hour > 0 else 1.0
+                )
+            else:
+                # Static envs: treat as fully covered for fairness gate
+                progress[env] = 1.0
+
+        if progress:
+            min_progress = min(progress.values())
+            ahead_envs = [
+                env for env, p in progress.items()
+                if p > min_progress + self.PROGRESS_LEADER_BUFFER
+            ]
+            if ahead_envs:
+                # Drop ahead envs from this scheduling tick. Slot budget
+                # naturally redirects to laggards via env_weights below.
+                for env in ahead_envs:
+                    env_missing_tasks.pop(env, None)
+
+                logger.debug(
+                    f"miner {hotkey[:8]}... fairness gate: pausing "
+                    f"{len(ahead_envs)} envs ahead of bottleneck "
+                    f"(min_progress={min_progress:.2f}, "
+                    f"buffer={self.PROGRESS_LEADER_BUFFER}): {ahead_envs}"
+                )
+
+        if not env_missing_tasks:
+            # Everyone is too far ahead — bottleneck self-balancing,
+            # nothing to allocate this tick.
+            return
+
         # Anti-starvation check: detect envs with missing tasks but no active tasks
         starving_envs = [
             env for env in env_missing_tasks
@@ -517,12 +633,14 @@ class PerMinerSamplingScheduler:
         
         slots_available = allowed_total - total_pool_count
 
-        # Per-miner dynamic env weights: laggard envs (low window
-        # completeness) get the bulk of this miner's slots; near-
-        # saturated envs drop to a floor so they still accept a trickle
-        # for newly rotated-in tasks.
+        # Per-miner dynamic env weights: laggard envs (those whose
+        # actual sample throughput trails the rotation rate) get the
+        # bulk of this miner's slots; envs already meeting or exceeding
+        # rotation drop to a floor so they accept just a trickle.
+        # `actual_samples_per_hour` was already fetched above for the
+        # fairness gate; reuse it.
         env_completeness = self._compute_env_completeness(
-            sampling_envs, environments, env_missing_tasks, env_active_counts
+            sampling_envs, environments, actual_samples_per_hour
         )
         env_weights = self._get_env_weights_for_miner(
             sampling_envs, environments, env_completeness
