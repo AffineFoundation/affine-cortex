@@ -1299,7 +1299,7 @@ async def cmd_get_pool():
     """Get task pool statistics: task count per miner per environment.
     
     Shows how many tasks each miner has in the sampling pool for each environment,
-    including pending, assigned, and paused tasks, plus sampling statistics and missing tasks.
+    including pending and assigned tasks, plus sampling statistics and missing tasks.
     Only displays environments where enabled_for_sampling=True.
     """
     print("Fetching task pool statistics...\n")
@@ -1365,7 +1365,6 @@ async def cmd_get_pool():
         global_stats = {
             'pending': {},  # {(hotkey, revision): count}
             'assigned': {},
-            'paused': {},
             'missing': {}  # {(hotkey, revision): count}
         }
         
@@ -1381,7 +1380,7 @@ async def cmd_get_pool():
             sampling_config = env_config.get('sampling_config', {})
             sampling_list = set(sampling_config.get('sampling_list', []))
             
-            for status in ['pending', 'assigned', 'paused']:
+            for status in ['pending', 'assigned']:
                 counts = await task_dao.get_miner_task_counts(env, status)
                 env_stats[env][status] = counts
                 
@@ -1450,23 +1449,22 @@ async def cmd_get_pool():
             for hotkey, revision in all_miners_keys:
                 pending = global_stats['pending'].get((hotkey, revision), 0)
                 assigned = global_stats['assigned'].get((hotkey, revision), 0)
-                paused = global_stats['paused'].get((hotkey, revision), 0)
                 missing = global_stats['missing'].get((hotkey, revision), 0)
-                total = pending + assigned + paused
+                total = pending + assigned
                 uid = uid_by_hotkey.get(hotkey, '?')
-                
+
                 # Get global sampling stats
                 sampling_stats = global_stats_by_miner.get((hotkey, revision), {})
                 stats_15m = sampling_stats.get('last_15min', {})
                 stats_1h = sampling_stats.get('last_1hour', {})
                 stats_6h = sampling_stats.get('last_6hours', {})
                 stats_24h = sampling_stats.get('last_24hours', {})
-                
+
                 # Get slots
                 slots = slots_by_miner.get((hotkey, revision))
-                
+
                 miner_totals.append((
-                    uid, hotkey, revision, pending, assigned, paused, missing, total,
+                    uid, hotkey, revision, pending, assigned, missing, total,
                     stats_15m, stats_1h, stats_6h, stats_24h, slots
                 ))
             
@@ -1481,18 +1479,17 @@ async def cmd_get_pool():
             # Print header
             print(
                 f"\n{'UID':<5} {'Hotkey':<19} {'Rev':<11} "
-                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Miss':<6} "
+                f"{'Pend':<6} {'Assg':<6} {'Miss':<6} "
                 f"{'Slots':<6} "
                 f"{'15m':<12} {'1h':<12} {'6h':<12} {'24h':<12}"
             )
             print("-" * 200)
-            
+
             total_pending = sum(global_stats['pending'].values())
             total_assigned = sum(global_stats['assigned'].values())
-            total_paused = sum(global_stats['paused'].values())
             total_missing = sum(global_stats['missing'].values())
-            
-            for uid, hotkey, revision, pending, assigned, paused, missing, total, s15m, s1h, s6h, s24h, slots in miner_totals:
+
+            for uid, hotkey, revision, pending, assigned, missing, total, s15m, s1h, s6h, s24h, slots in miner_totals:
                 # Format sampling stats as "samples/succ"
                 def format_stats(stats):
                     if not stats or stats.get('samples', 0) == 0:
@@ -1500,19 +1497,19 @@ async def cmd_get_pool():
                     samples = stats.get('samples', 0)
                     success = stats.get('success', 0)
                     return f"{samples}/{success}"
-                
+
                 print(
                     f"{str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
-                    f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} "
+                    f"{pending:<6} {assigned:<6} {missing:<6} "
                     f"{(slots if slots is not None else '-'):<6} "
                     f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
                     f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
                 )
-            
+
             print("-" * 200)
             print(
                 f"{'TOTAL':<5} {'':<18} {'':<10} "
-                f"{total_pending:<6} {total_assigned:<6} {total_paused:<6} {total_missing:<6}"
+                f"{total_pending:<6} {total_assigned:<6} {total_missing:<6}"
             )
         
         # Print per-environment breakdown
@@ -1531,11 +1528,10 @@ async def cmd_get_pool():
                 miner_key = f"{hotkey}#{revision}"
                 pending = env_stats[env]['pending'].get(miner_key, 0)
                 assigned = env_stats[env]['assigned'].get(miner_key, 0)
-                paused = env_stats[env]['paused'].get(miner_key, 0)
                 missing = env_missing_stats[env].get(miner_key, 0)
-                total = pending + assigned + paused
+                total = pending + assigned
                 uid = uid_by_hotkey.get(hotkey, '?')
-                
+
                 # Get sampling stats for this specific environment
                 miner_env_stats = env_stats_by_miner.get((hotkey, revision), {})
                 env_specific_stats = miner_env_stats.get(env, {})
@@ -1543,36 +1539,35 @@ async def cmd_get_pool():
                 stats_1h = env_specific_stats.get('last_1hour', {})
                 stats_6h = env_specific_stats.get('last_6hours', {})
                 stats_24h = env_specific_stats.get('last_24hours', {})
-                
+
                 # Get slots
                 slots = slots_by_miner.get((hotkey, revision))
-                
+
                 env_totals.append((
-                    uid, hotkey, revision, pending, assigned, paused, missing, total,
+                    uid, hotkey, revision, pending, assigned, missing, total,
                     stats_15m, stats_1h, stats_6h, stats_24h, slots
                 ))
-            
+
             # Sort by (UID, hotkey, revision) to ensure unique ordering
             env_totals.sort(key=lambda x: (
                 int(x[0]) if str(x[0]).isdigit() else 99999,  # UID (numeric)
                 x[1],  # hotkey
                 x[2]   # revision
             ))
-            
+
             print(
                 f"  {'UID':<5} {'Hotkey':<19} {'Rev':<11} "
-                f"{'Pend':<6} {'Assg':<6} {'Paus':<6} {'Miss':<6} "
+                f"{'Pend':<6} {'Assg':<6} {'Miss':<6} "
                 f"{'Slots':<6} "
                 f"{'15m':<12} {'1h':<12} {'6h':<12} {'24h':<12}"
             )
             print("  " + "-" * 196)
-            
+
             env_total_pending = sum(env_stats[env]['pending'].values())
             env_total_assigned = sum(env_stats[env]['assigned'].values())
-            env_total_paused = sum(env_stats[env]['paused'].values())
             env_total_missing = sum(env_missing_stats[env].values())
-            
-            for uid, hotkey, revision, pending, assigned, paused, missing, total, s15m, s1h, s6h, s24h, slots in env_totals:
+
+            for uid, hotkey, revision, pending, assigned, missing, total, s15m, s1h, s6h, s24h, slots in env_totals:
                 # Format sampling stats as "samples/succ"
                 def format_stats(stats):
                     if not stats or stats.get('samples', 0) == 0:
@@ -1580,19 +1575,19 @@ async def cmd_get_pool():
                     samples = stats.get('samples', 0)
                     success = stats.get('success', 0)
                     return f"{samples}/{success}"
-                
+
                 print(
                     f"  {str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
-                    f"{pending:<6} {assigned:<6} {paused:<6} {missing:<6} "
+                    f"{pending:<6} {assigned:<6} {missing:<6} "
                     f"{(slots if slots is not None else '-'):<6} "
                     f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
                     f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
                 )
-            
+
             print("  " + "-" * 196)
             print(
                 f"  {'TOTAL':<5} {'':<18} {'':<10} "
-                f"{env_total_pending:<6} {env_total_assigned:<6} {env_total_paused:<6} {env_total_missing:<6}"
+                f"{env_total_pending:<6} {env_total_assigned:<6} {env_total_missing:<6}"
             )
         
         print("\n" + "=" * 206)
@@ -1606,7 +1601,7 @@ def get_pools():
     """Get task pool statistics per miner per environment.
 
     Shows the number of tasks each miner has in the sampling pool,
-    broken down by environment and status (pending/assigned/paused).
+    broken down by environment and status (pending/assigned).
 
     Example:
         af db get-pools
@@ -1705,8 +1700,7 @@ async def cmd_get_pool_by_uid(uid: int, env: Optional[str], full: bool):
             # Separate by status
             pending_task_ids = {t['task_id'] for t in tasks if t.get('status') == 'pending'}
             assigned_task_ids = {t['task_id'] for t in tasks if t.get('status') == 'assigned'}
-            paused_task_ids = {t['task_id'] for t in tasks if t.get('status') == 'paused'}
-            pool_task_ids = pending_task_ids | assigned_task_ids | paused_task_ids
+            pool_task_ids = pending_task_ids | assigned_task_ids
 
             # Calculate missing task_ids
             missing_task_ids = all_task_ids - sampled_task_ids - pool_task_ids
@@ -1718,7 +1712,6 @@ async def cmd_get_pool_by_uid(uid: int, env: Optional[str], full: bool):
             print(f"  Sampled:  {len(sampled_task_ids):>6}")
             print(f"  Pending:  {len(pending_task_ids):>6}")
             print(f"  Assigned: {len(assigned_task_ids):>6}")
-            print(f"  Paused:   {len(paused_task_ids):>6}")
             print(f"  Missing:  {len(missing_task_ids):>6}")
 
             # Print task IDs if --full or small count
@@ -1735,7 +1728,6 @@ async def cmd_get_pool_by_uid(uid: int, env: Optional[str], full: bool):
             print_task_ids("Sampled task_ids", sampled_task_ids)
             print_task_ids("Pending task_ids", pending_task_ids)
             print_task_ids("Assigned task_ids", assigned_task_ids)
-            print_task_ids("Paused task_ids", paused_task_ids)
             print_task_ids("Missing task_ids", missing_task_ids)
 
             print()
@@ -1751,7 +1743,7 @@ async def cmd_get_pool_by_uid(uid: int, env: Optional[str], full: bool):
 def get_pool_by_uid(uid: int, env: Optional[str], full: bool):
     """Get task pool status for a specific miner by UID.
 
-    Shows sampled, pending, assigned, paused, and missing task IDs
+    Shows sampled, pending, assigned, and missing task IDs
     for the specified miner. If ENV is not specified, shows all
     environments enabled for sampling.
 
@@ -2175,88 +2167,6 @@ def delete_miner(uid: int):
         af db delete-miner --uid 1001
     """
     asyncio.run(cmd_delete_miner(uid))
-
-
-async def cmd_delete_paused(uid: int, env: str):
-    """Delete all paused tasks for a miner in an environment."""
-    print(f"Looking up paused tasks for UID={uid}, env={env}...\n")
-    await init_client()
-
-    try:
-        miners_dao = MinersDAO()
-        task_pool_dao = TaskPoolDAO()
-        config_dao = SystemConfigDAO()
-
-        # Get miner info by UID
-        miner = await miners_dao.get_miner_by_uid(uid)
-        if not miner:
-            print(f"Error: Miner not found for UID={uid}")
-            return
-
-        hotkey = miner['hotkey']
-        model_revision = miner['revision']
-        model = miner.get('model', 'N/A')
-
-        print(f"Miner: UID={uid}, Hotkey={hotkey[:16]}..., Revision={model_revision[:8]}...")
-        print(f"Model: {model}\n")
-
-        # Resolve env shorthand
-        environments = await config_dao.get_param_value('environments', default={})
-        if env not in environments and ':' not in env:
-            matching_envs = [e for e in environments.keys() if e.endswith(f':{env}')]
-            if len(matching_envs) == 1:
-                env = matching_envs[0]
-            elif len(matching_envs) > 1:
-                print(f"Error: Ambiguous environment name: {env}. Matches: {', '.join(matching_envs)}")
-                return
-            else:
-                print(f"Error: Environment not found: {env}. Available: {', '.join(environments.keys())}")
-                return
-        elif env not in environments:
-            print(f"Error: Environment not found: {env}. Available: {', '.join(environments.keys())}")
-            return
-
-        # Get tasks and filter for paused
-        tasks = await task_pool_dao.get_tasks_by_miner(
-            miner_hotkey=hotkey,
-            model_revision=model_revision,
-            env=env
-        )
-        paused_tasks = [t for t in tasks if t.get('status') == 'paused']
-
-        if not paused_tasks:
-            print(f"No paused tasks found for UID={uid} in {env}.")
-            return
-
-        print(f"Found {len(paused_tasks)} paused task(s) in {env}.")
-        confirm = input("Delete these tasks? [y/N] ").strip().lower()
-        if confirm != 'y':
-            print("Aborted.")
-            return
-
-        deleted = await task_pool_dao._batch_delete_tasks(paused_tasks)
-        print(f"Deleted {deleted} paused task(s).")
-
-    finally:
-        await close_client()
-
-
-@db.command("delete-paused")
-@click.argument("uid", type=UID)
-@click.argument("env", type=str)
-def delete_paused(uid: int, env: str):
-    """Delete all paused tasks for a miner in an environment.
-
-    Paused tasks are failed sampling tasks that exceeded max retries.
-    Deleting them allows re-sampling of those tasks.
-
-    System miners use UIDs > 1000 (e.g., 1001, 1002).
-
-    Examples:
-        af db delete-paused 42 agentgym:alfworld
-        af db delete-paused 1001 webshop
-    """
-    asyncio.run(cmd_delete_paused(uid, env))
 
 
 async def cmd_pareto(uids: list):
