@@ -287,7 +287,10 @@ class R2ToDynamoMigration:
                 self.stats['total_skipped'] += 1
                 return False
             
-            # Save sample result (will overwrite if newer)
+            # Save sample result (will overwrite if newer).
+            # overwrite=True bypasses the dedup-via-conditional-write
+            # guard added for live sampling — migrations need to replace
+            # existing rows.
             await self.sample_dao.save_sample(
                 miner_hotkey=hotkey,
                 model_revision=revision,
@@ -300,7 +303,8 @@ class R2ToDynamoMigration:
                 validator_hotkey=validator_hotkey,
                 block_number=block,
                 signature=signature,
-                timestamp=timestamp_ms
+                timestamp=timestamp_ms,
+                overwrite=True,
             )
             
             # Track miners updated
