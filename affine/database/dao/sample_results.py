@@ -8,6 +8,7 @@ import json
 import time
 import asyncio
 from typing import Dict, Any, List, Optional, Tuple
+from botocore.exceptions import ClientError
 from affine.database.base_dao import BaseDAO
 from affine.database.schema import get_table_name
 from affine.database.client import get_client
@@ -72,10 +73,11 @@ class SampleResultsDAO(BaseDAO):
         validator_hotkey: str,
         block_number: int,
         signature: str,
-        timestamp: Optional[int] = None
-    ) -> Dict[str, Any]:
+        timestamp: Optional[int] = None,
+        overwrite: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         """Save a sampling result.
-        
+
         Args:
             miner_hotkey: Miner's hotkey
             model_revision: Model revision hash
@@ -89,23 +91,29 @@ class SampleResultsDAO(BaseDAO):
             block_number: Current block number
             signature: Cryptographic signature for verification
             timestamp: Optional timestamp (defaults to now)
-            
+            overwrite: If True, blindly upsert (used by migrations that
+                intentionally replace older records). If False (default),
+                use a conditional write that fails when a sample for the
+                same (miner, revision, env, task_id) already exists —
+                blocks duplicate writes and surfaces the duplicate via
+                a warning log.
+
         Returns:
-            Saved item
+            Saved item, or None if a duplicate write was blocked.
         """
         if timestamp is None:
             timestamp = int(time.time() * 1000)  # milliseconds
-        
+
         # Ensure task_id is integer for proper range queries
         task_id_int = int(task_id) if not isinstance(task_id, int) else task_id
-        
+
         # Compress extra data (contains conversation + request)
         extra_json = json.dumps(extra, separators=(',', ':'))
         extra_compressed = self.compress_data(extra_json)
-        
+
         # Calculate TTL: 30 days from now (in seconds)
         ttl_seconds = int(time.time()) + (30 * 86400)
-        
+
         item = {
             'pk': self._make_pk(miner_hotkey, model_revision, env),
             'sk': self._make_sk(str(task_id_int)),
@@ -124,8 +132,32 @@ class SampleResultsDAO(BaseDAO):
             'signature': signature,
             'ttl': ttl_seconds,  # TTL: auto-delete after 30 days
         }
-        
-        return await self.put(item)
+
+        if overwrite:
+            return await self.put(item)
+
+        # Conditional write: only insert if no row already exists for
+        # this (pk, sk). Without this, a duplicate save_sample call
+        # would silently overwrite the earlier row.
+        client = get_client()
+        serialized = self._serialize(item)
+        try:
+            await client.put_item(
+                TableName=self.table_name,
+                Item=serialized,
+                ConditionExpression='attribute_not_exists(pk) AND attribute_not_exists(sk)',
+            )
+        except ClientError as e:
+            if e.response.get('Error', {}).get('Code') == 'ConditionalCheckFailedException':
+                logger.warning(
+                    f"Duplicate sample blocked: miner={miner_hotkey[:8]}... "
+                    f"env={env} task_id={task_id_int} "
+                    f"validator={validator_hotkey[:8] if validator_hotkey else '<none>'}... "
+                    f"(an existing sample for this key was preserved)"
+                )
+                return None
+            raise
+        return item
     
     async def get_sample_by_task_id(
         self,
