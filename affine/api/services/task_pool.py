@@ -586,9 +586,15 @@ class TaskPoolManager:
                 # Get current block number (cached)
                 block_number = await self._get_current_block()
                 
-                # Save sample to database
+                # Save sample to database. save_sample returns None when its
+                # conditional put is rejected by another writer that already
+                # persisted a sample for the same (miner, revision, env,
+                # task_id). Treat None as "we lost the race": skip the log
+                # entry to keep execution_logs free of duplicates, and let
+                # the existing sample_results row remain untouched.
+                saved = None
                 try:
-                    await self.sample_dao.save_sample(
+                    saved = await self.sample_dao.save_sample(
                         miner_hotkey=task["miner_hotkey"],
                         model_revision=task["model_revision"],
                         model=task["model"],
@@ -604,18 +610,28 @@ class TaskPoolManager:
                 except Exception as e:
                     logger.error(f"Failed to save sample for task {task_uuid}: {e}", exc_info=True)
                     # Continue to log and complete task even if sample save fails
-                
-                # Log task completion
-                await self.logs_dao.log_task_complete(
-                    miner_hotkey=task['miner_hotkey'],
-                    task_uuid=task_uuid,
-                    dataset_task_id=task['task_id'],
-                    env=task['env'],
-                    executor_hotkey=executor_hotkey,
-                    score=result['score'],
-                    latency_ms=result['latency_ms'],
-                    execution_time_ms=result.get('execution_time_ms', 0)
-                )
+                    saved = "error"  # log the attempt so failures are auditable
+
+                if saved is None:
+                    logger.info(
+                        f"Skipping log_task_complete for task {task_uuid}: "
+                        f"sample already persisted by another writer "
+                        f"(miner={task['miner_hotkey'][:8]}.. env={task['env']} "
+                        f"task_id={task['task_id']})"
+                    )
+                else:
+                    # Log task completion (only when our write was the winner
+                    # or save_sample raised — never when CCFE'd silently).
+                    await self.logs_dao.log_task_complete(
+                        miner_hotkey=task['miner_hotkey'],
+                        task_uuid=task_uuid,
+                        dataset_task_id=task['task_id'],
+                        env=task['env'],
+                        executor_hotkey=executor_hotkey,
+                        score=result['score'],
+                        latency_ms=result['latency_ms'],
+                        execution_time_ms=result.get('execution_time_ms', 0)
+                    )
             else:
                 if not error_message:
                     raise ValueError(
