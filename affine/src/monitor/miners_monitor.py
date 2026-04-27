@@ -659,6 +659,21 @@ class MinersMonitor:
                 )
                 envs = []
 
+            # Champion exemption. Match by hotkey (all revisions of
+            # current champion's hotkey are protected). On read failure
+            # skip the whole cycle — never risk terminating champion.
+            champion_hotkey = None
+            try:
+                champion = await self.config_dao.get_param_value('champion')
+                if isinstance(champion, dict):
+                    champion_hotkey = champion.get('hotkey') or None
+            except Exception as e:
+                logger.warning(
+                    f"[MinersMonitor] champion load failed: {e} — "
+                    f"skipping cold-tracking this cycle"
+                )
+                return
+
             # Bittensor produces a block ≈ every 12 seconds. miner.block is
             # the chain block at which the model commitment was first revealed.
             SECONDS_PER_BLOCK = 12
@@ -667,6 +682,9 @@ class MinersMonitor:
                 if miner.uid == 0 or miner.uid > 1000:
                     continue
                 if not miner.hotkey or not miner.revision:
+                    continue
+
+                if champion_hotkey and miner.hotkey == champion_hotkey:
                     continue
 
                 is_cold = miner.chute_status != 'hot'
