@@ -228,12 +228,22 @@ class PerMinerSamplingScheduler:
         revision: str,
         sampling_envs: List[str],
     ) -> Dict[str, float]:
-        """Per-env actual sample rate (samples/hour) for one miner.
+        """Per-env actual successful-sample rate (samples/hour) for one miner.
 
-        Reads the rolling `last_1hour.samples` aggregated by the
+        Reads the rolling `last_1hour.success` aggregated by the
         sampling-stats sync loop (5 min cadence). Used to drive the
         throughput-based completeness signal in
-        `_compute_env_completeness`.
+        `_compute_env_completeness` and the min-progress fairness gate.
+
+        Important: this returns *successful* samples, not total
+        attempts. The `samples` field in env_stats also counts
+        rate_limit_errors / timeouts / other_errors, which inflates
+        the rate for envs whose chute is rejecting calls. Using that
+        inflated value would make rate-limited envs look "ahead" and
+        starve them of slots — exactly the opposite of what fairness
+        should do. Target rate is `rotation_count * 3600 /
+        rotation_interval`, which is set in completed-samples units,
+        so the actual must be measured the same way.
 
         Returns 0 for any env without a record — that ensures new or
         cold miners look fully under-target and get the highest
@@ -253,9 +263,9 @@ class PerMinerSamplingScheduler:
         env_stats = stats.get("env_stats") or {}
         for env in sampling_envs:
             window = (env_stats.get(env) or {}).get("last_1hour") or {}
-            samples = window.get("samples", 0)
+            success = window.get("success", 0)
             try:
-                out[env] = float(samples or 0)
+                out[env] = float(success or 0)
             except (TypeError, ValueError):
                 out[env] = 0.0
         return out
