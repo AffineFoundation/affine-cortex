@@ -14,54 +14,55 @@ from affine.database.dao.miners import MinersDAO
 
 
 class MinerSlotsAdjuster:
-    """Dynamic slots adjuster based on sampling success rate.
-    
-    Uses sampling_stats from MinerStats table (last_1hour window) to determine
-    success rate. No need to query sample_results table.
-    
-    Adjustment rules (see constants below for current values):
-    - Only adjust miners with >= MIN_SAMPLES_FOR_ADJUSTMENT samples
-      in the last 6 hours.
-    - Success rate >= HIGH_SUCCESS_THRESHOLD: slots += 6 (cap MAX_SLOTS).
-    - Success rate <  LOW_SUCCESS_THRESHOLD:  slots -= 1 (floor MIN_SLOTS).
-    - Adjustment loop runs every ADJUSTMENT_INTERVAL seconds.
+    """Conservative-backoff slots adjuster.
 
-    Persistence:
-    - sampling_slots stored in MinerStats table
-    - slots_last_adjusted_at tracks last adjustment time
+    Reads sampling_stats.last_1hour from MinerStats. Tiered, asymmetric
+    update — fast multiplicative cuts on failure, slow additive grows
+    on success — so an overloaded chute gets relief quickly while a
+    recovering chute can't immediately re-trip itself.
+
+      sr >= 0.90       cur + 2
+      sr >= 0.70       hold (hysteresis)
+      sr >= 0.50       cur - 3
+      sr >= 0.30       int(cur * 0.7)
+      sr <  0.30       int(cur * 0.5)
     """
 
     DEFAULT_SLOTS = 20
-    MIN_SLOTS = 20
+    MIN_SLOTS = 15
     MAX_SLOTS = 50
-    ADJUSTMENT_INTERVAL = 21600  # 6 hours in seconds
-    MIN_SAMPLES_FOR_ADJUSTMENT = 50
-    HIGH_SUCCESS_THRESHOLD = 0.80
-    LOW_SUCCESS_THRESHOLD = 0.50
-    
+
+    # Per-miner cadence (gate) — each miner adjusted at most once per
+    # ADJUSTMENT_INTERVAL. Outer poll runs more often so brand new
+    # miners (last_adjusted_at == 0) don't have to wait the full
+    # interval for their first adjustment.
+    ADJUSTMENT_INTERVAL = 7200      # 2 h
+    LOOP_INTERVAL_SECONDS = 600     # 10 min
+
+    MIN_SAMPLES_FOR_ADJUSTMENT = 30
+
     def __init__(
         self,
         miner_stats_dao: Optional[MinerStatsDAO] = None,
-        miners_dao: Optional[MinersDAO] = None
+        miners_dao: Optional[MinersDAO] = None,
     ):
         self.miner_stats_dao = miner_stats_dao or MinerStatsDAO()
         self.miners_dao = miners_dao or MinersDAO()
         self._running = False
         self._task: Optional[asyncio.Task] = None
-    
+
     async def start(self):
-        """Start the slots adjuster loop."""
         logger.info(
-            f"Starting MinerSlotsAdjuster: interval={self.ADJUSTMENT_INTERVAL}s ({self.ADJUSTMENT_INTERVAL//3600}h), "
+            f"Starting MinerSlotsAdjuster: "
+            f"cadence={self.ADJUSTMENT_INTERVAL}s, "
+            f"poll={self.LOOP_INTERVAL_SECONDS}s, "
             f"min_samples={self.MIN_SAMPLES_FOR_ADJUSTMENT}, "
-            f"thresholds=({self.LOW_SUCCESS_THRESHOLD}, {self.HIGH_SUCCESS_THRESHOLD}), "
-            f"data_window=last_6hours"
+            f"slots=[{self.MIN_SLOTS}, {self.MAX_SLOTS}]"
         )
         self._running = True
         self._task = asyncio.create_task(self._adjustment_loop())
-    
+
     async def stop(self):
-        """Stop the slots adjuster loop."""
         logger.info("Stopping MinerSlotsAdjuster")
         self._running = False
         if self._task:
@@ -70,160 +71,103 @@ class MinerSlotsAdjuster:
                 await self._task
             except asyncio.CancelledError:
                 pass
-    
+
     async def _adjustment_loop(self):
-        """Main adjustment loop - runs every 6 hours."""
-        # Initial delay to let system stabilize (10 minutes)
-        await asyncio.sleep(600)
-        
+        await asyncio.sleep(600)  # initial settle
         while self._running:
             try:
                 await self._adjust_all_miners()
-                await asyncio.sleep(self.ADJUSTMENT_INTERVAL)
+                await asyncio.sleep(self.LOOP_INTERVAL_SECONDS)
             except asyncio.CancelledError:
-                logger.info("Slots adjustment loop cancelled")
                 break
             except Exception as e:
                 logger.error(f"Slots adjustment error: {e}", exc_info=True)
-                await asyncio.sleep(600)  # Retry after 10 minutes
-    
+                await asyncio.sleep(600)
+
     async def _adjust_all_miners(self):
-        """Adjust slots for all eligible miners."""
         current_time = int(time.time())
-        
-        # Get all valid miners
         miners = await self.miners_dao.get_valid_miners()
-        
-        adjusted_count = 0
-        skipped_count = 0
-        
+        adjusted = 0
         for miner in miners:
             try:
-                adjusted = await self._adjust_miner_slots(
-                    miner,
-                    current_time
-                )
-                if adjusted:
-                    adjusted_count += 1
-                else:
-                    skipped_count += 1
+                if await self._adjust_miner_slots(miner, current_time):
+                    adjusted += 1
             except Exception as e:
                 logger.error(
                     f"Error adjusting slots for miner {miner['hotkey'][:8]}...: {e}"
                 )
-        
         logger.info(
-            f"Slots adjustment completed: adjusted={adjusted_count}, "
-            f"skipped={skipped_count}, total={len(miners)}"
+            f"Slots adjustment: adjusted={adjusted}, total={len(miners)}"
         )
-    
+
     async def _adjust_miner_slots(
-        self,
-        miner: Dict[str, Any],
-        current_time: int
+        self, miner: Dict[str, Any], current_time: int
     ) -> bool:
-        """Adjust slots for a single miner based on success rate.
-        
-        Uses sampling_stats.last_6hours from MinerStats table.
-        
-        Args:
-            miner: Miner dict with hotkey, revision
-            current_time: Current timestamp
-            
-        Returns:
-            True if adjustment was made, False otherwise
-        """
         hotkey = miner['hotkey']
         revision = miner['revision']
-        
-        # Get current stats including slots and sampling_stats
+
         stats = await self.miner_stats_dao.get_miner_stats(hotkey, revision)
         current_slots = self.DEFAULT_SLOTS
         last_adjusted = 0
-        
         if stats:
-            current_slots = stats.get('sampling_slots', self.DEFAULT_SLOTS)
-            if current_slots is None:
-                current_slots = self.DEFAULT_SLOTS
-            last_adjusted = stats.get('slots_last_adjusted_at', 0)
-            if last_adjusted is None:
-                last_adjusted = 0
+            current_slots = stats.get('sampling_slots') or self.DEFAULT_SLOTS
+            last_adjusted = stats.get('slots_last_adjusted_at') or 0
 
-        # Always bump stale low slots up to MIN_SLOTS, regardless of cadence
-        # or sample volume. Without this, legacy records with slots below the
-        # current floor (e.g., values written before MIN_SLOTS was raised)
-        # could stay stuck — they don't run enough samples to clear the
-        # MIN_SAMPLES_FOR_ADJUSTMENT gate below, so the success-rate path
-        # never reaches them.
+        # Floor stale below-MIN slots regardless of cadence/sample volume.
         if current_slots < self.MIN_SLOTS:
             await self.miner_stats_dao.update_sampling_slots(
-                hotkey=hotkey,
-                revision=revision,
-                slots=self.MIN_SLOTS,
-                adjusted_at=current_time,
+                hotkey=hotkey, revision=revision,
+                slots=self.MIN_SLOTS, adjusted_at=current_time,
             )
             logger.info(
-                f"Miner {hotkey[:8]}... slots floored: {current_slots} -> {self.MIN_SLOTS}"
+                f"Miner {hotkey[:8]}... slots floored: "
+                f"{current_slots} -> {self.MIN_SLOTS}"
             )
             return True
 
-        # Check if adjustment is due (every 6 hours)
-        # If last_adjusted is 0 (never adjusted), skip this check and allow first adjustment
-        # Otherwise, enforce 6-hour interval strictly
-        if last_adjusted > 0 and current_time - last_adjusted < self.ADJUSTMENT_INTERVAL:
-            logger.debug(
-                f"Miner {hotkey[:8]}... last adjusted {current_time - last_adjusted}s ago, "
-                f"skipping (interval={self.ADJUSTMENT_INTERVAL}s)"
-            )
+        # Cadence gate. last_adjusted == 0 → first-ever adjustment.
+        if (last_adjusted > 0
+                and current_time - last_adjusted < self.ADJUSTMENT_INTERVAL):
             return False
 
-        # Get sampling stats from MinerStats.sampling_stats.last_6hours
-        sampling_stats = {}
-        if stats:
-            sampling_stats = stats.get('sampling_stats', {}).get('last_6hours', {})
-
+        sampling_stats = (stats or {}).get('sampling_stats', {}).get('last_1hour', {})
         total_samples = sampling_stats.get('samples', 0)
         successful_samples = sampling_stats.get('success', 0)
 
-        # Skip if not enough samples - don't update timestamp so we can check again next cycle
-        # This ensures low-activity miners eventually get adjusted when they have enough samples
         if total_samples < self.MIN_SAMPLES_FOR_ADJUSTMENT:
-            logger.debug(
-                f"Miner {hotkey[:8]}... has {total_samples} samples in last 6 hours, "
-                f"skipping adjustment (need >= {self.MIN_SAMPLES_FOR_ADJUSTMENT})"
-            )
             return False
 
-        # Use pre-calculated success_rate if available, otherwise calculate
         success_rate = sampling_stats.get('success_rate')
         if success_rate is None:
-            success_rate = successful_samples / total_samples if total_samples > 0 else 0
+            success_rate = successful_samples / total_samples
 
-        # Determine adjustment
-        new_slots = current_slots
-        action = "unchanged"
+        # Tiered backoff. Asymmetric on purpose.
+        if success_rate >= 0.90:
+            new_slots = current_slots + 2
+        elif success_rate >= 0.70:
+            new_slots = current_slots
+        elif success_rate >= 0.50:
+            new_slots = current_slots - 3
+        elif success_rate >= 0.30:
+            new_slots = int(current_slots * 0.7)
+        else:
+            new_slots = int(current_slots * 0.5)
 
-        if success_rate >= self.HIGH_SUCCESS_THRESHOLD:
-            new_slots = min(current_slots + 6, self.MAX_SLOTS)
-            if new_slots > current_slots:
-                action = "increased"
-        elif success_rate < self.LOW_SUCCESS_THRESHOLD:
-            new_slots = max(current_slots - 1, self.MIN_SLOTS)
-            if new_slots < current_slots:
-                action = "decreased"
-        
-        # Apply adjustment only if slots actually changed
-        if action != "unchanged":
-            await self.miner_stats_dao.update_sampling_slots(
-                hotkey=hotkey,
-                revision=revision,
-                slots=new_slots,
-                adjusted_at=current_time
-            )
+        new_slots = max(self.MIN_SLOTS, min(self.MAX_SLOTS, new_slots))
+
+        # Always write the timestamp so the cadence gate fires correctly
+        # next cycle, even when slots stayed the same (hold zone).
+        await self.miner_stats_dao.update_sampling_slots(
+            hotkey=hotkey, revision=revision,
+            slots=new_slots, adjusted_at=current_time,
+        )
+
+        if new_slots != current_slots:
+            action = "increased" if new_slots > current_slots else "decreased"
             logger.info(
-                f"Miner {hotkey[:8]}... slots {action}: {current_slots} -> {new_slots} "
-                f"(success_rate={success_rate:.1%}, samples={total_samples})"
+                f"Miner {hotkey[:8]}... slots {action}: "
+                f"{current_slots} -> {new_slots} "
+                f"(sr={success_rate:.1%}, samples={total_samples})"
             )
             return True
-        
         return False
