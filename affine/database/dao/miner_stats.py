@@ -26,6 +26,16 @@ class MinerStatsDAO(BaseDAO):
     4. Cleanup inactive miners: cleanup_inactive_miners()
     """
     
+    # A miner that has been cold for this many cumulative seconds (across
+    # all causes — chute torn down, fetch failed, deployment unhealthy)
+    # is auto-terminated. 48h = 172800s.
+    COLD_TERMINATION_THRESHOLD_SECONDS = 48 * 3600
+
+    # Upper bound on the per-call cold-time delta. Refresh cadence is ~5
+    # minutes, so a single missed cycle adds ~10min; if the monitor is
+    # down longer than this cap, we don't credit the gap as cold time.
+    COLD_TRACKING_DELTA_CAP_SECONDS = 600
+
     def __init__(self):
         self.table_name = get_table_name("miner_stats")
         super().__init__()
@@ -640,4 +650,119 @@ class MinerStatsDAO(BaseDAO):
                 ':zero': {'N': '0'},
             },
         )
+
+    async def update_cold_tracking(
+        self,
+        hotkey: str,
+        revision: str,
+        is_cold: bool,
+        backfill_last_seen_ms: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Track cumulative cold time and auto-terminate at the threshold.
+
+        Counted only after the miner has been observed sampling at least
+        once (`has_been_hot`). On the first call for a record that lacks
+        any prior tracking field, the caller may pass the most recent
+        sample timestamp via ``backfill_last_seen_ms`` so accumulated
+        cold time on long-cold miners is credited from that point.
+
+        Args:
+            hotkey: miner hotkey
+            revision: model revision
+            is_cold: True if the miner is currently not actively sampling
+                (any cause: chute cold, fetch failed, deployment failed, …)
+            backfill_last_seen_ms: epoch milliseconds of most recent
+                sample. Used only when the record has no prior
+                ``last_status_check_at``. Implies the miner has been hot
+                in the past.
+
+        Returns:
+            Subset of fields actually written, or None if the record
+            does not exist (never sampled — skip).
+        """
+        from affine.database.client import get_client
+        client = get_client()
+
+        pk = self._make_pk(hotkey)
+        sk = self._make_sk(revision)
+
+        existing = await self.get(pk, sk)
+        if not existing:
+            return None
+
+        if existing.get('challenge_status') == 'terminated':
+            return None
+
+        now = int(time.time())
+        cold_total = int(existing.get('cold_seconds_total', 0) or 0)
+        has_been_hot = bool(existing.get('has_been_hot', False))
+        last_check = existing.get('last_status_check_at')
+
+        if last_check is None:
+            if not is_cold:
+                has_been_hot = True
+                delta = 0
+            elif backfill_last_seen_ms:
+                has_been_hot = True
+                delta = max(0, now - int(backfill_last_seen_ms) // 1000)
+            else:
+                delta = 0
+        else:
+            try:
+                last_check_int = int(last_check)
+            except (ValueError, TypeError):
+                last_check_int = now
+            delta = max(0, min(now - last_check_int, self.COLD_TRACKING_DELTA_CAP_SECONDS))
+            if not is_cold:
+                has_been_hot = True
+
+        if is_cold and has_been_hot:
+            cold_total += delta
+
+        new_status = existing.get('challenge_status', 'sampling')
+        new_reason = existing.get('termination_reason', '') or ''
+        terminate_now = (
+            cold_total >= self.COLD_TERMINATION_THRESHOLD_SECONDS
+            and new_status != 'terminated'
+        )
+        if terminate_now:
+            new_status = 'terminated'
+            new_reason = 'cold_too_long'
+            logger.info(
+                f"[ColdTermination] Terminating miner hk={hotkey[:8]}... "
+                f"rev={revision[:8]}... cold_seconds_total={cold_total} "
+                f"(>= {self.COLD_TERMINATION_THRESHOLD_SECONDS})"
+            )
+
+        try:
+            await client.update_item(
+                TableName=self.table_name,
+                Key={'pk': {'S': pk}, 'sk': {'S': sk}},
+                UpdateExpression=(
+                    'SET cold_seconds_total = :ct, '
+                    'has_been_hot = :hbh, '
+                    'last_status_check_at = :now, '
+                    'last_updated_at = :now, '
+                    'challenge_status = :cs, '
+                    'termination_reason = :tr'
+                ),
+                ExpressionAttributeValues={
+                    ':ct': {'N': str(cold_total)},
+                    ':hbh': {'BOOL': has_been_hot},
+                    ':now': {'N': str(now)},
+                    ':cs': {'S': new_status},
+                    ':tr': {'S': new_reason},
+                },
+                ConditionExpression='attribute_exists(pk)',
+            )
+        except client.exceptions.ConditionalCheckFailedException:
+            return None
+
+        return {
+            'cold_seconds_total': cold_total,
+            'has_been_hot': has_been_hot,
+            'last_status_check_at': now,
+            'challenge_status': new_status,
+            'termination_reason': new_reason,
+        }
 

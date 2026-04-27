@@ -627,6 +627,64 @@ class MinersMonitor:
                 logger.warning(
                     f"[MinersMonitor] Failed to release chute for uid={miner.uid}: {e}, marked cold")
 
+    async def _update_cold_tracking(self, miners: list) -> None:
+        """Accumulate cold-time and auto-terminate miners that have been
+        non-hot for too long.
+
+        Cold = anything other than actively-sampling-hot. We start the
+        clock only once a miner has produced at least one sample, so
+        brand-new miners that have never come up don't get terminated.
+        For miners that already exist when this is first deployed, we
+        backfill the clock from the most recent sample timestamp.
+        """
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        from affine.database.dao.sample_results import SampleResultsDAO
+
+        miner_stats_dao = MinerStatsDAO()
+        sample_dao = SampleResultsDAO()
+
+        envs = await self.config_dao.get_sampling_environments()
+
+        for miner in miners:
+            if miner.uid == 0 or miner.uid > 1000:
+                continue
+            if not miner.hotkey or not miner.revision:
+                continue
+
+            is_cold = miner.chute_status != 'hot'
+
+            try:
+                existing = await miner_stats_dao.get_miner_stats(
+                    miner.hotkey, miner.revision)
+                if not existing:
+                    # Never sampled — skip.
+                    continue
+
+                backfill_ms = None
+                if existing.get('last_status_check_at') is None and envs:
+                    backfill_ms = await sample_dao.get_latest_sample_timestamp_ms(
+                        miner.hotkey, miner.revision, envs)
+
+                result = await miner_stats_dao.update_cold_tracking(
+                    hotkey=miner.hotkey,
+                    revision=miner.revision,
+                    is_cold=is_cold,
+                    backfill_last_seen_ms=backfill_ms,
+                )
+
+                if result and result.get('challenge_status') == 'terminated' \
+                        and result.get('termination_reason') == 'cold_too_long':
+                    logger.info(
+                        f"[MinersMonitor] Miner uid={miner.uid} "
+                        f"hk={miner.hotkey[:8]}... terminated for cold_too_long "
+                        f"(cold_seconds_total={result.get('cold_seconds_total')})"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[MinersMonitor] cold-tracking update failed for "
+                    f"uid={miner.uid}: {e}"
+                )
+
     async def refresh_miners(self) -> Dict[str, MinerInfo]:
         """Refresh and validate all miners
         
@@ -794,6 +852,8 @@ class MinersMonitor:
                     first_block=miner.block,
                     template_check_result=miner.template_check_result,
                 )
+
+            await self._update_cold_tracking(miners)
 
             valid_miners = {m.key(): m for m in miners if m.is_valid}
 
