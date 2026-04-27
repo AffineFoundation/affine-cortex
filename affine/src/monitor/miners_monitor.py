@@ -627,6 +627,101 @@ class MinersMonitor:
                 logger.warning(
                     f"[MinersMonitor] Failed to release chute for uid={miner.uid}: {e}, marked cold")
 
+    async def _update_cold_tracking(self, miners: list, current_block: int) -> None:
+        """Accumulate cold-time and auto-terminate stale miners.
+
+        Two termination triggers:
+          - cold_too_long: miner has produced samples in the past but
+            cumulative cold time has crossed the 36h threshold.
+          - never_sampled: miner has been on-chain for 48h+ without ever
+            producing a successful sample.
+
+        For miners that already exist when this is first deployed, the
+        cold clock is backfilled from the most recent sample timestamp.
+
+        Best-effort: any failure is logged but never propagates out of
+        the refresh loop, so cold tracking can never break miner
+        validation or scheduling.
+        """
+        try:
+            from affine.database.dao.miner_stats import MinerStatsDAO
+            from affine.database.dao.sample_results import SampleResultsDAO
+
+            miner_stats_dao = MinerStatsDAO()
+            sample_dao = SampleResultsDAO()
+
+            try:
+                envs = await self.config_dao.get_sampling_environments()
+            except Exception as e:
+                logger.warning(
+                    f"[MinersMonitor] failed to load sampling envs for "
+                    f"cold-tracking backfill: {e}"
+                )
+                envs = []
+
+            # Bittensor produces a block ≈ every 12 seconds. miner.block is
+            # the chain block at which the model commitment was first revealed.
+            SECONDS_PER_BLOCK = 12
+
+            for miner in miners:
+                if miner.uid == 0 or miner.uid > 1000:
+                    continue
+                if not miner.hotkey or not miner.revision:
+                    continue
+
+                is_cold = miner.chute_status != 'hot'
+
+                chain_age_seconds = None
+                if miner.block and current_block and current_block > miner.block:
+                    chain_age_seconds = (current_block - miner.block) * SECONDS_PER_BLOCK
+
+                try:
+                    existing = await miner_stats_dao.get_miner_stats(
+                        miner.hotkey, miner.revision)
+
+                    # Backfill only when:
+                    # - record exists (otherwise no fields to backfill)
+                    # - this is the first cold-tracking call for the row
+                    # - the miner is currently cold (a hot miner doesn't
+                    #   need a backfilled cold clock — its has_been_hot
+                    #   flips True this cycle and starts fresh)
+                    # - we have an env list to look up samples in
+                    backfill_ms = None
+                    if (existing
+                            and existing.get('last_status_check_at') is None
+                            and is_cold
+                            and envs):
+                        backfill_ms = await sample_dao.get_latest_sample_timestamp_ms(
+                            miner.hotkey, miner.revision, envs)
+
+                    result = await miner_stats_dao.update_cold_tracking(
+                        hotkey=miner.hotkey,
+                        revision=miner.revision,
+                        is_cold=is_cold,
+                        chain_age_seconds=chain_age_seconds,
+                        backfill_last_seen_ms=backfill_ms,
+                    )
+
+                    if result and result.get('challenge_status') == 'terminated':
+                        reason = result.get('termination_reason', '')
+                        if reason in ('cold_too_long', 'never_sampled'):
+                            logger.info(
+                                f"[MinersMonitor] Miner uid={miner.uid} "
+                                f"hk={miner.hotkey[:8]}... terminated ({reason}) "
+                                f"cold_seconds_total={result.get('cold_seconds_total')} "
+                                f"chain_age_seconds={chain_age_seconds}"
+                            )
+                except Exception as e:
+                    logger.warning(
+                        f"[MinersMonitor] cold-tracking update failed for "
+                        f"uid={miner.uid}: {e}"
+                    )
+        except Exception as e:
+            logger.error(
+                f"[MinersMonitor] cold-tracking pass failed at top level: {e}",
+                exc_info=True,
+            )
+
     async def refresh_miners(self) -> Dict[str, MinerInfo]:
         """Refresh and validate all miners
         
@@ -794,6 +889,8 @@ class MinersMonitor:
                     first_block=miner.block,
                     template_check_result=miner.template_check_result,
                 )
+
+            await self._update_cold_tracking(miners, current_block=current_block)
 
             valid_miners = {m.key(): m for m in miners if m.is_valid}
 

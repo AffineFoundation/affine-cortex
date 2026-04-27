@@ -26,6 +26,22 @@ class MinerStatsDAO(BaseDAO):
     4. Cleanup inactive miners: cleanup_inactive_miners()
     """
     
+    # A miner that has been cold for this many cumulative seconds (across
+    # all causes — chute torn down, fetch failed, deployment unhealthy)
+    # AFTER having been sampled at least once is auto-terminated.
+    # 36h = 129600s.
+    COLD_TERMINATION_THRESHOLD_SECONDS = 36 * 3600
+
+    # A miner that has been registered on-chain for this many seconds and
+    # has STILL never produced a successful sample is auto-terminated.
+    # 48h = 172800s. Chain age is `(current_block - first_block) * 12`.
+    NEVER_SAMPLED_TERMINATION_THRESHOLD_SECONDS = 48 * 3600
+
+    # Upper bound on the per-call cold-time delta. Refresh cadence is ~5
+    # minutes, so a single missed cycle adds ~10min; if the monitor is
+    # down longer than this cap, we don't credit the gap as cold time.
+    COLD_TRACKING_DELTA_CAP_SECONDS = 600
+
     def __init__(self):
         self.table_name = get_table_name("miner_stats")
         super().__init__()
@@ -640,4 +656,226 @@ class MinerStatsDAO(BaseDAO):
                 ':zero': {'N': '0'},
             },
         )
+
+    async def update_cold_tracking(
+        self,
+        hotkey: str,
+        revision: str,
+        is_cold: bool,
+        chain_age_seconds: Optional[int] = None,
+        backfill_last_seen_ms: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Track cumulative cold time and auto-terminate at the thresholds.
+
+        Two termination paths:
+          - ``cold_too_long`` (36h): miner has been sampled at least once
+            (``has_been_hot``) and accumulated cumulative cold time
+            crosses ``COLD_TERMINATION_THRESHOLD_SECONDS``.
+          - ``never_sampled`` (48h): miner has been on-chain for at
+            least ``NEVER_SAMPLED_TERMINATION_THRESHOLD_SECONDS`` and
+            has still produced no successful samples.
+
+        On the first call for a record that lacks any prior tracking
+        field, the caller may pass the most recent sample timestamp via
+        ``backfill_last_seen_ms`` so accumulated cold time on long-cold
+        miners is credited from that point.
+
+        Args:
+            hotkey: miner hotkey
+            revision: model revision
+            is_cold: True if the miner is currently not actively sampling
+                (any cause: chute cold, fetch failed, deployment failed, …)
+            chain_age_seconds: seconds since the miner's commitment was
+                first revealed on chain. Used to terminate never-sampled
+                miners that have lingered too long.
+            backfill_last_seen_ms: epoch milliseconds of most recent
+                sample. Used only when the record has no prior
+                ``last_status_check_at``. Implies the miner has been hot
+                in the past.
+
+        Returns:
+            Subset of fields actually written, or None if there's
+            nothing to do (record missing AND not eligible for
+            never-sampled termination).
+        """
+        from affine.database.client import get_client
+        client = get_client()
+
+        pk = self._make_pk(hotkey)
+        sk = self._make_sk(revision)
+
+        existing = await self.get(pk, sk)
+
+        # Case B: no miner_stats row → miner has never been sampled.
+        # If chain age has crossed the never-sampled threshold,
+        # upsert a terminated record. A miner that has been on-chain
+        # for 48h+ without a single successful sample is broken
+        # regardless of current chute_status, so terminate
+        # unconditionally on age.
+        if not existing:
+            if (chain_age_seconds is not None
+                    and chain_age_seconds >= self.NEVER_SAMPLED_TERMINATION_THRESHOLD_SECONDS):
+                return await self._upsert_never_sampled_termination(hotkey, revision)
+            return None
+
+        if existing.get('challenge_status') == 'terminated':
+            return None
+
+        now = int(time.time())
+        cold_total = int(existing.get('cold_seconds_total', 0) or 0)
+        has_been_hot = bool(existing.get('has_been_hot', False))
+        last_check = existing.get('last_status_check_at')
+
+        if last_check is None:
+            if not is_cold:
+                has_been_hot = True
+                delta = 0
+            elif backfill_last_seen_ms:
+                has_been_hot = True
+                delta = max(0, now - int(backfill_last_seen_ms) // 1000)
+            else:
+                delta = 0
+        else:
+            try:
+                last_check_int = int(last_check)
+            except (ValueError, TypeError):
+                last_check_int = now
+            delta = max(0, min(now - last_check_int, self.COLD_TRACKING_DELTA_CAP_SECONDS))
+            if not is_cold:
+                has_been_hot = True
+
+        if is_cold and has_been_hot:
+            cold_total += delta
+
+        new_status = existing.get('challenge_status', 'sampling')
+        new_reason = existing.get('termination_reason', '') or ''
+
+        if (cold_total >= self.COLD_TERMINATION_THRESHOLD_SECONDS
+                and new_status != 'terminated'):
+            new_status = 'terminated'
+            new_reason = 'cold_too_long'
+            logger.info(
+                f"[ColdTermination] Terminating miner hk={hotkey[:8]}... "
+                f"rev={revision[:8]}... cold_seconds_total={cold_total} "
+                f"(>= {self.COLD_TERMINATION_THRESHOLD_SECONDS})"
+            )
+        elif (not has_been_hot
+                and chain_age_seconds is not None
+                and chain_age_seconds >= self.NEVER_SAMPLED_TERMINATION_THRESHOLD_SECONDS
+                and new_status != 'terminated'):
+            new_status = 'terminated'
+            new_reason = 'never_sampled'
+            logger.info(
+                f"[ColdTermination] Terminating never-sampled miner "
+                f"hk={hotkey[:8]}... rev={revision[:8]}... "
+                f"chain_age_seconds={chain_age_seconds} "
+                f"(>= {self.NEVER_SAMPLED_TERMINATION_THRESHOLD_SECONDS})"
+            )
+
+        try:
+            await client.update_item(
+                TableName=self.table_name,
+                Key={'pk': {'S': pk}, 'sk': {'S': sk}},
+                UpdateExpression=(
+                    'SET cold_seconds_total = :ct, '
+                    'has_been_hot = :hbh, '
+                    'last_status_check_at = :now, '
+                    'last_updated_at = :now, '
+                    'challenge_status = :cs, '
+                    'termination_reason = :tr'
+                ),
+                ExpressionAttributeValues={
+                    ':ct': {'N': str(cold_total)},
+                    ':hbh': {'BOOL': has_been_hot},
+                    ':now': {'N': str(now)},
+                    ':cs': {'S': new_status},
+                    ':tr': {'S': new_reason},
+                },
+                ConditionExpression='attribute_exists(pk)',
+            )
+        except client.exceptions.ConditionalCheckFailedException:
+            return None
+
+        return {
+            'cold_seconds_total': cold_total,
+            'has_been_hot': has_been_hot,
+            'last_status_check_at': now,
+            'challenge_status': new_status,
+            'termination_reason': new_reason,
+        }
+
+    async def _upsert_never_sampled_termination(
+        self,
+        hotkey: str,
+        revision: str,
+    ) -> Dict[str, Any]:
+        """Initialize a miner_stats record in 'terminated/never_sampled'
+        state for a miner that has been on-chain too long without ever
+        producing a sample.
+
+        Mirrors the if_not_exists initializer pattern from
+        ``update_challenge_state`` so the row has the full schema and
+        is safe for subsequent updates.
+        """
+        from affine.database.client import get_client
+        client = get_client()
+
+        pk = self._make_pk(hotkey)
+        sk = self._make_sk(revision)
+        now = int(time.time())
+
+        await client.update_item(
+            TableName=self.table_name,
+            Key={'pk': {'S': pk}, 'sk': {'S': sk}},
+            UpdateExpression=(
+                'SET challenge_status = :cs, '
+                'termination_reason = :tr, '
+                'cold_seconds_total = if_not_exists(cold_seconds_total, :zero), '
+                'has_been_hot = if_not_exists(has_been_hot, :false_b), '
+                'last_status_check_at = :now, '
+                'last_updated_at = :now, '
+                'hotkey = if_not_exists(hotkey, :hk), '
+                'revision = if_not_exists(revision, :rev), '
+                'model = if_not_exists(model, :empty_str), '
+                'first_seen_at = if_not_exists(first_seen_at, :now), '
+                'best_rank = if_not_exists(best_rank, :default_rank), '
+                'best_weight = if_not_exists(best_weight, :zero_f), '
+                'is_currently_online = if_not_exists(is_currently_online, :false_b), '
+                'env_stats = if_not_exists(env_stats, :empty_map), '
+                'sampling_stats = if_not_exists(sampling_stats, :empty_map), '
+                'sampling_slots = if_not_exists(sampling_slots, :default_slots), '
+                'slots_last_adjusted_at = if_not_exists(slots_last_adjusted_at, :zero), '
+                'challenge_consecutive_wins = if_not_exists(challenge_consecutive_wins, :zero), '
+                'challenge_total_losses = if_not_exists(challenge_total_losses, :zero), '
+                'challenge_consecutive_losses = if_not_exists(challenge_consecutive_losses, :zero), '
+                'challenge_checkpoints_passed = if_not_exists(challenge_checkpoints_passed, :zero)'
+            ),
+            ExpressionAttributeValues={
+                ':cs': {'S': 'terminated'},
+                ':tr': {'S': 'never_sampled'},
+                ':now': {'N': str(now)},
+                ':zero': {'N': '0'},
+                ':zero_f': {'N': '0.0'},
+                ':false_b': {'BOOL': False},
+                ':hk': {'S': hotkey},
+                ':rev': {'S': revision},
+                ':empty_str': {'S': ''},
+                ':default_rank': {'N': '999'},
+                ':empty_map': {'M': {}},
+                ':default_slots': {'N': '20'},
+            },
+        )
+
+        logger.info(
+            f"[ColdTermination] Terminating never-sampled miner "
+            f"(no prior stats) hk={hotkey[:8]}... rev={revision[:8]}..."
+        )
+
+        return {
+            'cold_seconds_total': 0,
+            'has_been_hot': False,
+            'last_status_check_at': now,
+            'challenge_status': 'terminated',
+            'termination_reason': 'never_sampled',
+        }
 

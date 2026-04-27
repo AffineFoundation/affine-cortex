@@ -217,6 +217,46 @@ class SampleResultsDAO(BaseDAO):
                     pass
         return None
     
+    async def get_latest_sample_timestamp_ms(
+        self,
+        miner_hotkey: str,
+        model_revision: str,
+        envs: List[str],
+    ) -> Optional[int]:
+        """Return the most recent sample timestamp (in milliseconds) for a
+        (hotkey, revision) pair across the given envs, or None if no sample
+        has ever been recorded.
+
+        Used by cold-time tracking to backfill an existing miner's last
+        observed activity when no in-band tracking exists yet.
+        """
+        client = get_client()
+        latest_ms: Optional[int] = None
+
+        for env in envs:
+            pk = self._make_pk(miner_hotkey, model_revision, env)
+            params = {
+                'TableName': self.table_name,
+                'KeyConditionExpression': 'pk = :pk',
+                'ExpressionAttributeValues': {':pk': {'S': pk}},
+                'ProjectionExpression': '#ts',
+                'ExpressionAttributeNames': {'#ts': 'timestamp'},
+            }
+            items = await self._query_all_pages(client, params)
+            for item in items:
+                ts_field = item.get('timestamp', {})
+                ts_raw = ts_field.get('N') if isinstance(ts_field, dict) else None
+                if ts_raw is None:
+                    continue
+                try:
+                    ts = int(ts_raw)
+                except (ValueError, TypeError):
+                    continue
+                if latest_ms is None or ts > latest_ms:
+                    latest_ms = ts
+
+        return latest_ms
+
     async def get_completed_task_ids(
         self,
         miner_hotkey: str,
