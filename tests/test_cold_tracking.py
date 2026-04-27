@@ -400,22 +400,23 @@ class TestNeverSampledTermination:
         assert r["termination_reason"] == "cold_too_long"
 
     @pytest.mark.asyncio
-    async def test_no_record_hot_miner_chain_age_over_48h_NOT_terminated(self):
-        """Safety: a HOT miner with no stats row yet — even on-chain
-        for 48h+ — must not be terminated. This guards against
-        validator-restart-after-downtime scenarios where good miners
-        haven't been picked up for sampling yet."""
+    async def test_no_record_hot_miner_chain_age_over_48h_terminated(self):
+        """A miner with no stats row that has been on-chain for 48h+
+        is terminated regardless of current chute state. 48h is enough
+        time for any working miner+validator pair to produce at least
+        one sample; failure to do so means the deployment is broken."""
         dao, client = make_dao_with_mock_client()
         client.get_item.return_value = {}  # no record
 
         with patched_clients(client):
             r = await dao.update_cold_tracking(
-                HK, REV, is_cold=False,           # HOT
+                HK, REV, is_cold=False,           # current state irrelevant
                 chain_age_seconds=72 * 3600,
             )
 
-        assert r is None
-        client.update_item.assert_not_called()
+        assert r is not None
+        assert r["challenge_status"] == "terminated"
+        assert r["termination_reason"] == "never_sampled"
 
 
 # ─────────────────────────────────────────────────────────────────────────

@@ -707,16 +707,13 @@ class MinerStatsDAO(BaseDAO):
         existing = await self.get(pk, sk)
 
         # Case B: no miner_stats row → miner has never been sampled.
-        # If the miner is currently cold AND chain age has crossed the
-        # never-sampled threshold, upsert a terminated record. We
-        # require is_cold here because a HOT miner with no row yet
-        # might just be one the validator hasn't picked up for sampling
-        # — terminating them would punish innocent miners after a
-        # validator restart or extended downtime. Once they go cold,
-        # the next refresh will catch them.
+        # If chain age has crossed the never-sampled threshold,
+        # upsert a terminated record. A miner that has been on-chain
+        # for 48h+ without a single successful sample is broken
+        # regardless of current chute_status, so terminate
+        # unconditionally on age.
         if not existing:
-            if (is_cold
-                    and chain_age_seconds is not None
+            if (chain_age_seconds is not None
                     and chain_age_seconds >= self.NEVER_SAMPLED_TERMINATION_THRESHOLD_SECONDS):
                 return await self._upsert_never_sampled_termination(hotkey, revision)
             return None
