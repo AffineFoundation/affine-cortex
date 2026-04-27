@@ -399,6 +399,72 @@ class TestNeverSampledTermination:
 
         assert r["termination_reason"] == "cold_too_long"
 
+    @pytest.mark.asyncio
+    async def test_no_record_hot_miner_chain_age_over_48h_NOT_terminated(self):
+        """Safety: a HOT miner with no stats row yet — even on-chain
+        for 48h+ — must not be terminated. This guards against
+        validator-restart-after-downtime scenarios where good miners
+        haven't been picked up for sampling yet."""
+        dao, client = make_dao_with_mock_client()
+        client.get_item.return_value = {}  # no record
+
+        with patched_clients(client):
+            r = await dao.update_cold_tracking(
+                HK, REV, is_cold=False,           # HOT
+                chain_age_seconds=72 * 3600,
+            )
+
+        assert r is None
+        client.update_item.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Hot miner is never wrongly terminated
+# ─────────────────────────────────────────────────────────────────────────
+
+
+class TestHotMinerSafety:
+
+    @pytest.mark.asyncio
+    async def test_existing_record_hot_chain_age_over_48h_not_terminated(self):
+        """An existing-record hot miner over 48h chain age must not
+        terminate. has_been_hot flips True via the is_cold=False
+        branch so the never_sampled condition is False."""
+        dao, client = make_dao_with_mock_client()
+        client.get_item.return_value = serialize_get_response(stats_row(
+            has_been_hot=False,  # was never observed hot before
+        ))
+
+        with patched_clients(client):
+            r = await dao.update_cold_tracking(
+                HK, REV, is_cold=False,           # currently HOT now
+                chain_age_seconds=72 * 3600,
+            )
+
+        assert r["challenge_status"] == "sampling"
+        assert r["has_been_hot"] is True
+
+    @pytest.mark.asyncio
+    async def test_already_terminated_hot_miner_no_op(self):
+        """Even if challenge_status was set to terminated externally
+        (e.g., champion_loss), and miner is now hot, we don't touch
+        the row."""
+        dao, client = make_dao_with_mock_client()
+        client.get_item.return_value = serialize_get_response(stats_row(
+            challenge_status="terminated",
+            termination_reason="champion_loss",
+            has_been_hot=True,
+        ))
+
+        with patched_clients(client):
+            r = await dao.update_cold_tracking(
+                HK, REV, is_cold=False,
+                chain_age_seconds=72 * 3600,
+            )
+
+        assert r is None
+        client.update_item.assert_not_called()
+
 
 # ─────────────────────────────────────────────────────────────────────────
 # Threshold constants
