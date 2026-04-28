@@ -921,22 +921,29 @@ class PerMinerSamplingScheduler:
             remaining_slots -= 1
         
         # Stage 3: round-robin for any remaining slots.
-        # Only used when under-quota envs have no available tasks; in that case, it is better
-        # to allocate to any env with available tasks than to waste capacity.
-        # MAX_ENV_SHARE cap: prefer envs still below cap; fall back to
-        # over-cap envs only when no alternative exists (otherwise we'd
-        # leave slots unused).
+        # Only used when under-quota envs have no available tasks; in that
+        # case, it is better to allocate to any env with available tasks
+        # than to waste capacity.
+        # MAX_ENV_SHARE cap is enforced on the absolute planned active
+        # count, not the per-tick increment. Earlier this stage compared
+        # `planned - env_active_counts` to max_per_env, which only bounded
+        # the increment from this single tick — across many ticks the
+        # active count could drift well beyond max_per_env. Now any env at
+        # or above max_per_env is filtered out; if every eligible env is
+        # capped we stop, leaving the slot idle this tick rather than
+        # pushing past the share limit.
         if remaining_slots > 0:
             envs_with_tasks = [e for e in sorted_by_weight_desc if env_missing_tasks.get(e)]
             env_index = 0
             while remaining_slots > 0 and envs_with_tasks:
-                def _tick_alloc(e: str) -> int:
-                    return planned_active_counts.get(e, 0) - int(env_active_counts.get(e, 0))
+                below_cap = [
+                    e for e in envs_with_tasks
+                    if planned_active_counts.get(e, 0) < max_per_env
+                ]
+                if not below_cap:
+                    break
 
-                below_cap = [e for e in envs_with_tasks if _tick_alloc(e) < max_per_env]
-                candidates = below_cap if below_cap else envs_with_tasks
-
-                env = candidates[env_index % len(candidates)]
+                env = below_cap[env_index % len(below_cap)]
                 if env_missing_tasks.get(env):
                     task_id = env_missing_tasks[env].pop(0)
                     selected.append({'env': env, 'task_id': task_id})
