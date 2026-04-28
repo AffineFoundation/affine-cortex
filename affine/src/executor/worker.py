@@ -226,7 +226,12 @@ class ExecutorWorker:
             extra = result.extra or {}
             if result.error:
                 extra["error"] = result.error
-            
+            elif isinstance(extra.get("conversation"), list) and len(extra["conversation"]) <= 1:
+                # Chute died before producing any model turn — drop, don't
+                # save. The submit endpoint routes extra["error"] to
+                # log_task_failure → save_sample skipped → task can retry.
+                extra["error"] = "sampling_failed: model produced no output"
+
             submission = SampleSubmission(
                 task_uuid=task_uuid,
                 score=float(result.score),
