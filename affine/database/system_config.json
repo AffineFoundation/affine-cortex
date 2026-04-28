@@ -94,10 +94,10 @@
       "enabled_for_scoring": false,
       "sampling_config": {
         "dataset_range": [[0, 132000000]],
-        "sampling_count": 10,
-        "rotation_enabled": false,
+        "sampling_count": 40,
+        "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 1730
+        "rotation_interval": 430
       }
     }
   }
