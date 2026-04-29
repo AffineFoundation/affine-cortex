@@ -4,7 +4,6 @@ version = "0.1.1"
 description = "Anima Machina"
 authors = [{ name = "affine", email = "affine@affine.io" }]
 dependencies = [
-    "substrate-interface>=1.7.0",
     "python-dotenv>=0.21.0",
     "bittensor",
     "bittensor-cli",
