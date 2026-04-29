@@ -91,7 +91,7 @@
     },
     "TERMINAL": {
       "enabled_for_sampling": true,
-      "enabled_for_scoring": false,
+      "enabled_for_scoring": true,
       "sampling_config": {
         "dataset_range": [[0, 132000000]],
         "sampling_count": 40,
