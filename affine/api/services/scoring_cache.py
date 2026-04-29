@@ -257,12 +257,20 @@ class ScoringCacheManager:
         # historical common-task data — so going cold no longer freezes
         # the loss counter and doesn't let a terminated miner evade
         # termination by dropping out.
+        #
+        # Skip deregistered hotkeys (uid <= 0): once the network reclaims
+        # their UID slot they are no longer subnet participants, so they
+        # have no place in the scoring cache, the scorer's Pareto round,
+        # or the rank table. Their challenge state remains in miner_stats
+        # for audit but should not consume a UID slot in /scores/latest.
         all_db_miners = await miners_dao.get_all_miners()
         extra_added = 0
         for miner in all_db_miners:
             hotkey = miner.get('hotkey', '')
             revision = miner.get('revision', '')
             if not hotkey or not revision:
+                continue
+            if (miner.get('uid') or 0) <= 0:
                 continue
             if (hotkey, revision) in current_miner_keys:
                 continue  # Already in valid_miners

@@ -204,13 +204,6 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
             score_snapshots_dao = ScoreSnapshotsDAO()
             scores_dao = ScoresDAO()
 
-            # Read previous scores BEFORE saving this round, so we can
-            # copy last known scores for terminated miners not in scoring_data.
-            prev_scores = await scores_dao.get_latest_scores(limit=256)
-            prev_by_hk = {}
-            for s in prev_scores.get('scores', []):
-                prev_by_hk[s.get('miner_hotkey', '')] = s
-
             await scorer.save_results(
                 result=result,
                 score_snapshots_dao=score_snapshots_dao,
@@ -220,42 +213,6 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
                 block_number=block_number,
             )
             logger.info("Results saved successfully")
-
-            # Write terminated miners not in scoring_data to scores table
-            # so they remain visible in af get-rank.
-            result_hotkeys = {m.hotkey for m in result.miners.values()}
-
-            all_miners = await miner_stats_dao.get_all_historical_miners()
-            terminated_extra = 0
-            for ms in all_miners:
-                hk = ms.get('hotkey', '')
-                if (ms.get('challenge_status') == 'terminated'
-                        and hk not in result_hotkeys):
-                    prev = prev_by_hk.get(hk, {})
-                    await scores_dao.save_score(
-                        block_number=block_number,
-                        miner_hotkey=hk,
-                        uid=prev.get('uid', ms.get('uid', 0)),
-                        model_revision=ms.get('revision', ''),
-                        model=prev.get('model', ms.get('model_repo', '')),
-                        first_block=prev.get('first_block', 0),
-                        overall_score=0.0,
-                        average_score=prev.get('average_score', 0.0),
-                        scores_by_env=prev.get('scores_by_env', {}),
-                        total_samples=prev.get('total_samples', 0),
-                        challenge_info={
-                            'status': 'terminated',
-                            'termination_reason': ms.get('termination_reason', ''),
-                            'checkpoints_passed': ms.get('challenge_checkpoints_passed', 0),
-                            'total_losses': ms.get('challenge_total_losses', 0),
-                            'consecutive_losses': ms.get('challenge_consecutive_losses', 0),
-                            'consecutive_wins': 0,
-                            'is_champion': False,
-                        },
-                    )
-                    terminated_extra += 1
-            if terminated_extra:
-                logger.info(f"Wrote {terminated_extra} terminated miners to scores (not in scoring_data)")
 
         elapsed = time.time() - start_time
         logger.info(f"Scoring completed in {elapsed:.2f}s")
