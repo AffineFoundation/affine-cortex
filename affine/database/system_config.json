@@ -23,7 +23,7 @@
           "field": "tasks.completed_up_to",
           "range_type": "zero_to_value"
         },
-        "sampling_count": 40,
+        "sampling_count": 30,
         "rotation_enabled": true,
         "rotation_count": 1,
         "rotation_interval": 430
@@ -34,7 +34,7 @@
       "enabled_for_scoring": true,
       "sampling_config": {
         "dataset_range": [[0, 78060000]],
-        "sampling_count": 50,
+        "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
         "rotation_interval": 350
@@ -56,7 +56,7 @@
       "enabled_for_scoring": true,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
-        "sampling_count": 50,
+        "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
         "rotation_interval": 350
@@ -67,7 +67,7 @@
       "enabled_for_scoring": true,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
-        "sampling_count": 40,
+        "sampling_count": 20,
         "rotation_enabled": true,
         "rotation_count": 1,
         "rotation_interval": 430
@@ -94,7 +94,7 @@
       "enabled_for_scoring": true,
       "sampling_config": {
         "dataset_range": [[0, 132000000]],
-        "sampling_count": 40,
+        "sampling_count": 30,
         "rotation_enabled": true,
         "rotation_count": 1,
         "rotation_interval": 430
