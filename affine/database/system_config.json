@@ -1,17 +1,6 @@
 {
   "validator_burn_percentage": 0.0,
   "environments": {
-    "GAME": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "sampling_config": {
-        "dataset_range": [[0, 500000000],[600000000, 800000000]],
-        "sampling_count": 50,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 350
-      }
-    },
     "SWE-INFINITE": {
       "display_name": "SWE",
       "enabled_for_sampling": true,
@@ -26,7 +15,7 @@
         "sampling_count": 30,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 430
+        "rotation_interval": 360
       }
     },
     "LIVEWEB": {
@@ -37,7 +26,7 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 350
+        "rotation_interval": 270
       }
     },
     "LOGPROBS": {
@@ -59,7 +48,7 @@
         "sampling_count": 40,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 350
+        "rotation_interval": 270
       }
     },
     "MEMORY": {
@@ -70,7 +59,7 @@
         "sampling_count": 20,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 430
+        "rotation_interval": 540
       }
     },
     "DISTILL": {
@@ -86,7 +75,7 @@
         "sampling_count": 30,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 580
+        "rotation_interval": 360
       }
     },
     "TERMINAL": {
@@ -97,7 +86,7 @@
         "sampling_count": 30,
         "rotation_enabled": true,
         "rotation_count": 1,
-        "rotation_interval": 430
+        "rotation_interval": 360
       }
     }
   }
