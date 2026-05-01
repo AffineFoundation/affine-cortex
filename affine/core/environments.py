@@ -736,16 +736,18 @@ class SDKEnvironment:
         """Build Result object from evaluation result"""
         extra = result.get("extra", {}).copy()
         extra["image"] = self.docker_image
-        # For sample persistence, swap the per-workload base_url for the
-        # provider-supplied public display URL (e.g. Targon workload URLs get
-        # replaced with https://api.targon.com/v1) so the public /samples
-        # API can't be used to discover private endpoints. Chutes miners
-        # set no public URL so their (already miner-public) slug stays
-        # recorded as-is.
+        # For sample persistence, only Chutes' base_url stays in the record:
+        # it points at a public miner-owned slug that is discoverable on
+        # chutes.ai anyway. Any non-Chutes provider (Targon today) routes
+        # through a private workload endpoint that must not leak via the
+        # public /samples API, and a generic placeholder URL carries no
+        # useful information — strip the field entirely. We use
+        # ``public_base_url`` as the signal: Chutes leaves it None, every
+        # private provider sets it to something non-None.
         sanitized = payload.copy()
         public_url = getattr(miner, "public_base_url", None) if miner else None
-        if public_url:
-            sanitized["base_url"] = public_url
+        if public_url is not None:
+            sanitized.pop("base_url", None)
         extra["request"] = sanitized
         
         return Result(

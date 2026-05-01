@@ -236,9 +236,21 @@ class TargonDeployerService:
             )
             return
 
-        from affine.core.providers.targon_client import external_url
+        from affine.core.providers.targon_client import (
+            external_url, derive_deployment_args_from_chute,
+        )
+        from affine.utils.api_client import get_chute_info
         model_hf_repo = miner["model"]
         uid = miner.get("uid")
+        chute_id = miner.get("chute_id")
+
+        # Mirror the miner's Chutes config (gpu_count, engine, resource tier)
+        # on Targon so tensor parallelism and runtime match what the miner
+        # actually built for. Launch-args not exposed by the Chutes API
+        # (max-model-len, mem-fraction, …) stay at env defaults.
+        chute_args = derive_deployment_args_from_chute(
+            await get_chute_info(chute_id) if chute_id else None
+        )
 
         # Dedupe: if a Targon workload with our deterministic name already
         # exists (manual `af targon deploy`, or orphaned by a crashed writer),
@@ -247,7 +259,7 @@ class TargonDeployerService:
             model_hf_repo, revision, uid=uid, hotkey=hotkey,
         )
         deployment_id = adopted_id or await self.client.create_deployment(
-            model_hf_repo=model_hf_repo, revision=revision,
+            model_hf_repo=model_hf_repo, revision=revision, **chute_args,
         )
         if not deployment_id:
             logger.warning(

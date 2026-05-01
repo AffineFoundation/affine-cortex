@@ -187,5 +187,6 @@ class TargonDeploymentsDAO(BaseDAO):
         return existing
 
     async def mark_deleted(self, deployment_id: str) -> bool:
-        updated = await self.set_status(deployment_id, "deleted")
-        return updated is not None
+        """Remove the row entirely (hard delete). Nothing reads the 'deleted'
+        state, so keeping tombstones just wastes DDB rows."""
+        return await self.delete(self._make_pk(deployment_id), self._make_sk())

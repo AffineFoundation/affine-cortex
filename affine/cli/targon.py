@@ -283,6 +283,7 @@ async def _deploy_workload(
     resource: Optional[str] = None,
     engine: Optional[str] = None,
     tensor_parallel: Optional[int] = None,
+    data_parallel: Optional[int] = None,
     with_volume: bool = False, volume_size_mb: int = 80_000,
     no_wait: bool = False,
     timeout_sec: int = 1800, poll_sec: int = 15,
@@ -330,6 +331,7 @@ async def _deploy_workload(
     workload_uid = await client.create_deployment(
         model_hf_repo=model_repo, revision=revision,
         gpu_count=gpu_count, tensor_parallel=tensor_parallel,
+        data_parallel=data_parallel,
         engine=engine, volumes=resolved_volumes, name=workload_name,
     )
     if not workload_uid:
@@ -401,15 +403,22 @@ def targon():
 @click.option("--uid", required=True, type=int, help="Miner UID")
 @click.option("--affine-api", default="https://api.affine.io/api/v1",
               show_default=True)
-@click.option("--gpu-type", default="h100", show_default=True,
-              type=click.Choice(["h100", "h200", "b200"], case_sensitive=False))
-@click.option("--gpu-count", default=1, show_default=True, type=int,
-              help="GPUs per replica (1/2/4/8). Auto-sets tensor parallelism.")
+@click.option("--gpu-type", default=None,
+              type=click.Choice(["h100", "h200", "b200"], case_sensitive=False),
+              help="Default: derived from Chutes config, else h200")
+@click.option("--gpu-count", default=None, type=int,
+              help="GPUs per replica. Default: derived from Chutes node_selector.gpu_count")
 @click.option("--resource", default=None,
               help="Explicit Targon resource name (overrides gpu-type/count)")
 @click.option("--engine", default=None,
-              type=click.Choice(["sglang", "vllm"], case_sensitive=False))
+              type=click.Choice(["sglang", "vllm"], case_sensitive=False),
+              help="Default: derived from Chutes image.name")
 @click.option("--tensor-parallel", default=None, type=int)
+@click.option("--data-parallel", default=None, type=int,
+              help="Replica count: each replica holds a full model copy. "
+                   "Use with --tensor-parallel 1 to maximize per-replica "
+                   "KV cache (lets long context fit on small models). "
+                   "tp × dp must equal gpu_count.")
 @click.option("--with-volume", is_flag=True,
               help="Attach persistent volume (for frequent redeploys of same revision)")
 @click.option("--volume-size-mb", default=80_000, show_default=True, type=int)
@@ -422,15 +431,21 @@ def targon():
 @click.option("--dry-run", is_flag=True)
 def deploy_cmd(
     uid: int, affine_api: str,
-    gpu_type: str, gpu_count: int, resource: Optional[str],
+    gpu_type: Optional[str], gpu_count: Optional[int], resource: Optional[str],
     engine: Optional[str], tensor_parallel: Optional[int],
+    data_parallel: Optional[int],
     with_volume: bool, volume_size_mb: int,
     model: Optional[str],
     max_model_len: Optional[str], gpu_mem_util: Optional[str],
     no_wait: bool, timeout_sec: int, poll_sec: int,
     dry_run: bool,
 ):
-    """Deploy a miner's model to Targon (create + wait + activate + smoke-test)."""
+    """Deploy a miner's model to Targon (create + wait + activate + smoke-test).
+
+    By default, gpu_count and engine are derived from the miner's Chutes config
+    (same tensor parallelism and runtime as Chutes). gpu_type defaults to h200.
+    All defaults can be overridden with explicit flags.
+    """
     async def _go():
         miner = await _miner_info_by_uid(uid, affine_api)
         if not miner:
@@ -446,6 +461,20 @@ def deploy_cmd(
             f"UID {uid}: hotkey={hotkey[:12]}... rev={revision[:8]}... model={model_repo}"
         )
 
+        # Mirror Chutes config unless the user pinned values with flags.
+        from affine.core.providers.targon_client import (
+            derive_deployment_args_from_chute, TARGON_GPU_TYPE,
+        )
+        from affine.utils.api_client import get_chute_info
+        chute_args: Dict[str, Any] = {}
+        if miner.get("chute_id"):
+            chute_args = derive_deployment_args_from_chute(
+                await get_chute_info(miner["chute_id"])
+            )
+        final_gpu_type = gpu_type or TARGON_GPU_TYPE
+        final_gpu_count = gpu_count or chute_args.get("gpu_count", 1)
+        final_engine = engine or chute_args.get("engine")
+
         import os
         if max_model_len:
             os.environ["TARGON_MAX_MODEL_LEN"] = str(max_model_len)
@@ -454,20 +483,22 @@ def deploy_cmd(
 
         if dry_run:
             client = get_targon_client()
-            resolved = resource or resource_name_for(gpu_type, gpu_count)
+            resolved = resource or resource_name_for(final_gpu_type, final_gpu_count)
             click.echo(
                 f"\nDRY-RUN: POST /workloads (RENTAL)\n"
                 f"  name={client._workload_name(model_repo, revision, uid=uid, hotkey=hotkey)}\n"
-                f"  engine={(engine or client.default_engine).lower()}\n"
-                f"  resource={resolved}  gpu_count={gpu_count}  tp={tensor_parallel or gpu_count}\n"
+                f"  engine={(final_engine or client.default_engine).lower()}\n"
+                f"  resource={resolved}  gpu_count={final_gpu_count}  "
+                f"tp={tensor_parallel or final_gpu_count}\n"
                 f"  volume={'yes' if with_volume else '(none)'}"
             )
             return
 
         await _deploy_workload(
             uid, hotkey, revision, model_repo,
-            gpu_type=gpu_type, gpu_count=gpu_count, resource=resource,
-            engine=engine, tensor_parallel=tensor_parallel,
+            gpu_type=final_gpu_type, gpu_count=final_gpu_count, resource=resource,
+            engine=final_engine, tensor_parallel=tensor_parallel,
+            data_parallel=data_parallel,
             with_volume=with_volume, volume_size_mb=volume_size_mb,
             no_wait=no_wait, timeout_sec=timeout_sec, poll_sec=poll_sec,
         )
