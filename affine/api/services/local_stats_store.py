@@ -29,6 +29,7 @@ class LocalStatsStore:
                 "success": 0,
                 "rate_limit_errors": 0,
                 "timeout_errors": 0,
+                "unavailable_errors": 0,
                 "other_errors": 0
             })
         )
@@ -87,6 +88,8 @@ class LocalStatsStore:
             stats["rate_limit_errors"] += 1
         elif error_type == "timeout":
             stats["timeout_errors"] += 1
+        elif error_type == "unavailable":
+            stats["unavailable_errors"] += 1
         elif error_type == "other":
             stats["other_errors"] += 1
     
@@ -130,14 +133,20 @@ class LocalStatsStore:
                         "success": 0,
                         "rate_limit_errors": 0,
                         "timeout_errors": 0,
+                        "unavailable_errors": 0,
                         "other_errors": 0
                     }
-                
-                # Accumulate all metrics
+
+                # Accumulate all metrics. .get() on the new bucket
+                # tolerates files written before this field existed.
                 existing_miners[miner_key]["samples"] += buffer_stats["samples"]
                 existing_miners[miner_key]["success"] += buffer_stats["success"]
                 existing_miners[miner_key]["rate_limit_errors"] += buffer_stats["rate_limit_errors"]
                 existing_miners[miner_key]["timeout_errors"] += buffer_stats["timeout_errors"]
+                existing_miners[miner_key]["unavailable_errors"] = (
+                    existing_miners[miner_key].get("unavailable_errors", 0)
+                    + buffer_stats.get("unavailable_errors", 0)
+                )
                 existing_miners[miner_key]["other_errors"] += buffer_stats["other_errors"]
             
             # Step 3: Write accumulated data to file
@@ -183,19 +192,20 @@ class LocalStatsStore:
             "success": 0,
             "rate_limit_errors": 0,
             "timeout_errors": 0,
+            "unavailable_errors": 0,
             "other_errors": 0
         })
-        
+
         # Iterate through all stats files
         for stats_file in sorted(self.base_dir.glob("stats_*.json")):
             try:
                 with open(stats_file, 'r') as f:
                     data = json.load(f)
-                
+
                 # Time filter
                 if data["timestamp"] < cutoff_time:
                     continue
-                
+
                 # Aggregate each miner's statistics
                 for miner_key, stats in data["miners"].items():
                     agg = aggregated[miner_key]
@@ -203,6 +213,7 @@ class LocalStatsStore:
                     agg["success"] += stats["success"]
                     agg["rate_limit_errors"] += stats["rate_limit_errors"]
                     agg["timeout_errors"] += stats.get("timeout_errors", 0)
+                    agg["unavailable_errors"] += stats.get("unavailable_errors", 0)
                     agg["other_errors"] += stats["other_errors"]
             
             except Exception as e:

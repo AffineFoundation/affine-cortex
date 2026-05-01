@@ -31,6 +31,84 @@ class SamplingStatsCollector:
         self._sync_task: Optional[asyncio.Task] = None
         self._running = False
     
+    # Patterns where the chute literally cannot serve the request right
+    # now — no warm replicas, billing hold, or deleted. Unlike
+    # rate_limit, sending *fewer* concurrent requests does not help; the
+    # underlying chute is offline / misconfigured / unfunded. The slots
+    # adjuster should ignore this bucket entirely (treat like
+    # other_errors, not like load).
+    #
+    # Checked first so that wrappers carrying both "Eval model
+    # unreachable" and a 503 status get classified as unavailable, not
+    # as load.
+    _UNAVAILABLE_PATTERNS = (
+        "402",                              # billing: zero balance
+        "zero balance",
+        "404",                              # missing chute
+        "No matching chute",
+        "503",                              # no instances available
+        "No instances available",
+        "ServiceUnavailableError",          # litellm wrapper for HTTP 503
+        "No infrastructure available",      # HTTP 500 capacity-class message
+    )
+
+    # Patterns where the chute is online but signaling "too much" —
+    # cutting concurrency genuinely helps. Calibrated against real
+    # production error strings; intentionally conservative — generic
+    # wrappers like ``BackendError`` and ``InternalServerError`` cover
+    # too many non-load failures to be safe load signals.
+    _LOAD_PATTERNS = (
+        "429",                              # explicit rate-limit code
+        "RateLimitError",                   # litellm / OpenAI wrapper
+        "Infrastructure is at maximum capacity",
+        "maximum capacity",
+        "Eval model unreachable",           # NAVWORLD/MEMORY wrapper, default to load
+        "model unreachable",
+    )
+
+    # Patterns indicating a hard wall-clock timeout (model/agent didn't
+    # finish within env proxy_timeout or HTTP client timeout). Ambiguous
+    # signal — could be overload OR slow model OR slow agent loop — so
+    # kept separate from rate_limit to avoid auto-cutting legitimately
+    # slow inference. Note "timed out" is a broad match that covers
+    # "Method 'evaluate' on environment X timed out" (env proxy timeout)
+    # as well as nested LLM/HTTP timeouts.
+    _TIMEOUT_PATTERNS = (
+        "timed out",
+        "ReadTimeout",
+        "APITimeoutError",
+        "TimeoutError",
+        "Agent timeout",
+        "agent_timeout",
+        "Codex timed out",
+        "Pre-fetch timeout",
+    )
+
+    @classmethod
+    def _classify_error(cls, error_message: str) -> str:
+        """Bucket an error_message into unavailable / rate_limit / timeout / other.
+
+        Order matters:
+          1. ``unavailable`` first — most specific. A wrapper like
+             "Eval model unreachable after 10 retries: 503" should not be
+             classified as load just because it nominally says
+             "unreachable"; the embedded 503 means the chute has no
+             warm replicas, which lower concurrency cannot fix.
+          2. ``rate_limit`` next — chute online but at capacity.
+          3. ``timeout`` next — wall-clock overrun, ambiguous.
+          4. ``other`` — model behavior, scorer bugs, file errors, etc.
+        """
+        for pat in cls._UNAVAILABLE_PATTERNS:
+            if pat in error_message:
+                return "unavailable"
+        for pat in cls._LOAD_PATTERNS:
+            if pat in error_message:
+                return "rate_limit"
+        for pat in cls._TIMEOUT_PATTERNS:
+            if pat in error_message:
+                return "timeout"
+        return "other"
+
     def record_sample(
         self,
         hotkey: str,
@@ -40,7 +118,7 @@ class SamplingStatsCollector:
         error_message: Optional[str] = None
     ):
         """Record a sampling event
-        
+
         Args:
             hotkey: Miner hotkey
             revision: Model revision
@@ -48,16 +126,10 @@ class SamplingStatsCollector:
             success: Whether the sample succeeded
             error_message: Error message (if failed)
         """
-        # Classify error type
         error_type = None
         if not success and error_message:
-            if "RateLimitError" in error_message or "429" in error_message:
-                error_type = "rate_limit"
-            elif "timed out after" in error_message or "ReadTimeout" in error_message or "APITimeoutError" in error_message:
-                error_type = "timeout"
-            else:
-                error_type = "other"
-        
+            error_type = self._classify_error(error_message)
+
         # Record to local store (accumulates in current 5-minute window)
         self._local_store.record_sample(hotkey, revision, env, success, error_type)
     
@@ -108,6 +180,7 @@ class SamplingStatsCollector:
                     "success": stats["success"],
                     "rate_limit_errors": stats["rate_limit_errors"],
                     "timeout_errors": stats.get("timeout_errors", 0),
+                    "unavailable_errors": stats.get("unavailable_errors", 0),
                     "other_errors": stats["other_errors"],
                     "success_rate": success_rate,
                     "samples_per_min": samples_per_min
