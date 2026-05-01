@@ -37,6 +37,10 @@ from affine.database.dao.targon_deployments import TargonDeploymentsDAO
 
 DEFAULT_POLL_INTERVAL = int(os.getenv("TARGON_POLL_INTERVAL_SEC", "30"))
 DEFAULT_MAX_DEPLOYMENTS = int(os.getenv("TARGON_MAX_DEPLOYMENTS", "4"))
+# How often to scan all Targon-side workloads for orphans (workloads that
+# match our naming convention but have no DB row). Cheaper than per-cycle
+# because it's bounded by Targon's list endpoint size.
+DEFAULT_ORPHAN_SWEEP_INTERVAL = int(os.getenv("TARGON_ORPHAN_SWEEP_SEC", "300"))
 
 
 class TargonDeployerService:
@@ -57,6 +61,8 @@ class TargonDeployerService:
         self.client = client or get_targon_client()
         self.poll_interval = poll_interval
         self.max_deployments = max(1, max_deployments)
+        self.orphan_sweep_interval = DEFAULT_ORPHAN_SWEEP_INTERVAL
+        self._last_orphan_sweep_at = 0
         self._stop_event = asyncio.Event()
 
     async def run(self) -> None:
@@ -72,6 +78,7 @@ class TargonDeployerService:
         while not self._stop_event.is_set():
             try:
                 await self._reconcile_targets()
+                await self._orphan_sweep()
                 await self._health_sweep()
             except Exception as e:
                 logger.error(f"TargonDeployerService loop error: {e}", exc_info=True)
@@ -309,13 +316,112 @@ class TargonDeployerService:
         re-enters the queue — if it's still the top candidate it redeploys
         immediately; if a higher-priority winner is waiting, that one takes
         the slot instead.
+
+        Skips the entire sweep when the Targon API itself is unreachable —
+        otherwise a transient platform outage would cause every deployment
+        to return ``status=None`` simultaneously and trip the failure
+        threshold, mass-releasing the whole pool.
         """
         if not self.client.configured:
+            return
+        if not await self._targon_api_healthy():
+            logger.warning(
+                "Targon API probe failed; skipping health sweep this cycle "
+                "(no deployments will be released until the API recovers)"
+            )
             return
         active = await self.dao.list_by_status("active")
         deploying = await self.dao.list_by_status("deploying")
         for d in list(active) + list(deploying):
             await self._check_and_release(d)
+
+    async def _targon_api_healthy(self) -> bool:
+        """Lightweight probe: list 1 workload. Returns False on any
+        exception or None response — those mean the API as a whole is
+        unreachable and per-deployment status calls would just repeat the
+        same false signal.
+        """
+        try:
+            result = await self.client.list_workloads(limit=1)
+        except Exception as e:
+            logger.warning(f"Targon API probe raised: {e}")
+            return False
+        return result is not None
+
+    async def _orphan_sweep(self) -> None:
+        """Delete Targon workloads that match our naming prefix but have
+        no row in ``targon_deployments``.
+
+        Catches the cases where ``create_deployment`` succeeded on Targon
+        but ``upsert_deployment`` failed locally (so the workload runs
+        forever billing nobody), where an operator hand-deleted a DB row,
+        or where a manual ``af targon deploy`` was abandoned without a
+        matching target.
+
+        Throttled by ``self.orphan_sweep_interval`` (default 5 min) so we
+        don't pull a 200-item list every poll. We never delete a workload
+        whose name doesn't start with the affine prefix, so this is safe
+        in shared Targon accounts.
+        """
+        if not self.client.configured:
+            return
+        now = int(time.time())
+        if now - self._last_orphan_sweep_at < self.orphan_sweep_interval:
+            return
+
+        try:
+            listing = await self.client.list_workloads(limit=200)
+        except Exception as e:
+            logger.warning(f"Orphan-sweep: list_workloads raised: {e}")
+            return
+        if listing is None:
+            # API unhealthy — try again next interval, don't update timestamp
+            # so we don't skip a real sweep.
+            return
+        self._last_orphan_sweep_at = now
+
+        items = (listing.get("items") if isinstance(listing, dict) else listing) or []
+        if not items:
+            return
+
+        db_uids: Set[str] = set()
+        for status in ("active", "deploying"):
+            for d in await self.dao.list_by_status(status):
+                db_uids.add(d["deployment_id"])
+
+        prefix = self.client.WORKLOAD_NAME_PREFIX + "-"
+        deleted = 0
+        skipped_unmanaged = 0
+        for w in items:
+            wid = w.get("uid") or w.get("id")
+            name = (w.get("name") or "")
+            if not wid:
+                continue
+            if not name.startswith(prefix):
+                skipped_unmanaged += 1
+                continue
+            if wid in db_uids:
+                continue
+            try:
+                ok = await self.client.delete_deployment(wid)
+                if ok:
+                    deleted += 1
+                    logger.warning(
+                        f"Orphan-sweep: deleted untracked Targon workload "
+                        f"{wid} (name={name})"
+                    )
+                else:
+                    logger.warning(
+                        f"Orphan-sweep: delete returned false for {wid} (name={name})"
+                    )
+            except Exception as e:
+                logger.error(f"Orphan-sweep: failed to delete {wid}: {e}")
+
+        if deleted or skipped_unmanaged:
+            logger.info(
+                f"Orphan-sweep: scanned {len(items)} workload(s), "
+                f"deleted {deleted}, skipped {skipped_unmanaged} non-affine"
+            )
 
     # Consecutive failed probes before we conclude a deployment is truly dead.
     # Debounces transient Targon state-aggregator lag (~30s) without waiting
