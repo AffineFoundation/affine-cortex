@@ -28,8 +28,8 @@ class MinerSlotsAdjuster:
       sr <  0.30       int(cur * 0.5)
     """
 
-    DEFAULT_SLOTS = 20
-    MIN_SLOTS = 15
+    DEFAULT_SLOTS = 25
+    MIN_SLOTS = 20
     MAX_SLOTS = 50
 
     # Per-miner cadence (gate) — each miner adjusted at most once per

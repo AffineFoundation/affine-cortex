@@ -20,7 +20,7 @@ from affine.core.setup import logger
 # later because CP monotonicity blocks re-triggering within the reign).
 FIRST_CHALLENGE_SLOTS_BONUS = 10
 FIRST_CHALLENGE_SLOTS_CAP = 30
-FIRST_CHALLENGE_DEFAULT_SLOTS = 20  # Matches MinerStatsDAO init default / slots_adjuster MIN_SLOTS
+FIRST_CHALLENGE_DEFAULT_SLOTS = 25  # Matches MinerStatsDAO init default / slots_adjuster DEFAULT_SLOTS
 
 
 class Scorer:
