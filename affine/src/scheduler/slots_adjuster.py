@@ -130,16 +130,24 @@ class MinerSlotsAdjuster:
                 and current_time - last_adjusted < self.ADJUSTMENT_INTERVAL):
             return False
 
+        # Use *inference_health* (success / (success + rate_limit_errors))
+        # rather than the raw success_rate. Failures unrelated to chute
+        # load — model quality (no_tools, empty output), billing (HTTP 402
+        # zero balance), missing chute (404), scorer errors — should not
+        # cause slots to shrink, since lowering concurrency does not fix
+        # any of them. Only HTTP 429 ("Infrastructure at maximum capacity")
+        # is a true overload signal: it means the chute literally cannot
+        # absorb more requests right now. timeout_errors are intentionally
+        # excluded because they are ambiguous (slow model vs. overload).
         sampling_stats = (stats or {}).get('sampling_stats', {}).get('last_1hour', {})
-        total_samples = sampling_stats.get('samples', 0)
-        successful_samples = sampling_stats.get('success', 0)
+        successful_samples = int(sampling_stats.get('success', 0) or 0)
+        rate_limit_errors = int(sampling_stats.get('rate_limit_errors', 0) or 0)
+        load_relevant_samples = successful_samples + rate_limit_errors
 
-        if total_samples < self.MIN_SAMPLES_FOR_ADJUSTMENT:
+        if load_relevant_samples < self.MIN_SAMPLES_FOR_ADJUSTMENT:
             return False
 
-        success_rate = sampling_stats.get('success_rate')
-        if success_rate is None:
-            success_rate = successful_samples / total_samples
+        success_rate = successful_samples / load_relevant_samples
 
         # Tiered backoff. Asymmetric on purpose.
         if success_rate >= 0.90:
@@ -167,7 +175,8 @@ class MinerSlotsAdjuster:
             logger.info(
                 f"Miner {hotkey[:8]}... slots {action}: "
                 f"{current_slots} -> {new_slots} "
-                f"(sr={success_rate:.1%}, samples={total_samples})"
+                f"(inference_health={success_rate:.1%}, "
+                f"success={successful_samples}, rate_limit={rate_limit_errors})"
             )
             return True
         return False
