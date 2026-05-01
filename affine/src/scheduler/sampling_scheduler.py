@@ -38,7 +38,7 @@ class PerMinerSamplingScheduler:
        cooldown needed.
     """
 
-    DEFAULT_SLOTS = 20
+    DEFAULT_SLOTS = 25
     MIN_SLOTS = 20
     MAX_SLOTS = 50
 
