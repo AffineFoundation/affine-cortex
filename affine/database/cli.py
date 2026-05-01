@@ -1188,10 +1188,10 @@ async def cmd_get_stats():
             for env, stats in env_stats.items():
                 if env not in env_aggregates:
                     env_aggregates[env] = {
-                        'last_15min': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'other_errors': 0},
-                        'last_1hour': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'other_errors': 0},
-                        'last_6hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'other_errors': 0},
-                        'last_24hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'other_errors': 0}
+                        'last_15min': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
+                        'last_1hour': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
+                        'last_6hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
+                        'last_24hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0}
                     }
                 
                 for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
@@ -1201,6 +1201,7 @@ async def cmd_get_stats():
                         env_aggregates[env][window]['success'] += wstats.get('success', 0)
                         env_aggregates[env][window]['rate_limit_errors'] += wstats.get('rate_limit_errors', 0)
                         env_aggregates[env][window]['timeout_errors'] += wstats.get('timeout_errors', 0)
+                        env_aggregates[env][window]['unavailable_errors'] += wstats.get('unavailable_errors', 0)
                         env_aggregates[env][window]['other_errors'] += wstats.get('other_errors', 0)
         
         # Print results
@@ -1210,10 +1211,10 @@ async def cmd_get_stats():
         
         # Calculate global totals
         global_totals = {
-            'last_15min': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'other_errors': 0},
-            'last_1hour': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'other_errors': 0},
-            'last_6hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'other_errors': 0},
-            'last_24hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'other_errors': 0}
+            'last_15min': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
+            'last_1hour': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
+            'last_6hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
+            'last_24hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0}
         }
         
         for env_stats in env_aggregates.values():
@@ -1222,6 +1223,7 @@ async def cmd_get_stats():
                 global_totals[window]['success'] += env_stats[window]['success']
                 global_totals[window]['rate_limit_errors'] += env_stats[window]['rate_limit_errors']
                 global_totals[window]['timeout_errors'] += env_stats[window]['timeout_errors']
+                global_totals[window]['unavailable_errors'] += env_stats[window]['unavailable_errors']
                 global_totals[window]['other_errors'] += env_stats[window]['other_errors']
         
         # Print global totals first
@@ -1248,6 +1250,7 @@ async def cmd_get_stats():
             print(f"  Success: {success} ({success_rate:.1f}%)")
             print(f"  Rate limit errors: {wstats['rate_limit_errors']}")
             print(f"  Timeout errors: {wstats['timeout_errors']}")
+            print(f"  Unavailable errors: {wstats.get('unavailable_errors', 0)}")
             print(f"  Other errors: {wstats['other_errors']}")
             print(f"  Samples/min: {samples_per_min:.2f}")
         
@@ -1272,6 +1275,7 @@ async def cmd_get_stats():
                 print(f"    Success: {success} ({success_rate:.1f}%)")
                 print(f"    Rate limit errors: {wstats['rate_limit_errors']}")
                 print(f"    Timeout errors: {wstats['timeout_errors']}")
+                print(f"    Unavailable errors: {wstats.get('unavailable_errors', 0)}")
                 print(f"    Other errors: {wstats['other_errors']}")
                 print(f"    Samples/min: {samples_per_min:.2f}")
         
