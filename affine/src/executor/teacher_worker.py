@@ -225,6 +225,10 @@ class TeacherWorker:
                 val = os.getenv(key, "")
                 if val:
                     env_vars[key] = val
+            for key in getattr(config, "optional_env_vars", []):
+                val = os.getenv(key, "")
+                if val:
+                    env_vars[key] = val
 
             mem_limit = convert_memory_format(config.mem_limit, mode)
             base_name = env_name.lower().replace(":", "-")

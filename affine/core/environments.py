@@ -65,6 +65,9 @@ class EnvConfig:
     # Environment variables that must be sourced from the host process environment
     # and forwarded into the container (e.g., credentials/endpoints).
     required_env_vars: List[str] = field(default_factory=list)
+    # Like required_env_vars, but forwarded only when set on the host.
+    # Use for optional fallbacks/credentials that the env can run without.
+    optional_env_vars: List[str] = field(default_factory=list)
     mem_limit: str = "10g"
     volumes: Optional[Dict[str, Dict[str, str]]] = None
     eval_params: Dict[str, Any] = field(default_factory=lambda: {
@@ -358,6 +361,7 @@ _ENV_CONFIGS_CANONICAL = {
         mem_limit="5g",
         env_vars={"QQR_CACHE_DIR": "/var/lib/navworld/cache"},
         required_env_vars=["AMAP_MAPS_API_KEY"],
+        optional_env_vars=["DASHSCOPE_API_KEY"],
         volumes={
             "/var/lib/navworld/cache": {
                 "bind": "/var/lib/navworld/cache",

@@ -539,6 +539,12 @@ def _create_environment(env_name: str, network_host: bool = False, basilica: boo
             )
         env_vars[key] = value
 
+    # Forward optional host env vars only when set
+    for key in getattr(config, "optional_env_vars", []):
+        value = os.getenv(key)
+        if value:
+            env_vars[key] = value
+
     # Add ENV_NAME for affine environments
     if "task_type" in config.eval_params:
         env_vars["ENV_NAME"] = config.eval_params["task_type"]
