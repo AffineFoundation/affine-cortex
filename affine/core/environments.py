@@ -512,6 +512,12 @@ class SDKEnvironment:
                 )
             env_vars[key] = value
 
+        # Forward optional host env vars only when set
+        for key in getattr(self.config, "optional_env_vars", []):
+            value = os.getenv(key)
+            if value:
+                env_vars[key] = value
+
         # Add ENV_NAME for affine environments (from task_type in eval_params)
         if "task_type" in self.config.eval_params:
             env_vars["ENV_NAME"] = self.config.eval_params["task_type"]
