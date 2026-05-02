@@ -64,6 +64,16 @@ class SamplingStatsCollector:
         "maximum capacity",
         "Eval model unreachable",           # NAVWORLD/MEMORY wrapper, default to load
         "model unreachable",
+        # Empty-reply path raised by NAVWORLD (affinetes qqr env, commits
+        # 8b8c2c9 / e75cf64): chute responds 200 but with no content and
+        # no tool_calls, or all retries return non-200. Production scan
+        # showed this only occurs on overloaded chutes (median 8s latency,
+        # concentrated on miners with chute scaling lagging slots) — i.e.
+        # cutting concurrency genuinely helps. Without this entry the
+        # signal lands in other_errors and slots_adjuster never sees it.
+        "Model returned empty reply",
+        "Empty LLM response",               # earlier wording from 8b8c2c9
+        "returned empty reply",             # broader fallback
     )
 
     # Patterns indicating a hard wall-clock timeout (model/agent didn't
