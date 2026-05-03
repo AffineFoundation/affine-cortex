@@ -16,6 +16,7 @@ from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.anti_copy import AntiCopyDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
+from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scorer.scorer import Scorer
 from affine.src.scorer.config import ScorerConfig
@@ -197,6 +198,23 @@ async def run_scoring_once(save_to_db: bool, range_type: str = "scoring"):
             anticopy_records=anticopy_records,
             print_summary=True,
         )
+
+        # If champion's chute is cold, zero out weights this round.
+        # Champion is the sole weight recipient, so zeroing them = no weights set.
+        if champion_state and champion_state.get('hotkey') and result.final_weights:
+            miners_dao = MinersDAO()
+            champion_record = await miners_dao.get_miner_by_hotkey(
+                champion_state['hotkey']
+            )
+            if champion_record and champion_record.get('chute_status') == 'cold':
+                logger.warning(
+                    f"Champion {champion_state['hotkey'][:8]}... chute is cold; "
+                    "zeroing all weights this round"
+                )
+                for uid in result.final_weights:
+                    result.final_weights[uid] = 0.0
+                for miner in result.miners.values():
+                    miner.normalized_weight = 0.0
 
         # Save to database if requested
         if save_to_db:
