@@ -85,7 +85,12 @@ class TaskPoolDAO(BaseDAO):
                 'assigned_to': None,
                 'assigned_at': None,
                 'retry_count': 0,
-                'max_retries': 3,
+                # 1 = no retry. Tasks are partitioned per-miner, so retrying
+                # only re-hits the same miner's chute — pointless when the
+                # failure is persistent (overload, bad model, dead miner) and
+                # noisy when it isn't (the rotator will recreate the task on
+                # the next cycle and the scheduler can pick a different miner).
+                'max_retries': 1,
                 'last_error': None,
                 'last_error_code': None,
                 'last_failed_at': None,
