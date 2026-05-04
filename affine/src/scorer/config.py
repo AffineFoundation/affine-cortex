@@ -28,7 +28,7 @@ class ScorerConfig:
     as checkpoints progress.
     """
 
-    WIN_MIN_DOMINANT_ENVS: int = 2
+    WIN_MIN_DOMINANT_ENVS: int = 1
     """Champion challenge: minimum environments where the challenger must
     exceed by margin. Remaining environments must not be worse than
     score_a - WIN_NOT_WORSE_TOLERANCE.
