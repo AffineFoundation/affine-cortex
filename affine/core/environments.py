@@ -197,7 +197,7 @@ _ENV_CONFIGS_CANONICAL = {
         name="swe-infinite",
         docker_image="affinefoundation/swebench:infinite",
         env_type="swebench",
-        env_vars={"UVICORN_WORKERS": "15"},
+        env_vars={"UVICORN_WORKERS": "15", "MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT": "30"},
         required_env_vars=["DOCKER_HUB_USERNAME", "DOCKER_HUB_TOKEN", "HF_TOKEN"],
         mem_limit="10g",
         volumes={
@@ -209,9 +209,9 @@ _ENV_CONFIGS_CANONICAL = {
         eval_params={
             "max_iterations": 50,
             "temperature": 0.0,
-            "timeout": 7200,
+            "timeout": 28800,
         },
-        proxy_timeout=7300,
+        proxy_timeout=29000,
     ),
     "print": EnvConfig(
         name="print",
