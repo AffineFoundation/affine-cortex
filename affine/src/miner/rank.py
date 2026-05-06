@@ -154,23 +154,20 @@ def _is_color_tty() -> bool:
 
 
 def format_boost(status: Optional[str]) -> str:
-    """Fixed-width badge for the scheduling-acceleration column.
+    """Two-cell badge for the scheduling-acceleration column.
 
-    The validator can pin a subset of miners to dedicated capacity each
-    cycle so their samples come back faster. Bright when the boost is
-    live, dim while it's warming up, blank when the miner is on the
-    standard path. Width matches the "Boost" header (5 chars) so column
-    alignment is stable regardless of glyph and ANSI escapes don't
-    confuse downstream padding.
+    ⚡ / ⏳ render as two terminal cells in CJK-aware fonts (East Asian
+    Wide), but Python sees them as a single char — so empty rows need
+    two literal spaces to match the rendered column width and keep the
+    rest of the table aligned.
     """
-    glyph = _BOOST_GLYPHS.get(status or "", "")
+    glyph = _BOOST_GLYPHS.get(status or "")
     if not glyph:
-        return "     "  # 5 visible chars
-    cell = f"{glyph:^5}"  # ≤2-cell glyph centered in 5 visible columns
+        return "  "
     if not _is_color_tty():
-        return cell
+        return glyph
     color = "1;92" if status == "active" else "1;93"  # green / yellow
-    return f"\033[{color}m{cell}\033[0m"
+    return f"\033[{color}m{glyph}\033[0m"
 
 
 # Backwards-compat shim — earlier callers / tests may still import this.
@@ -262,7 +259,10 @@ async def print_rank_table():
         # Boost column ("⚡") sits next to UID so it survives narrow
         # terminals — accelerated miners are the most operationally
         # interesting rows and the rightmost column is the first to clip.
-        header_parts = ["Hotkey  ", " UID", "Boost", "Model                    "]
+        # ⚡ is glued to Model (no space between them) because the column
+        # separator already provides space on the *left* of the glyph,
+        # and a wide ⚡ visually filling its cell needs no right padding.
+        header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
         for env in environments:
             disp = env_display_name(env, env_configs.get(env, {}))
             header_parts.append(f"{disp:>26}")
@@ -323,8 +323,7 @@ async def print_rank_table():
             row_parts = [
                 f"{m.hotkey[:8]:8s}",
                 f"{m.uid:4d}",
-                format_boost(m.targon_status),
-                f"{m.model[:25]:25s}",
+                f"{format_boost(m.targon_status)}| {m.model[:25]:25s}",
             ]
 
             for env in environments:
