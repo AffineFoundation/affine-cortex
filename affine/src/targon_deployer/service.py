@@ -17,14 +17,14 @@ Each loop iteration:
     3. Tear down any deployment whose (hotkey, revision) is no longer a
        target — covers champion change, challenger termination, challenger
        losing its only win, etc. Teardown is immediate (no 24h grace).
-    4. Health sweep: probe every active/deploying deployment. We treat a
-       deployment as "ready" only when *both* Targon's container-level
-       signal (status=running, ready_replicas>0) *and* an active OpenAI
-       /v1/models probe of the workload succeed. The latter is essential
-       because Targon's readiness check only verifies port openness; after
-       a Targon rebuild the /data volume is wiped and vLLM/sglang has to
-       re-download model weights from HF (10-30 min), during which the
-       container is "running" but inference returns 5xx.
+    4. Health sweep: probe every active/deploying deployment. The
+       authoritative signal is an active OpenAI /v1/models probe against
+       the workload — Targon's container-level state lags vLLM in both
+       directions (ready_replicas can stay 0 for a minute after the model
+       has actually loaded, and stays 1 after a rebuild has wiped /data
+       while vLLM is re-downloading), so trusting it would either miss
+       a serving deployment or keep routing to a broken one. /v1/models
+       is exactly what task fetch sees when it routes traffic.
 
        Release is time-based, not count-based: a deployment must be
        continuously unhealthy for at least TARGON_UNHEALTHY_RELEASE_SEC
@@ -305,6 +305,15 @@ class TargonDeployerService:
                 f"TargonDeployerService: {role} {hotkey[:12]}.. has no miner/model row"
             )
             return
+        uid = miner.get("uid")
+        if uid is None:
+            # Without uid we can't build a unique workload name — bail
+            # rather than silently fall back to a model-only name that
+            # would collide whenever two miners share the same model.
+            logger.warning(
+                f"TargonDeployerService: {role} {hotkey[:12]}.. miner row missing uid"
+            )
+            return
 
         from affine.core.providers.targon_client import (
             external_url, derive_deployment_args_from_chute, fixed_gpu_count,
@@ -312,7 +321,6 @@ class TargonDeployerService:
         )
         from affine.utils.api_client import get_chute_info
         model_hf_repo = miner["model"]
-        uid = miner.get("uid")
         chute_id = miner.get("chute_id")
 
         # Mirror the miner's Chutes config (gpu_count, engine, resource tier)
@@ -341,7 +349,8 @@ class TargonDeployerService:
             model_hf_repo, revision, uid=uid, hotkey=hotkey,
         )
         deployment_id = adopted_id or await self.client.create_deployment(
-            model_hf_repo=model_hf_repo, revision=revision, **chute_args,
+            model_hf_repo=model_hf_repo, revision=revision,
+            uid=uid, hotkey=hotkey, **chute_args,
         )
         if not deployment_id:
             logger.warning(
@@ -367,7 +376,7 @@ class TargonDeployerService:
 
     async def _find_existing_on_targon(
         self, model_hf_repo: str, revision: str,
-        *, uid: Optional[int] = None, hotkey: Optional[str] = None,
+        *, uid: int, hotkey: str,
     ) -> Optional[str]:
         """Look up a live Targon workload that matches our naming convention."""
         expected_name = self.client._workload_name(
@@ -547,21 +556,26 @@ class TargonDeployerService:
         running = int(status.get("running_instances", 0) or 0)
         healthy = bool(status.get("healthy", False))
         base_url = status.get("base_url") or deployment.get("base_url")
-        targon_up = running > 0 and healthy
 
-        # Two-signal readiness: container running AND model server actually
-        # serving. Skip the model probe when Targon already says no — we're
-        # going to count it as failed regardless, no point doing the HTTP.
-        model_ready = False
-        if targon_up:
-            model_ready = await self._probe_model_ready(base_url)
+        # Active inference probe is the authoritative readiness signal.
+        # Targon's ready_replicas can lag behind vLLM in *either* direction:
+        # it stays 0 for a minute after the model has actually loaded
+        # (so trusting Targon means tasks miss a serving deployment), and
+        # it can also stay 1 after a rebuild has wiped /data (the rebuild
+        # case our probe was added for). Either way, /v1/models is the
+        # signal that matches what task fetch will actually see when it
+        # routes traffic, so we make it the only signal that matters.
+        model_ready = await self._probe_model_ready(base_url)
 
-        if targon_up and model_ready:
-            # Both green: this is the only path that flips deploying → active
-            # via update_health (which sets status='active' when healthy +
-            # instance_count>0) and resets consecutive_failures.
+        if model_ready:
+            # Probe success is sufficient — synthesize at least 1 instance
+            # so update_health flips status to 'active' even when Targon's
+            # bookkeeping is still catching up.
             await self.dao.update_health(
-                deployment_id, instance_count=running, healthy=True, base_url=base_url,
+                deployment_id,
+                instance_count=max(running, 1),
+                healthy=True,
+                base_url=base_url,
             )
             return
 
@@ -578,7 +592,7 @@ class TargonDeployerService:
         await self._on_failed_probe(
             deployment,
             reason=(
-                f"running={running} healthy={healthy} model_ready={model_ready} "
+                f"running={running} healthy={healthy} model_ready=False "
                 f"age={age}s db_status={db_status}"
             ),
         )

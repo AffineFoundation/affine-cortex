@@ -300,6 +300,9 @@ class TargonClient:
         self,
         model_hf_repo: str,
         revision: str,
+        *,
+        uid: int,
+        hotkey: str,
         image: Optional[str] = None,
         resource_name: Optional[str] = None,
         name: Optional[str] = None,
@@ -420,7 +423,9 @@ class TargonClient:
                 args += ["--tensor-parallel-size", str(tp)]
 
         body: Dict[str, Any] = {
-            "name": name or self._workload_name(model_hf_repo, revision),
+            "name": name or self._workload_name(
+                model_hf_repo, revision, uid=uid, hotkey=hotkey,
+            ),
             "image": image,
             "resource_name": resource,
             "type": "RENTAL",
@@ -484,7 +489,7 @@ class TargonClient:
     @staticmethod
     def _workload_name(
         model_hf_repo: str, revision: str,
-        *, uid: Optional[int] = None, hotkey: Optional[str] = None,
+        *, uid: int, hotkey: str,
     ) -> str:
         """Build a Targon-valid workload name.
 
@@ -494,28 +499,22 @@ class TargonClient:
           e.g.  affine-affin-44-5fnfl-92540    (len=28)
 
         `modelname` = the part after the last `/` in the HF repo (or the
-        whole thing if no slash). We grep the first 5 chars — enough to
+        whole thing if no slash). We take the first 5 chars — enough to
         distinguish most model families while staying inside the length
-        budget.
-
-        When uid or hotkey is missing, fall back to a model-only variant
-        so the function stays callable from legacy paths.
+        budget. uid + hotkey5 disambiguate miners that share a model;
+        rev5 disambiguates revisions of the same miner.
         """
+        if uid is None or not hotkey:
+            raise ValueError(
+                "_workload_name requires uid and hotkey — they're the only "
+                "tokens that disambiguate miners from each other"
+            )
         prefix = TargonClient.WORKLOAD_NAME_PREFIX  # 'affine' (6)
         rev5 = TargonClient._sanitize_token((revision or "")[:5], 5) or "norev"
         repo_tail = (model_hf_repo or "").split("/")[-1]
         model5 = TargonClient._sanitize_token(repo_tail[:5], 5)
-        if uid is not None and hotkey:
-            hk5 = TargonClient._sanitize_token(hotkey[:5], 5)
-            return f"{prefix}-{model5}-{uid}-{hk5}-{rev5}"
-        # Fallback (no uid/hotkey): slug + 8-char revision — compat path
-        # used by the targon_deployer when the caller only has model+rev.
-        rev8 = TargonClient._sanitize_token((revision or "")[:8], 8) or "norev"
-        slug = TargonClient._sanitize_token(
-            (model_hf_repo or "").replace("/", "-"),
-            32 - len(prefix) - 2 - len(rev8),
-        )
-        return f"{prefix}-{slug}-{rev8}"
+        hk5 = TargonClient._sanitize_token(hotkey[:5], 5)
+        return f"{prefix}-{model5}-{uid}-{hk5}-{rev5}"
 
     @staticmethod
     def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:

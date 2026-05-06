@@ -330,6 +330,7 @@ async def _deploy_workload(
     )
     workload_uid = await client.create_deployment(
         model_hf_repo=model_repo, revision=revision,
+        uid=uid, hotkey=hotkey,
         gpu_count=gpu_count, tensor_parallel=tensor_parallel,
         data_parallel=data_parallel,
         engine=engine, volumes=resolved_volumes, name=workload_name,
