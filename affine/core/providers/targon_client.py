@@ -61,6 +61,28 @@ def resource_name_for(gpu_type: str, gpu_count: int) -> Optional[str]:
 TARGON_GPU_TYPE = "h200"
 
 
+def fixed_gpu_count() -> Optional[int]:
+    """Operator override for per-deployment GPU count.
+
+    When set, the deployer ignores the miner's chute ``node_selector.gpu_count``
+    and pins every Targon workload to this many GPUs (TP=count, DP=1). Lets the
+    operator size the pool to their physical capacity without depending on
+    whatever the miner happened to build for.
+
+    Default 2 because the operator scenario this exists for is "I have N
+    H200 boxes, run K miners on each" — 2 GPUs/miner doubles the parallel
+    miners we can host versus the 4-GPU chute defaults common in the network.
+    """
+    raw = os.getenv("TARGON_FIXED_GPU_COUNT", "2").strip()
+    if not raw or raw.lower() in ("0", "off", "false", "none", ""):
+        return None
+    try:
+        v = int(raw)
+        return v if v > 0 else None
+    except ValueError:
+        return None
+
+
 def derive_deployment_args_from_chute(
     chute_info: Optional[Dict[str, Any]],
 ) -> Dict[str, Any]:

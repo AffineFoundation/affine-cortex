@@ -1,11 +1,13 @@
 """Targon deployer reconciliation loop.
 
 Closed-loop auto-deployment over a small set of "targets" drawn from the
-current champion plus winning challengers:
+current champion plus the strongest currently-sampling challengers:
 
-    targets = { champion } ∪ top-N challengers by checkpoints_passed
-              where challenge_status == 'sampling' AND consecutive_wins > 0
-    |targets| ≤ MAX_TARGON_DEPLOYMENTS   (default 4, env-configurable)
+    targets = { champion } ∪ top-N challengers ranked by
+                  (consecutive_wins > 0  DESC,   # winners first
+                   first_block           ASC)    # within tier, earliest-submitted first
+              where challenge_status == 'sampling'
+    |targets| ≤ MAX_TARGON_DEPLOYMENTS   (default 8, env-configurable)
 
 Each loop iteration:
 
@@ -36,7 +38,7 @@ from affine.database.dao.targon_deployments import TargonDeploymentsDAO
 
 
 DEFAULT_POLL_INTERVAL = int(os.getenv("TARGON_POLL_INTERVAL_SEC", "30"))
-DEFAULT_MAX_DEPLOYMENTS = int(os.getenv("TARGON_MAX_DEPLOYMENTS", "4"))
+DEFAULT_MAX_DEPLOYMENTS = int(os.getenv("TARGON_MAX_DEPLOYMENTS", "8"))
 # How often to scan all Targon-side workloads for orphans (workloads that
 # match our naming convention but have no DB row). Cheaper than per-cycle
 # because it's bounded by Targon's list endpoint size.
@@ -95,22 +97,24 @@ class TargonDeployerService:
     async def _resolve_targets(self) -> List[Tuple[str, str, str]]:
         """Compute the target set for this cycle.
 
-        Selection order (first fills first, up to ``max_deployments``):
-          1. Current champion (if one is configured)
-          2. **Incumbents** — winners whose deployment already exists in the
-             targon_deployments table (status active/deploying/rebuilding) and
-             still qualify (sampling + consecutive_wins > 0). Giving them
-             priority turns the cap into a **FIFO queue**: once a miner gets a
-             slot, it keeps it until it drops out voluntarily (terminated /
-             wins→0 / champion change).
-          3. **Newcomers** — eligible winners not yet deployed. Ordered by
-             checkpoints_passed desc, wins desc. They queue up behind
-             incumbents and take any freed slots in the next cycle.
+        Champion is always slot 0. The remaining slots are filled from the
+        currently-sampling miner pool, ranked by:
+
+            (has_wins  DESC,   # consecutive_wins > 0 → True before False
+             first_block ASC)  # within a tier, earliest submitter first
+
+        The two-key sort makes "currently winning" the primary signal (those
+        miners are already in active competition) and breaks ties toward the
+        miner who's been on-chain longer — operators typically want the
+        steady state hosts before the latest entrants.
 
         Eligibility filter for challengers:
           - challenge_status == 'sampling'   (terminated miners excluded)
-          - consecutive_wins > 0             (only current winners deploy)
           - (hotkey, revision) != champion's (avoid double counting)
+
+        Note: ``consecutive_wins == 0`` is no longer a hard filter — wins
+        only reorder candidates, so a non-winner can take an empty slot
+        when the winner pool is smaller than ``max_deployments``.
 
         Returns list of (hotkey, revision, role) where role ∈ {'champion','winner'}.
         """
@@ -128,13 +132,27 @@ class TargonDeployerService:
 
         all_stats = await self.miner_stats_dao.get_all_historical_miners()
 
-        # (hotkey, revision) -> (cp, wins) for every eligible challenger.
-        eligible: Dict[Tuple[str, str], Tuple[int, int]] = {}
+        # Hotkey-keyed first_block lookup. ``miners`` is a small table (≤256
+        # rows) so a single scan is cheaper than per-hotkey lookups, and
+        # first_block is per-hotkey (stable across revisions) so the join
+        # key is hotkey alone.
+        miners = await self.miners_dao.get_all_miners()
+        first_block_by_hotkey: Dict[str, int] = {}
+        for m in miners:
+            hk = m.get("hotkey")
+            if not hk:
+                continue
+            try:
+                first_block_by_hotkey[hk] = int(m.get("first_block") or 0)
+            except (TypeError, ValueError):
+                continue
+
+        # (hotkey, revision) -> (has_wins, first_block) for every eligible miner.
+        # ``has_wins`` is the primary sort key; ``first_block`` the tiebreaker.
+        # Miners with no first_block on record sort to the end (sentinel).
+        eligible: Dict[Tuple[str, str], Tuple[bool, int]] = {}
         for s in all_stats:
             if s.get("challenge_status") != "sampling":
-                continue
-            wins = int(s.get("challenge_consecutive_wins", 0) or 0)
-            if wins <= 0:
                 continue
             hotkey = s.get("hotkey")
             revision = s.get("revision")
@@ -142,47 +160,56 @@ class TargonDeployerService:
                 continue
             if (hotkey, revision) in seen:
                 continue
-            cp = int(s.get("challenge_checkpoints_passed", 0) or 0)
-            eligible[(hotkey, revision)] = (cp, wins)
+            wins = int(s.get("challenge_consecutive_wins", 0) or 0)
+            has_wins = wins > 0
+            first_block = first_block_by_hotkey.get(hotkey)
+            if first_block is None or first_block <= 0:
+                # Sentinel: unknown first_block sorts after everyone known.
+                first_block = 10**12
+            eligible[(hotkey, revision)] = (has_wins, first_block)
 
         # Pass 1: incumbents (already deployed → keep their slot).
-        incumbents: List[Tuple[int, int, str, str]] = []
+        # Giving them admission priority turns the cap into a FIFO queue:
+        # once a miner gets a slot, it keeps it until it drops out
+        # voluntarily (terminated / champion change / cap shrunk).
+        incumbents: List[Tuple[bool, int, str, str]] = []
         incumbent_seen: Set[Tuple[str, str]] = set()
         for status in ("active", "deploying"):
             for d in await self.dao.list_by_status(status):
                 key = (d.get("hotkey"), d.get("revision"))
                 if key in seen or key in incumbent_seen or key not in eligible:
                     continue
-                cp, wins = eligible[key]
-                incumbents.append((cp, wins, key[0], key[1]))
+                has_wins, first_block = eligible[key]
+                incumbents.append((has_wins, first_block, key[0], key[1]))
                 incumbent_seen.add(key)
 
         # Pass 2: newcomers (eligible but not yet deployed).
-        newcomers: List[Tuple[int, int, str, str]] = []
-        for key, (cp, wins) in eligible.items():
+        newcomers: List[Tuple[bool, int, str, str]] = []
+        for key, (has_wins, first_block) in eligible.items():
             if key in seen or key in incumbent_seen:
                 continue
-            newcomers.append((cp, wins, key[0], key[1]))
+            newcomers.append((has_wins, first_block, key[0], key[1]))
 
-        # Within each group, sort by CP desc then wins desc for deterministic
-        # ordering. Incumbents are admitted before any newcomer regardless of
-        # ranking — that's what makes this a queue, not a priority reshuffle.
-        incumbents.sort(key=lambda t: (-t[0], -t[1], t[2], t[3]))
-        newcomers.sort(key=lambda t: (-t[0], -t[1], t[2], t[3]))
+        # Composite sort: winners first (has_wins True before False),
+        # within each tier earliest submission first (first_block asc).
+        # Hotkey/revision suffixes break any further ties deterministically.
+        sort_key = lambda t: (0 if t[0] else 1, t[1], t[2], t[3])
+        incumbents.sort(key=sort_key)
+        newcomers.sort(key=sort_key)
         ordered = incumbents + newcomers
 
         slots_left = self.max_deployments - len(targets)
-        for cp, wins, hotkey, revision in ordered[:slots_left]:
+        for has_wins, first_block, hotkey, revision in ordered[:slots_left]:
             targets.append((hotkey, revision, "winner"))
             seen.add((hotkey, revision))
 
         if len(ordered) > slots_left:
             queued = ordered[slots_left:]
             logger.info(
-                f"_resolve_targets: {len(queued)} eligible winner(s) queued "
+                f"_resolve_targets: {len(queued)} eligible miner(s) queued "
                 f"(waiting for slot): "
-                + ", ".join(f"{hk[:8]}..@{rev[:6]} cp={cp} w={w}"
-                            for cp, w, hk, rev in queued[:5])
+                + ", ".join(f"{hk[:8]}..@{rev[:6]} wins={'y' if hw else 'n'} fb={fb}"
+                            for hw, fb, hk, rev in queued[:5])
             )
         return targets
 
@@ -244,7 +271,8 @@ class TargonDeployerService:
             return
 
         from affine.core.providers.targon_client import (
-            external_url, derive_deployment_args_from_chute,
+            external_url, derive_deployment_args_from_chute, fixed_gpu_count,
+            resource_name_for, TARGON_GPU_TYPE,
         )
         from affine.utils.api_client import get_chute_info
         model_hf_repo = miner["model"]
@@ -258,6 +286,17 @@ class TargonDeployerService:
         chute_args = derive_deployment_args_from_chute(
             await get_chute_info(chute_id) if chute_id else None
         )
+
+        # Operator override: when TARGON_FIXED_GPU_COUNT is set we ignore the
+        # chute's gpu_count and pin every workload to the configured size, so
+        # a fixed Targon pool can be split evenly across N miners regardless
+        # of how each miner happened to size their chute.
+        forced = fixed_gpu_count()
+        if forced is not None:
+            chute_args["gpu_count"] = forced
+            resolved = resource_name_for(TARGON_GPU_TYPE, forced)
+            if resolved:
+                chute_args["resource_name"] = resolved
 
         # Dedupe: if a Targon workload with our deterministic name already
         # exists (manual `af targon deploy`, or orphaned by a crashed writer),

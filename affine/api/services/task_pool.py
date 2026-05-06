@@ -545,9 +545,11 @@ class TaskPoolManager:
                 model = miner_record.get('model', '')
 
                 # Provider routing: decide Chutes vs Targon per-task based on the
-                # freshest live capacity snapshot. Returns None if neither side
-                # can serve the miner right now.
-                route = await self._get_provider_router().select(miner_record)
+                # freshest live capacity snapshot. Env is forwarded so the router
+                # can honor the TARGON_ACCELERATED_ENVS whitelist (Targon-eligible
+                # envs only when the operator has scoped acceleration).
+                # Returns None if neither side can serve the miner right now.
+                route = await self._get_provider_router().select(miner_record, env=env)
                 if route is None:
                     logger.warning(
                         f"No live provider for miner {miner_hotkey[:12]}... "

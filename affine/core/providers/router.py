@@ -6,10 +6,16 @@ the freshest capacity snapshot we have. Intentionally provider-count agnostic:
 adding a third provider later is a new `BaseProvider` plus one elif.
 
 Routing policy:
-    For every miner, look up live capacity on both providers and split traffic
-    in proportion to their running instance counts. If one side is empty, all
-    traffic goes to the other. If both are empty, return None so the caller
-    can release the task back to pending.
+    For every (miner, env) pair, look up live capacity on both providers and
+    split traffic in proportion to their running instance counts. If one side
+    is empty, all traffic goes to the other. If both are empty, return None
+    so the caller can release the task back to pending.
+
+    Env gating: ``TARGON_ACCELERATED_ENVS`` (default ``*``) limits which envs
+    are eligible for Targon. When set to a comma-separated list, tasks whose
+    env isn't in that list bypass Targon entirely and route to Chutes only —
+    operators use this to pin a fixed Targon GPU pool to high-cost envs (e.g.
+    SWE-bench) without wasting capacity on cheap ones.
 
     There is no champion-only restriction — an operator deploying a Targon
     workload for any miner opts that miner into the split. This matters for
@@ -22,9 +28,27 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 from affine.core.providers.base import BaseProvider, ProviderInstanceInfo
+
+
+def _parse_accelerated_envs() -> Optional[Set[str]]:
+    """Parse ``TARGON_ACCELERATED_ENVS`` into a whitelist (or None = all).
+
+    Sentinels for "all envs eligible": unset, empty, ``*``, or ``all``.
+    Otherwise: comma-separated list of canonical env names. Reading at
+    import time is fine because this is a deployment-time toggle, not a
+    request-time knob.
+    """
+    raw = os.getenv("TARGON_ACCELERATED_ENVS", "*").strip()
+    if not raw or raw in ("*", "all", "ALL"):
+        return None
+    parts = {p.strip() for p in raw.split(",") if p.strip()}
+    return parts or None
+
+
+TARGON_ACCELERATED_ENVS: Optional[Set[str]] = _parse_accelerated_envs()
 
 
 @dataclass(frozen=True)
@@ -78,10 +102,28 @@ class ProviderRouter:
             public_base_url=provider.public_display_url,
         )
 
-    async def select(self, miner_record: Dict[str, Any]) -> Optional[RouteDecision]:
+    async def select(
+        self,
+        miner_record: Dict[str, Any],
+        env: Optional[str] = None,
+    ) -> Optional[RouteDecision]:
+        # Env gating: if a whitelist is configured and this env isn't on it,
+        # skip Targon entirely. We still consult Chutes — non-accelerated
+        # envs should keep sampling, just not eat Targon capacity.
+        targon_eligible = (
+            TARGON_ACCELERATED_ENVS is None
+            or (env is not None and env in TARGON_ACCELERATED_ENVS)
+        )
+
         chute_info = await self._instance_info(self.chutes, miner_record)
-        targon_info = await self._instance_info(self.targon, miner_record)
         c = int(chute_info.get("running_instances", 0) or 0)
+
+        if not targon_eligible:
+            if c <= 0:
+                return None
+            return self._decide(self.chutes, chute_info)
+
+        targon_info = await self._instance_info(self.targon, miner_record)
         t = int(targon_info.get("running_instances", 0) or 0)
 
         if c <= 0 and t <= 0:
