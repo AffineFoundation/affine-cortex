@@ -122,27 +122,11 @@ def derive_deployment_args_from_chute(
     return out
 
 
-# sglang tool-call parser names by model family. None = don't pass the flag.
-_TOOL_CALL_PARSER_HINTS = [
-    ("qwen", "qwen"),
-    ("llama-3", "llama3"),
-    ("llama3", "llama3"),
-    ("llama-4", "llama3"),     # llama3 parser covers both 3.x and 4
-    ("deepseek", "deepseekv3"),
-    ("mistral", "mistral"),
-]
-
-
-def _infer_tool_call_parser(model_hf_repo: str) -> Optional[str]:
-    name = (model_hf_repo or "").lower()
-    for needle, parser in _TOOL_CALL_PARSER_HINTS:
-        if needle in name:
-            return parser
-    # Affine miners predominantly fine-tune Qwen; default to qwen unless the
-    # operator explicitly disables via TARGON_SGLANG_TOOL_CALL_PARSER=none.
-    if "affine" in name:
-        return "qwen"
-    return None
+# All Affine miners on the network are Qwen3 fine-tunes, so we hard-code
+# qwen3 instead of inferring per-model. Operators with a non-Qwen3 miner
+# can override via TARGON_SGLANG_TOOL_CALL_PARSER, or set it to ``none``
+# to skip the flag entirely.
+DEFAULT_SGLANG_TOOL_CALL_PARSER = "qwen3"
 
 
 class TargonClient:
@@ -365,10 +349,12 @@ class TargonClient:
         # prefill batch; tool-call-parser enables OpenAI tool_calls for Qwen-
         # family models (the predominant Affine miner architecture).
         chunked_prefill_size = os.getenv("TARGON_SGLANG_CHUNKED_PREFILL_SIZE", "4096")
-        # Detect model family from HF path for tool-call-parser. sglang rejects
-        # a wrong parser at startup so guessing is risky — infer from the repo
-        # name when possible, else let operator override with the env var.
-        tool_call_parser = os.getenv("TARGON_SGLANG_TOOL_CALL_PARSER") or _infer_tool_call_parser(model_hf_repo)
+        # Pinned to Qwen3 because every Affine miner on the network today is a
+        # Qwen3 fine-tune. Operators with a non-Qwen3 miner override via the
+        # env var; set it to ``none`` to omit the flag entirely.
+        tool_call_parser = os.getenv(
+            "TARGON_SGLANG_TOOL_CALL_PARSER", DEFAULT_SGLANG_TOOL_CALL_PARSER,
+        )
 
         # Determine tp / dp split. tp×dp must == gpu_count.
         # Fallback: if neither passed, default to all-tensor-parallel (tp=gpu_count, dp=1)
