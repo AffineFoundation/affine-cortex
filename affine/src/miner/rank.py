@@ -230,11 +230,11 @@ async def print_rank_table():
         not_worse_tol = scorer_config.get("win_not_worse_tolerance", 0.015)
 
         # ── Header ────────────────────────────────────────────────────────
-        header_parts = ["Hotkey  ", " UID", "Model                    "]
+        header_parts = ["Hotkey  ", " UID", "Tgn", "Model                    "]
         for env in environments:
             disp = env_display_name(env, env_configs.get(env, {}))
             header_parts.append(f"{disp:>26}")
-        header_parts.extend(["  Status   ", "  CP ", " Challenge ", "Tgn"])
+        header_parts.extend(["  Status   ", "  CP ", " Challenge "])
         header_line = " | ".join(header_parts)
         table_width = len(header_line)
 
@@ -291,6 +291,7 @@ async def print_rank_table():
             row_parts = [
                 f"{m.hotkey[:8]:8s}",
                 f"{m.uid:4d}",
+                f"{format_targon(m.targon_status):>3}",
                 f"{m.model[:25]:25s}",
             ]
 
@@ -365,7 +366,6 @@ async def print_rank_table():
             row_parts.append(f"{status_str:>11}")
             row_parts.append(f"{cp_str:>5}")
             row_parts.append(f"{challenge_str:>11}")
-            row_parts.append(f"{format_targon(m.targon_status):>3}")
 
             print(" | ".join(row_parts), flush=True)
 
