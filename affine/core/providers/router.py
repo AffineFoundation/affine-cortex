@@ -42,12 +42,14 @@ from affine.core.providers.base import BaseProvider, ProviderInstanceInfo
 def _parse_accelerated_envs() -> Optional[Set[str]]:
     """Parse ``TARGON_ACCELERATED_ENVS`` into a whitelist (or None = all).
 
-    Sentinels for "all envs eligible": unset, empty, ``*``, or ``all``.
-    Otherwise: comma-separated list of canonical env names. Reading at
-    import time is fine because this is a deployment-time toggle, not a
-    request-time knob.
+    Default is ``swe-infinite`` — the most expensive env per task (longest
+    contexts, highest completion-token counts), so the paid Targon GPUs
+    earn back their cost fastest there. Operators add ``swe-pro`` /
+    ``swe-synth`` as the pool grows. Sentinels for "all envs eligible":
+    ``*`` or ``all``. Reading at import time is fine because this is a
+    deployment-time toggle, not a request-time knob.
     """
-    raw = os.getenv("TARGON_ACCELERATED_ENVS", "*").strip()
+    raw = os.getenv("TARGON_ACCELERATED_ENVS", "swe-infinite").strip()
     if not raw or raw in ("*", "all", "ALL"):
         return None
     parts = {p.strip() for p in raw.split(",") if p.strip()}
