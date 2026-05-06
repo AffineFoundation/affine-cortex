@@ -46,13 +46,15 @@ def _parse_accelerated_envs() -> Optional[Set[str]]:
     contexts, highest completion-token counts), so the paid Targon GPUs
     earn back their cost fastest there. Operators add ``swe-pro`` /
     ``swe-synth`` as the pool grows. Sentinels for "all envs eligible":
-    ``*`` or ``all``. Reading at import time is fine because this is a
-    deployment-time toggle, not a request-time knob.
+    ``*`` or ``all``. Whitelist is lowercased so callers passing the
+    canonical-uppercase task env (e.g. ``SWE-INFINITE``) still match.
+    Reading at import time is fine because this is a deployment-time
+    toggle, not a request-time knob.
     """
     raw = os.getenv("TARGON_ACCELERATED_ENVS", "swe-infinite").strip()
     if not raw or raw in ("*", "all", "ALL"):
         return None
-    parts = {p.strip() for p in raw.split(",") if p.strip()}
+    parts = {p.strip().lower() for p in raw.split(",") if p.strip()}
     return parts or None
 
 
@@ -118,9 +120,13 @@ class ProviderRouter:
         # Env gating: if a whitelist is configured and this env isn't on it,
         # skip Targon entirely. We still consult Chutes — non-accelerated
         # envs should keep sampling, just not eat Targon capacity.
+        # task_pool stores env in canonical-uppercase form (e.g.
+        # ``SWE-INFINITE``); whitelist is lowercased on parse, so compare
+        # against the lowercased value.
+        env_lc = (env or "").lower()
         targon_eligible = (
             TARGON_ACCELERATED_ENVS is None
-            or (env is not None and env in TARGON_ACCELERATED_ENVS)
+            or (env_lc and env_lc in TARGON_ACCELERATED_ENVS)
         )
 
         chute_info = await self._instance_info(self.chutes, miner_record)
