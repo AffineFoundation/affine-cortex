@@ -136,21 +136,27 @@ class TargonDeployerService:
         Champion is always slot 0. The remaining slots are filled from the
         currently-sampling miner pool, ranked by:
 
-            (has_wins  DESC,   # consecutive_wins > 0 → True before False
-             first_block ASC)  # within a tier, earliest submitter first
+            (chute_hot  DESC,   # miners actively serving on Chutes first
+             has_wins   DESC,   # consecutive_wins > 0 → True before False
+             first_block ASC)   # within a tier, earliest submitter first
 
-        The two-key sort makes "currently winning" the primary signal (those
-        miners are already in active competition) and breaks ties toward the
-        miner who's been on-chain longer — operators typically want the
-        steady state hosts before the latest entrants.
+        Why chute_hot leads the order: a cold Chutes effectively means the
+        miner has dropped offline (template check failed, miner forgot to
+        re-deploy, deletion in flight). Spending Targon GPU-hours to
+        accelerate a miner that can't keep their primary endpoint warm is
+        money thrown away — they'll likely fail termination soon and the
+        slot churns. Hot Chutes is the cheapest "alive" signal we have.
+
+        Within hot/cold tiers, has_wins still leads (active competitors)
+        and first_block tiebreaks toward longer-tenured miners.
 
         Eligibility filter for challengers:
           - challenge_status == 'sampling'   (terminated miners excluded)
           - (hotkey, revision) != champion's (avoid double counting)
 
-        Note: ``consecutive_wins == 0`` is no longer a hard filter — wins
-        only reorder candidates, so a non-winner can take an empty slot
-        when the winner pool is smaller than ``max_deployments``.
+        Note: ``chute_hot == False`` and ``consecutive_wins == 0`` are not
+        hard filters — they only reorder candidates, so a cold-but-sampling
+        miner can take an empty slot when no hotter miner is available.
 
         Returns list of (hotkey, revision, role) where role ∈ {'champion','winner'}.
         """
@@ -168,12 +174,13 @@ class TargonDeployerService:
 
         all_stats = await self.miner_stats_dao.get_all_historical_miners()
 
-        # Hotkey-keyed first_block lookup. ``miners`` is a small table (≤256
-        # rows) so a single scan is cheaper than per-hotkey lookups, and
-        # first_block is per-hotkey (stable across revisions) so the join
-        # key is hotkey alone.
+        # Per-hotkey (first_block, chute_status) from the miners table.
+        # Bounded to ~256 rows so a single scan is cheaper than per-hotkey
+        # lookups, and first_block is per-hotkey (stable across revisions)
+        # so the join key is hotkey alone.
         miners = await self.miners_dao.get_all_miners()
         first_block_by_hotkey: Dict[str, int] = {}
+        chute_hot_by_hotkey: Dict[str, bool] = {}
         for m in miners:
             hk = m.get("hotkey")
             if not hk:
@@ -181,12 +188,13 @@ class TargonDeployerService:
             try:
                 first_block_by_hotkey[hk] = int(m.get("first_block") or 0)
             except (TypeError, ValueError):
-                continue
+                pass
+            chute_hot_by_hotkey[hk] = (m.get("chute_status") or "").lower() == "hot"
 
-        # (hotkey, revision) -> (has_wins, first_block) for every eligible miner.
-        # ``has_wins`` is the primary sort key; ``first_block`` the tiebreaker.
+        # (hotkey, revision) -> (chute_hot, has_wins, first_block).
+        # Sort priority: chute_hot, then has_wins, then first_block.
         # Miners with no first_block on record sort to the end (sentinel).
-        eligible: Dict[Tuple[str, str], Tuple[bool, int]] = {}
+        eligible: Dict[Tuple[str, str], Tuple[bool, bool, int]] = {}
         for s in all_stats:
             if s.get("challenge_status") != "sampling":
                 continue
@@ -198,44 +206,44 @@ class TargonDeployerService:
                 continue
             wins = int(s.get("challenge_consecutive_wins", 0) or 0)
             has_wins = wins > 0
+            chute_hot = chute_hot_by_hotkey.get(hotkey, False)
             first_block = first_block_by_hotkey.get(hotkey)
             if first_block is None or first_block <= 0:
-                # Sentinel: unknown first_block sorts after everyone known.
-                first_block = 10**12
-            eligible[(hotkey, revision)] = (has_wins, first_block)
+                first_block = 10**12  # sentinel: unknown sorts last
+            eligible[(hotkey, revision)] = (chute_hot, has_wins, first_block)
 
         # Pass 1: incumbents (already deployed → keep their slot).
         # Giving them admission priority turns the cap into a FIFO queue:
         # once a miner gets a slot, it keeps it until it drops out
         # voluntarily (terminated / champion change / cap shrunk).
-        incumbents: List[Tuple[bool, int, str, str]] = []
+        incumbents: List[Tuple[bool, bool, int, str, str]] = []
         incumbent_seen: Set[Tuple[str, str]] = set()
         for status in ("active", "deploying"):
             for d in await self.dao.list_by_status(status):
                 key = (d.get("hotkey"), d.get("revision"))
                 if key in seen or key in incumbent_seen or key not in eligible:
                     continue
-                has_wins, first_block = eligible[key]
-                incumbents.append((has_wins, first_block, key[0], key[1]))
+                hot, has_wins, first_block = eligible[key]
+                incumbents.append((hot, has_wins, first_block, key[0], key[1]))
                 incumbent_seen.add(key)
 
         # Pass 2: newcomers (eligible but not yet deployed).
-        newcomers: List[Tuple[bool, int, str, str]] = []
-        for key, (has_wins, first_block) in eligible.items():
+        newcomers: List[Tuple[bool, bool, int, str, str]] = []
+        for key, (hot, has_wins, first_block) in eligible.items():
             if key in seen or key in incumbent_seen:
                 continue
-            newcomers.append((has_wins, first_block, key[0], key[1]))
+            newcomers.append((hot, has_wins, first_block, key[0], key[1]))
 
-        # Composite sort: winners first (has_wins True before False),
-        # within each tier earliest submission first (first_block asc).
-        # Hotkey/revision suffixes break any further ties deterministically.
-        sort_key = lambda t: (0 if t[0] else 1, t[1], t[2], t[3])
+        # Composite sort: chute_hot first (True before False), then
+        # has_wins, then first_block ascending. Hotkey/revision suffixes
+        # break any further ties deterministically.
+        sort_key = lambda t: (0 if t[0] else 1, 0 if t[1] else 1, t[2], t[3], t[4])
         incumbents.sort(key=sort_key)
         newcomers.sort(key=sort_key)
         ordered = incumbents + newcomers
 
         slots_left = self.max_deployments - len(targets)
-        for has_wins, first_block, hotkey, revision in ordered[:slots_left]:
+        for hot, has_wins, first_block, hotkey, revision in ordered[:slots_left]:
             targets.append((hotkey, revision, "winner"))
             seen.add((hotkey, revision))
 
@@ -244,8 +252,11 @@ class TargonDeployerService:
             logger.info(
                 f"_resolve_targets: {len(queued)} eligible miner(s) queued "
                 f"(waiting for slot): "
-                + ", ".join(f"{hk[:8]}..@{rev[:6]} wins={'y' if hw else 'n'} fb={fb}"
-                            for hw, fb, hk, rev in queued[:5])
+                + ", ".join(
+                    f"{hk[:8]}..@{rev[:6]} hot={'y' if h else 'n'} "
+                    f"wins={'y' if hw else 'n'} fb={fb}"
+                    for h, hw, fb, hk, rev in queued[:5]
+                )
             )
         return targets
 
