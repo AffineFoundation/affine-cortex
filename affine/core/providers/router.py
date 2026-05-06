@@ -162,25 +162,7 @@ class ProviderRouter:
 
 
 def build_default_router() -> ProviderRouter:
-    """Wire up the default Chutes+Targon router.
-
-    Targon provider is stubbed out when TARGON_API_KEY is absent so local
-    dev environments without Targon credentials don't pay for empty queries.
-    """
     from affine.core.providers.chutes import ChutesProvider
     from affine.core.providers.targon import TargonProvider
-    from affine.core.providers.base import BaseProvider
 
-    chutes = ChutesProvider()
-
-    if os.getenv("TARGON_API_KEY"):
-        targon: BaseProvider = TargonProvider()
-    else:
-        class _NoopTargon(BaseProvider):
-            name = "targon"
-            async def get_instance_info(self, miner_record):
-                return {"running_instances": 0, "healthy": False,
-                        "base_url": None, "model_identifier": "", "raw": {}}
-        targon = _NoopTargon()
-
-    return ProviderRouter(chutes=chutes, targon=targon)
+    return ProviderRouter(chutes=ChutesProvider(), targon=TargonProvider())
