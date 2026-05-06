@@ -17,17 +17,36 @@ Each loop iteration:
     3. Tear down any deployment whose (hotkey, revision) is no longer a
        target — covers champion change, challenger termination, challenger
        losing its only win, etc. Teardown is immediate (no 24h grace).
-    4. Health sweep: probe every active/deploying deployment. On 2
-       consecutive failed probes (debounces state-aggregator lag) we delete
-       the Targon workload + mark the DB row deleted. The miner re-enters
-       the queue next cycle — if it's still the top candidate it redeploys,
-       otherwise a higher-priority waiter takes the slot.
+    4. Health sweep: probe every active/deploying deployment. We treat a
+       deployment as "ready" only when *both* Targon's container-level
+       signal (status=running, ready_replicas>0) *and* an active OpenAI
+       /v1/models probe of the workload succeed. The latter is essential
+       because Targon's readiness check only verifies port openness; after
+       a Targon rebuild the /data volume is wiped and vLLM/sglang has to
+       re-download model weights from HF (10-30 min), during which the
+       container is "running" but inference returns 5xx.
+
+       Release is time-based, not count-based: a deployment must be
+       continuously unhealthy for at least TARGON_UNHEALTHY_RELEASE_SEC
+       (default 600s = 10 min) before we delete it. Targon's CDN has
+       occasional minute-long network blips and miner-side vLLM can pause
+       for a few minutes during prefill — a faster trigger would churn
+       perfectly fine deployments. Once released, the miner re-enters the
+       queue next cycle.
+
+       Freshly-created deployments get TARGON_INITIAL_LOAD_GRACE_SEC
+       (default 1800s) to complete their first model download before the
+       failure clock even starts — long enough for typical Affine miner
+       models (~30B params), short enough that a stuck container doesn't
+       waste a whole day.
 """
 
 import asyncio
 import os
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+import aiohttp
 
 from affine.core.providers.targon_client import TargonClient, get_targon_client
 from affine.core.setup import logger
@@ -43,6 +62,23 @@ DEFAULT_MAX_DEPLOYMENTS = int(os.getenv("TARGON_MAX_DEPLOYMENTS", "8"))
 # match our naming convention but have no DB row). Cheaper than per-cycle
 # because it's bounded by Targon's list endpoint size.
 DEFAULT_ORPHAN_SWEEP_INTERVAL = int(os.getenv("TARGON_ORPHAN_SWEEP_SEC", "300"))
+
+# How long a deployment may stay in 'deploying' state before the failure
+# counter starts ticking. Sized for first-time HF weight download on a
+# fresh /data volume — typical Affine fine-tunes (~30B params, fp16) take
+# 10-25 min over Targon's network. After this window a still-loading
+# deployment is released so we don't sit on a stuck container indefinitely.
+DEFAULT_INITIAL_LOAD_GRACE = int(os.getenv("TARGON_INITIAL_LOAD_GRACE_SEC", "1800"))
+# Timeout for the OpenAI /v1/models probe. Steady-state is sub-100ms; the
+# generous default just covers TLS setup on the first probe of a new URL.
+DEFAULT_MODEL_PROBE_TIMEOUT = float(os.getenv("TARGON_MODEL_PROBE_TIMEOUT_SEC", "5"))
+# A deployment must be continuously unhealthy for at least this long before
+# we tear it down. Targon's network reaches us through a CDN that has its
+# own occasional blips (and miner-side vLLM can pause for a few minutes
+# during prefill on a long context); a too-eager release would churn
+# perfectly fine deployments. 10 min is well past every transient we've
+# observed but far short of a real rebuild's recovery time.
+DEFAULT_UNHEALTHY_RELEASE_SEC = int(os.getenv("TARGON_UNHEALTHY_RELEASE_SEC", "600"))
 
 
 class TargonDeployerService:
@@ -462,11 +498,44 @@ class TargonDeployerService:
                 f"deleted {deleted}, skipped {skipped_unmanaged} non-affine"
             )
 
-    # Consecutive failed probes before we conclude a deployment is truly dead.
-    # Debounces transient Targon state-aggregator lag (~30s) without waiting
-    # long enough to matter to the miner. With poll_interval=30s, release
-    # happens ~60s after the first failed probe.
-    UNHEALTHY_FAIL_THRESHOLD = 2
+    # Floor on the number of failed probes before release becomes possible.
+    # The release decision is primarily *time*-based (see
+    # DEFAULT_UNHEALTHY_RELEASE_SEC); this counter just guards against the
+    # edge case where last_health_check_at is already old when we observe
+    # a single transient blip — without it, one bad probe after a long
+    # deployer outage would tear down an otherwise-fine deployment.
+    UNHEALTHY_FAIL_FLOOR = 2
+
+    async def _probe_model_ready(self, base_url: Optional[str]) -> bool:
+        """Active inference-layer probe — true iff /v1/models lists ≥1 model.
+
+        Targon's container-level "healthy" only verifies port connectivity,
+        so a freshly-rebuilt workload with /data wiped passes Targon's check
+        while vLLM/sglang is still downloading weights from HF. We need a
+        real signal from the OpenAI server itself to tell "warming up" or
+        "rebuild in progress" apart from "ready to serve".
+
+        Any non-200 response, network error, timeout, or empty data list
+        returns False — callers feed that into the same failure counter
+        the container probe uses.
+        """
+        if not base_url:
+            return False
+        url = base_url.rstrip("/") + "/models"
+        try:
+            timeout = aiohttp.ClientTimeout(total=DEFAULT_MODEL_PROBE_TIMEOUT)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return False
+                    payload = await resp.json(content_type=None)
+        except Exception as e:
+            logger.debug(f"_probe_model_ready({url}): {type(e).__name__}: {e}")
+            return False
+        if not isinstance(payload, dict):
+            return False
+        data = payload.get("data")
+        return isinstance(data, list) and len(data) > 0
 
     async def _check_and_release(self, deployment: Dict[str, Any]) -> None:
         deployment_id = deployment["deployment_id"]
@@ -477,41 +546,87 @@ class TargonDeployerService:
 
         running = int(status.get("running_instances", 0) or 0)
         healthy = bool(status.get("healthy", False))
-        base_url = status.get("base_url")
+        base_url = status.get("base_url") or deployment.get("base_url")
+        targon_up = running > 0 and healthy
 
-        if running > 0 and healthy:
-            # Resets consecutive_failures = 0 via the DAO.
+        # Two-signal readiness: container running AND model server actually
+        # serving. Skip the model probe when Targon already says no — we're
+        # going to count it as failed regardless, no point doing the HTTP.
+        model_ready = False
+        if targon_up:
+            model_ready = await self._probe_model_ready(base_url)
+
+        if targon_up and model_ready:
+            # Both green: this is the only path that flips deploying → active
+            # via update_health (which sets status='active' when healthy +
+            # instance_count>0) and resets consecutive_failures.
             await self.dao.update_health(
                 deployment_id, instance_count=running, healthy=True, base_url=base_url,
             )
             return
 
-        # Grace for deployments that are still initializing. We never release
-        # a freshly-created row on its first few probes — Targon's state
-        # aggregator needs time to reflect "running".
         age = int(time.time()) - int(deployment.get("created_at", 0) or 0)
-        if deployment.get("status") == "deploying" and age < 600:
+        db_status = deployment.get("status", "")
+
+        # Initial-load grace — a brand-new deployment hasn't yet successfully
+        # served any inference, so its row is still 'deploying'. We hold off
+        # on the failure counter until the grace window expires so a slow
+        # first-time HF download doesn't get released mid-pull.
+        if db_status == "deploying" and age < DEFAULT_INITIAL_LOAD_GRACE:
             return
 
         await self._on_failed_probe(
-            deployment, reason=f"running={running} healthy={healthy} age={age}s",
+            deployment,
+            reason=(
+                f"running={running} healthy={healthy} model_ready={model_ready} "
+                f"age={age}s db_status={db_status}"
+            ),
         )
 
     async def _on_failed_probe(
         self, deployment: Dict[str, Any], *, reason: str
     ) -> None:
+        """Time-based release decision.
+
+        ``last_health_check_at`` is bumped only by update_health() in the
+        green-on-both-signals path, so it doubles as "last time this
+        deployment was confirmed serving". A deployment that has never
+        been confirmed serving falls back to ``created_at`` so post-grace
+        stuck-loading workloads are still eligible for release.
+
+        Release happens iff the deployment has been continuously unhealthy
+        for at least DEFAULT_UNHEALTHY_RELEASE_SEC *and* the failure floor
+        is met (avoids releasing on a single blip after a long deployer
+        downtime, where the timestamp gap is misleading).
+        """
         deployment_id = deployment["deployment_id"]
+        now = int(time.time())
+        last_healthy_at = (
+            int(deployment.get("last_health_check_at", 0) or 0)
+            or int(deployment.get("created_at", 0) or 0)
+            or now
+        )
+        unhealthy_for = max(0, now - last_healthy_at)
         next_failures = int(deployment.get("consecutive_failures", 0) or 0) + 1
-        if next_failures >= self.UNHEALTHY_FAIL_THRESHOLD:
+
+        if (
+            unhealthy_for >= DEFAULT_UNHEALTHY_RELEASE_SEC
+            and next_failures >= self.UNHEALTHY_FAIL_FLOOR
+        ):
             await self._release_dead(
                 deployment,
-                reason=f"{reason} (failures={next_failures}/{self.UNHEALTHY_FAIL_THRESHOLD})",
+                reason=(
+                    f"{reason} "
+                    f"(unhealthy_for={unhealthy_for}s/"
+                    f"{DEFAULT_UNHEALTHY_RELEASE_SEC}s, failures={next_failures})"
+                ),
             )
             return
         await self.dao.increment_failure(deployment_id)
         logger.info(
             f"Targon {deployment_id} probe failed "
-            f"{next_failures}/{self.UNHEALTHY_FAIL_THRESHOLD} — {reason}"
+            f"(failures={next_failures}, unhealthy_for={unhealthy_for}s/"
+            f"{DEFAULT_UNHEALTHY_RELEASE_SEC}s) — {reason}"
         )
 
     async def _release_dead(
