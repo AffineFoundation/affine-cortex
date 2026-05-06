@@ -1,73 +1,52 @@
 """Provider router.
 
-Decides which provider (Chutes / Targon / ...) should serve a given miner for
-a given task. Called from `TaskPoolManager.fetch_task` so the decision reflects
-the freshest capacity snapshot we have. Intentionally provider-count agnostic:
-adding a third provider later is a new `BaseProvider` plus one elif.
+Per-task decision: which inference provider serves a given miner. An env
+opts into the accelerated provider by setting ``accelerated: true`` in
+its system_config row under ``environments``. Envs without the flag —
+or with it set to false — stay on the standard provider.
 
-Routing policy — Targon-primary with health-aware fallback:
-    For envs where Targon is eligible, route 100% to Targon when it's
-    healthy. Chutes is only used when Targon is degraded (consecutive
-    probe failures > 0) or has no deployment for this (hotkey, revision).
-    The operator paid for the Targon pool specifically to absorb these
-    envs, so splitting traffic 50/50 with Chutes wastes the paid GPUs
-    while Chutes — already burning tokens for non-accelerated envs and
-    other miners — gets squeezed harder.
-
-    Last-resort: if Targon is degraded *and* Chutes has no capacity, we
-    still send the task to Targon rather than release it to pending —
-    a slow response is better than a stalled queue.
-
-    Env gating: ``TARGON_ACCELERATED_ENVS`` (default ``*``) limits which envs
-    are eligible for Targon. When set to a comma-separated list, tasks whose
-    env isn't in that list bypass Targon entirely and route to Chutes only —
-    operators use this to pin a fixed Targon GPU pool to high-cost envs (e.g.
-    SWE-bench) without wasting capacity on cheap ones.
-
-    There is no champion-only restriction — an operator deploying a Targon
-    workload for any miner opts that miner into the split. This matters for
-    miners whose Chutes is cold but whose Targon is live: without the
-    deployment they'd be skipped entirely; with it they keep sampling.
+Within an accelerated env: take the accelerated provider when it's
+healthy (instances > 0 AND no recent probe failures), fall back to
+standard on degradation, and last-resort to the accelerated provider
+again if standard has no capacity either — a slow response beats a
+released task.
 """
 
-import asyncio
 import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set, Tuple
 
 from affine.core.providers.base import BaseProvider, ProviderInstanceInfo
+from affine.core.setup import logger
 
 
-def _parse_accelerated_envs() -> Optional[Set[str]]:
-    """Parse ``TARGON_ACCELERATED_ENVS`` into a whitelist (or None = all).
+ENVIRONMENTS_PARAM = "environments"
+ACCELERATED_ENVS_TTL = int(os.getenv("ACCELERATED_ENVS_TTL_SEC", "60"))
 
-    Default is ``swe-infinite`` — the most expensive env per task (longest
-    contexts, highest completion-token counts), so the paid Targon GPUs
-    earn back their cost fastest there. Operators add ``swe-pro`` /
-    ``swe-synth`` as the pool grows. Sentinels for "all envs eligible":
-    ``*`` or ``all``. Whitelist is lowercased so callers passing the
-    canonical-uppercase task env (e.g. ``SWE-INFINITE``) still match.
-    Reading at import time is fine because this is a deployment-time
-    toggle, not a request-time knob.
+
+def _extract_accelerated(envs_config: Any) -> Set[str]:
+    """Pull the set of envs flagged ``accelerated: true``.
+
+    The system_config ``environments`` row is a dict of env_name → config;
+    each per-env config may carry ``accelerated: true`` to opt in. Names
+    are lowercased to match the canonical task env in fetch_task.
     """
-    raw = os.getenv("TARGON_ACCELERATED_ENVS", "swe-infinite").strip()
-    if not raw or raw in ("*", "all", "ALL"):
-        return None
-    parts = {p.strip().lower() for p in raw.split(",") if p.strip()}
-    return parts or None
-
-
-TARGON_ACCELERATED_ENVS: Optional[Set[str]] = _parse_accelerated_envs()
+    if not isinstance(envs_config, dict):
+        return set()
+    return {
+        name.strip().lower()
+        for name, cfg in envs_config.items()
+        if isinstance(cfg, dict) and bool(cfg.get("accelerated", False)) and name
+    }
 
 
 @dataclass(frozen=True)
 class RouteDecision:
-    """Outcome of a single per-task routing decision."""
     provider: str
     base_url: str
     model_identifier: str
-    public_base_url: Optional[str] = None  # None -> persist base_url unchanged
+    public_base_url: Optional[str] = None  # None → persist base_url unchanged
 
 
 class ProviderRouter:
@@ -76,32 +55,53 @@ class ProviderRouter:
         chutes: BaseProvider,
         targon: BaseProvider,
         instance_cache_ttl: int = 60,
+        config_ttl: int = ACCELERATED_ENVS_TTL,
     ):
         self.chutes = chutes
         self.targon = targon
 
-        # (provider_name, hotkey, revision) -> (fetched_at_monotonic, info)
         self._instance_cache_ttl = instance_cache_ttl
         self._instance_cache: Dict[Tuple[str, str, str], Tuple[float, ProviderInstanceInfo]] = {}
-        self._instance_cache_lock = asyncio.Lock()
+
+        self._config_ttl = config_ttl
+        self._config_at: float = 0.0
+        self._accelerated: Set[str] = set()
+
+    async def _refresh_config(self) -> None:
+        """Reload the accelerated env set from system_config if cache expired.
+
+        Any error keeps the previously cached set so a transient DAO blip
+        doesn't accidentally switch acceleration on or off.
+        """
+        if (time.monotonic() - self._config_at) < self._config_ttl:
+            return
+        try:
+            from affine.database.dao.system_config import SystemConfigDAO
+            envs_config = await SystemConfigDAO().get_param_value(
+                ENVIRONMENTS_PARAM, default={},
+            )
+            self._accelerated = _extract_accelerated(envs_config)
+        except Exception as e:
+            logger.warning(
+                f"router: refresh of {ENVIRONMENTS_PARAM} failed, "
+                f"keeping previous value: {e}"
+            )
+        self._config_at = time.monotonic()
+
+    def _is_eligible(self, env: Optional[str]) -> bool:
+        return bool(env) and env.lower() in self._accelerated
 
     async def _instance_info(
         self, provider: BaseProvider, miner_record: Dict[str, Any]
     ) -> ProviderInstanceInfo:
-        """Provider.get_instance_info() with a (hotkey, revision) TTL cache.
-
-        Upstream APIs (Chutes / Targon) are called at most once per TTL per
-        miner-revision; concurrent fetch_task calls coalesce on the lock.
-        """
+        """Per-miner provider state with a (hotkey, revision) TTL cache."""
         key = (provider.name, miner_record.get("hotkey", ""), miner_record.get("revision", ""))
         now = time.monotonic()
-        async with self._instance_cache_lock:
-            hit = self._instance_cache.get(key)
-            if hit and (now - hit[0]) < self._instance_cache_ttl:
-                return hit[1]
+        hit = self._instance_cache.get(key)
+        if hit and (now - hit[0]) < self._instance_cache_ttl:
+            return hit[1]
         info = await provider.get_instance_info(miner_record)
-        async with self._instance_cache_lock:
-            self._instance_cache[key] = (time.monotonic(), info)
+        self._instance_cache[key] = (time.monotonic(), info)
         return info
 
     def _decide(self, provider: BaseProvider, info: Dict[str, Any]) -> RouteDecision:
@@ -117,45 +117,27 @@ class ProviderRouter:
         miner_record: Dict[str, Any],
         env: Optional[str] = None,
     ) -> Optional[RouteDecision]:
-        # Env gating: if a whitelist is configured and this env isn't on it,
-        # skip Targon entirely. We still consult Chutes — non-accelerated
-        # envs should keep sampling, just not eat Targon capacity.
-        # task_pool stores env in canonical-uppercase form (e.g.
-        # ``SWE-INFINITE``); whitelist is lowercased on parse, so compare
-        # against the lowercased value.
-        env_lc = (env or "").lower()
-        targon_eligible = (
-            TARGON_ACCELERATED_ENVS is None
-            or (env_lc and env_lc in TARGON_ACCELERATED_ENVS)
-        )
+        await self._refresh_config()
 
         chute_info = await self._instance_info(self.chutes, miner_record)
         c = int(chute_info.get("running_instances", 0) or 0)
 
-        if not targon_eligible:
-            if c <= 0:
-                return None
-            return self._decide(self.chutes, chute_info)
+        if not self._is_eligible(env):
+            return self._decide(self.chutes, chute_info) if c > 0 else None
 
         targon_info = await self._instance_info(self.targon, miner_record)
         t = int(targon_info.get("running_instances", 0) or 0)
-        # consecutive_failures is bumped by the health-sweep on every probe
-        # that doesn't pass; it's our freshest "Targon is acting up right
-        # now" signal, available without an extra DAO query because the
-        # provider already returned the full deployment row in `raw`.
+        # consecutive_failures comes from the deployment row the provider
+        # already returned in `raw` — no extra DAO query.
         targon_failures = int(
             (targon_info.get("raw") or {}).get("consecutive_failures", 0) or 0
         )
         targon_healthy = t > 0 and targon_failures == 0
 
-        # Targon-primary: as long as it's healthy, take all the traffic.
         if targon_healthy:
             return self._decide(self.targon, targon_info)
-        # Targon degraded or absent: prefer Chutes if it has capacity.
         if c > 0:
             return self._decide(self.chutes, chute_info)
-        # Chutes also empty: take Targon if it has *any* row at all
-        # (degraded but maybe still serving) before releasing the task.
         if t > 0:
             return self._decide(self.targon, targon_info)
         return None
