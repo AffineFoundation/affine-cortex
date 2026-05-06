@@ -356,9 +356,13 @@ class TargonClient:
             "TARGON_SGLANG_TOOL_CALL_PARSER", DEFAULT_SGLANG_TOOL_CALL_PARSER,
         )
 
-        # Determine tp / dp split. tp×dp must == gpu_count.
-        # Fallback: if neither passed, default to all-tensor-parallel (tp=gpu_count, dp=1)
-        # — this preserves prior behavior.
+        # Pin to data parallelism: every Affine miner today fits weights on a
+        # single H200 (≤30B fp16), and DP=gpu_count gives ~N× throughput vs
+        # splitting one replica across cards (multi-executor concurrency is
+        # the bottleneck, not single-request latency). A 70B+ challenger
+        # that won't fit on one card needs an explicit tensor_parallel override
+        # — no automatic fallback, so a sizing mistake fails loud at startup
+        # rather than silently halving throughput.
         if tensor_parallel is not None and data_parallel is not None:
             tp = int(tensor_parallel)
             dp = int(data_parallel)
@@ -369,8 +373,8 @@ class TargonClient:
             dp = int(data_parallel)
             tp = max(1, gpu_count // max(dp, 1))
         else:
-            tp = gpu_count
-            dp = 1
+            tp = 1
+            dp = gpu_count
 
         if eng == "sglang":
             args = [
