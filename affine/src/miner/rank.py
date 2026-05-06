@@ -138,14 +138,43 @@ def parse_ranked_miners(scores_list: List[Dict[str, Any]]) -> List[RankedMiner]:
     return out
 
 
-def format_targon(status: Optional[str]) -> str:
-    """One-glyph indicator for the Targon column.
+_BOOST_GLYPHS = {
+    "active":     "⚡",   # serving with dedicated capacity right now
+    "deploying":  "⏳",   # warming up, joining shortly
+}
 
-    `act` (active, serving) is what operators most want to see at a glance;
-    `dep` flags deployments still loading model weights from HF; blank
-    means the miner is Chutes-only this cycle.
+
+def _is_color_tty() -> bool:
+    """ANSI colors only if stdout is an interactive terminal."""
+    import sys
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def format_boost(status: Optional[str]) -> str:
+    """Fixed-width badge for the scheduling-acceleration column.
+
+    The validator can pin a subset of miners to dedicated capacity each
+    cycle so their samples come back faster. Bright when the boost is
+    live, dim while it's warming up, blank when the miner is on the
+    standard path. Width matches the "Boost" header (5 chars) so column
+    alignment is stable regardless of glyph and ANSI escapes don't
+    confuse downstream padding.
     """
-    return {"active": "act", "deploying": "dep"}.get(status or "", "")
+    glyph = _BOOST_GLYPHS.get(status or "", "")
+    if not glyph:
+        return "     "  # 5 visible chars
+    cell = f"{glyph:^5}"  # ≤2-cell glyph centered in 5 visible columns
+    if not _is_color_tty():
+        return cell
+    color = "1;92" if status == "active" else "1;93"  # green / yellow
+    return f"\033[{color}m{cell}\033[0m"
+
+
+# Backwards-compat shim — earlier callers / tests may still import this.
+format_targon = format_boost
 
 
 def sort_key(m: RankedMiner) -> tuple:
@@ -230,11 +259,14 @@ async def print_rank_table():
         not_worse_tol = scorer_config.get("win_not_worse_tolerance", 0.015)
 
         # ── Header ────────────────────────────────────────────────────────
-        header_parts = ["Hotkey  ", " UID", "Model                    "]
+        # Boost column ("⚡") sits next to UID so it survives narrow
+        # terminals — accelerated miners are the most operationally
+        # interesting rows and the rightmost column is the first to clip.
+        header_parts = ["Hotkey  ", " UID", "Boost", "Model                    "]
         for env in environments:
             disp = env_display_name(env, env_configs.get(env, {}))
             header_parts.append(f"{disp:>26}")
-        header_parts.extend(["  Status   ", "  CP ", " Challenge ", "Tgn"])
+        header_parts.extend(["  Status   ", "  CP ", " Challenge "])
         header_line = " | ".join(header_parts)
         table_width = len(header_line)
 
@@ -291,6 +323,7 @@ async def print_rank_table():
             row_parts = [
                 f"{m.hotkey[:8]:8s}",
                 f"{m.uid:4d}",
+                format_boost(m.targon_status),
                 f"{m.model[:25]:25s}",
             ]
 
@@ -365,7 +398,6 @@ async def print_rank_table():
             row_parts.append(f"{status_str:>11}")
             row_parts.append(f"{cp_str:>5}")
             row_parts.append(f"{challenge_str:>11}")
-            row_parts.append(f"{format_targon(m.targon_status):>3}")
 
             print(" | ".join(row_parts), flush=True)
 
@@ -391,12 +423,16 @@ async def print_rank_table():
             f"Terminated: {terminated_count}",
             flush=True,
         )
-        targon_active = sum(1 for m in miners if m.targon_status == "active")
-        targon_deploying = sum(1 for m in miners if m.targon_status == "deploying")
-        if targon_active or targon_deploying:
+        boost_active = sum(1 for m in miners if m.targon_status == "active")
+        boost_deploying = sum(1 for m in miners if m.targon_status == "deploying")
+        if boost_active or boost_deploying:
+            on, off = ("\033[1;96m", "\033[0m") if _is_color_tty() else ("", "")
+            zap, hourglass = ("⚡", "⏳")
             print(
-                f"Targon (Tgn col): {targon_active} active, "
-                f"{targon_deploying} deploying  |  act = serving, dep = loading model",
+                f"{on}Scheduler boost{off}: "
+                f"{zap} {boost_active} miner(s) on dedicated capacity now, "
+                f"{hourglass} {boost_deploying} warming up "
+                f"— validator-accelerated sampling lane",
                 flush=True,
             )
         print("=" * table_width, flush=True)
