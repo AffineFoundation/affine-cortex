@@ -102,6 +102,7 @@ class RankedMiner:
     consecutive_losses: int
     checkpoints_passed: int
     total_samples: int             # Samples produced in current scoring cycle
+    targon_status: Optional[str]   # 'active' | 'deploying' | None — Targon acceleration
 
     @property
     def is_cold(self) -> bool:
@@ -132,8 +133,19 @@ def parse_ranked_miners(scores_list: List[Dict[str, Any]]) -> List[RankedMiner]:
             consecutive_losses=int(ci.get("consecutive_losses", 0) or 0),
             checkpoints_passed=int(ci.get("checkpoints_passed", 0) or 0),
             total_samples=int(s.get("total_samples", 0) or 0),
+            targon_status=s.get("targon_status"),
         ))
     return out
+
+
+def format_targon(status: Optional[str]) -> str:
+    """One-glyph indicator for the Targon column.
+
+    `act` (active, serving) is what operators most want to see at a glance;
+    `dep` flags deployments still loading model weights from HF; blank
+    means the miner is Chutes-only this cycle.
+    """
+    return {"active": "act", "deploying": "dep"}.get(status or "", "")
 
 
 def sort_key(m: RankedMiner) -> tuple:
@@ -222,7 +234,7 @@ async def print_rank_table():
         for env in environments:
             disp = env_display_name(env, env_configs.get(env, {}))
             header_parts.append(f"{disp:>26}")
-        header_parts.extend(["  Status   ", "  CP ", " Challenge "])
+        header_parts.extend(["  Status   ", "  CP ", " Challenge ", "Tgn"])
         header_line = " | ".join(header_parts)
         table_width = len(header_line)
 
@@ -353,6 +365,7 @@ async def print_rank_table():
             row_parts.append(f"{status_str:>11}")
             row_parts.append(f"{cp_str:>5}")
             row_parts.append(f"{challenge_str:>11}")
+            row_parts.append(f"{format_targon(m.targon_status):>3}")
 
             print(" | ".join(row_parts), flush=True)
 
@@ -378,6 +391,14 @@ async def print_rank_table():
             f"Terminated: {terminated_count}",
             flush=True,
         )
+        targon_active = sum(1 for m in miners if m.targon_status == "active")
+        targon_deploying = sum(1 for m in miners if m.targon_status == "deploying")
+        if targon_active or targon_deploying:
+            print(
+                f"Targon (Tgn col): {targon_active} active, "
+                f"{targon_deploying} deploying  |  act = serving, dep = loading model",
+                flush=True,
+            )
         print("=" * table_width, flush=True)
 
 
