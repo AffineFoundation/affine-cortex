@@ -90,6 +90,12 @@ class MinerScore(BaseModel):
     scores_by_env: Dict[str, Dict[str, Any]]
     total_samples: int
     challenge_info: Optional[Dict[str, Any]] = None
+    # Targon acceleration status for this (hotkey, revision):
+    #   "active"    — Targon workload is up and serving inference
+    #   "deploying" — Targon workload exists, still loading model weights
+    #   None        — no Targon deployment for this revision (Chutes-only)
+    # Read by the CLI to mark which miners the Targon pool is hosting.
+    targon_status: Optional[str] = None
 
 
 class ScoresResponse(BaseModel):

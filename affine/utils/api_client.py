@@ -314,11 +314,13 @@ class APIClient:
                     return None
                 
                 info = await resp.json()
-                # Remove unnecessary fields
-                for k in ("readme", "cords", "tagline", "instances"):
+                # Remove unnecessary fields but keep instance count for provider routing
+                instances = info.pop("instances", None)
+                info["instance_count"] = len(instances) if isinstance(instances, list) else 0
+                for k in ("readme", "cords", "tagline"):
                     info.pop(k, None)
                 info.get("image", {}).pop("readme", None)
-                
+
                 return info
         except Exception as e:
             logger.debug(f"Failed to fetch chute {chute_id}: {e}")

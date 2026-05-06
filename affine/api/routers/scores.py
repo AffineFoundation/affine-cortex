@@ -18,8 +18,37 @@ from affine.api.dependencies import (
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.miners import MinersDAO
+from affine.database.dao.targon_deployments import TargonDeploymentsDAO
 
 router = APIRouter(prefix="/scores", tags=["Scores"])
+
+
+async def _build_targon_status_map() -> dict:
+    """Map (hotkey, revision) -> 'active' | 'deploying' for live Targon deployments.
+
+    Two GSI queries (status='active', status='deploying'); cheap because
+    each return at most a handful of rows. Returns an empty map on any
+    DAO error so a Targon-table outage doesn't 500 the rank endpoint —
+    the CLI just shows no acceleration markers.
+    """
+    try:
+        dao = TargonDeploymentsDAO()
+        active = await dao.list_by_status("active")
+        deploying = await dao.list_by_status("deploying")
+    except Exception:
+        return {}
+    out: dict = {}
+    # Active wins over deploying when both exist for the same key (a
+    # restart can briefly leave two rows).
+    for r in deploying:
+        hk, rev = r.get("hotkey"), r.get("revision")
+        if hk and rev:
+            out[(hk, rev)] = "deploying"
+    for r in active:
+        hk, rev = r.get("hotkey"), r.get("revision")
+        if hk and rev:
+            out[(hk, rev)] = "active"
+    return out
 
 
 @router.get("/latest", response_model=ScoresResponse, dependencies=[Depends(rate_limit_read)])
@@ -52,7 +81,9 @@ async def get_latest_scores(
         # Sort by overall_score descending and take top N
         scores_list.sort(key=lambda x: x.get("overall_score", 0.0), reverse=True)
         scores_list = scores_list[:top]
-        
+
+        targon_status = await _build_targon_status_map()
+
         # Convert to response models with safe field access
         miner_scores = [
             MinerScore(
@@ -66,6 +97,9 @@ async def get_latest_scores(
                 scores_by_env=s.get("scores_by_env"),
                 total_samples=s.get("total_samples"),
                 challenge_info=s.get("challenge_info"),
+                targon_status=targon_status.get(
+                    (s.get("miner_hotkey"), s.get("model_revision"))
+                ),
             )
             for s in scores_list
         ]
@@ -131,6 +165,7 @@ async def get_score_by_uid(
                 detail=f"Score not found for UID={uid}"
             )
         
+        targon_status = await _build_targon_status_map()
         return MinerScore(
             miner_hotkey=miner_score.get("miner_hotkey"),
             uid=miner_score.get("uid"),
@@ -142,6 +177,9 @@ async def get_score_by_uid(
             scores_by_env=miner_score.get("scores_by_env"),
             total_samples=miner_score.get("total_samples"),
             challenge_info=miner_score.get("challenge_info"),
+            targon_status=targon_status.get(
+                (miner_score.get("miner_hotkey"), miner_score.get("model_revision"))
+            ),
         )
 
     except HTTPException:

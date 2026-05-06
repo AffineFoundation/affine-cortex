@@ -111,22 +111,31 @@ class AsyncCache(Generic[T]):
 class TaskPoolManager:
     """
     Manages task pool with weighted random selection and dual caching.
-    
+
     Uses background refresh for miner counts to avoid blocking fetch requests.
     """
-    
-    def __init__(self, miners_cache_ttl: int = 60, stats_cache_ttl: int = 60, block_cache_ttl: int = 10):
+
+    def __init__(
+        self,
+        miners_cache_ttl: int = 60,
+        stats_cache_ttl: int = 60,
+        block_cache_ttl: int = 10,
+        provider_router=None,
+    ):
         """Initialize TaskPoolManager with caches.
-        
+
         Args:
             miners_cache_ttl: TTL for miners cache (seconds)
             stats_cache_ttl: TTL for pool stats cache (seconds)
             block_cache_ttl: TTL for block number cache (seconds)
+            provider_router: Optional ProviderRouter. If None, one is built on
+                first use from the default Chutes + Targon providers.
         """
         self.dao = TaskPoolDAO()
         self.logs_dao = ExecutionLogsDAO()
         self.miners_dao = MinersDAO()
         self.sample_dao = SampleResultsDAO()
+        self._provider_router = provider_router
         
         # Async caches with background refresh
         self._miners_cache = AsyncCache[Dict[str, Dict[str, Any]]](
@@ -159,8 +168,61 @@ class TaskPoolManager:
         async def fetch_miners():
             miners_list = await self.miners_dao.get_all_miners()
             return {miner['hotkey']: miner for miner in miners_list}
-        
+
         return await self._miners_cache.get(fetch_miners)
+
+    def _get_provider_router(self):
+        """Lazily build the provider router on first use."""
+        if self._provider_router is None:
+            from affine.core.providers.router import build_default_router
+            self._provider_router = build_default_router()
+        return self._provider_router
+
+    async def _release_assignment(self, task: Dict[str, Any]) -> None:
+        """Return a just-assigned task to the pending pool.
+
+        Used when provider routing fails after `batch_assign_tasks` has already
+        flipped the row to 'assigned'. Mirrors the delete+put pattern in
+        TaskPoolDAO but keeps retry_count untouched (this wasn't an execution
+        failure).
+        """
+        try:
+            from affine.database.client import get_client
+            client = get_client()
+
+            old_pk = task['pk']
+            old_sk = task['sk']
+            new_status = 'pending'
+            new_sk = self.dao._make_sk(task['env'], new_status, task['task_id'])
+            new_gsi1_pk = self.dao._make_gsi1_pk(task['env'], new_status)
+            new_gsi1_sk = self.dao._make_gsi1_sk(
+                task['miner_hotkey'], task['model_revision'], task['task_id']
+            )
+
+            released = {
+                **task,
+                'sk': new_sk,
+                'status': new_status,
+                'assigned_to': None,
+                'assigned_at': None,
+                'gsi1_pk': new_gsi1_pk,
+                'gsi1_sk': new_gsi1_sk,
+            }
+
+            await self.dao.put(released)
+            await client.delete_item(
+                TableName=self.dao.table_name,
+                Key={'pk': {'S': old_pk}, 'sk': {'S': old_sk}},
+            )
+
+            # Drop from uuid cache so the next fetch can re-assign it.
+            async with self._cache_lock:
+                self._uuid_cache.pop(task.get('task_uuid', ''), None)
+        except Exception as e:
+            logger.error(
+                f"Failed to release assignment for task {task.get('task_uuid', '')[:8]}: {e}",
+                exc_info=True,
+            )
     
     async def _get_current_block(self) -> int:
         """Get current block number with caching."""
@@ -478,26 +540,45 @@ class TaskPoolManager:
                     continue
                 
                 chute_slug = miner_record.get('chute_slug')
-                if not chute_slug:
-                    logger.warning(f"chute_slug not found for hotkey {miner_hotkey[:16]}..., skipping task")
-                    continue
-
-                # Get model identifier (needed for system miners to call the correct API)
+                # chute_slug is no longer strictly required — a Targon-only miner
+                # might have an empty slug but a live Targon deployment.
                 model = miner_record.get('model', '')
 
-                # Add miner_uid, chute_slug, and model to task
+                # Provider routing: decide Chutes vs Targon per-task based on the
+                # freshest live capacity snapshot. Env is forwarded so the router
+                # can honor the TARGON_ACCELERATED_ENVS whitelist (Targon-eligible
+                # envs only when the operator has scoped acceleration).
+                # Returns None if neither side can serve the miner right now.
+                route = await self._get_provider_router().select(miner_record, env=env)
+                if route is None:
+                    logger.warning(
+                        f"No live provider for miner {miner_hotkey[:12]}... "
+                        f"(env={env}, task_uuid={result['task_uuid'][:8]}...), releasing"
+                    )
+                    await self._release_assignment(result)
+                    continue
+
+                # Add miner_uid, chute_slug, and model to task (keep chute_slug
+                # for backward-compat; executors prefer base_url when present).
+                # `public_base_url` lets executors record a redacted URL to the
+                # samples table without ever exposing the private Targon endpoint.
                 enriched_task = {
                     **result,
                     'miner_uid': miner_uid,
-                    'chute_slug': chute_slug,
+                    'chute_slug': chute_slug or '',
                     'model': model,
+                    'provider': route.provider,
+                    'base_url': route.base_url,
+                    'public_base_url': route.public_base_url,
+                    'inference_model': route.model_identifier or model,
                 }
-                
+
                 assigned_tasks.append(enriched_task)
-                
+
                 logger.debug(
                     f"Task {result['task_uuid']} assigned to {executor_hotkey} "
-                    f"(miner={miner_hotkey[:12]}..., uid={miner_uid}, env={env}, task_id={result['task_id']})"
+                    f"(miner={miner_hotkey[:12]}..., uid={miner_uid}, env={env}, "
+                    f"task_id={result['task_id']}, provider={provider_name})"
                 )
             
             logger.info(

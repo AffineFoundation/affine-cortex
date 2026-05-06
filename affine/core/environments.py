@@ -708,25 +708,47 @@ class SDKEnvironment:
         """Evaluate single miner"""
         start = time.monotonic()
         kwargs = self._prepare_eval_kwargs(**kwargs)
-        
-        # Build payload with miner info
+
+        # Build payload with miner info. Prefer explicit base_url (provider-routed)
+        # and fall back to deriving Chutes URL from slug for backward compatibility.
         payload = kwargs.copy()
-        if miner and hasattr(miner, 'slug') and miner.slug:
-            payload.update({
-                "model": miner.model,
-                "base_url": f"https://{miner.slug}.chutes.ai/v1"
-            })
-        
+        if miner:
+            base_url = getattr(miner, "base_url", None)
+            inference_model = getattr(miner, "inference_model", None)
+            slug = getattr(miner, "slug", None)
+            if base_url:
+                payload.update({
+                    "model": inference_model or miner.model,
+                    "base_url": base_url,
+                })
+            elif slug:
+                payload.update({
+                    "model": miner.model,
+                    "base_url": f"https://{slug}.chutes.ai/v1",
+                })
+
         result = await self._env.evaluate(_timeout=self.config.proxy_timeout, **payload)
         
         return self._build_result(result, miner, payload, start)
     
-    def _build_result(self, result: Dict[str, Any], miner: Optional["Miner"], 
+    def _build_result(self, result: Dict[str, Any], miner: Optional["Miner"],
                      payload: Dict[str, Any], start_time: float) -> Result:
         """Build Result object from evaluation result"""
         extra = result.get("extra", {}).copy()
         extra["image"] = self.docker_image
-        extra["request"] = payload.copy()
+        # For sample persistence, only Chutes' base_url stays in the record:
+        # it points at a public miner-owned slug that is discoverable on
+        # chutes.ai anyway. Any non-Chutes provider (Targon today) routes
+        # through a private workload endpoint that must not leak via the
+        # public /samples API, and a generic placeholder URL carries no
+        # useful information — strip the field entirely. We use
+        # ``public_base_url`` as the signal: Chutes leaves it None, every
+        # private provider sets it to something non-None.
+        sanitized = payload.copy()
+        public_url = getattr(miner, "public_base_url", None) if miner else None
+        if public_url is not None:
+            sanitized.pop("base_url", None)
+        extra["request"] = sanitized
         
         return Result(
             miner_hotkey=miner.hotkey if miner else "",
@@ -763,9 +785,12 @@ class SDKEnvironment:
     
     @staticmethod
     def _validate_miner(miner: Any) -> bool:
-        """Validate miner object"""
-        return (hasattr(miner, "model") and hasattr(miner, "slug") and 
-                miner.model and miner.slug)
+        """Validate miner object. Either a slug (legacy Chutes) or base_url is enough."""
+        if not hasattr(miner, "model") or not miner.model:
+            return False
+        has_slug = getattr(miner, "slug", None)
+        has_base_url = getattr(miner, "base_url", None)
+        return bool(has_slug or has_base_url)
 
 
 # ========================= Factory Functions =========================

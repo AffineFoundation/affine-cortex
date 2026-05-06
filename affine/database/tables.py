@@ -94,6 +94,7 @@ async def init_tables():
         SCORE_SNAPSHOTS_SCHEMA, SCORE_SNAPSHOTS_TTL,
         MINER_STATS_SCHEMA,
         ANTI_COPY_RESULTS_SCHEMA, ANTI_COPY_RESULTS_TTL,
+        TARGON_DEPLOYMENTS_SCHEMA,
     )
 
     print("Initializing DynamoDB tables...")
@@ -109,8 +110,9 @@ async def init_tables():
         create_table(SCORE_SNAPSHOTS_SCHEMA, ttl_attribute=SCORE_SNAPSHOTS_TTL["AttributeName"]),
         create_table(MINER_STATS_SCHEMA),
         create_table(ANTI_COPY_RESULTS_SCHEMA, ttl_attribute=ANTI_COPY_RESULTS_TTL["AttributeName"]),
+        create_table(TARGON_DEPLOYMENTS_SCHEMA),
     )
-    
+
     print("All tables initialized successfully")
 
 
