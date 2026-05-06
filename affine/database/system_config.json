@@ -5,6 +5,7 @@
       "display_name": "SWE",
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
+      "accelerated": true,
       "sampling_config": {
         "dataset_range": [[1616, 1716]],
         "dataset_range_source": {
@@ -54,6 +55,7 @@
     "MEMORY": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
+      "accelerated": true,
       "sampling_config": {
         "dataset_range": [[0, 1000000000]],
         "sampling_count": 20,
