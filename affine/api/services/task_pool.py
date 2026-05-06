@@ -578,7 +578,7 @@ class TaskPoolManager:
                 logger.debug(
                     f"Task {result['task_uuid']} assigned to {executor_hotkey} "
                     f"(miner={miner_hotkey[:12]}..., uid={miner_uid}, env={env}, "
-                    f"task_id={result['task_id']}, provider={provider_name})"
+                    f"task_id={result['task_id']}, provider={route.provider})"
                 )
             
             logger.info(
