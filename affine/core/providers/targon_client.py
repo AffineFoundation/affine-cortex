@@ -122,11 +122,14 @@ def derive_deployment_args_from_chute(
     return out
 
 
-# All Affine miners on the network are Qwen3 fine-tunes, so we hard-code
-# qwen3 instead of inferring per-model. Operators with a non-Qwen3 miner
+# All Affine miners on the network are Qwen fine-tunes, so we hard-code
+# the legacy `qwen` parser instead of inferring per-model. The newer `qwen3`
+# parser was tried but caused early sglang lifecycle issues on the
+# lmsysorg/sglang:latest image; the legacy parser is what every miner ran
+# successfully through Chutes for months. Operators with a non-Qwen miner
 # can override via TARGON_SGLANG_TOOL_CALL_PARSER, or set it to ``none``
 # to skip the flag entirely.
-DEFAULT_SGLANG_TOOL_CALL_PARSER = "qwen3"
+DEFAULT_SGLANG_TOOL_CALL_PARSER = "qwen"
 
 
 class TargonClient:
