@@ -5,11 +5,18 @@ a given task. Called from `TaskPoolManager.fetch_task` so the decision reflects
 the freshest capacity snapshot we have. Intentionally provider-count agnostic:
 adding a third provider later is a new `BaseProvider` plus one elif.
 
-Routing policy:
-    For every (miner, env) pair, look up live capacity on both providers and
-    split traffic in proportion to their running instance counts. If one side
-    is empty, all traffic goes to the other. If both are empty, return None
-    so the caller can release the task back to pending.
+Routing policy — Targon-primary with health-aware fallback:
+    For envs where Targon is eligible, route 100% to Targon when it's
+    healthy. Chutes is only used when Targon is degraded (consecutive
+    probe failures > 0) or has no deployment for this (hotkey, revision).
+    The operator paid for the Targon pool specifically to absorb these
+    envs, so splitting traffic 50/50 with Chutes wastes the paid GPUs
+    while Chutes — already burning tokens for non-accelerated envs and
+    other miners — gets squeezed harder.
+
+    Last-resort: if Targon is degraded *and* Chutes has no capacity, we
+    still send the task to Targon rather than release it to pending —
+    a slow response is better than a stalled queue.
 
     Env gating: ``TARGON_ACCELERATED_ENVS`` (default ``*``) limits which envs
     are eligible for Targon. When set to a comma-separated list, tasks whose
@@ -25,7 +32,6 @@ Routing policy:
 
 import asyncio
 import os
-import random
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Set, Tuple
@@ -125,16 +131,26 @@ class ProviderRouter:
 
         targon_info = await self._instance_info(self.targon, miner_record)
         t = int(targon_info.get("running_instances", 0) or 0)
+        # consecutive_failures is bumped by the health-sweep on every probe
+        # that doesn't pass; it's our freshest "Targon is acting up right
+        # now" signal, available without an extra DAO query because the
+        # provider already returned the full deployment row in `raw`.
+        targon_failures = int(
+            (targon_info.get("raw") or {}).get("consecutive_failures", 0) or 0
+        )
+        targon_healthy = t > 0 and targon_failures == 0
 
-        if c <= 0 and t <= 0:
-            return None
-        if c <= 0:
+        # Targon-primary: as long as it's healthy, take all the traffic.
+        if targon_healthy:
             return self._decide(self.targon, targon_info)
-        if t <= 0:
+        # Targon degraded or absent: prefer Chutes if it has capacity.
+        if c > 0:
             return self._decide(self.chutes, chute_info)
-        if random.random() < (t / (c + t)):
+        # Chutes also empty: take Targon if it has *any* row at all
+        # (degraded but maybe still serving) before releasing the task.
+        if t > 0:
             return self._decide(self.targon, targon_info)
-        return self._decide(self.chutes, chute_info)
+        return None
 
 
 def build_default_router() -> ProviderRouter:
