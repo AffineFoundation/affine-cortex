@@ -1319,13 +1319,8 @@ async def cmd_get_pool():
         config_dao = SystemConfigDAO()
         sample_dao = SampleResultsDAO()
         
-        # Scan the full miners table — `get_valid_miners()` would skip
-        # any miner whose `is_valid` GSI hasn't flipped to 'true' yet
-        # (e.g. freshly registered, or scrubbed by a recent validity
-        # sweep), which makes get-pools silently drop actively-sampling
-        # miners that show up in `af get-rank`. 256-row cap → scan cost
-        # is fine.
-        all_miners = await miners_dao.get_all_miners()
+        # Get only valid miners for hotkey lookup
+        all_miners = await miners_dao.get_valid_miners()
         uid_by_hotkey = {m['hotkey']: m['uid'] for m in all_miners}
         
         # Get all miner stats for sampling statistics
