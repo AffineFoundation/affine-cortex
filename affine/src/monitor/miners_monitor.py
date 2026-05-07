@@ -26,31 +26,32 @@ from affine.database.dao.anti_copy import AntiCopyDAO
 from affine.core.setup import logger
 
 
-# Durable invalidation prefixes promoted to challenge_status='terminated' so
-# downstream (chute release, scheduler, deployer) reads one sticky signal.
-# Transient reasons (chute_fetch_failed / hf_model_fetch_failed / chute_slug_empty
-# / chute_not_hot / no_commit / incomplete_commit / validation_error) are
-# excluded — they can recover on the next refresh.
-_PERMANENT_INVALID_REASON_PREFIXES = (
-    "anticopy:",
-    "model_hash_duplicate:",
-    "model_mismatch:",
+# invalid_reason format is "<kind>" or "<kind>:<detail>". Kinds in this set
+# are durable terminations (rule violations, plagiarism); the rest are
+# transient HTTP / lookup blips (chute_fetch_failed, hf_model_fetch_failed,
+# chute_slug_empty, chute_not_hot, no_commit, incomplete_commit,
+# validation_error) which can recover next refresh and must not flow into
+# challenge_status='terminated' lest a single blip release a healthy chute.
+_TERMINAL_INVALID_KINDS = frozenset({
+    "anticopy",
+    "model_hash_duplicate",
+    "model_mismatch",
     "model_name_missing_affine",
-    "repo_name_not_ending_with_hotkey:",
-    "revision_mismatch:",
-    "multiple_commits:",
-    "model_check:",
-    "duplicate_repo:",
-    "malicious_template:",
+    "repo_name_not_ending_with_hotkey",
+    "revision_mismatch",
+    "multiple_commits",
+    "model_check",
+    "duplicate_repo",
+    "malicious_template",
     "blacklisted",
     "invalid_json_commit",
-)
+})
 
 
-def _is_permanent_invalid(reason: Optional[str]) -> bool:
+def _is_terminal_invalid(reason: Optional[str]) -> bool:
     if not reason:
         return False
-    return reason.startswith(_PERMANENT_INVALID_REASON_PREFIXES)
+    return reason.split(":", 1)[0] in _TERMINAL_INVALID_KINDS
 
 
 @dataclass
@@ -630,7 +631,7 @@ class MinersMonitor:
                 continue
             if miner.uid == 0 or miner.uid > 1000:
                 continue
-            if not _is_permanent_invalid(miner.invalid_reason):
+            if not _is_terminal_invalid(miner.invalid_reason):
                 continue
 
             try:
