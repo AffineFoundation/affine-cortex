@@ -430,7 +430,13 @@ async def print_rank_table():
                 }.get(kind, kind[:11])
                 status_str = kind_label
                 cp_str = "—"
-                challenge_str = (detail[:24] if detail else "—")
+                # Detail (similarity scores, mismatched chute name, etc.)
+                # is supplementary here — Status already names the kind.
+                # Truncate to the 11-char column width so a long detail
+                # doesn't shove the rest of the row out of alignment;
+                # operators drill in via `af get-miner <uid>` for the
+                # full invalid_reason if they need it.
+                challenge_str = (detail[:11] if detail else "—")
             elif m.is_cold:
                 status_str = "cold"
                 cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"
