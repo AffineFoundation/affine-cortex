@@ -207,6 +207,7 @@ class Scorer:
             challenge_info = {
                 "status": miner.challenge_status,
                 "consecutive_wins": miner.challenge_consecutive_wins,
+                "total_wins": miner.challenge_total_wins,
                 "total_losses": miner.challenge_total_losses,
                 "consecutive_losses": miner.challenge_consecutive_losses,
                 "checkpoints_passed": miner.challenge_checkpoints_passed,
@@ -235,6 +236,7 @@ class Scorer:
                     hotkey=miner.hotkey,
                     revision=miner.model_revision,
                     consecutive_wins=miner.challenge_consecutive_wins,
+                    total_wins=miner.challenge_total_wins,
                     total_losses=miner.challenge_total_losses,
                     consecutive_losses=miner.challenge_consecutive_losses,
                     checkpoints_passed=miner.challenge_checkpoints_passed,

@@ -637,6 +637,7 @@ class MinersMonitor:
                     hotkey=miner.hotkey,
                     revision=miner.revision,
                     consecutive_wins=int(state.get('challenge_consecutive_wins', 0) or 0),
+                    total_wins=int(state.get('challenge_total_wins', 0) or 0),
                     total_losses=int(state.get('challenge_total_losses', 0) or 0),
                     consecutive_losses=int(state.get('challenge_consecutive_losses', 0) or 0),
                     checkpoints_passed=int(state.get('challenge_checkpoints_passed', 0) or 0),

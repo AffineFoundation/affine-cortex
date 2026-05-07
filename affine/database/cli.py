@@ -1870,11 +1870,13 @@ async def cmd_get_miner(hotkey: str, revision: Optional[str]):
             print(f"  Challenge:        challenge_status={chal_status}"
                   + (f"  reason={term_reason}" if term_reason else ""))
             wins = stats.get('challenge_consecutive_wins', 0)
+            tot_wins = stats.get('challenge_total_wins', 0)
             tot_losses = stats.get('challenge_total_losses', 0)
             con_losses = stats.get('challenge_consecutive_losses', 0)
             cp = stats.get('challenge_checkpoints_passed', 0)
-            print(f"                    consecutive_wins={wins}  total_losses={tot_losses}  "
-                  f"consecutive_losses={con_losses}  checkpoints_passed={cp}")
+            print(f"                    consecutive_wins={wins}  total_wins={tot_wins}  "
+                  f"total_losses={tot_losses}  consecutive_losses={con_losses}  "
+                  f"checkpoints_passed={cp}")
 
             # Basic Info
             print("\n[BASIC INFO]")

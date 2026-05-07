@@ -491,6 +491,7 @@ class MinerStatsDAO(BaseDAO):
     # Fields that make up a miner's challenge state (loss/win counters etc.)
     _CHALLENGE_FIELDS = (
         'challenge_consecutive_wins',
+        'challenge_total_wins',
         'challenge_total_losses',
         'challenge_consecutive_losses',
         'challenge_checkpoints_passed',
@@ -502,6 +503,7 @@ class MinerStatsDAO(BaseDAO):
     def _challenge_defaults() -> Dict[str, Any]:
         return {
             'challenge_consecutive_wins': 0,
+            'challenge_total_wins': 0,
             'challenge_total_losses': 0,
             'challenge_consecutive_losses': 0,
             'challenge_checkpoints_passed': 0,
@@ -524,7 +526,8 @@ class MinerStatsDAO(BaseDAO):
         if not stats:
             return False
         for k in ('challenge_total_losses', 'challenge_consecutive_losses',
-                  'challenge_consecutive_wins', 'challenge_checkpoints_passed'):
+                  'challenge_consecutive_wins', 'challenge_total_wins',
+                  'challenge_checkpoints_passed'):
             if stats.get(k, 0):
                 return True
         if stats.get('challenge_status') == 'terminated':
@@ -590,6 +593,7 @@ class MinerStatsDAO(BaseDAO):
         checkpoints_passed: int,
         status: str,
         termination_reason: str = '',
+        total_wins: int = 0,
     ) -> None:
         """Update miner's champion challenge state.
 
@@ -619,6 +623,7 @@ class MinerStatsDAO(BaseDAO):
             Key={'pk': {'S': pk}, 'sk': {'S': sk}},
             UpdateExpression=(
                 'SET challenge_consecutive_wins = :cw, '
+                'challenge_total_wins = :tw, '
                 'challenge_total_losses = :tl, '
                 'challenge_consecutive_losses = :cl, '
                 'challenge_checkpoints_passed = :cp, '
@@ -639,6 +644,7 @@ class MinerStatsDAO(BaseDAO):
             ),
             ExpressionAttributeValues={
                 ':cw': {'N': str(consecutive_wins)},
+                ':tw': {'N': str(total_wins)},
                 ':tl': {'N': str(total_losses)},
                 ':cl': {'N': str(consecutive_losses)},
                 ':cp': {'N': str(checkpoints_passed)},
@@ -846,6 +852,7 @@ class MinerStatsDAO(BaseDAO):
                 'sampling_slots = if_not_exists(sampling_slots, :default_slots), '
                 'slots_last_adjusted_at = if_not_exists(slots_last_adjusted_at, :zero), '
                 'challenge_consecutive_wins = if_not_exists(challenge_consecutive_wins, :zero), '
+                'challenge_total_wins = if_not_exists(challenge_total_wins, :zero), '
                 'challenge_total_losses = if_not_exists(challenge_total_losses, :zero), '
                 'challenge_consecutive_losses = if_not_exists(challenge_consecutive_losses, :zero), '
                 'challenge_checkpoints_passed = if_not_exists(challenge_checkpoints_passed, :zero)'

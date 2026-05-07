@@ -539,6 +539,7 @@ async def get_miner_command(uid: int):
                 print(f"  Status:              {status}")
                 print(f"  Checkpoints passed:  {cs.get('challenge_checkpoints_passed', 0)}")
                 print(f"  Consecutive wins:    {cs.get('challenge_consecutive_wins', 0)}")
+                print(f"  Total wins:          {cs.get('challenge_total_wins', 0)}")
                 print(f"  Total losses:        {cs.get('challenge_total_losses', 0)}")
                 print(f"  Consecutive losses:  {cs.get('challenge_consecutive_losses', 0)}")
                 if status == 'terminated':
