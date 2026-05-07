@@ -370,9 +370,9 @@ _ENV_CONFIGS_CANONICAL = {
         },
         eval_params={
             "temperature": 0.7,
-            "timeout": 1200,
+            "timeout": 1800,
         },
-        proxy_timeout=1260,
+        proxy_timeout=1860,
         cpu_limit="2000m",
     ),
 }
