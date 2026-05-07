@@ -39,6 +39,7 @@ class MinerData:
 
     # Champion challenge state
     challenge_consecutive_wins: int = 0
+    challenge_total_wins: int = 0
     challenge_total_losses: int = 0
     challenge_consecutive_losses: int = 0
     challenge_checkpoints_passed: int = 0

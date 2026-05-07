@@ -115,6 +115,7 @@ class ChampionChallenge:
         for miner in miners.values():
             p = prev.get(miner.hotkey, {})
             miner.challenge_consecutive_wins = p.get('challenge_consecutive_wins', 0)
+            miner.challenge_total_wins = p.get('challenge_total_wins', 0)
             miner.challenge_total_losses = p.get('challenge_total_losses', 0)
             miner.challenge_consecutive_losses = p.get('challenge_consecutive_losses', 0)
             miner.challenge_checkpoints_passed = p.get('challenge_checkpoints_passed', 0)
@@ -307,6 +308,7 @@ class ChampionChallenge:
 
             if cmp.b_dominates_a:
                 miner.challenge_consecutive_wins += 1
+                miner.challenge_total_wins += 1
                 miner.challenge_consecutive_losses = 0
                 logger.info(f"UID {uid} dominates at CP {cp} "
                             f"(wins: {miner.challenge_consecutive_wins})")
@@ -513,6 +515,7 @@ class ChampionChallenge:
 
     def _reset_state(self, miner: MinerData):
         miner.challenge_consecutive_wins = 0
+        miner.challenge_total_wins = 0
         miner.challenge_total_losses = 0
         miner.challenge_consecutive_losses = 0
         miner.challenge_checkpoints_passed = 0

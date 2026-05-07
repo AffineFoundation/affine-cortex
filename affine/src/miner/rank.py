@@ -98,6 +98,7 @@ class RankedMiner:
     is_champion: bool
     status: str                    # challenge_status — 'sampling' | 'terminated'
     consecutive_wins: int
+    total_wins: int
     total_losses: int
     consecutive_losses: int
     checkpoints_passed: int
@@ -146,6 +147,7 @@ def parse_ranked_miners(scores_list: List[Dict[str, Any]]) -> List[RankedMiner]:
             is_champion=bool(ci.get("is_champion", False)),
             status=ci.get("status", "sampling"),
             consecutive_wins=int(ci.get("consecutive_wins", 0) or 0),
+            total_wins=int(ci.get("total_wins", 0) or 0),
             total_losses=int(ci.get("total_losses", 0) or 0),
             consecutive_losses=int(ci.get("consecutive_losses", 0) or 0),
             checkpoints_passed=int(ci.get("checkpoints_passed", 0) or 0),
@@ -447,8 +449,8 @@ async def print_rank_table():
                 parts = []
                 if m.checkpoints_passed >= dethrone_cp and m.consecutive_wins > 0:
                     parts.append("READY")
-                elif m.consecutive_wins > 0:
-                    parts.append(f"W:{m.consecutive_wins}")
+                elif m.total_wins > 0:
+                    parts.append(f"W:{m.total_wins}")
                 if m.total_losses > 0:
                     parts.append(f"L:{m.total_losses}/{M}")
                 challenge_str = " ".join(parts) if parts else "—"
