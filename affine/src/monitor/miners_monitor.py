@@ -816,30 +816,16 @@ class MinersMonitor:
                 
                 # Check blacklist
                 if hotkey in blacklist:
-                    miners.append(MinerInfo(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model="",
-                        revision="",
-                        chute_id="",
-                        block=0,
-                        is_valid=False,
-                        invalid_reason="blacklisted"
-                    ))
+                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
+                    m.mark_invalid("blacklisted", permanent=True)
+                    miners.append(m)
                     continue
-                
+
                 # Check for commit
                 if hotkey not in commits:
-                    miners.append(MinerInfo(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model="",
-                        revision="",
-                        chute_id="",
-                        block=0,
-                        is_valid=False,
-                        invalid_reason="no_commit"
-                    ))
+                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
+                    m.mark_invalid("no_commit", permanent=False)
+                    miners.append(m)
                     continue
                 
                 try:
@@ -852,16 +838,16 @@ class MinersMonitor:
                     
                     # Check if all required fields present
                     if not model or not revision or not chute_id:
-                        miners.append(MinerInfo(
+                        m = MinerInfo(
                             uid=uid,
                             hotkey=hotkey,
                             model=model,
                             revision=revision,
                             chute_id=chute_id,
                             block=int(block) if uid != 0 else 0,
-                            is_valid=False,
-                            invalid_reason="incomplete_commit:missing_fields"
-                        ))
+                        )
+                        m.mark_invalid("incomplete_commit:missing_fields", permanent=False)
+                        miners.append(m)
                         continue
 
                     # Validate miner
@@ -879,28 +865,14 @@ class MinersMonitor:
                     
                 except json.JSONDecodeError as e:
                     logger.debug(f"Invalid JSON in commit for uid={uid}: {e}")
-                    miners.append(MinerInfo(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model="",
-                        revision="",
-                        chute_id="",
-                        block=0,
-                        is_valid=False,
-                        invalid_reason="invalid_json_commit"
-                    ))
+                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
+                    m.mark_invalid("invalid_json_commit", permanent=True)
+                    miners.append(m)
                 except Exception as e:
                     logger.debug(f"Failed to validate uid={uid}: {e}")
-                    miners.append(MinerInfo(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model="",
-                        revision="",
-                        chute_id="",
-                        block=0,
-                        is_valid=False,
-                        invalid_reason=f"validation_error:{str(e)[:50]}"
-                    ))
+                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
+                    m.mark_invalid(f"validation_error:{str(e)[:50]}", permanent=False)
+                    miners.append(m)
             
             # Detect plagiarism
             miners = await self._detect_plagiarism(miners)
