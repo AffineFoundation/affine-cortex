@@ -197,15 +197,15 @@ def sort_key(m: RankedMiner) -> tuple:
     """Champion → active sampling (highest CP first) → cold → invalid → terminated."""
     if m.is_champion:
         return (0,)
+    if m.is_invalid:
+        # Validator-side rejection (anticopy / model_mismatch / repo-name /…)
+        # checked BEFORE terminated: a permanently-invalid miner now also
+        # carries challenge_status='terminated', and we want it grouped by
+        # its specific kind (anticopy etc.) rather than mixed in with
+        # champion-loss/cold-too-long terminations.
+        return (3, -m.checkpoints_passed, -m.average_score)
     if m.status == "terminated":
         return (4, -m.total_losses, -m.checkpoints_passed)
-    if m.is_invalid:
-        # validator-side rejection (anticopy / model_mismatch / repo-name /
-        # …): not in the competition anymore even though challenge_status
-        # might still read 'sampling' — group below cold but above
-        # challenge-terminated so operators can spot them as a distinct
-        # bucket.
-        return (3, -m.checkpoints_passed, -m.average_score)
     if m.is_cold:
         return (2, -m.checkpoints_passed, -m.average_score)
     # Active sampling: closeness to dethrone, then checkpoint depth, then avg
@@ -397,13 +397,6 @@ async def print_rank_table():
                 status_str = "★ CHAMPION"
                 cp_str = "—"
                 challenge_str = "—"
-            elif m.status == "terminated":
-                status_str = "TERMINATED"
-                cp_str = str(m.checkpoints_passed)
-                if m.total_losses == 0:
-                    challenge_str = "pairwise"
-                else:
-                    challenge_str = f"L:{m.total_losses}/{M}"
             elif m.is_invalid:
                 # validator-side rejection: sampling has actually stopped
                 # via get_valid_miners() filter, so showing 'sampling' or
@@ -437,6 +430,13 @@ async def print_rank_table():
                 # operators drill in via `af get-miner <uid>` for the
                 # full invalid_reason if they need it.
                 challenge_str = (detail[:11] if detail else "—")
+            elif m.status == "terminated":
+                status_str = "TERMINATED"
+                cp_str = str(m.checkpoints_passed)
+                if m.total_losses == 0:
+                    challenge_str = "pairwise"
+                else:
+                    challenge_str = f"L:{m.total_losses}/{M}"
             elif m.is_cold:
                 status_str = "cold"
                 cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"
