@@ -38,6 +38,12 @@ class MinerInfo:
     block: int = 0
     is_valid: bool = False
     invalid_reason: Optional[str] = None
+    # True iff invalid_reason is a durable termination (rule violation,
+    # confirmed plagiarism). False for transient blips (HTTP/lookup
+    # failures) that may recover next refresh. Set at the same site as
+    # invalid_reason via mark_invalid() so classification cannot drift
+    # away from the reasons it classifies.
+    permanent_invalid: bool = False
     model_hash: str = ""  # HuggingFace model hash (cached)
     hf_revision: str = ""  # HuggingFace actual revision (cached)
     chute_status: str = ""
@@ -46,6 +52,23 @@ class MinerInfo:
     def key(self) -> str:
         """Generate unique key: hotkey#revision"""
         return f"{self.hotkey}#{self.revision}"
+
+    def mark_invalid(self, reason: str, *, permanent: bool) -> None:
+        """Set is_valid=False with reason and explicit permanence.
+
+        permanent=True  → durable failure (rule violation, plagiarism); will
+                          flow into challenge_status='terminated' and release
+                          the chute downstream.
+        permanent=False → transient blip (HTTP timeout, cold chute, etc);
+                          downstream leaves the deployment alone, lets the
+                          next refresh cycle decide.
+
+        The keyword-only argument is intentional: every new invalid_reason
+        added to the codebase MUST classify itself, so the system can't
+        silently leak chutes when someone adds a new failure mode."""
+        self.is_valid = False
+        self.invalid_reason = reason
+        self.permanent_invalid = permanent
 
 
 class MinersMonitor:
@@ -348,83 +371,73 @@ class MinersMonitor:
         # Only enforced when the latest commit is at or after this block.
         _MULTI_COMMIT_ENFORCE_BLOCK = 7710000
         if uid != 0 and commit_count > 1 and block >= _MULTI_COMMIT_ENFORCE_BLOCK:
-            info.is_valid = False
-            info.invalid_reason = f"multiple_commits:count={commit_count}"
+            info.mark_invalid(f"multiple_commits:count={commit_count}", permanent=True)
             return info
 
         # Step 1: Fetch chute info
         chute = await get_chute_info(chute_id)
         if not chute:
-            info.is_valid = False
-            info.invalid_reason = "chute_fetch_failed"
+            info.mark_invalid("chute_fetch_failed", permanent=False)
             return info
-        
+
         info.chute_slug = chute.get("slug", "")
         info.chute_status = "hot" if chute.get("hot", False) else "cold"
-        
+
         # Step 2: Validate chute_slug is not empty
         if not info.chute_slug:
-            info.is_valid = False
-            info.invalid_reason = "chute_slug_empty"
+            info.mark_invalid("chute_slug_empty", permanent=False)
             return info
 
         # Step 3: Check chute is hot
         if not chute.get("hot", False):
-            info.is_valid = False
-            info.invalid_reason = "chute_not_hot"
+            info.mark_invalid("chute_not_hot", permanent=False)
             return info
-        
+
         # Step 4: Verify model name matches chute
         chute_model = chute.get("name", "")
         if model != chute_model:
             # Skip validation for uid 0
             if uid != 0:
-                info.is_valid = False
-                info.invalid_reason = f"model_mismatch:chute={chute_model}"
+                info.mark_invalid(f"model_mismatch:chute={chute_model}", permanent=True)
                 return info
 
         # Step 5: Verify model name contains "Affine" or "affine" (except uid 0)
         if uid != 0:
             if "affine" not in model.lower():
-                info.is_valid = False
-                info.invalid_reason = "model_name_missing_affine"
+                info.mark_invalid("model_name_missing_affine", permanent=True)
                 return info
 
         # Step 6: Verify repo name ends with hotkey
         if uid != 0 and block >= 7290000:
             # Extract repo name from model (format: owner/repo_name)
             repo_name = model.split('/')[-1] if '/' in model else model
-            
+
             # Check if repo name ends with hotkey (case-insensitive)
             if not repo_name.lower().endswith(hotkey.lower()):
-                info.is_valid = False
-                info.invalid_reason = f"repo_name_not_ending_with_hotkey:repo={repo_name}"
+                info.mark_invalid(f"repo_name_not_ending_with_hotkey:repo={repo_name}", permanent=True)
                 return info
 
         # Step 7: Verify revision matches chute
         chute_revision = chute.get("revision", "")
         if chute_revision and revision != chute_revision:
-            info.is_valid = False
-            info.invalid_reason = f"revision_mismatch:chute={chute_revision}"
+            info.mark_invalid(f"revision_mismatch:chute={chute_revision}", permanent=True)
             return info
-        
+
         # Step 8: Fetch HuggingFace model info and verify revision
         model_info = await self._get_model_info(model, revision)
         if not model_info:
-            info.is_valid = False
-            info.invalid_reason = "hf_model_fetch_failed"
+            info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
-        
+
         model_hash, hf_revision, _ = model_info
-        
+
         # Cache model info in MinerInfo
         info.model_hash = model_hash
         info.hf_revision = hf_revision
-        
+
         # Verify revision matches
         if revision != hf_revision:
-            info.is_valid = False
-            info.invalid_reason = f"revision_mismatch:hf={hf_revision}"
+            info.mark_invalid(f"revision_mismatch:hf={hf_revision}", permanent=True)
             return info
 
         # Step 9: Check model architecture (must be Qwen3-32B)
@@ -432,8 +445,7 @@ class MinersMonitor:
         if uid != 0 and uid <= 1000:
             size_result = await check_model_size(model, revision)
             if not size_result["pass"]:
-                info.is_valid = False
-                info.invalid_reason = f"model_check:{size_result['reason']}"
+                info.mark_invalid(f"model_check:{size_result['reason']}", permanent=True)
                 logger.info(
                     f"[MinersMonitor] Model rejected for uid={uid}: "
                     f"model={model} reason={size_result['reason']}"
@@ -444,8 +456,7 @@ class MinersMonitor:
         if uid != 0:
             duplicate_source = await self._is_duplicate_commit(model, revision)
             if duplicate_source:
-                info.is_valid = False
-                info.invalid_reason = f"duplicate_repo:from={duplicate_source}"
+                info.mark_invalid(f"duplicate_repo:from={duplicate_source}", permanent=True)
                 logger.info(
                     f"[MinersMonitor] Duplicate repo detected for uid={uid}: "
                     f"model={model} is duplicated from {duplicate_source}"
@@ -468,8 +479,7 @@ class MinersMonitor:
                 logger.debug(f"[MinersMonitor] Skipping template check for uid={uid} (cached: safe)")
             elif cached_result and cached_result.startswith("unsafe:"):
                 # Previously failed, use cached result directly
-                info.is_valid = False
-                info.invalid_reason = f"malicious_template:{cached_result[7:]}"
+                info.mark_invalid(f"malicious_template:{cached_result[7:]}", permanent=True)
                 logger.debug(f"[MinersMonitor] Using cached template result for uid={uid}: {cached_result}")
                 return info
             else:
@@ -477,11 +487,10 @@ class MinersMonitor:
                 template_result = await check_template_safety(model, revision)
                 if not template_result["safe"]:
                     reason = template_result['reason']
-                    info.is_valid = False
-                    info.invalid_reason = f"malicious_template:{reason}"
                     # Only cache deterministic failures; transient errors
                     # (network/HF outages) should be retried next refresh
                     transient = reason.startswith("template_fetch_failed:") or reason.startswith("check_error:")
+                    info.mark_invalid(f"malicious_template:{reason}", permanent=not transient)
                     if transient:
                         # Leave template_check_result as None so next refresh retries
                         logger.warning(
@@ -531,13 +540,15 @@ class MinersMonitor:
                     if sim_str:
                         reason += f"({sim_str})"
                     if ac_status == "cheat":
-                        info.is_valid = False
-                        info.invalid_reason = reason
+                        info.mark_invalid(reason, permanent=True)
                         logger.info(
                             f"[MinersMonitor] Anti-copy flagged uid={uid}: "
                             f"model={model} high similarity with {orig_model} [{sim_str}]"
                         )
                         return info
+                    # 'suspicious' is NOT an invalidation — only flags a
+                    # softer reason for downstream pareto margin tightening.
+                    # is_valid stays True; do not call mark_invalid.
                     info.invalid_reason = reason
                     logger.info(
                         f"[MinersMonitor] Anti-copy suspicious uid={uid}: "
@@ -584,8 +595,10 @@ class MinersMonitor:
             # Mark duplicates as invalid
             for block, uid, miner in group[1:]:
                 if miner.is_valid:
-                    miner.is_valid = False
-                    miner.invalid_reason = f"model_hash_duplicate:earliest_uid={earliest_uid}"
+                    miner.mark_invalid(
+                        f"model_hash_duplicate:earliest_uid={earliest_uid}",
+                        permanent=True,
+                    )
                     logger.info(
                         f"[MinersMonitor] Plagiarism detected: uid={uid} copied from uid={earliest_uid} "
                         f"(hash={model_hash[:16]}...)"
@@ -593,6 +606,51 @@ class MinersMonitor:
         
         return miners
     
+    async def _terminate_permanently_invalid(self, miners: list):
+        """Promote durable is_valid=False reasons (anticopy etc.) to challenge_status='terminated' so the existing terminated-only chute release fires; transient reasons are skipped to avoid killing a healthy chute on a one-cycle blip."""
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        miner_stats_dao = MinerStatsDAO()
+
+        for miner in miners:
+            if miner.is_valid is not False:
+                continue
+            if miner.uid == 0 or miner.uid > 1000:
+                continue
+            if not miner.permanent_invalid:
+                continue
+            # Chain-side direct constructs (blacklisted / invalid_json_commit)
+            # carry revision="" because there's no usable commit to anchor a
+            # challenge_state row to. Writing a terminated row at (hotkey, "")
+            # would later poison get_challenge_state's hotkey-fallback for any
+            # future revision the same hotkey commits, locking an un-blacklisted
+            # miner out forever.
+            if not miner.revision:
+                continue
+
+            try:
+                state = await miner_stats_dao.get_challenge_state(
+                    miner.hotkey, miner.revision)
+                if state.get('challenge_status') == 'terminated':
+                    continue
+
+                await miner_stats_dao.update_challenge_state(
+                    hotkey=miner.hotkey,
+                    revision=miner.revision,
+                    consecutive_wins=int(state.get('challenge_consecutive_wins', 0) or 0),
+                    total_losses=int(state.get('challenge_total_losses', 0) or 0),
+                    consecutive_losses=int(state.get('challenge_consecutive_losses', 0) or 0),
+                    checkpoints_passed=int(state.get('challenge_checkpoints_passed', 0) or 0),
+                    status='terminated',
+                    termination_reason=f"invalid:{miner.invalid_reason}",
+                )
+                logger.info(
+                    f"[MinersMonitor] Terminated permanently-invalid miner "
+                    f"uid={miner.uid} hk={miner.hotkey[:8]}.. "
+                    f"reason={miner.invalid_reason}")
+            except Exception as e:
+                logger.warning(
+                    f"[MinersMonitor] Failed to terminate uid={miner.uid}: {e}")
+
     async def _release_terminated_chutes(self, miners: list):
         """Release chute deployments for miners terminated by champion challenge."""
         from affine.database.dao.miner_stats import MinerStatsDAO
@@ -766,30 +824,16 @@ class MinersMonitor:
                 
                 # Check blacklist
                 if hotkey in blacklist:
-                    miners.append(MinerInfo(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model="",
-                        revision="",
-                        chute_id="",
-                        block=0,
-                        is_valid=False,
-                        invalid_reason="blacklisted"
-                    ))
+                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
+                    m.mark_invalid("blacklisted", permanent=True)
+                    miners.append(m)
                     continue
-                
+
                 # Check for commit
                 if hotkey not in commits:
-                    miners.append(MinerInfo(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model="",
-                        revision="",
-                        chute_id="",
-                        block=0,
-                        is_valid=False,
-                        invalid_reason="no_commit"
-                    ))
+                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
+                    m.mark_invalid("no_commit", permanent=False)
+                    miners.append(m)
                     continue
                 
                 try:
@@ -802,16 +846,16 @@ class MinersMonitor:
                     
                     # Check if all required fields present
                     if not model or not revision or not chute_id:
-                        miners.append(MinerInfo(
+                        m = MinerInfo(
                             uid=uid,
                             hotkey=hotkey,
                             model=model,
                             revision=revision,
                             chute_id=chute_id,
                             block=int(block) if uid != 0 else 0,
-                            is_valid=False,
-                            invalid_reason="incomplete_commit:missing_fields"
-                        ))
+                        )
+                        m.mark_invalid("incomplete_commit:missing_fields", permanent=False)
+                        miners.append(m)
                         continue
 
                     # Validate miner
@@ -829,28 +873,14 @@ class MinersMonitor:
                     
                 except json.JSONDecodeError as e:
                     logger.debug(f"Invalid JSON in commit for uid={uid}: {e}")
-                    miners.append(MinerInfo(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model="",
-                        revision="",
-                        chute_id="",
-                        block=0,
-                        is_valid=False,
-                        invalid_reason="invalid_json_commit"
-                    ))
+                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
+                    m.mark_invalid("invalid_json_commit", permanent=True)
+                    miners.append(m)
                 except Exception as e:
                     logger.debug(f"Failed to validate uid={uid}: {e}")
-                    miners.append(MinerInfo(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model="",
-                        revision="",
-                        chute_id="",
-                        block=0,
-                        is_valid=False,
-                        invalid_reason=f"validation_error:{str(e)[:50]}"
-                    ))
+                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
+                    m.mark_invalid(f"validation_error:{str(e)[:50]}", permanent=False)
+                    miners.append(m)
             
             # Detect plagiarism
             miners = await self._detect_plagiarism(miners)
@@ -885,6 +915,11 @@ class MinersMonitor:
                     template_check_result="safe",
                 )
                 miners.append(system_miner)
+
+            # Must run before _release_terminated_chutes so durable
+            # invalidations land in challenge_status='terminated' and
+            # the release path below picks them up the same cycle.
+            await self._terminate_permanently_invalid(miners)
 
             # Release chutes for terminated miners before persist,
             # so the cold status is written to DB in the same round.
