@@ -26,6 +26,33 @@ from affine.database.dao.anti_copy import AntiCopyDAO
 from affine.core.setup import logger
 
 
+# Durable invalidation prefixes promoted to challenge_status='terminated' so
+# downstream (chute release, scheduler, deployer) reads one sticky signal.
+# Transient reasons (chute_fetch_failed / hf_model_fetch_failed / chute_slug_empty
+# / chute_not_hot / no_commit / incomplete_commit / validation_error) are
+# excluded — they can recover on the next refresh.
+_PERMANENT_INVALID_REASON_PREFIXES = (
+    "anticopy:",
+    "model_hash_duplicate:",
+    "model_mismatch:",
+    "model_name_missing_affine",
+    "repo_name_not_ending_with_hotkey:",
+    "revision_mismatch:",
+    "multiple_commits:",
+    "model_check:",
+    "duplicate_repo:",
+    "malicious_template:",
+    "blacklisted",
+    "invalid_json_commit",
+)
+
+
+def _is_permanent_invalid(reason: Optional[str]) -> bool:
+    if not reason:
+        return False
+    return reason.startswith(_PERMANENT_INVALID_REASON_PREFIXES)
+
+
 @dataclass
 class MinerInfo:
     """Miner information data class"""
@@ -593,6 +620,43 @@ class MinersMonitor:
         
         return miners
     
+    async def _terminate_permanently_invalid(self, miners: list):
+        """Promote durable is_valid=False reasons (anticopy etc.) to challenge_status='terminated' so the existing terminated-only chute release fires; transient reasons are skipped to avoid killing a healthy chute on a one-cycle blip."""
+        from affine.database.dao.miner_stats import MinerStatsDAO
+        miner_stats_dao = MinerStatsDAO()
+
+        for miner in miners:
+            if miner.is_valid is not False:
+                continue
+            if miner.uid == 0 or miner.uid > 1000:
+                continue
+            if not _is_permanent_invalid(miner.invalid_reason):
+                continue
+
+            try:
+                state = await miner_stats_dao.get_challenge_state(
+                    miner.hotkey, miner.revision)
+                if state.get('challenge_status') == 'terminated':
+                    continue
+
+                await miner_stats_dao.update_challenge_state(
+                    hotkey=miner.hotkey,
+                    revision=miner.revision,
+                    consecutive_wins=int(state.get('challenge_consecutive_wins', 0) or 0),
+                    total_losses=int(state.get('challenge_total_losses', 0) or 0),
+                    consecutive_losses=int(state.get('challenge_consecutive_losses', 0) or 0),
+                    checkpoints_passed=int(state.get('challenge_checkpoints_passed', 0) or 0),
+                    status='terminated',
+                    termination_reason=f"invalid:{miner.invalid_reason}",
+                )
+                logger.info(
+                    f"[MinersMonitor] Terminated permanently-invalid miner "
+                    f"uid={miner.uid} hk={miner.hotkey[:8]}.. "
+                    f"reason={miner.invalid_reason}")
+            except Exception as e:
+                logger.warning(
+                    f"[MinersMonitor] Failed to terminate uid={miner.uid}: {e}")
+
     async def _release_terminated_chutes(self, miners: list):
         """Release chute deployments for miners terminated by champion challenge."""
         from affine.database.dao.miner_stats import MinerStatsDAO
@@ -885,6 +949,11 @@ class MinersMonitor:
                     template_check_result="safe",
                 )
                 miners.append(system_miner)
+
+            # Must run before _release_terminated_chutes so durable
+            # invalidations land in challenge_status='terminated' and
+            # the release path below picks them up the same cycle.
+            await self._terminate_permanently_invalid(miners)
 
             # Release chutes for terminated miners before persist,
             # so the cold status is written to DB in the same round.
