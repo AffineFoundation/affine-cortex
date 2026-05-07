@@ -407,14 +407,30 @@ async def print_rank_table():
             elif m.is_invalid:
                 # validator-side rejection: sampling has actually stopped
                 # via get_valid_miners() filter, so showing 'sampling' or
-                # 'cold' would be misleading. The reason (anticopy / etc.)
-                # goes in the Challenge column for at-a-glance triage.
-                status_str = "INVALID"
+                # 'cold' would be misleading. Surface the *specific* cause
+                # in the Status column (a generic 'INVALID' loses the
+                # signal an operator needs); the detail tail (similarity
+                # scores, mismatched chute name, etc.) goes in Challenge.
+                reason = m.invalid_reason or "invalid"
+                kind, _, detail = reason.partition(":")
+                # Map raw miners-monitor reason keys to compact labels
+                # that fit the 11-char Status column without dropping
+                # information. Unknown reasons fall through truncated.
+                kind_label = {
+                    "anticopy": "anticopy",
+                    "chute_fetch_failed": "chute_fetch",
+                    "chute_slug_empty": "chute_empty",
+                    "chute_not_hot": "chute_cold",
+                    "model_mismatch": "model_mis",
+                    "model_name_missing_affine": "name_miss",
+                    "repo_name_not_ending_with_hotkey": "repo_name",
+                    "revision_mismatch": "rev_mis",
+                    "hf_model_fetch_failed": "hf_fetch",
+                    "multiple_commits": "multi_cmt",
+                }.get(kind, kind[:11])
+                status_str = kind_label
                 cp_str = "—"
-                reason = m.invalid_reason or ""
-                # Trim long reasons (anticopy carries the full target
-                # repo path); 24 chars fits the existing column width.
-                challenge_str = reason[:24] if reason else "invalid"
+                challenge_str = (detail[:24] if detail else "—")
             elif m.is_cold:
                 status_str = "cold"
                 cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"
