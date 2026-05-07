@@ -198,19 +198,13 @@ def sort_key(m: RankedMiner) -> tuple:
     if m.is_champion:
         return (0,)
     if m.status == "terminated":
-        # Check terminated FIRST: once a permanently-invalid miner's chute
-        # has been released by miners-monitor, the next refresh cycle's
-        # _validate_miner overwrites invalid_reason with 'chute_fetch_failed'
-        # (the chute is gone, so HTTP fetch fails). The original reason
-        # (anticopy / model_mismatch / …) is gone from the miners table —
-        # only challenge_status='terminated' is sticky. Routing through the
-        # is_invalid branch would surface the misleading 'chute_fetch' kind
-        # label. The terminated bucket is the only stable, accurate signal.
         return (4, -m.total_losses, -m.checkpoints_passed)
     if m.is_invalid:
-        # Transient invalidations (chute_fetch_failed without termination,
-        # hf_model_fetch_failed, etc.) genuinely reflect the current cycle's
-        # cause, so the kind label is informative here.
+        # validator-side rejection (anticopy / model_mismatch / repo-name /
+        # …): not in the competition anymore even though challenge_status
+        # might still read 'sampling' — group below cold but above
+        # challenge-terminated so operators can spot them as a distinct
+        # bucket.
         return (3, -m.checkpoints_passed, -m.average_score)
     if m.is_cold:
         return (2, -m.checkpoints_passed, -m.average_score)
@@ -404,9 +398,6 @@ async def print_rank_table():
                 cp_str = "—"
                 challenge_str = "—"
             elif m.status == "terminated":
-                # See sort_key: post-release cycles overwrite the original
-                # invalid_reason with 'chute_fetch_failed', so the only
-                # accurate label here is the generic TERMINATED.
                 status_str = "TERMINATED"
                 cp_str = str(m.checkpoints_passed)
                 if m.total_losses == 0:
