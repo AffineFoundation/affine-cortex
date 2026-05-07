@@ -96,13 +96,15 @@ class RankedMiner:
     scores_by_env: Dict[str, Dict[str, Any]]
     average_score: float
     is_champion: bool
-    status: str                    # 'sampling' | 'terminated'
+    status: str                    # challenge_status — 'sampling' | 'terminated'
     consecutive_wins: int
     total_losses: int
     consecutive_losses: int
     checkpoints_passed: int
     total_samples: int             # Samples produced in current scoring cycle
     targon_status: Optional[str]   # 'active' | 'deploying' | None — Targon acceleration
+    is_valid: Optional[bool]       # validator-side admissibility (anticopy etc.)
+    invalid_reason: Optional[str]
 
     @property
     def is_cold(self) -> bool:
@@ -112,14 +114,29 @@ class RankedMiner:
         return (
             not self.is_champion
             and self.status == "sampling"
+            and self.is_valid is not False  # invalid miners get their own bucket
             and self.total_samples == 0
         )
+
+    @property
+    def is_invalid(self) -> bool:
+        # validator-side invalidation (anticopy, model_mismatch, repo-name,
+        # etc.) — sampling scheduler stops sampling these via is_valid filter,
+        # so they shouldn't be displayed as 'sampling' even when their
+        # challenge_status snapshot still says so.
+        return self.is_valid is False
 
 
 def parse_ranked_miners(scores_list: List[Dict[str, Any]]) -> List[RankedMiner]:
     out = []
     for s in scores_list:
         ci = s.get("challenge_info") or {}
+        # is_valid arrives over the API as JSON bool (or None if the miners
+        # row was missing); preserve None vs False distinction so the UI
+        # only shows INVALID when we actually know the miner was rejected.
+        is_valid = s.get("is_valid")
+        if is_valid is not None:
+            is_valid = bool(is_valid)
         out.append(RankedMiner(
             uid=s.get("uid"),
             hotkey=s.get("miner_hotkey") or "",
@@ -134,6 +151,8 @@ def parse_ranked_miners(scores_list: List[Dict[str, Any]]) -> List[RankedMiner]:
             checkpoints_passed=int(ci.get("checkpoints_passed", 0) or 0),
             total_samples=int(s.get("total_samples", 0) or 0),
             targon_status=s.get("targon_status"),
+            is_valid=is_valid,
+            invalid_reason=s.get("invalid_reason"),
         ))
     return out
 
@@ -175,11 +194,18 @@ format_targon = format_boost
 
 
 def sort_key(m: RankedMiner) -> tuple:
-    """Champion → active sampling (highest CP first) → cold → terminated."""
+    """Champion → active sampling (highest CP first) → cold → invalid → terminated."""
     if m.is_champion:
         return (0,)
     if m.status == "terminated":
-        return (3, -m.total_losses, -m.checkpoints_passed)
+        return (4, -m.total_losses, -m.checkpoints_passed)
+    if m.is_invalid:
+        # validator-side rejection (anticopy / model_mismatch / repo-name /
+        # …): not in the competition anymore even though challenge_status
+        # might still read 'sampling' — group below cold but above
+        # challenge-terminated so operators can spot them as a distinct
+        # bucket.
+        return (3, -m.checkpoints_passed, -m.average_score)
     if m.is_cold:
         return (2, -m.checkpoints_passed, -m.average_score)
     # Active sampling: closeness to dethrone, then checkpoint depth, then avg
@@ -378,6 +404,39 @@ async def print_rank_table():
                     challenge_str = "pairwise"
                 else:
                     challenge_str = f"L:{m.total_losses}/{M}"
+            elif m.is_invalid:
+                # validator-side rejection: sampling has actually stopped
+                # via get_valid_miners() filter, so showing 'sampling' or
+                # 'cold' would be misleading. Surface the *specific* cause
+                # in the Status column (a generic 'INVALID' loses the
+                # signal an operator needs); the detail tail (similarity
+                # scores, mismatched chute name, etc.) goes in Challenge.
+                reason = m.invalid_reason or "invalid"
+                kind, _, detail = reason.partition(":")
+                # Map raw miners-monitor reason keys to compact labels
+                # that fit the 11-char Status column without dropping
+                # information. Unknown reasons fall through truncated.
+                kind_label = {
+                    "anticopy": "anticopy",
+                    "chute_fetch_failed": "chute_fetch",
+                    "chute_slug_empty": "chute_empty",
+                    "chute_not_hot": "chute_cold",
+                    "model_mismatch": "model_mis",
+                    "model_name_missing_affine": "name_miss",
+                    "repo_name_not_ending_with_hotkey": "repo_name",
+                    "revision_mismatch": "rev_mis",
+                    "hf_model_fetch_failed": "hf_fetch",
+                    "multiple_commits": "multi_cmt",
+                }.get(kind, kind[:11])
+                status_str = kind_label
+                cp_str = "—"
+                # Detail (similarity scores, mismatched chute name, etc.)
+                # is supplementary here — Status already names the kind.
+                # Truncate to the 11-char column width so a long detail
+                # doesn't shove the rest of the row out of alignment;
+                # operators drill in via `af get-miner <uid>` for the
+                # full invalid_reason if they need it.
+                challenge_str = (detail[:11] if detail else "—")
             elif m.is_cold:
                 status_str = "cold"
                 cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"

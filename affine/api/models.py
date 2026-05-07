@@ -96,6 +96,15 @@ class MinerScore(BaseModel):
     #   None        — no Targon deployment for this revision (Chutes-only)
     # Read by the CLI to mark which miners the Targon pool is hosting.
     targon_status: Optional[str] = None
+    # Validator-side admissibility, sourced from the miners table.
+    # is_valid=False means the validator has invalidated this miner
+    # (anticopy cheat, model_mismatch, repo-name violation, etc.) —
+    # sampling scheduler stops sampling them via get_valid_miners(),
+    # so their challenge_status may still read 'sampling' from a stale
+    # scoring snapshot. The CLI surfaces this so a miner that's been
+    # silently sidelined isn't shown as actively competing.
+    is_valid: Optional[bool] = None
+    invalid_reason: Optional[str] = None
 
 
 class ScoresResponse(BaseModel):

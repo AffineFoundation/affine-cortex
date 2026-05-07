@@ -494,13 +494,43 @@ async def get_miner_command(uid: int):
         data = await client.get(endpoint)
         if data:
             print(json.dumps(data, indent=2, ensure_ascii=False))
-            
+
             # Fetch and display sampling stats via API
             stats_endpoint = f"/miners/uid/{uid}/stats"
             stats_data = await client.get(stats_endpoint)
-            
-            # Display challenge state
+
             cs = stats_data.get('challenge_state') if stats_data else None
+
+            # Effective status: is_valid (validator-side admissibility,
+            # set by miners-monitor for anticopy / model_mismatch /
+            # repo-name / hf-fetch / etc.) gates whether sampling is
+            # actually happening — get_valid_miners() filters it.
+            # challenge_status (sampling/terminated) only reflects
+            # challenge-game outcome, so a miner can read 'sampling'
+            # there while is_valid=False has silently sidelined them.
+            # Surface the combined effective state up front so an
+            # operator doesn't have to cross-reference the JSON above
+            # with the CHAMPION CHALLENGE STATE section below.
+            is_valid_raw = data.get('is_valid')
+            is_valid = str(is_valid_raw or '').lower() == 'true'
+            invalid_reason = data.get('invalid_reason') or ''
+            chal_status = (cs or {}).get('challenge_status', 'sampling')
+            term_reason = (cs or {}).get('termination_reason') or ''
+
+            if not is_valid:
+                effective = f"TERMINATED (invalid: {invalid_reason or 'no reason recorded'})"
+            elif chal_status == 'terminated':
+                effective = f"TERMINATED (challenge: {term_reason or 'no reason recorded'})"
+            else:
+                effective = "SAMPLING"
+
+            print("\n" + "=" * 80)
+            print("EFFECTIVE STATUS")
+            print("=" * 80)
+            print(f"  Status:              {effective}")
+            print(f"  Validator admits:    is_valid={is_valid_raw if is_valid_raw is not None else '-'}"
+                  + (f"  reason={invalid_reason}" if invalid_reason else ""))
+
             if cs:
                 print("\n" + "="*80)
                 print("CHAMPION CHALLENGE STATE")

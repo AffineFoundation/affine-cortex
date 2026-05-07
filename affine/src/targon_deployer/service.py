@@ -133,55 +133,61 @@ class TargonDeployerService:
     async def _resolve_targets(self) -> List[Tuple[str, str, str]]:
         """Compute the target set for this cycle.
 
-        Champion is always slot 0 (deployed regardless of Chutes state —
-        a cold-Chutes champion still earns the dethrone-protection slot).
-
-        The remaining slots are filled from sampling miners whose Chutes
-        endpoint is currently hot, ranked by:
+        Champion gets slot 0; remaining slots are filled from sampling
+        miners ranked by:
 
             (has_wins   DESC,   # consecutive_wins > 0 → True before False
              first_block ASC)   # within a tier, earliest submitter first
 
-        Why Chutes-hot is a hard filter for challengers: a cold Chutes is
-        the cheapest "miner has effectively dropped offline" signal we
-        have (template check failed, miner forgot to redeploy, deletion
-        in flight). Spending Targon GPU-hours on those slots throws money
-        away — the miner is likely to fail termination soon and the slot
-        churns. We'd rather leave the slot empty than waste it.
+        Eligibility filter (applies to *both* champion and challengers):
+          - is_valid == 'true'                   (validator admits it)
+          - chute_status == 'hot'                (Chutes is serving)
+          - challenge_status == 'sampling'       (challengers only)
+          - (hotkey, revision) != champion's     (no double counting)
 
-        Side effect: a previously-hot incumbent that goes cold is no
-        longer in the eligible set, so it falls out of the target set
-        and gets torn down on this reconcile. The slot opens up for a
-        currently-hot miner.
+        Why is_valid is required, not just chute_hot: the chute_hot
+        filter catches the *common* invalidation paths because most
+        of them clear chute_status as a side effect (chute_fetch_failed,
+        chute_slug_empty, chute_not_hot). But anticopy, model_mismatch,
+        repo-name violations, revision_mismatch, hf_model_fetch_failed,
+        and multiple_commits all leave chute_status='hot' while flipping
+        is_valid='false'. Sampling scheduler also gates on is_valid via
+        get_valid_miners(), so without the same gate here the deployer
+        burns GPU on miners no one is actually sampling. UID 187's
+        anticopy case is the canonical example.
 
-        Eligibility filter for challengers:
-          - challenge_status == 'sampling'      (terminated miners excluded)
-          - chute_status == 'hot'               (offline miners excluded)
-          - (hotkey, revision) != champion's    (avoid double counting)
+        Why is_valid applies to champion too: dethrone-protection is
+        meant to ride out a *transient Chutes blip* — short hiccups
+        in the network/CDN. validator-side invalidation (anticopy,
+        repo-name) is deterministic, not transient, and sampling
+        scheduler stops sampling the champion anyway. Keeping the
+        deployment costs GPU-hours for nothing. Once is_valid flips
+        back to 'true', the deployer recreates the slot on the next
+        reconcile.
+
+        Why Chutes-hot is a hard filter for challengers: a cold Chutes
+        is the cheapest "miner has effectively dropped offline" signal
+        we have. Spending Targon GPU-hours on those slots throws money
+        away — the miner is likely to churn soon. We'd rather leave
+        the slot empty than waste it.
+
+        Side effect: a previously-eligible incumbent that goes
+        invalid/cold falls out of the target set and gets torn down on
+        this reconcile, freeing the slot for the next queued candidate.
 
         Returns list of (hotkey, revision, role) where role ∈ {'champion','winner'}.
         """
         targets: List[Tuple[str, str, str]] = []
         seen: Set[Tuple[str, str]] = set()
 
-        champion = await self.config_dao.get_param_value("champion", default=None)
-        if champion and champion.get("hotkey") and champion.get("revision"):
-            champ_key = (champion["hotkey"], champion["revision"])
-            targets.append((champ_key[0], champ_key[1], "champion"))
-            seen.add(champ_key)
-
-        if self.max_deployments <= 1:
-            return targets
-
-        all_stats = await self.miner_stats_dao.get_all_historical_miners()
-
-        # Per-hotkey (first_block, chute_status) from the miners table.
-        # Bounded to ~256 rows so a single scan is cheaper than per-hotkey
-        # lookups, and first_block is per-hotkey (stable across revisions)
-        # so the join key is hotkey alone.
+        # Per-hotkey (first_block, chute_status, is_valid) from the
+        # miners table. Loaded up front because both the champion check
+        # and the challenger eligibility loop need is_valid + chute_hot.
+        # Bounded to ~256 rows → one scan is cheaper than per-hotkey lookups.
         miners = await self.miners_dao.get_all_miners()
         first_block_by_hotkey: Dict[str, int] = {}
         chute_hot_by_hotkey: Dict[str, bool] = {}
+        is_valid_by_hotkey: Dict[str, bool] = {}
         for m in miners:
             hk = m.get("hotkey")
             if not hk:
@@ -191,9 +197,29 @@ class TargonDeployerService:
             except (TypeError, ValueError):
                 pass
             chute_hot_by_hotkey[hk] = (m.get("chute_status") or "").lower() == "hot"
+            # is_valid is a string column ('true' / 'false') because it
+            # backs a GSI partition key; coerce defensively.
+            is_valid_by_hotkey[hk] = str(m.get("is_valid") or "").lower() == "true"
 
-        # (hotkey, revision) -> (has_wins, first_block) for hot, sampling miners.
-        # Cold Chutes are filtered out entirely (not just deprioritized).
+        champion = await self.config_dao.get_param_value("champion", default=None)
+        if (
+            champion
+            and champion.get("hotkey")
+            and champion.get("revision")
+            and is_valid_by_hotkey.get(champion["hotkey"], False)
+        ):
+            champ_key = (champion["hotkey"], champion["revision"])
+            targets.append((champ_key[0], champ_key[1], "champion"))
+            seen.add(champ_key)
+
+        if self.max_deployments <= 1:
+            return targets
+
+        all_stats = await self.miner_stats_dao.get_all_historical_miners()
+
+        # (hotkey, revision) -> (has_wins, first_block) for hot, valid,
+        # sampling miners. Cold/invalid miners are filtered out entirely
+        # (not just deprioritized) so they release their existing slot.
         eligible: Dict[Tuple[str, str], Tuple[bool, int]] = {}
         for s in all_stats:
             if s.get("challenge_status") != "sampling":
@@ -205,6 +231,8 @@ class TargonDeployerService:
             if (hotkey, revision) in seen:
                 continue
             if not chute_hot_by_hotkey.get(hotkey, False):
+                continue
+            if not is_valid_by_hotkey.get(hotkey, False):
                 continue
             wins = int(s.get("challenge_consecutive_wins", 0) or 0)
             has_wins = wins > 0
