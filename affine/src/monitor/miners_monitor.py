@@ -618,6 +618,14 @@ class MinersMonitor:
                 continue
             if not miner.permanent_invalid:
                 continue
+            # Chain-side direct constructs (blacklisted / invalid_json_commit)
+            # carry revision="" because there's no usable commit to anchor a
+            # challenge_state row to. Writing a terminated row at (hotkey, "")
+            # would later poison get_challenge_state's hotkey-fallback for any
+            # future revision the same hotkey commits, locking an un-blacklisted
+            # miner out forever.
+            if not miner.revision:
+                continue
 
             try:
                 state = await miner_stats_dao.get_challenge_state(
