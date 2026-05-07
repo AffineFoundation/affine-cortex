@@ -51,6 +51,34 @@ async def _build_targon_status_map() -> dict:
     return out
 
 
+async def _build_validity_map() -> dict:
+    """Map hotkey -> (is_valid_bool, invalid_reason_str|None) from miners table.
+
+    Surfaces validator-side invalidation in the rank UI: scoring
+    snapshots only carry challenge_status, but a miner can be
+    challenge_status='sampling' while is_valid=False (e.g. anticopy
+    cheat, model_mismatch). Without this lookup the CLI shows them
+    as still competing when in reality sampling has stopped.
+
+    One full scan (256-row cap → cheap). Empty map on any DAO error
+    so a miners-table blip just hides reasons rather than 500ing.
+    """
+    try:
+        dao = MinersDAO()
+        miners = await dao.get_all_miners()
+    except Exception:
+        return {}
+    out: dict = {}
+    for m in miners:
+        hk = m.get("hotkey")
+        if not hk:
+            continue
+        # is_valid stored as 'true'/'false' string in the GSI partition key.
+        is_valid = str(m.get("is_valid") or "").lower() == "true"
+        out[hk] = (is_valid, m.get("invalid_reason") or None)
+    return out
+
+
 @router.get("/latest", response_model=ScoresResponse, dependencies=[Depends(rate_limit_read)])
 async def get_latest_scores(
     top: int = Query(32, description="Return top N miners by score", ge=1, le=256),
@@ -83,11 +111,15 @@ async def get_latest_scores(
         scores_list = scores_list[:top]
 
         targon_status = await _build_targon_status_map()
+        validity = await _build_validity_map()
 
         # Convert to response models with safe field access
-        miner_scores = [
-            MinerScore(
-                miner_hotkey=s.get("miner_hotkey"),
+        miner_scores = []
+        for s in scores_list:
+            hk = s.get("miner_hotkey")
+            is_valid, invalid_reason = validity.get(hk, (None, None))
+            miner_scores.append(MinerScore(
+                miner_hotkey=hk,
                 uid=s.get("uid"),
                 model_revision=s.get("model_revision"),
                 model=s.get("model"),
@@ -98,11 +130,11 @@ async def get_latest_scores(
                 total_samples=s.get("total_samples"),
                 challenge_info=s.get("challenge_info"),
                 targon_status=targon_status.get(
-                    (s.get("miner_hotkey"), s.get("model_revision"))
+                    (hk, s.get("model_revision"))
                 ),
-            )
-            for s in scores_list
-        ]
+                is_valid=is_valid,
+                invalid_reason=invalid_reason,
+            ))
 
         return ScoresResponse(
             block_number=block_number,

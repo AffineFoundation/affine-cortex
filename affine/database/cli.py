@@ -1813,9 +1813,13 @@ async def cmd_get_miner(hotkey: str, revision: Optional[str]):
                 print(f"No miner found with revision matching '{revision}'")
                 return
         
-        # Get online miners for UID and model lookup
-        online_miners = await miners_dao.get_valid_miners()
-        miners_by_hotkey = {m['hotkey']: m for m in online_miners}
+        # Pull every miner row, not just is_valid='true' — otherwise an
+        # invalidated miner (anticopy cheat, model_mismatch, etc.) shows
+        # up as 'offline' here even though it has a record we want to
+        # surface, with the invalid_reason that explains why sampling
+        # stopped.
+        all_miners = await miners_dao.get_all_miners()
+        miners_by_hotkey = {m['hotkey']: m for m in all_miners}
 
         # Print each matching miner
         for i, stats in enumerate(matching_stats, 1):
@@ -1834,6 +1838,43 @@ async def cmd_get_miner(hotkey: str, revision: Optional[str]):
             print("=" * 120)
             print(f"MINER #{i}: {hotkey_val}")
             print("=" * 120)
+
+            # Effective status: is_valid (validator-side admissibility)
+            # gates *whether sampling is happening at all* via
+            # get_valid_miners(). challenge_status (sampling/terminated)
+            # only reflects challenge-game outcome. So a miner can read
+            # challenge_status='sampling' while is_valid='false' and
+            # actually have zero tasks generated — that's the case for
+            # anticopy cheat and other miners-monitor invalidations.
+            # Surface both, plus an EFFECTIVE label that makes the
+            # combined state obvious without having to cross-reference.
+            is_valid_str = miner_record.get('is_valid')
+            is_valid = str(is_valid_str or '').lower() == 'true'
+            invalid_reason = miner_record.get('invalid_reason') or ''
+            chal_status = stats.get('challenge_status', 'sampling')
+            term_reason = stats.get('termination_reason') or ''
+
+            if not miner_record:
+                effective = 'OFFLINE (not in miners table)'
+            elif not is_valid:
+                effective = f'TERMINATED (invalid: {invalid_reason or "no reason recorded"})'
+            elif chal_status == 'terminated':
+                effective = f'TERMINATED (challenge: {term_reason or "no reason recorded"})'
+            else:
+                effective = 'SAMPLING'
+
+            print("\n[STATUS]")
+            print(f"  Effective:        {effective}")
+            print(f"  Validator:        is_valid={is_valid_str if is_valid_str is not None else '-'}"
+                  + (f"  reason={invalid_reason}" if invalid_reason else ""))
+            print(f"  Challenge:        challenge_status={chal_status}"
+                  + (f"  reason={term_reason}" if term_reason else ""))
+            wins = stats.get('challenge_consecutive_wins', 0)
+            tot_losses = stats.get('challenge_total_losses', 0)
+            con_losses = stats.get('challenge_consecutive_losses', 0)
+            cp = stats.get('challenge_checkpoints_passed', 0)
+            print(f"                    consecutive_wins={wins}  total_losses={tot_losses}  "
+                  f"consecutive_losses={con_losses}  checkpoints_passed={cp}")
 
             # Basic Info
             print("\n[BASIC INFO]")
