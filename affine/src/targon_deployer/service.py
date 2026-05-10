@@ -596,6 +596,16 @@ class TargonDeployerService:
         running = int(status.get("running_instances", 0) or 0)
         healthy = bool(status.get("healthy", False))
         base_url = status.get("base_url") or deployment.get("base_url")
+        # Surface Targon's own diagnostic on the failure path. We were
+        # blind to platform-level signals (e.g. "Waiting for GPU resources
+        # to become available") because the deployer only consumed
+        # running_instances; the message is the difference between
+        # "GPU pool starved" and "miner image broken".
+        raw = status.get("raw") or {}
+        tg_status = raw.get("status") or ""
+        tg_message = raw.get("message") or ""
+        ready_replicas = int(raw.get("ready_replicas", 0) or 0)
+        total_replicas = int(raw.get("total_replicas", 0) or 0)
 
         # Active inference probe is the authoritative readiness signal.
         # Targon's ready_replicas can lag behind vLLM in *either* direction:
@@ -633,7 +643,9 @@ class TargonDeployerService:
             deployment,
             reason=(
                 f"running={running} healthy={healthy} model_ready=False "
-                f"age={age}s db_status={db_status}"
+                f"age={age}s db_status={db_status} "
+                f"tg_status={tg_status!r} ready={ready_replicas}/{total_replicas} "
+                f"tg_msg={tg_message!r}"
             ),
         )
 
