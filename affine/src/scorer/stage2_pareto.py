@@ -62,8 +62,11 @@ class Stage2ParetoFilter:
         apply_anticopy_bias = (label == "pairwise")
 
         def _effective_margin(actor: MinerData, target: MinerData) -> float:
+            # Apply tightened margin against the alleged source for BOTH
+            # 'suspicious' and 'cheat' (cheat is no longer hard-invalidated
+            # by miners_monitor — both rely on this margin bias instead).
             if apply_anticopy_bias and (
-                getattr(actor, "anticopy_status", "clean") == "suspicious"
+                getattr(actor, "anticopy_status", "clean") in ("suspicious", "cheat")
                 and getattr(actor, "anticopy_target_uid", None) == target.uid
             ):
                 return margin * suspicious_multiplier

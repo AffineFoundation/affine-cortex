@@ -539,20 +539,20 @@ class MinersMonitor:
                     reason = f"{reason_prefix}={orig_model}"
                     if sim_str:
                         reason += f"({sim_str})"
-                    if ac_status == "cheat":
-                        info.mark_invalid(reason, permanent=True)
-                        logger.info(
-                            f"[MinersMonitor] Anti-copy flagged uid={uid}: "
-                            f"model={model} high similarity with {orig_model} [{sim_str}]"
-                        )
-                        return info
-                    # 'suspicious' is NOT an invalidation — only flags a
-                    # softer reason for downstream pareto margin tightening.
-                    # is_valid stays True; do not call mark_invalid.
+                    # Neither 'cheat' nor 'suspicious' triggers invalidation
+                    # anymore — both surface the same soft signal and let
+                    # stage2_pareto apply a tightened dominance margin
+                    # against the alleged source. Hard invalidation on
+                    # cheat caused false positives on legitimate fine-tunes
+                    # of an earlier base (e.g. uid 15 vs 213: 10pt SWE
+                    # improvement but logprobs still near-identical on
+                    # template tokens). is_valid stays True; do not call
+                    # mark_invalid.
                     info.invalid_reason = reason
                     logger.info(
-                        f"[MinersMonitor] Anti-copy suspicious uid={uid}: "
-                        f"model={model} high similarity with {orig_model} [{sim_str}]"
+                        f"[MinersMonitor] Anti-copy {ac_status} uid={uid}: "
+                        f"model={model} similarity with {orig_model} [{sim_str}] "
+                        f"(downgraded to soft flag, not invalidated)"
                     )
             except Exception as e:
                 logger.debug(f"[MinersMonitor] Anti-copy check failed for uid={uid}: {e}")
