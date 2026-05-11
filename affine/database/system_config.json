@@ -22,6 +22,7 @@
     "LIVEWEB": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
+      "accelerated": true,
       "sampling_config": {
         "dataset_range": [[0, 78060000]],
         "sampling_count": 40,
@@ -84,6 +85,7 @@
     "TERMINAL": {
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
+      "accelerated": true,
       "sampling_config": {
         "dataset_range": [[0, 132000000]],
         "sampling_count": 30,
