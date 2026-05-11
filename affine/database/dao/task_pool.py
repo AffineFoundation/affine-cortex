@@ -30,16 +30,24 @@ class TaskPoolDAO(BaseDAO):
         return f"MINER#{miner_hotkey}#REV#{model_revision}"
     
     def _make_sk(self, env: str, status: str, task_id: int) -> str:
-        """Generate sort key with env, status, and task_id."""
-        return f"ENV#{env}#STATUS#{status}#TASK_ID#{task_id:06d}"
-    
+        """Generate sort key with env, status, and task_id.
+
+        Coerce to int defensively: sampling_list entries arriving from
+        system_config are JSON-decoded and a value that was written as a
+        string (e.g. via the admin CLI) flows through unchanged. A single
+        str in the list crashes the whole batch_create_tasks call —
+        which is the entire sampling pipeline — so we normalise here at
+        the DAO boundary instead of trusting upstream typing.
+        """
+        return f"ENV#{env}#STATUS#{status}#TASK_ID#{int(task_id):06d}"
+
     def _make_gsi1_pk(self, env: str, status: str) -> str:
         """Generate GSI1 partition key for env+status queries."""
         return f"ENV#{env}#STATUS#{status}"
-    
+
     def _make_gsi1_sk(self, miner_hotkey: str, model_revision: str, task_id: int) -> str:
         """Generate GSI1 sort key for miner+task_id queries."""
-        return f"MINER#{miner_hotkey}#REV#{model_revision}#TASK_ID#{task_id:06d}"
+        return f"MINER#{miner_hotkey}#REV#{model_revision}#TASK_ID#{int(task_id):06d}"
     
     async def batch_create_tasks(
         self,
@@ -66,15 +74,19 @@ class TaskPoolDAO(BaseDAO):
         status = 'pending'
         
         for task_info in tasks:
+            # Coerce task_id to int once at the boundary so downstream
+            # consumers (sk, gsi1_sk, executor formatting) all see a
+            # consistent integer regardless of how upstream tagged it.
+            task_id = int(task_info['task_id'])
             pk = self._make_pk(task_info['miner_hotkey'], task_info['model_revision'])
-            sk = self._make_sk(task_info['env'], status, task_info['task_id'])
+            sk = self._make_sk(task_info['env'], status, task_id)
             task_uuid = str(uuid.uuid4())
-            
+
             item = {
                 'pk': pk,
                 'sk': sk,
                 'task_uuid': task_uuid,
-                'task_id': task_info['task_id'],
+                'task_id': task_id,
                 'miner_hotkey': task_info['miner_hotkey'],
                 'model_revision': task_info['model_revision'],
                 'model': task_info['model'],
@@ -99,7 +111,7 @@ class TaskPoolDAO(BaseDAO):
                 'gsi1_sk': self._make_gsi1_sk(
                     task_info['miner_hotkey'],
                     task_info['model_revision'],
-                    task_info['task_id']
+                    task_id,
                 ),
             }
             items.append(item)
