@@ -330,7 +330,8 @@ class TargonDeployerService:
                 if key in target_keys:
                     continue
                 deployment_id = d["deployment_id"]
-                await self.client.delete_deployment(deployment_id)
+                if not self._is_manual_deployment(deployment_id):
+                    await self.client.delete_deployment(deployment_id)
                 await self.dao.mark_deleted(deployment_id)
                 logger.info(
                     f"Auto-release: deleted {deployment_id} "
@@ -592,8 +593,20 @@ class TargonDeployerService:
         data = payload.get("data")
         return isinstance(data, list) and len(data) > 0
 
+    @staticmethod
+    def _is_manual_deployment(deployment_id: str) -> bool:
+        """A row not backed by a real Targon workload uid (operator-inserted
+        for an off-platform inference endpoint). Skip every Targon API call
+        for these — querying ``/workloads/<manual-id>/state`` 404s and the
+        404 is counted as a probe failure, releasing the row in under 10 min.
+        """
+        return not (deployment_id or "").startswith("wrk-")
+
     async def _check_and_release(self, deployment: Dict[str, Any]) -> None:
         deployment_id = deployment["deployment_id"]
+        if self._is_manual_deployment(deployment_id):
+            await self._check_and_release_manual(deployment)
+            return
         status = await self.client.get_deployment_status(deployment_id)
         if status is None:
             await self._on_failed_probe(deployment, reason="status=None")
@@ -655,6 +668,39 @@ class TargonDeployerService:
             ),
         )
 
+    async def _check_and_release_manual(self, deployment: Dict[str, Any]) -> None:
+        """Health check path for operator-inserted (non-Targon) rows.
+
+        Only signal is whether ``base_url + /v1/models`` is serving — no
+        Targon API status query, no ``running_instances`` from Targon's
+        bookkeeping. Same init-grace + unhealthy_for accounting as the
+        Targon path, so a manual row that genuinely stops responding
+        still gets auto-released; it just doesn't fail every probe
+        because Targon doesn't know the id.
+        """
+        deployment_id = deployment["deployment_id"]
+        base_url = deployment.get("base_url")
+        model_ready = await self._probe_model_ready(base_url)
+        if model_ready:
+            await self.dao.update_health(
+                deployment_id,
+                instance_count=max(int(deployment.get("instance_count", 1) or 1), 1),
+                healthy=True,
+                base_url=base_url,
+            )
+            return
+        age = int(time.time()) - int(deployment.get("created_at", 0) or 0)
+        db_status = deployment.get("status", "")
+        if db_status == "deploying" and age < DEFAULT_INITIAL_LOAD_GRACE:
+            return
+        await self._on_failed_probe(
+            deployment,
+            reason=(
+                f"manual model_ready=False base_url={base_url!r} "
+                f"age={age}s db_status={db_status}"
+            ),
+        )
+
     async def _on_failed_probe(
         self, deployment: Dict[str, Any], *, reason: str
     ) -> None:
@@ -713,7 +759,8 @@ class TargonDeployerService:
         self, deployment: Dict[str, Any], *, reason: str
     ) -> None:
         deployment_id = deployment["deployment_id"]
-        await self.client.delete_deployment(deployment_id)
+        if not self._is_manual_deployment(deployment_id):
+            await self.client.delete_deployment(deployment_id)
         await self.dao.mark_deleted(deployment_id)
         logger.warning(
             f"Released Targon {deployment_id} "
