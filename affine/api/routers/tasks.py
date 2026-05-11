@@ -137,6 +137,8 @@ if config.SERVICES_ENABLED:
         # These indicate model limitations rather than temporary failures
         ZERO_SCORE_ERROR_PATTERNS = [
             "is longer than the model",
+            "exceeds the maximum allowed length",
+            "exceeds the maximum context length",
         ]
         
         # Check if error matches any zero-score patterns
