@@ -183,32 +183,12 @@ class ChampionChallenge:
         """
         min_windows = self.config.PARETO_MIN_WINDOWS
 
-        # Phase 3a-1: Champion strict-dominates check.
-        # If champion exceeds a miner by margin in ALL envs, terminate
-        # immediately — no point continuing to challenge.
-        # Compare with miner as A (incumbent) and champion as B (challenger),
-        # so b_dominates_a means "champion beats miner by margin in every env".
-        if champion_miner and champion_uid is not None:
-            for uid, m in miners.items():
-                if uid == champion_uid or m.challenge_status == 'terminated':
-                    continue
-                if not self._meets_per_env_threshold(
-                        champion_miner, m, environments,
-                        env_sampling_counts, min_windows):
-                    continue
-                cmp = self.pareto._compare_miners(
-                    m, champion_miner, environments, "champion_dominance",
-                    min_dominant_envs=0)  # strict: ALL envs
-                if cmp.b_dominates_a:  # champion actively beats miner in every env
-                    m.challenge_status = 'terminated'
-                    detail = ','.join(
-                        f'{e}:{d.get("a_score",0):.3f}vs{d.get("b_score",0):.3f}{"✗" if d.get("winner")!="A" else "✓"}'
-                        for e, d in cmp.env_comparisons.items() if d.get("winner"))
-                    m.termination_reason = f'dominated_by_champion:{champion_miner.hotkey[:10]}|{detail}'
-                    logger.info(f"CHAMPION DOMINANCE: UID {uid} terminated "
-                                f"(champion exceeds by margin in all envs)")
-
-        # Phase 3a-2: Non-champion pairwise Pareto dominance.
+        # Phase 3a: Non-champion pairwise Pareto dominance.
+        # Champion is excluded from Pareto dominance — it only acts as the
+        # defender in Phase 3b challenges. Killing a miner via champion
+        # strict-dominance can terminate a model that is still capable of
+        # winning ≥1 env vs the champion (i.e., a legitimate challenger),
+        # which is incorrect: dethrone eligibility is decided in 3b alone.
         eligible = sorted(
             (
                 (uid, m) for uid, m in miners.items()
