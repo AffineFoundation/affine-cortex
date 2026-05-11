@@ -101,6 +101,12 @@ class TargonDeployerService:
         self.max_deployments = max(1, max_deployments)
         self.orphan_sweep_interval = DEFAULT_ORPHAN_SWEEP_INTERVAL
         self._last_orphan_sweep_at = 0
+        # Floor for the unhealthy_for clock so a service restart can't
+        # release every deployment that happens to have a stale
+        # last_health_check_at carried over from before the downtime.
+        # We need a fresh DEFAULT_UNHEALTHY_RELEASE_SEC window of failed
+        # probes AFTER startup before a workload is eligible for release.
+        self._service_started_at = int(time.time())
         self._stop_event = asyncio.Event()
 
     async def run(self) -> None:
@@ -662,15 +668,23 @@ class TargonDeployerService:
 
         Release happens iff the deployment has been continuously unhealthy
         for at least DEFAULT_UNHEALTHY_RELEASE_SEC *and* the failure floor
-        is met (avoids releasing on a single blip after a long deployer
-        downtime, where the timestamp gap is misleading).
+        is met. The unhealthy clock is also floored at
+        ``_service_started_at`` so a deployer restart can't immediately
+        release every workload whose stale ``last_health_check_at`` is
+        already past the release threshold — after a restart the clock
+        starts over and the deployer has to observe a fresh
+        DEFAULT_UNHEALTHY_RELEASE_SEC of failed probes before tearing
+        anything down.
         """
         deployment_id = deployment["deployment_id"]
         now = int(time.time())
-        last_healthy_at = (
-            int(deployment.get("last_health_check_at", 0) or 0)
-            or int(deployment.get("created_at", 0) or 0)
-            or now
+        last_healthy_at = max(
+            (
+                int(deployment.get("last_health_check_at", 0) or 0)
+                or int(deployment.get("created_at", 0) or 0)
+                or now
+            ),
+            self._service_started_at,
         )
         unhealthy_for = max(0, now - last_healthy_at)
         next_failures = int(deployment.get("consecutive_failures", 0) or 0) + 1
