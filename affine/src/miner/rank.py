@@ -108,18 +108,6 @@ class RankedMiner:
     invalid_reason: Optional[str]
 
     @property
-    def is_cold(self) -> bool:
-        # Challenge state preserved across cold/hot cycles, so a miner can sit
-        # in 'sampling' indefinitely without producing samples. Flag that as
-        # cold so operators can tell it apart from actively-sampled miners.
-        return (
-            not self.is_champion
-            and self.status == "sampling"
-            and self.is_valid is not False  # invalid miners get their own bucket
-            and self.total_samples == 0
-        )
-
-    @property
     def is_invalid(self) -> bool:
         # validator-side invalidation (anticopy, model_mismatch, repo-name,
         # etc.) — sampling scheduler stops sampling these via is_valid filter,
@@ -196,22 +184,14 @@ format_targon = format_boost
 
 
 def sort_key(m: RankedMiner) -> tuple:
-    """Champion → active sampling (highest CP first) → cold → invalid → terminated."""
+    """Champion → sampling (highest CP first) → invalid → terminated."""
     if m.is_champion:
         return (0,)
     if m.status == "terminated":
-        return (4, -m.total_losses, -m.checkpoints_passed)
+        return (3, -m.total_losses, -m.checkpoints_passed)
     if m.is_invalid:
-        # validator-side rejection (anticopy / model_mismatch / repo-name /
-        # …): not in the competition anymore even though challenge_status
-        # might still read 'sampling' — group below cold but above
-        # challenge-terminated so operators can spot them as a distinct
-        # bucket.
-        return (3, -m.checkpoints_passed, -m.average_score)
-    if m.is_cold:
         return (2, -m.checkpoints_passed, -m.average_score)
-    # Active sampling: closeness to dethrone, then checkpoint depth, then avg
-    # Sort by checkpoint progress (closest to dethrone first), then avg score
+    # Sampling: by checkpoint progress (closest to dethrone first), then avg.
     return (1, -m.checkpoints_passed, -m.average_score)
 
 
@@ -439,10 +419,6 @@ async def print_rank_table():
                 # operators drill in via `af get-miner <uid>` for the
                 # full invalid_reason if they need it.
                 challenge_str = (detail[:11] if detail else "—")
-            elif m.is_cold:
-                status_str = "cold"
-                cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"
-                challenge_str = "—"
             else:
                 status_str = "sampling"
                 cp_str = f"{m.checkpoints_passed}/{dethrone_cp}"
@@ -463,10 +439,9 @@ async def print_rank_table():
 
         # ── Footer ────────────────────────────────────────────────────────
         print("=" * table_width, flush=True)
-        cold_count = sum(1 for m in miners if m.is_cold)
         sampling_count = sum(
             1 for m in miners
-            if m.status == "sampling" and not m.is_champion and not m.is_cold
+            if m.status == "sampling" and not m.is_champion and not m.is_invalid
         )
         terminated_count = sum(1 for m in miners if m.status == "terminated")
 
@@ -479,7 +454,7 @@ async def print_rank_table():
 
         print(
             f"Total: {len(miners)}  |  {champ_summary}  |  "
-            f"Sampling: {sampling_count}  |  Cold: {cold_count}  |  "
+            f"Sampling: {sampling_count}  |  "
             f"Terminated: {terminated_count}",
             flush=True,
         )
