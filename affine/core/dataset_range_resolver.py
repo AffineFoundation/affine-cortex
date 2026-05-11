@@ -44,7 +44,7 @@ def _build_range(value: int, range_type: str) -> List[List[int]]:
     """Build dataset_range from extracted value and range_type.
 
     Supported range_types:
-        - "zero_to_value": [[0, value - 1]]  (0-indexed inclusive range)
+        - "zero_to_value": [[0, value]]  (exclusive end, covers IDs 0..value-1)
 
     Args:
         value: The extracted integer value
@@ -56,7 +56,7 @@ def _build_range(value: int, range_type: str) -> List[List[int]]:
     if range_type == "zero_to_value":
         if value <= 0:
             return [[0, 0]]
-        return [[0, value - 1]]
+        return [[0, value]]
 
     raise ValueError(f"Unknown range_type: {range_type}")
 
@@ -106,7 +106,7 @@ def expand_dataset_range(
     - Then compact to enforce min_segment_size and max_segments
     """
     if range_type == "zero_to_value":
-        new_end = new_value - 1
+        new_end = new_value
         if new_end <= 0:
             return None
 
