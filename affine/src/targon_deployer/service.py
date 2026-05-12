@@ -162,14 +162,20 @@ class TargonDeployerService:
         burns GPU on miners no one is actually sampling. UID 187's
         anticopy case is the canonical example.
 
-        Why is_valid applies to champion too: dethrone-protection is
-        meant to ride out a *transient Chutes blip* — short hiccups
-        in the network/CDN. validator-side invalidation (anticopy,
-        repo-name) is deterministic, not transient, and sampling
-        scheduler stops sampling the champion anyway. Keeping the
-        deployment costs GPU-hours for nothing. Once is_valid flips
-        back to 'true', the deployer recreates the slot on the next
-        reconcile.
+        Why champion bypasses is_valid / chute_status entirely:
+        ``system_config.champion`` is updated only on a real dethrone
+        (champion_challenge writes the new winner) or permanent
+        termination (miners-monitor flips challenge_status='terminated'
+        and the scorer subsequently re-elects). Both of those are
+        explicit, durable events. A transient chute_fetch_failed /
+        chute_not_hot / hf_model_fetch_failed flips is_valid='false'
+        for one refresh cycle and recovers on the next, but with the
+        old gate the deployer auto-released the champion's slot in
+        between — and then on recovery had to recreate via Targon API,
+        burning queue time on an unrelated GPU pool and dropping
+        acceleration for the most important miner in the system. So
+        long as ``system_config.champion`` still points at this hotkey,
+        keep the slot.
 
         Why Chutes-hot is a hard filter for challengers: a cold Chutes
         is the cheapest "miner has effectively dropped offline" signal
@@ -208,12 +214,7 @@ class TargonDeployerService:
             is_valid_by_hotkey[hk] = str(m.get("is_valid") or "").lower() == "true"
 
         champion = await self.config_dao.get_param_value("champion", default=None)
-        if (
-            champion
-            and champion.get("hotkey")
-            and champion.get("revision")
-            and is_valid_by_hotkey.get(champion["hotkey"], False)
-        ):
+        if champion and champion.get("hotkey") and champion.get("revision"):
             champ_key = (champion["hotkey"], champion["revision"])
             targets.append((champ_key[0], champ_key[1], "champion"))
             seen.add(champ_key)
