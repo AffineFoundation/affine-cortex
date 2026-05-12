@@ -158,18 +158,6 @@ class AntiCopyService:
 
     async def _run_detection(self):
         """Run one round of copy detection."""
-        # Detection is OFF by default while the LOGPROBS env is being
-        # reworked (n_tokens=20 plus template-heavy prompts gives near-1.0
-        # logprob cosine even for legitimate fine-tunes of the same base).
-        # Set ANTICOPY_ENABLED=1 to re-enable after the env is updated and
-        # detector thresholds are recalibrated. No DB writes happen while
-        # disabled, so existing anti_copy_results rows are NOT refreshed —
-        # they will age out via TTL or need manual cleanup.
-        import os
-        if os.getenv("ANTICOPY_ENABLED", "0") != "1":
-            logger.info("[AntiCopy] disabled by default (set ANTICOPY_ENABLED=1 to enable), skipping detection")
-            return
-
         miners = await self._fetch_miners()
         if len(miners) < 2:
             logger.warning("[AntiCopy] Not enough miners for comparison, skipping")
