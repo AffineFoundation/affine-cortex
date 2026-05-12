@@ -32,7 +32,7 @@
       }
     },
     "LOGPROBS": {
-      "enabled_for_sampling": true,
+      "enabled_for_sampling": false,
       "enabled_for_scoring": false,
       "sampling_config": {
         "dataset_range": [[100000000, 300000000], [400000000, 500000000]],
