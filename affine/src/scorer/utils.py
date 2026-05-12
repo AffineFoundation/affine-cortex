@@ -1,9 +1,4 @@
-"""
-Scorer Utility Functions
-"""
-
 from typing import List
-
 
 def geometric_mean(values: List[float], epsilon: float = 0.0) -> float:
     """Geometric mean with optional epsilon smoothing.
@@ -21,17 +16,15 @@ def geometric_mean(values: List[float], epsilon: float = 0.0) -> float:
     """
     if not values:
         return 0.0
+
+    product = 1.0
     n = len(values)
 
-    if epsilon > 0:
-        product = 1.0
-        for v in values:
-            product *= (v + epsilon)
-        return max(product ** (1.0 / n) - epsilon, 0.0)
-
-    if any(v <= 0 for v in values):
-        return 0.0
-    product = 1.0
     for v in values:
+        if epsilon > 0:
+            v += epsilon
+        if v <= 0:
+            return 0.0
         product *= v
-    return product ** (1.0 / n)
+
+    return product ** (1.0 / n) - (epsilon if epsilon > 0 else 0.0)
