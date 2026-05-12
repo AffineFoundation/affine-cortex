@@ -107,19 +107,6 @@ services:
       - /var/log/affine/targon_deployer:/var/log/affine/targon_deployer
     command: ["-v", "servers", "targon-deployer"]
 
-  # Anti-Copy Detection - Model copy detection service
-  anticopy:
-    image: affinefoundation/affine:latest
-    container_name: affine-anticopy
-    restart: unless-stopped
-    mem_reservation: "2g"
-    mem_limit: "4g"
-    env_file:
-      - .env
-    volumes:
-      - /var/log/affine/anticopy:/var/log/affine/anticopy
-    command: ["-v", "servers", "anticopy"]
-
   # Scorer - Weight calculation service
   scorer:
     image: affinefoundation/affine:latest
@@ -146,7 +133,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 30 affine-api affine-scheduler affine-executor affine-teacher affine-monitor affine-anticopy affine-scorer affine-targon-deployer
+    command: --interval 30 affine-api affine-scheduler affine-executor affine-teacher affine-monitor affine-scorer affine-targon-deployer
 
 networks:
   default:

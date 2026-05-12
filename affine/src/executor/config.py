@@ -8,6 +8,9 @@ ENV_MAX_CONCURRENT = {
     "LGC-v2": 300,
     "LIVEWEB": 50,
     "NAVWORLD": 100,
+    "SWE-PRO": 80,
+    "SWE-SYNTH": 80,
+    "SWE-INFINITE": 80,
 }
 
 # Default max concurrent tasks if environment not found in config
