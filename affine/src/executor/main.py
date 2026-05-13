@@ -122,7 +122,7 @@ class ExecutorManager:
         separately) and per-env in-flight from the shared
         ``in_flight_values`` Values. Format:
 
-            [STATUS] running=N/480 | env@done/target +delta in Xs rate:Y/h
+            [STATUS] running=N/GLOBAL_DISPATCH_BUDGET | env@done/target +delta in Xs rate:Y/h
                 run:R | env2@... | total +D in Xs rate:Y/h
 
         First print after start is the baseline (delta+rate omitted).
@@ -223,22 +223,19 @@ async def _enabled_envs() -> List[str]:
 
 
 async def _env_concurrency_caps(envs: List[str]) -> Dict[str, int]:
-    """Read ``EnvConfig.max_concurrent`` for the named envs. Returns a
-    dict of only the envs that have a positive cap configured."""
+    """Read ``EnvConfig.max_concurrent`` for the named envs via the
+    shared ``_env_from_payload`` parser. Returns a dict of only the
+    envs that have a positive cap configured — sharing the parser
+    keeps the int/bool/str validation in one place."""
+    from affine.src.scorer.window_state import _env_from_payload
+
     config_dao = SystemConfigDAO()
     envs_raw = await config_dao.get_param_value("environments", default={}) or {}
     out: Dict[str, int] = {}
     for name in envs:
-        cfg = envs_raw.get(name) or {}
-        sampling = cfg.get("sampling") or cfg.get("window_config") or {}
-        raw = sampling.get("max_concurrent")
-        cap: Optional[int] = None
-        if isinstance(raw, int) and raw > 0:
-            cap = raw
-        elif isinstance(raw, str) and raw.isdigit() and int(raw) > 0:
-            cap = int(raw)
-        if cap is not None:
-            out[name] = cap
+        cfg = _env_from_payload(envs_raw.get(name))
+        if cfg.max_concurrent:
+            out[name] = cfg.max_concurrent
     return out
 
 
