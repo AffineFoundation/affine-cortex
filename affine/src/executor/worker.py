@@ -43,7 +43,7 @@ class ExecutorWorker:
         max_concurrent: int = 60,
         poll_interval_sec: float = 5.0,
         idle_sleep_sec: float = 10.0,
-        warmup_sec: float = 60.0,
+        warmup_sec: float = 180.0,
     ):
         self.worker_id = worker_id
         self.env = env
@@ -51,9 +51,13 @@ class ExecutorWorker:
         self.poll_interval_sec = poll_interval_sec
         self.idle_sleep_sec = idle_sleep_sec
         # ``warmup_sec``: env containers report "ready" before they are
-        # fully serving — the affinetes pool finishes deploy / ssh tunnel
-        # setup but the env's own app boot can lag. Sleep before the first
-        # tick so the initial batch doesn't hit a half-cold container.
+        # fully serving — affinetes finishes SSH tunnel + container startup
+        # but the env's own app-level init (e.g. liveweb's Stooq lock /
+        # cache build, memorygym worker boot) can still be running. With
+        # 60s the first tick after a restart historically slammed into the
+        # tail of that init and produced a flood of empty ReadErrors;
+        # 180s gives external data sources + uvicorn worker fanout enough
+        # time to settle.
         self.warmup_sec = warmup_sec
 
         self.running = False
