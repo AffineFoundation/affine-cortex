@@ -216,7 +216,9 @@ async def _run() -> None:
     await init_client()
     envs = await _enabled_envs()
     if not envs:
-        logger.error("executor: no enabled envs in system_config.environments")
+        logger.error(
+            "executor: no sampling-enabled envs in system_config.environments"
+        )
         return
 
     manager = ExecutorManager(envs=envs, verbosity=1)

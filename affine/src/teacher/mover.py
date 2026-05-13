@@ -113,9 +113,9 @@ class TeacherMover:
         The queue-window refactor removed per-env ``rotation_interval`` /
         ``rotation_count`` from SystemConfig; the mover now drives its
         own cadence via ``MOVER_PROMOTE_INTERVAL_SEC`` /
-        ``MOVER_PROMOTE_COUNT`` module constants. The only field we
-        still consult on the DISTILL env is its ``enabled`` flag, which
-        we honor so the mover pauses when DISTILL is paused.
+        ``MOVER_PROMOTE_COUNT`` module constants. The only environment
+        gate it honors is ``enabled_for_sampling``: if DISTILL is not
+        sampling, the public bucket should not keep rotating fresh tasks.
         """
         try:
             environments = await self._config_dao.get_param_value(
@@ -312,7 +312,7 @@ class TeacherMover:
             f"public={self.public_bucket} "
             f"(interval={MOVER_PROMOTE_INTERVAL_SEC}s, "
             f"count={MOVER_PROMOTE_COUNT}, gated by "
-            f"SystemConfig.environments.{DISTILL_ENV_KEY}.enabled)"
+            f"SystemConfig.environments.{DISTILL_ENV_KEY}.enabled_for_sampling)"
         )
         self.running = True
         while self.running:
@@ -328,7 +328,7 @@ class TeacherMover:
             interval_sec, target_count, enabled = cfg
             if not enabled:
                 logger.info(
-                    f"[MOVER] {DISTILL_ENV_KEY}.enabled is false, "
+                    f"[MOVER] {DISTILL_ENV_KEY}.enabled_for_sampling is false, "
                     f"pausing for {interval_sec}s"
                 )
                 await self._sleep_interruptible(interval_sec)

@@ -150,7 +150,7 @@ class FlowScheduler:
     async def tick(self, current_block: int) -> None:
         envs = await self.state.get_environments()
         if not envs:
-            logger.warning("FlowScheduler: no enabled envs; skipping tick")
+            logger.warning("FlowScheduler: no sampling-enabled envs; skipping tick")
             return
 
         battle = await self.state.get_battle()

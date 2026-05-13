@@ -134,10 +134,10 @@ class SystemConfigDAO(BaseDAO):
     
     # Environment Configuration Management
     #
-    # The queue-window flow has a single ``enabled`` flag per env; the old
-    # split between ``enabled_for_sampling`` and ``enabled_for_scoring`` is
-    # gone. ``WindowStateStore.get_environments()`` is the only consumer
-    # and filters by ``enabled`` directly, so no helper here.
+    # Environment rows use two independent gates:
+    #   enabled_for_sampling controls task-id materialization/executor work.
+    #   enabled_for_scoring controls DECIDE/rank score columns.
+    # The legacy ``enabled`` key is accepted by StateStore as a sampling alias.
 
     # Blacklist Configuration Management
     
