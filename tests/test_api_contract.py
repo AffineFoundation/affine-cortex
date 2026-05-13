@@ -82,6 +82,9 @@ class _FakeSystemConfigDAO:
     async def get_param(self, key):
         return self.rows.get(key)
 
+    async def get_param_value(self, key, default=None):
+        return self.rows.get(key, default)
+
 
 def test_public_server_does_not_mount_internal_logs_by_default():
     from affine.api.server import app
@@ -269,6 +272,11 @@ async def test_scores_latest_filters_to_current_miners(monkeypatch):
             },
         }),
     )
+    monkeypatch.setattr(
+        scores_router,
+        "SystemConfigDAO",
+        lambda: _FakeSystemConfigDAO({}),
+    )
 
     response = await get_latest_scores(
         top=256,
@@ -305,6 +313,71 @@ async def test_scores_latest_filters_to_current_miners(monkeypatch):
     assert [row.uid for row in response.scores] == [7]
     assert response.scores[0].challenge_status == "terminated"
     assert response.scores[0].termination_reason == "lost_to_champion:abc"
+
+
+@pytest.mark.asyncio
+async def test_scores_latest_filters_disabled_scoring_envs(monkeypatch):
+    monkeypatch.setattr(
+        scores_router,
+        "MinersDAO",
+        lambda: _FakeMinersDAO({
+            ("uid", 7): {
+                "uid": 7,
+                "hotkey": "current-hk",
+                "revision": "current-rev",
+                "is_valid": "true",
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        scores_router,
+        "MinerStatsDAO",
+        lambda: _FakeMinerStatsDAO({}),
+    )
+    monkeypatch.setattr(
+        scores_router,
+        "SystemConfigDAO",
+        lambda: _FakeSystemConfigDAO({
+            "environments": {
+                "SWE": {
+                    "enabled_for_sampling": True,
+                    "enabled_for_scoring": True,
+                    "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]]},
+                },
+                "DISTILL": {
+                    "enabled_for_sampling": True,
+                    "enabled_for_scoring": False,
+                    "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]]},
+                },
+            },
+        }),
+    )
+
+    response = await get_latest_scores(
+        top=256,
+        dao=_FakeScoresDAO({
+            "block_number": 123,
+            "calculated_at": 456,
+            "scores": [
+                {
+                    "uid": 7,
+                    "miner_hotkey": "current-hk",
+                    "model_revision": "current-rev",
+                    "model": "org/current",
+                    "first_block": 2,
+                    "overall_score": 1.0,
+                    "average_score": 1.0,
+                    "scores_by_env": {
+                        "SWE": {"score": 0.8},
+                        "DISTILL": {"score": 0.9},
+                    },
+                    "total_samples": 20,
+                },
+            ],
+        }),
+    )
+
+    assert response.scores[0].scores_by_env == {"SWE": {"score": 0.8}}
 
 
 @pytest.mark.asyncio

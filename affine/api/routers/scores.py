@@ -19,8 +19,24 @@ from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
+from affine.database.dao.system_config import SystemConfigDAO
+from affine.src.scorer.window_state import StateStore
 
 router = APIRouter(prefix="/scores", tags=["Scores"])
+
+
+class _StaticConfigStore:
+    def __init__(self, data: dict):
+        self._data = data
+
+    async def get(self, key: str, default=None):
+        return self._data.get(key, default)
+
+    async def set(self, key: str, value) -> None:
+        self._data[key] = value
+
+    async def delete(self, key: str) -> bool:
+        return self._data.pop(key, None) is not None
 
 
 async def _build_validity_map() -> dict:
@@ -58,6 +74,28 @@ async def _build_validity_map() -> dict:
     return out
 
 
+async def _scoring_env_names() -> set[str] | None:
+    raw = await SystemConfigDAO().get_param_value("environments", default=None)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return set()
+    envs = await StateStore(_StaticConfigStore({"environments": raw})).get_scoring_environments()
+    return set(envs.keys())
+
+
+def _filter_scores_by_env(scores_by_env, scoring_envs: set[str] | None):
+    if not isinstance(scores_by_env, dict):
+        return {}
+    if scoring_envs is None:
+        return scores_by_env
+    return {
+        env: payload
+        for env, payload in scores_by_env.items()
+        if env in scoring_envs
+    }
+
+
 @router.get("/latest", response_model=ScoresResponse, dependencies=[Depends(rate_limit_read)])
 async def get_latest_scores(
     top: int = Query(32, description="Return top N miners by score", ge=1, le=256),
@@ -86,6 +124,7 @@ async def get_latest_scores(
         scores_list = scores_data.get("scores", [])
         
         validity = await _build_validity_map()
+        scoring_envs = await _scoring_env_names()
         scores_list = [
             s for s in scores_list
             if s.get("miner_hotkey") in validity
@@ -109,7 +148,9 @@ async def get_latest_scores(
                 first_block=s.get("first_block"),
                 overall_score=s.get("overall_score"),
                 average_score=s.get("average_score"),
-                scores_by_env=s.get("scores_by_env"),
+                scores_by_env=_filter_scores_by_env(
+                    s.get("scores_by_env"), scoring_envs,
+                ),
                 total_samples=s.get("total_samples"),
                 is_valid=is_valid,
                 invalid_reason=invalid_reason,
@@ -182,6 +223,7 @@ async def get_score_by_uid(
         is_valid, invalid_reason, challenge_status, termination_reason = (
             await _build_validity_map()
         ).get(hk, (None, None, None, None))
+        scoring_envs = await _scoring_env_names()
         return MinerScore(
             miner_hotkey=hk,
             uid=miner_score.get("uid"),
@@ -190,7 +232,9 @@ async def get_score_by_uid(
             first_block=miner_score.get("first_block"),
             overall_score=miner_score.get("overall_score"),
             average_score=miner_score.get("average_score"),
-            scores_by_env=miner_score.get("scores_by_env"),
+            scores_by_env=_filter_scores_by_env(
+                miner_score.get("scores_by_env"), scoring_envs,
+            ),
             total_samples=miner_score.get("total_samples"),
             is_valid=is_valid,
             invalid_reason=invalid_reason,
