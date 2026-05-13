@@ -1,10 +1,12 @@
 """
 ``af servers executor`` — manager that spawns one subprocess per env.
 
-The manager process owns nothing performance-critical: it spawns N
+The manager process does very little hot-path work: it spawns N
 ``WorkerProcess`` instances (one per enabled env), restarts them if
-they die, and aggregates stats reported via a multiprocessing.Queue.
-All actual sampling lives in the subprocesses.
+they die, prints a periodic ``[STATUS]`` line for operators, and owns
+the cross-process IPC primitives (``BoundedSemaphore`` for global
+dispatch budget; one ``Value(c_int)`` per env for live in-flight
+read-back).
 
 Each subprocess has its own asyncio loop + SDKEnvironment (Docker +
 SSH tunnel + paramiko Transport), so paramiko thread budget and
@@ -15,7 +17,6 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
-import queue
 import signal
 from typing import Any, Dict, List
 
@@ -31,7 +32,6 @@ from affine.src.scorer.dao_adapters import SampleResultsAdapter
 
 
 HEALTH_CHECK_INTERVAL_SEC = 10
-STATS_DRAIN_INTERVAL_SEC = 0.2
 STATUS_PRINT_INTERVAL_SEC = 30
 
 
@@ -40,7 +40,6 @@ class ExecutorManager:
         self.envs = envs
         self.verbosity = verbosity
         self.mp_ctx = multiprocessing.get_context("spawn")
-        self.stats_queue: multiprocessing.Queue = self.mp_ctx.Queue()
         # Single cross-process bounded semaphore = the real concurrency
         # gate. Sized to the b300 saturation point so the inference
         # backend is the bottleneck (where we want it). Workers
@@ -56,7 +55,6 @@ class ExecutorManager:
             env: self.mp_ctx.Value("i", 0, lock=False) for env in envs
         }
         self.workers: List[WorkerProcess] = []
-        self.aggregated: Dict[str, Dict[str, Any]] = {}
         # Per-env running totals from the prior status print, used to
         # compute "finished in last interval" + rate/h.
         self._last_status_at: float = 0.0
@@ -73,7 +71,6 @@ class ExecutorManager:
         for idx, env in enumerate(self.envs):
             wp = WorkerProcess(
                 worker_id=idx, env=env,
-                stats_queue=self.stats_queue,
                 global_sem=self.global_sem,
                 in_flight_value=self.in_flight_values[env],
                 max_concurrent=get_max_concurrent(env),
@@ -82,7 +79,6 @@ class ExecutorManager:
             wp.start()
             self.workers.append(wp)
         self.running = True
-        asyncio.create_task(self._stats_collector())
         asyncio.create_task(self._health_checker())
         asyncio.create_task(self._status_printer())
         logger.info(f"Spawned {len(self.workers)} worker subprocesses")
@@ -95,17 +91,6 @@ class ExecutorManager:
             except Exception as e:
                 logger.warning(f"terminate({wp.env}) raised: {e}")
         self.workers.clear()
-
-    async def _stats_collector(self) -> None:
-        while self.running:
-            try:
-                payload = self.stats_queue.get_nowait()
-            except queue.Empty:
-                await asyncio.sleep(STATS_DRAIN_INTERVAL_SEC)
-                continue
-            env = payload.get("env")
-            if env:
-                self.aggregated[env] = payload
 
     async def _health_checker(self) -> None:
         while self.running:

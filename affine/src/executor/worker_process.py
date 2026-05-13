@@ -19,7 +19,6 @@ def run_worker_subprocess(
     worker_id: int,
     env: str,
     max_concurrent: int,
-    stats_queue: multiprocessing.Queue,
     global_sem: Any,
     in_flight_value: Any,
     verbosity: int = 1,
@@ -81,7 +80,6 @@ class WorkerProcess:
         self,
         worker_id: int,
         env: str,
-        stats_queue: multiprocessing.Queue,
         global_sem: Any,
         in_flight_value: Any,
         *,
@@ -91,7 +89,6 @@ class WorkerProcess:
         self.worker_id = worker_id
         self.env = env
         self.max_concurrent = max_concurrent
-        self.stats_queue = stats_queue
         self.global_sem = global_sem
         self.in_flight_value = in_flight_value
         self.verbosity = verbosity
@@ -102,7 +99,7 @@ class WorkerProcess:
         self._proc = ctx.Process(
             target=run_worker_subprocess,
             args=(self.worker_id, self.env, self.max_concurrent,
-                  self.stats_queue, self.global_sem, self.in_flight_value,
+                  self.global_sem, self.in_flight_value,
                   self.verbosity),
             name=f"executor-{self.env}",
             daemon=False,
