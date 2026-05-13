@@ -325,12 +325,6 @@ def _print_rank_table(
         f"  |  Queue head: {queue_count}  |  Valid: {valid}  |  Invalid: {invalid}"
     )
     print(f"Sampling: {_ansi('⚡', '1;92')} marks miners in the current live sampling set")
-    if queue:
-        head = ", ".join(
-            f"#{row.get('position')} UID {row.get('uid')}"
-            for row in queue[:_QUEUE_PREVIEW]
-        )
-        print(f"Queue: {head}")
     print(_ansi("=" * width, "2"))
 
 async def get_rank_command() -> None:
