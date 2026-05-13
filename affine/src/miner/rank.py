@@ -154,6 +154,14 @@ def _status_for(
     return "VALID"
 
 
+def _reason_for(row: Dict[str, Any], status: str) -> str:
+    if status == "TERMINATED":
+        return _short(row.get("termination_reason"), 18)
+    if row.get("is_valid") is False:
+        return _short(row.get("invalid_reason"), 18)
+    return ""
+
+
 def _colored_status(status: str, *, is_invalid: bool) -> str:
     text = f"{status:>11}"
     if status == "CHAMPION":
@@ -247,7 +255,7 @@ def _print_rank_table(
 
     header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
     header_parts.extend(f"{env[:24]:>24}" for env in envs)
-    header_parts.extend(["  Status   ", " Weight "])
+    header_parts.extend(["  Status   ", " Reason           ", " Weight "])
     header_line = " | ".join(header_parts)
     width = max(88, len(header_line))
 
@@ -310,6 +318,7 @@ def _print_rank_table(
             row_parts.append(f"{_env_cell(scores_by_env.get(env), live_count):>24}")
         row_parts.extend([
             _colored_status(status, is_invalid=(row.get("is_valid") is False)),
+            f"{_reason_for(row, status):18s}",
             f"{_as_float(row.get('overall_score')):>7.4f}",
         ])
         print(" | ".join(row_parts))

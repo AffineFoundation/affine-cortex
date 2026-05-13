@@ -111,6 +111,7 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     assert "Battle:     UID 2" in out
     assert "Hotkey" in out
     assert "⚡| Model" in out
+    assert "Reason" in out
     assert " Valid " not in out
     assert "CHAMPION" in out
     assert "BATTLING" in out
@@ -156,6 +157,7 @@ def test_rank_table_groups_invalid_miners_below_valid_rows():
 
     assert out.index("good") < out.index("bad")
     assert "model_misma" in out
+    assert "model_mismatch:de" in out
 
 
 def test_rank_table_sorts_miners_by_status_then_uid_not_score():
@@ -187,6 +189,7 @@ def test_rank_table_sorts_miners_by_status_then_uid_not_score():
                 "is_valid": False,
                 "invalid_reason": "hf_model_fetch_failed",
                 "challenge_status": "terminated",
+                "termination_reason": "lost_to_champion:abc",
                 "scores_by_env": {},
             },
             {
@@ -208,7 +211,7 @@ def test_rank_table_sorts_miners_by_status_then_uid_not_score():
     assert out.index("uid9") < out.index("terminated")
     assert out.index("terminated") < out.index("invalid")
     assert "TERMINATED" in out
-    assert "hf_model_fe" not in out
+    assert "lost_to_champion:" in out
 
 
 def test_rank_table_shows_terminated_for_terminated_status():
