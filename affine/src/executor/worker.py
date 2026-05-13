@@ -61,6 +61,12 @@ class ExecutorWorker:
 
     async def initialize(self) -> None:
         safe_log(f"[{self.env}] worker init", "INFO")
+        # Each subprocess (spawn context) starts with a fresh Python module
+        # state — the parent process's init_client() doesn't carry over.
+        # Initialize the DynamoDB client here so the first DAO call doesn't
+        # raise ``RuntimeError("DynamoDB client not initialized")``.
+        from affine.database import init_client
+        await init_client()
         self._state = StateStore(
             SystemConfigKVAdapter(
                 SystemConfigDAO(), updated_by=f"executor-{self.env}",
