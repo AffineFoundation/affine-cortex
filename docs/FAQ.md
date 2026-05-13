@@ -91,7 +91,7 @@ The validator can be configured with a `validator_burn_percentage` (in `system_c
 **Q13: How can I see the live state?**
 
 ```
-af get-rank      # one-stop: window state + queue head + weights table
+af get-rank      # one-stop rank/status table
 af get-scores    # top-N scores from the latest snapshot
 af get-score 42  # one miner's score
 af get-weights   # latest normalized weights (what the validator sets on chain)

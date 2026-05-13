@@ -5,7 +5,7 @@ Provides the CLI surface miners use to participate:
   - pull          : fetch a UID's committed model from HuggingFace
   - commit        : write {model, revision} on chain (one-shot per hotkey)
   - miner-deploy  : convenience wrapper (HF upload → commit)
-  - get-rank      : one-stop status (window + queue + weights)
+  - get-rank      : one-stop status (rank/status table)
   - get-weights / get-scores / get-score / get-miner
 """
 

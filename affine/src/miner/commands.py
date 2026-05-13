@@ -8,7 +8,7 @@ After the queue-window refactor, the miner-side surface is purely:
   - get-weights       : pretty-print the latest weight snapshot
   - get-scores / get-score : score table / single-miner score
   - get-miner         : basic public miner metadata
-  - get-rank          : one-stop status — window state + queue head + weight table
+  - get-rank          : one-stop status — rank/status table
 
 The validator hosts inference per window via the scorer service; miners
 upload to HuggingFace and commit their model snapshot.

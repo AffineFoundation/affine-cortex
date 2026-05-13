@@ -14,8 +14,8 @@ from affine.api.middleware import setup_middleware
 from affine.api.routers import (
     config_router,
     miners_router,
+    rank_router,
     scores_router,
-    windows_router,
 )
 from affine.core.setup import logger
 from affine.database import close_client, init_client
@@ -55,9 +55,9 @@ app = FastAPI(
 
 setup_middleware(app)
 
-# Read-only public endpoints: live state, miner metadata, scores/weights,
+# Read-only public endpoints: rank/status, miner metadata, scores/weights,
 # and public validator configuration.
-app.include_router(windows_router, prefix="/api/v1")
+app.include_router(rank_router, prefix="/api/v1")
 app.include_router(miners_router, prefix="/api/v1")
 app.include_router(scores_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")

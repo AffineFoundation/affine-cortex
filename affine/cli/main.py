@@ -20,7 +20,7 @@ Miner Commands:
 - af get-scores  : Query latest scores for top N miners
 - af get-score   : Query score for a specific miner
 - af get-miner   : Query public miner metadata
-- af get-rank    : Query window + queue + weights table (one-stop)
+- af get-rank    : Query the public rank/status table
 
 Docker Commands:
 - af deploy : Deploy docker containers (validator/backend)
@@ -251,7 +251,7 @@ def get_rank(ctx):
     """Query and display miner ranking table.
 
     Shows the live window state (champion/challenger/phase/progress),
-    the challenger queue head, and the current weight snapshot.
+    the public rank/status snapshot.
 
     Example:
         af get-rank

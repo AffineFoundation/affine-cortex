@@ -379,12 +379,14 @@ def _print_scores(scores_resp: Optional[Dict[str, Any]]) -> None:
 
 async def get_rank_command() -> None:
     async with cli_api_client() as client:
-        window = await _safe_get(client, "/windows/current")
-        queue = await _safe_get(client, f"/windows/queue?limit={_QUEUE_PREVIEW}")
-        scores = await _safe_get(client, f"/scores/latest?top={_RANK_FETCH_LIMIT}")
+        payload = await _safe_get(
+            client,
+            f"/rank/current?top={_RANK_FETCH_LIMIT}&queue_limit={_QUEUE_PREVIEW}",
+        )
+    payload = payload if isinstance(payload, dict) else {}
 
     _print_rank_table(
-        window if isinstance(window, dict) else None,
-        queue if isinstance(queue, list) else None,
-        scores if isinstance(scores, dict) else None,
+        payload.get("window") if isinstance(payload.get("window"), dict) else None,
+        payload.get("queue") if isinstance(payload.get("queue"), list) else None,
+        payload.get("scores") if isinstance(payload.get("scores"), dict) else None,
     )

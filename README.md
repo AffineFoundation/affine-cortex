@@ -52,7 +52,7 @@ Learn how to:
 - Pull models from the network
 - Improve models with reinforcement learning
 - Upload to HuggingFace and commit on-chain (validator hosts inference)
-- Use CLI commands to query rank, queue, and live champion / in-flight battle state
+- Use CLI commands to query public rank/status and miner metadata
 
 ### For Validators
 

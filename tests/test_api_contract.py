@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 import affine.api.routers.config as config_router
+import affine.api.routers.rank as rank_router
 from affine.api.routers.miners import get_miner_by_hotkey, get_miner_by_uid
 from affine.api.routers.logs import get_miner_logs
 from affine.api.routers.scores import get_latest_weights
@@ -56,7 +57,9 @@ def test_public_server_does_not_mount_internal_logs_by_default():
     paths = {route.path for route in app.routes}
     assert "/" in paths
     assert "/api/v1/health" in paths
-    assert "/api/v1/windows/current" in paths
+    assert "/api/v1/rank/current" in paths
+    assert "/api/v1/windows/current" not in paths
+    assert "/api/v1/windows/queue" not in paths
     assert "/api/v1/miners/uid/{uid}" in paths
     assert "/api/v1/miners/hotkey/{hotkey}" in paths
     assert "/api/v1/scores/latest" in paths
@@ -143,6 +146,30 @@ async def test_config_router_blocks_internal_config_keys(monkeypatch):
         await config_router.get_config("current_task_ids")
 
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_rank_router_aggregates_rank_payload(monkeypatch):
+    async def fake_current_state():
+        return {"champion": {"uid": 7}, "sample_counts": {"7": {"SWE": 300}}}
+
+    async def fake_queue(limit):
+        return [{"position": 1, "uid": 8, "limit_seen": limit}]
+
+    async def fake_scores(top, dao):
+        return {"scores": [{"uid": 7}], "top_seen": top}
+
+    monkeypatch.setattr(rank_router, "get_current_state", fake_current_state)
+    monkeypatch.setattr(rank_router, "get_queue", fake_queue)
+    monkeypatch.setattr(rank_router, "get_latest_scores", fake_scores)
+
+    response = await rank_router.get_current_rank(top=32, queue_limit=5)
+
+    assert response == {
+        "window": {"champion": {"uid": 7}, "sample_counts": {"7": {"SWE": 300}}},
+        "queue": [{"position": 1, "uid": 8, "limit_seen": 5}],
+        "scores": {"scores": [{"uid": 7}], "top_seen": 32},
+    }
 
 
 @pytest.mark.asyncio

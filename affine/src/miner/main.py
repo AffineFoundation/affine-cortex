@@ -8,7 +8,7 @@ Surfaced via ``affine/cli/main.py``:
   - get-weights
   - get-scores / get-score
   - get-miner
-  - get-rank      (one-stop: window + queue + weight table)
+  - get-rank      (one-stop: rank/status table)
 """
 
 from __future__ import annotations

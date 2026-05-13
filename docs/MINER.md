@@ -112,7 +112,7 @@ second commit invalidates the miner permanently (see [Multi-commit Rule](#multi-
 
 | Command | What it shows |
 | --- | --- |
-| `af get-rank` | One-stop status — current state (champion + in-flight battle), challenger queue head, and weight snapshot table |
+| `af get-rank` | One-stop public rank/status table |
 | `af get-miner --uid UID` | Public miner metadata: model, revision, validity, queue status, and commit blocks |
 | `af get-weights` | Latest on-chain-bound weights only |
 | `af get-scores --top N` | Top N miners from the latest snapshot |

@@ -246,7 +246,7 @@ af get-weights
 # View top 10 miners
 af get-scores --top 10
 
-# One-stop: window state + queue head + weights table
+# One-stop rank/status table
 af get-rank
 
 # Inspect one miner's public metadata
