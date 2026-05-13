@@ -696,6 +696,145 @@ def delete_endpoint(name):
     asyncio.run(_cmd_delete_endpoint(name))
 
 
+# --------------------------------------------------------------------------- #
+# Sample progress
+# --------------------------------------------------------------------------- #
+
+
+def _parse_duration(spec: str) -> int:
+    """Parse '5m', '2h', '30s', 'all' → seconds (0 = 'all')."""
+    spec = spec.strip().lower()
+    if spec in ("all", "0", ""):
+        return 0
+    unit = spec[-1]
+    if unit not in "smh":
+        return int(spec)
+    n = int(spec[:-1])
+    return n * (1 if unit == "s" else 60 if unit == "m" else 3600)
+
+
+async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
+    """Per-env progress + rate + ETA for the current refresh."""
+    import time
+    from datetime import datetime
+    from affine.database.client import get_client
+    from affine.database.schema import get_table_name
+
+    await init_client()
+    try:
+        win_secs = _parse_duration(window_spec)
+        sc = SystemConfigDAO()
+        dao = SampleResultsDAO()
+        client = get_client()
+        table = get_table_name("sample_results")
+
+        champion = await sc.get_param_value("champion") or {}
+        battle = await sc.get_param_value("current_battle")
+        tids = await sc.get_param_value("current_task_ids") or {}
+        envs = await sc.get_param_value("environments") or {}
+        rb = int(tids.get("refreshed_at_block", 0))
+
+        subjects = []
+        if miner_filter in ("champion", "both") and champion.get("hotkey"):
+            subjects.append(("champion", champion["uid"], champion["hotkey"], champion["revision"]))
+        if miner_filter in ("challenger", "both") and battle:
+            chal = battle.get("challenger") or {}
+            if chal.get("hotkey"):
+                subjects.append(("challenger", chal["uid"], chal["hotkey"], chal["revision"]))
+
+        if not subjects:
+            click.echo("No subjects to report (no champion / battle, or filter excluded all).")
+            return
+
+        win_label = window_spec if win_secs > 0 else "all-time"
+        click.echo(f"refresh_block={rb}  window={win_label}")
+        for role, uid, hk, rev in subjects:
+            click.echo("")
+            click.echo(f"=== {role}  uid={uid}  ({hk[:14]}...@{rev[:8]}) ===")
+            click.echo(f"{'env':<16}{'target':>8}{'done':>7}{'%':>5}  {'pool':>5}  {'rate/min':>10}  {'eta':>8}  {'last_write':>11}")
+
+            now_ms = int(time.time() * 1000)
+            cutoff_ms = now_ms - win_secs * 1000 if win_secs > 0 else 0
+
+            for env_name in sorted(envs.keys()):
+                cfg = envs[env_name]
+                if not cfg.get("enabled"):
+                    click.echo(f"{env_name:<16}{'-':>8}{'-':>7}{'-':>5}  {'-':>5}  {'(disabled)':>10}")
+                    continue
+                target = (cfg.get("sampling") or {}).get("sampling_count", 0)
+                pool = tids.get("task_ids", {}).get(env_name) or []
+                pool_size = len(pool)
+
+                pk = dao._make_pk(hk, rev, env_name)
+                rows = []
+                last_key = None
+                while True:
+                    params = {
+                        "TableName": table,
+                        "KeyConditionExpression": "pk = :pk AND begins_with(sk, :sk)",
+                        "ExpressionAttributeValues": {":pk": {"S": pk}, ":sk": {"S": "TASK#"}},
+                        "ProjectionExpression": "refresh_block, #t",
+                        "ExpressionAttributeNames": {"#t": "timestamp"},
+                    }
+                    if last_key:
+                        params["ExclusiveStartKey"] = last_key
+                    resp = await client.query(**params)
+                    rows.extend(resp.get("Items", []))
+                    last_key = resp.get("LastEvaluatedKey")
+                    if not last_key:
+                        break
+
+                current = [
+                    int(r["timestamp"]["N"]) for r in rows
+                    if "refresh_block" in r and int(r["refresh_block"]["N"]) == rb
+                    and "timestamp" in r
+                ]
+                done = len(current)
+                pct = (100 * done // target) if target else 0
+                last_str = (
+                    datetime.fromtimestamp(max(current) / 1000).strftime("%H:%M:%S")
+                    if current else "—"
+                )
+
+                if win_secs > 0:
+                    in_window = [t for t in current if t >= cutoff_ms]
+                    rate_per_min = len(in_window) / (win_secs / 60.0)
+                else:
+                    rate_per_min = 0.0
+
+                remaining = max(0, target - done)
+                if remaining <= 0:
+                    eta = "done"
+                elif rate_per_min <= 0:
+                    eta = "∞"
+                else:
+                    eta_min = remaining / rate_per_min
+                    eta = f"{eta_min:.0f}m" if eta_min < 60 else f"{eta_min/60:.1f}h"
+
+                click.echo(
+                    f"{env_name:<16}{target:>8}{done:>7}{pct:>4}%  {pool_size:>5}  "
+                    f"{rate_per_min:>8.1f}/m  {eta:>8}  {last_str:>11}"
+                )
+    finally:
+        await close_client()
+
+
+@db.command("sample-progress")
+@click.option("--window", default="5m",
+              help="Rate window: '30s', '5m', '2h', or 'all' (default: 5m)")
+@click.option("--miner", default="champion",
+              type=click.Choice(["champion", "challenger", "both"]),
+              help="Which miner to report (default: champion)")
+def sample_progress(window, miner):
+    """Show per-env sample progress, write rate, and ETA for the current refresh.
+
+    Useful for spotting bottleneck envs — compare rate across envs and
+    see which ones won't finish their sampling_count before the next
+    7200-block refresh.
+    """
+    asyncio.run(_cmd_sample_progress(window, miner))
+
+
 def main():
     db()
 
