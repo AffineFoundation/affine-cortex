@@ -209,10 +209,12 @@ class ExecutorWorker:
                 miner=miner_obj, task_id=task_id,
             )
         except Exception as e:
-            latency_ms = int((time.monotonic() - started) * 1000)
-            logger.warning(
-                f"[{self.env}] task_id={task_id} miner=uid{miner.uid} evaluate raised: "
-                f"{type(e).__name__}: {e}; will retry next tick"
+            latency_s = time.monotonic() - started
+            latency_ms = int(latency_s * 1000)
+            error_brief = str(e).replace("\n", " ").replace("\r", " ")[:200]
+            logger.info(
+                f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
+                f"task_id={task_id:<8} │ {latency_s:6.3f}s │ {type(e).__name__}: {error_brief}"
             )
             self.metrics.record_completion(success=False, latency_ms=latency_ms)
             return
@@ -237,12 +239,12 @@ class ExecutorWorker:
             refresh_block=refresh_block,
         )
         self.metrics.record_completion(success=success, latency_ms=latency_ms)
-        # Observable success signal — without this, docker logs only shows
-        # failures, giving the false impression that nothing is being
-        # written even when sample_results is filling up.
+        # Observable success signal in the legacy executor's line format:
+        # [RESULT] U<uid> │ <env>           │      0.500 │ task_id=12345 │   1.234s
+        latency_s = latency_ms / 1000.0
         logger.info(
-            f"[{self.env}] task_id={task_id} miner=uid{miner.uid} "
-            f"persisted score={score:.4f} success={success} latency={latency_ms}ms"
+            f"[RESULT] U{miner.uid:<4} │ {self.env:<20} │ {score:10.3f} │ "
+            f"task_id={task_id:<8} │ {latency_s:6.3f}s"
         )
 
 
