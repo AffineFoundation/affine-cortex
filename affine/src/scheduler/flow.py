@@ -200,7 +200,14 @@ class FlowScheduler:
             return
 
         # 9. Sufficient overlap — run the contest on overlap task_ids only.
-        await self._decide(champion, battle, envs, task_state, current_block)
+        # The comparator sees only envs whose ``enabled_for_scoring`` is
+        # true; sampling-only envs accumulate data without affecting
+        # DECIDE. Same ``envs`` dict object stays in use for any tick
+        # paths that need the full sampling set.
+        scoring_envs = await self.state.get_scoring_environments()
+        await self._decide(
+            champion, battle, scoring_envs, task_state, current_block,
+        )
 
     # ---- helpers ----------------------------------------------------------
 
@@ -299,7 +306,7 @@ class FlowScheduler:
         Order: ``set_champion`` writes BEFORE ``mark_terminated``. If we
         crashed in between, recovery would read ``system_config.champion``
         on the next tick, see the right miner, and continue. The reverse
-        order would leave us with ``miners[X].challenge_status='champion'``
+        order would leave us with ``miner_stats[X].challenge_status='champion'``
         but ``system_config.champion=None``; recovery's cold_start would
         then skip X (since queue.pick_next filters by status pending) and
         promote the next miner Y instead, stranding X permanently as
@@ -314,7 +321,13 @@ class FlowScheduler:
             since_block=current_block,
         )
         await self.state.set_champion(new_champ)
-        await self.queue.mark_terminated(candidate.uid, OUTCOME_WON)
+        await self.queue.mark_terminated(
+            candidate.uid,
+            OUTCOME_WON,
+            hotkey=candidate.hotkey,
+            revision=candidate.revision,
+            model=candidate.model,
+        )
         logger.info(
             f"FlowScheduler: bootstrap champion = uid {candidate.uid}"
         )
@@ -419,7 +432,14 @@ class FlowScheduler:
             # Used their one shot — mark FAILED so the queue doesn't keep
             # retrying a model the platform can't host.
             from affine.src.scorer.challenger_queue import OUTCOME_FAILED
-            await self.queue.mark_terminated(candidate.uid, OUTCOME_FAILED)
+            await self.queue.mark_terminated(
+                candidate.uid,
+                OUTCOME_FAILED,
+                reason=f"deployment_failed:{type(e).__name__}",
+                hotkey=candidate.hotkey,
+                revision=candidate.revision,
+                model=candidate.model,
+            )
             return
         if self.cfg.single_instance_provider:
             champion.deployment_id = None
@@ -477,7 +497,13 @@ class FlowScheduler:
                 f"for uid={champion.uid}; finalizing bookkeeping without "
                 f"re-running comparator"
             )
-            await self.queue.mark_terminated(champion.uid, OUTCOME_WON)
+            await self.queue.mark_terminated(
+                champion.uid,
+                OUTCOME_WON,
+                hotkey=champion.hotkey,
+                revision=champion.revision,
+                model=champion.model,
+            )
             await self.state.clear_battle()
             return
 
@@ -495,7 +521,14 @@ class FlowScheduler:
                 f"invalidated mid-battle; forcing LOST regardless of scores"
             )
             await self._teardown_record(battle)
-            await self.queue.mark_terminated(battle.challenger.uid, OUTCOME_LOST)
+            await self.queue.mark_terminated(
+                battle.challenger.uid,
+                OUTCOME_LOST,
+                reason="invalidated_mid_battle",
+                hotkey=battle.challenger.hotkey,
+                revision=battle.challenger.revision,
+                model=battle.challenger.model,
+            )
             await self.state.clear_battle()
             return
 
@@ -551,8 +584,21 @@ class FlowScheduler:
             # concurrent reader sees the new identity before either miners
             # row flips.
             await self.state.set_champion(new_champion)
-            await self.queue.mark_terminated(battle.challenger.uid, OUTCOME_WON)
-            await self.queue.mark_terminated(champion.uid, OUTCOME_LOST)
+            await self.queue.mark_terminated(
+                battle.challenger.uid,
+                OUTCOME_WON,
+                hotkey=battle.challenger.hotkey,
+                revision=battle.challenger.revision,
+                model=battle.challenger.model,
+            )
+            await self.queue.mark_terminated(
+                champion.uid,
+                OUTCOME_LOST,
+                reason=f"dethroned_by:{battle.challenger.hotkey[:10]}",
+                hotkey=champion.hotkey,
+                revision=champion.revision,
+                model=champion.model,
+            )
             await self._write_weights(
                 new_champion, current_block, result,
                 previous_champion=champion,
@@ -563,7 +609,14 @@ class FlowScheduler:
             )
         else:
             await self._teardown_record(battle)
-            await self.queue.mark_terminated(battle.challenger.uid, OUTCOME_LOST)
+            await self.queue.mark_terminated(
+                battle.challenger.uid,
+                OUTCOME_LOST,
+                reason=f"lost_to_champion:{champion.hotkey[:10]}:{result.reason}",
+                hotkey=battle.challenger.hotkey,
+                revision=battle.challenger.revision,
+                model=battle.challenger.model,
+            )
             # Single-instance provider: the teardown just emptied the
             # inference host (champion's container went away with the
             # challenger's — they're the same container). Champion's

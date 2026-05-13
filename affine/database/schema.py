@@ -219,6 +219,18 @@ SCORE_SNAPSHOTS_TTL = {
 # - Permanent storage of all miner metadata (not just current 256)
 # - Real-time sampling statistics via sliding windows
 # - No GSI needed (cleanup uses full scan, which is efficient for small tables)
+MINER_STATS_SCHEMA = {
+    "TableName": get_table_name("miner_stats"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},
+        {"AttributeName": "sk", "KeyType": "RANGE"},
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
 
 
 

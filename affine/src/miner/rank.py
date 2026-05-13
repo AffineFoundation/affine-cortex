@@ -142,10 +142,10 @@ def _status_for(
     if row.get("is_valid") is False:
         reason = str(row.get("invalid_reason") or "invalid")
         return reason.split(":", 1)[0][:11]
-    # Terminated by DECIDE (new flow) or by the legacy-terminated
-    # bootstrap CLI — out of the queue regardless of is_valid.
+    # Terminated lifecycle state lives in miner_stats, not the current
+    # miners snapshot.
     chal_status = str(row.get("challenge_status") or "")
-    if chal_status.startswith("terminated_"):
+    if chal_status == "terminated":
         return "TERMINATED"
     if uid == battle_uid:
         return "BATTLING"

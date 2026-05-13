@@ -157,10 +157,8 @@ def test_rank_table_groups_invalid_miners_below_valid_rows():
     assert "model_misma" in out
 
 
-def test_rank_table_shows_terminated_for_terminated_lost():
-    """challenge_status='terminated_lost' (set by DECIDE or by the
-    legacy-terminated bootstrap CLI) should render TERMINATED — out of
-    the queue, distinct from VALID/CHAMPION/BATTLING."""
+def test_rank_table_shows_terminated_for_terminated_status():
+    """miner_stats challenge_status='terminated' renders TERMINATED."""
     scores = {
         "block_number": 100,
         "calculated_at": 0,
@@ -171,7 +169,7 @@ def test_rank_table_shows_terminated_for_terminated_lost():
                 "model": "org/lost",
                 "overall_score": 0.0,
                 "is_valid": True,
-                "challenge_status": "terminated_lost",
+                "challenge_status": "terminated",
                 "termination_reason": "lost_to_champion:5GepM",
                 "scores_by_env": {},
             },
@@ -181,7 +179,7 @@ def test_rank_table_shows_terminated_for_terminated_lost():
                 "model": "org/good",
                 "overall_score": 0.0,
                 "is_valid": True,
-                "challenge_status": "pending",
+                "challenge_status": "sampling",
                 "scores_by_env": {},
             },
         ],
@@ -194,8 +192,7 @@ def test_rank_table_shows_terminated_for_terminated_lost():
     assert "5" in out
 
 
-def test_rank_table_terminated_won_also_renders_terminated():
-    """Champion winners that left the throne (terminated_won) — also TERMINATED."""
+def test_rank_table_terminated_status_renders_terminated():
     scores = {
         "block_number": 100,
         "calculated_at": 0,
@@ -206,7 +203,7 @@ def test_rank_table_terminated_won_also_renders_terminated():
                 "model": "org/ex",
                 "overall_score": 0.0,
                 "is_valid": True,
-                "challenge_status": "terminated_won",
+                "challenge_status": "terminated",
                 "scores_by_env": {},
             },
         ],

@@ -21,9 +21,8 @@ from affine.src.scorer.challenger_queue import (
     ChallengerQueue,
     STATUS_CHAMPION,
     STATUS_IN_PROGRESS,
-    STATUS_PENDING,
-    STATUS_TERMINATED_FAILED,
-    STATUS_TERMINATED_LOST,
+    STATUS_SAMPLING,
+    STATUS_TERMINATED,
 )
 from affine.src.scorer.comparator import WindowComparator
 from affine.src.scorer.sampler import WindowSampler
@@ -47,7 +46,7 @@ class _InMemoryMinerStore:
     async def list_valid_pending(self) -> List[dict]:
         return [r for r in self.rows.values() if str(r.get("is_valid", "")).lower() == "true"]
 
-    async def claim_pending(self, uid: int, window_id: int, *, expected_status=STATUS_PENDING) -> bool:
+    async def claim_pending(self, uid: int, window_id: int, *, expected_status=STATUS_SAMPLING) -> bool:
         row = self.rows.get(uid)
         if row is None:
             return False
@@ -58,8 +57,24 @@ class _InMemoryMinerStore:
         row["last_window_id"] = window_id
         return True
 
-    async def set_terminal(self, uid: int, new_status: str) -> None:
+    async def set_terminal(
+        self,
+        uid: int,
+        new_status: str,
+        *,
+        reason: str = "",
+        hotkey: str | None = None,
+        revision: str | None = None,
+        model: str = "",
+    ) -> None:
         self.rows.setdefault(uid, {"uid": uid})["challenge_status"] = new_status
+        self.rows.setdefault(uid, {"uid": uid})["termination_reason"] = reason
+        if hotkey is not None:
+            self.rows[uid]["hotkey"] = hotkey
+        if revision is not None:
+            self.rows[uid]["revision"] = revision
+        if model:
+            self.rows[uid]["model"] = model
 
 
 @dataclass
@@ -128,7 +143,7 @@ class _WeightWriterFake:
         self.calls.append(kwargs)
 
 
-def _make_miner(uid, hotkey, first_block, *, status=STATUS_PENDING, valid=True,
+def _make_miner(uid, hotkey, first_block, *, status=STATUS_SAMPLING, valid=True,
                 revision=None, model=None):
     return {
         "uid": uid,
@@ -363,7 +378,7 @@ async def test_challenger_wins_promotes_and_writes_weights():
     new_champ = await state.get_champion()
     assert new_champ.uid == 2
     assert new_champ.hotkey == "chal_hk"
-    assert miner_store.rows[1]["challenge_status"] == STATUS_TERMINATED_LOST
+    assert miner_store.rows[1]["challenge_status"] == STATUS_TERMINATED
     assert miner_store.rows[2]["challenge_status"] == STATUS_CHAMPION
     assert await state.get_battle() is None
     # Weight write happened (champion changed).
@@ -400,7 +415,7 @@ async def test_champion_holds_when_challenger_score_lower():
 
     champ = await state.get_champion()
     assert champ.uid == 1  # unchanged
-    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED_LOST
+    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED
     assert await state.get_battle() is None
     # Challenger's Targon torn down, champion's preserved.
     assert "wrk-002" in deployer.teardowns
@@ -434,7 +449,7 @@ async def test_deploy_failure_marks_challenger_failed():
     scheduler._teardown = failing_deployer.teardown
 
     await scheduler.tick(current_block=52)
-    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED_FAILED
+    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED
     assert await state.get_battle() is None
 
 
@@ -572,10 +587,21 @@ async def test_cold_start_set_champion_writes_before_mark_terminated():
             write_log.append("set_champion")
         await orig_set_param(key, value)
 
-    async def logged_set_terminal(uid, status):
+    async def logged_set_terminal(
+        uid,
+        status,
+        *,
+        reason="",
+        hotkey=None,
+        revision=None,
+        model="",
+    ):
         if status == STATUS_CHAMPION:
             write_log.append(f"mark_won_uid={uid}")
-        await orig_set_terminal(uid, status)
+        await orig_set_terminal(
+            uid, status, reason=reason,
+            hotkey=hotkey, revision=revision, model=model,
+        )
 
     kv.set = logged_set
     miner_store.set_terminal = logged_set_terminal
@@ -638,7 +664,7 @@ async def test_challenger_invalidated_mid_battle_does_not_get_promoted():
     champ = await state.get_champion()
     assert champ.uid == 1, f"invalid challenger was wrongly promoted: {champ}"
     # Challenger marked terminated (used their shot).
-    assert miner_store.rows[2]["challenge_status"] in (STATUS_TERMINATED_LOST,)
+    assert miner_store.rows[2]["challenge_status"] in (STATUS_TERMINATED,)
     # No weight write happened (champion didn't change).
     assert weight_writer.calls == []
     # Challenger's Targon was torn down, champion's preserved.

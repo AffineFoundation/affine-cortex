@@ -84,12 +84,25 @@ class TaskIdState:
 
 @dataclass
 class EnvConfig:
-    """Per-env runtime config from ``system_config['environments']``."""
+    """Per-env runtime config from ``system_config['environments']``.
+
+    Two independent gates:
+
+      - ``enabled_for_sampling`` — include this env in the sampler /
+        executor pipeline (materialise task_ids, run evaluate()).
+      - ``enabled_for_scoring`` — include this env in the DECIDE Pareto
+        comparison. Strictly narrower: an env that's
+        ``enabled_for_sampling=true, enabled_for_scoring=false`` keeps
+        accumulating data while DECIDE ignores it — used for onboarding
+        a new env so its possibly-broken scoring can't poison contest
+        outcomes during the bake-in period.
+    """
     display_name: str
-    enabled: bool
+    enabled_for_sampling: bool
     sampling_count: int
     dataset_range: List[List[int]]
     sampling_mode: str = "random"  # 'random' | 'latest'
+    enabled_for_scoring: bool = True
     # Optional remote source for the dataset's current top index. When
     # set, the scheduler resolves ``dataset_range`` from this URL at
     # each window refresh so envs whose dataset accumulates new
@@ -168,13 +181,30 @@ class StateStore:
     # -- env config ---------------------------------------------------------
 
     async def get_environments(self) -> Dict[str, EnvConfig]:
+        """Envs the worker should sample for. Filtered to
+        ``enabled_for_sampling=true`` regardless of their
+        ``enabled_for_scoring`` flag — sampling-only envs still need
+        their task_ids materialised so data accumulates while DECIDE
+        excludes them."""
         raw = await self._kv.get(self.KEY_ENVIRONMENTS, default={}) or {}
         out: Dict[str, EnvConfig] = {}
         for env, cfg in raw.items():
             coerced = _env_from_payload(cfg)
-            if coerced.enabled:
+            if coerced.enabled_for_sampling:
                 out[env] = coerced
         return out
+
+    async def get_scoring_environments(self) -> Dict[str, EnvConfig]:
+        """Envs the comparator should consider at DECIDE. Stricter
+        than :meth:`get_environments`: requires both
+        ``enabled_for_sampling=true`` AND ``enabled_for_scoring=true``
+        so a new env can be sampled for data collection without its
+        (possibly broken) scores poisoning the Pareto verdict."""
+        return {
+            env: cfg
+            for env, cfg in (await self.get_environments()).items()
+            if cfg.enabled_for_scoring
+        }
 
 
 # ---- in-memory test fake --------------------------------------------------
@@ -335,14 +365,25 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
 def _env_from_payload(payload: Any) -> EnvConfig:
     if not isinstance(payload, dict):
         return EnvConfig(
-            display_name="", enabled=False,
+            display_name="", enabled_for_sampling=False,
             sampling_count=0, dataset_range=[], sampling_mode="random",
         )
     sampling = payload.get("sampling") or payload.get("window_config") or {}
     src = sampling.get("dataset_range_source")
+    # ``enabled_for_sampling`` is the explicit name; fall back to the
+    # legacy ``enabled`` key so an unmigrated row keeps working until
+    # ``af db load-config`` rewrites it under the new shape.
+    sampling_flag = payload.get(
+        "enabled_for_sampling",
+        payload.get("enabled", True),
+    )
     return EnvConfig(
         display_name=str(payload.get("display_name", "")),
-        enabled=bool(payload.get("enabled", True)),
+        enabled_for_sampling=bool(sampling_flag),
+        # Default True so existing envs keep their pre-flag behavior
+        # (sampling and scoring both on). New envs opt out of scoring
+        # explicitly by setting ``enabled_for_scoring: false``.
+        enabled_for_scoring=bool(payload.get("enabled_for_scoring", True)),
         sampling_count=int(sampling.get("sampling_count", 0)),
         dataset_range=list(sampling.get("dataset_range", []) or []),
         sampling_mode=str(sampling.get("sampling_mode", "random")),

@@ -3,7 +3,8 @@
   "environments": {
     "SWE-INFINITE": {
       "display_name": "SWE",
-      "enabled": true,
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 300,
         "dataset_range": [[0, 5000]],
@@ -17,7 +18,8 @@
     },
     "DISTILL": {
       "display_name": "DISTILL",
-      "enabled": false,
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
       "sampling": {
         "sampling_count": 300,
         "dataset_range": [[0, 1000]],
@@ -31,7 +33,8 @@
     },
     "LIVEWEB": {
       "display_name": "LIVEWEB",
-      "enabled": true,
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 400,
         "dataset_range": [[0, 78060000]],
@@ -40,7 +43,8 @@
     },
     "LOGPROBS": {
       "display_name": "LOGPROBS",
-      "enabled": false,
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
       "sampling": {
         "sampling_count": 500,
         "dataset_range": [[100000000, 300000000], [400000000, 500000000]],
@@ -49,7 +53,8 @@
     },
     "NAVWORLD": {
       "display_name": "NAVWORLD",
-      "enabled": true,
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 400,
         "dataset_range": [[0, 1000000000]],
@@ -58,7 +63,8 @@
     },
     "MEMORY": {
       "display_name": "MEMORY",
-      "enabled": true,
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 200,
         "dataset_range": [[0, 1000000000]],
@@ -67,7 +73,8 @@
     },
     "TERMINAL": {
       "display_name": "TERMINAL",
-      "enabled": true,
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 300,
         "dataset_range": [[0, 132000000]],

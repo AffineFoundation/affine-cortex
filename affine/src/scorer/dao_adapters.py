@@ -1,7 +1,7 @@
 """
 DynamoDB adapters used by the flow scheduler and executor.
 
-  MinersQueueAdapter   wraps MinersDAO into ChallengerQueue's storage protocol
+  MinersQueueAdapter   joins current miners with historical miner_stats state
   SampleResultsAdapter wraps SampleResultsDAO for persist + count + read
 """
 
@@ -11,14 +11,13 @@ import json
 import time
 from typing import Any, Dict, List, Optional
 
-from botocore.exceptions import ClientError
-
 from affine.core.setup import logger
 from affine.database.client import get_client
+from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.sample_results import SampleResultsDAO
 
-from .challenger_queue import STATUS_PENDING
+from .challenger_queue import STATUS_SAMPLING
 
 
 # --------------------------------------------------------------------------- #
@@ -27,80 +26,80 @@ from .challenger_queue import STATUS_PENDING
 
 
 class MinersQueueAdapter:
-    """Implements ``ChallengerQueue``'s storage protocol on top of ``MinersDAO``.
+    """Queue storage over ``miners`` plus historical ``miner_stats``.
 
-    ``claim_pending`` uses DynamoDB ``ConditionExpression`` to atomically
-    transition a row from ``pending`` to ``in_progress`` — racing windows
-    can't claim the same miner twice.
+    ``miners`` contains the current online/valid UID snapshot. ``miner_stats``
+    is the source of truth for challenge lifecycle state and survives churn.
     """
 
-    def __init__(self, dao: Optional[MinersDAO] = None):
+    def __init__(
+        self,
+        dao: Optional[MinersDAO] = None,
+        stats_dao: Optional[MinerStatsDAO] = None,
+    ):
         self._dao = dao or MinersDAO()
-        self._table_name = self._dao.table_name
+        self._stats = stats_dao or MinerStatsDAO()
 
     async def list_valid_pending(self) -> List[Dict[str, Any]]:
-        """Return every is_valid=true miner. Status filtering is done by
-        the queue itself in memory — the subnet has ≤256 miners so a
-        single GSI scan is cheap."""
-        return await self._dao.get_valid_miners()
+        """Return every valid current miner enriched with historical status."""
+        miners = await self._dao.get_valid_miners()
+        state_map = await self._stats.build_challenge_state_map(miners)
+        out: List[Dict[str, Any]] = []
+        for miner in miners:
+            row = dict(miner)
+            state = state_map.get((row.get("hotkey"), row.get("revision"))) or {}
+            row["challenge_status"] = state.get(
+                "challenge_status", MinerStatsDAO.STATUS_SAMPLING,
+            )
+            row["termination_reason"] = state.get("termination_reason") or None
+            out.append(row)
+        return out
 
     async def claim_pending(
-        self, uid: int, window_id: int, *, expected_status: str = STATUS_PENDING,
+        self, uid: int, window_id: int, *, expected_status: str = STATUS_SAMPLING,
     ) -> bool:
-        client = get_client()
-        pk = self._dao._make_pk(uid)
+        miner = await self._dao.get_miner_by_uid(uid)
+        if not miner or str(miner.get("is_valid") or "").lower() != "true":
+            return False
         try:
-            await client.update_item(
-                TableName=self._table_name,
-                Key={"pk": {"S": pk}},
-                UpdateExpression=(
-                    "SET challenge_status = :new, last_window_id = :wid, "
-                    "challenge_claimed_at = :now"
-                ),
-                ConditionExpression=(
-                    "attribute_exists(pk) AND ("
-                    "attribute_not_exists(challenge_status) "
-                    "OR challenge_status = :expected"
-                    ")"
-                ),
-                ExpressionAttributeValues={
-                    ":new": {"S": "in_progress"},
-                    ":wid": {"N": str(window_id)},
-                    ":now": {"N": str(int(time.time()))},
-                    ":expected": {"S": expected_status},
-                },
+            return await self._stats.claim_for_challenge(
+                hotkey=str(miner["hotkey"]),
+                revision=str(miner["revision"]),
+                model=str(miner.get("model") or ""),
+                window_id=window_id,
             )
-            return True
-        except ClientError as e:
-            code = e.response.get("Error", {}).get("Code")
-            if code == "ConditionalCheckFailedException":
-                return False
+        except Exception as e:
             logger.warning(
-                f"MinersQueueAdapter.claim_pending(uid={uid}) failed: {code}: {e}"
+                f"MinersQueueAdapter.claim_pending(uid={uid}) failed: {e}"
             )
             return False
 
-    async def set_terminal(self, uid: int, new_status: str) -> None:
-        client = get_client()
-        pk = self._dao._make_pk(uid)
-        try:
-            await client.update_item(
-                TableName=self._table_name,
-                Key={"pk": {"S": pk}},
-                UpdateExpression=(
-                    "SET challenge_status = :new, challenge_terminated_at = :now"
-                ),
-                ConditionExpression="attribute_exists(pk)",
-                ExpressionAttributeValues={
-                    ":new": {"S": new_status},
-                    ":now": {"N": str(int(time.time()))},
-                },
-            )
-        except ClientError as e:
+    async def set_terminal(
+        self,
+        uid: int,
+        new_status: str,
+        *,
+        reason: str = "",
+        hotkey: Optional[str] = None,
+        revision: Optional[str] = None,
+        model: str = "",
+    ) -> None:
+        if not hotkey or not revision:
+            miner = await self._dao.get_miner_by_uid(uid)
+        else:
+            miner = {"hotkey": hotkey, "revision": revision, "model": model}
+        if not miner or not miner.get("hotkey") or not miner.get("revision"):
             logger.warning(
                 f"MinersQueueAdapter.set_terminal(uid={uid}, status={new_status}) "
-                f"failed: {e}"
+                "skipped: missing hotkey/revision"
             )
+            return
+        await self._stats.update_challenge_status(
+            hotkey=str(miner["hotkey"]),
+            revision=str(miner["revision"]),
+            status=new_status,
+            termination_reason=reason,
+        )
 
 
 # --------------------------------------------------------------------------- #

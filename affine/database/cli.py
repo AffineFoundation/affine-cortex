@@ -10,9 +10,9 @@ Slim, focused on operations that still make sense post-refactor:
   - Drop sample_results rows by env+task range
   - Inspect, register, or remove individual miners (incl. system miners)
 
-Removed: every command tied to the dead per-miner slot scheduler, the
-sampling-list rotation, MinerStatsDAO, TaskPoolDAO, AntiCopyDAO, or the
-targon_deployer reconciler. Those concepts no longer exist.
+Removed: commands tied to the dead per-miner slot scheduler,
+sampling-list rotation, TaskPoolDAO, AntiCopyDAO, or the targon_deployer
+reconciler. Historical miner lifecycle state is still in MinerStatsDAO.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import click
 
 from affine.cli.types import UID
 from affine.database import close_client, init_client, init_tables
-from affine.database.dao import MinersDAO, SampleResultsDAO, SystemConfigDAO
+from affine.database.dao import MinerStatsDAO, MinersDAO, SampleResultsDAO, SystemConfigDAO
 from affine.database.tables import delete_table, list_tables, reset_tables
 
 
@@ -391,11 +391,18 @@ async def _cmd_get_miner(hotkey: Optional[str], uid: Optional[int]) -> None:
         if not m:
             print("(not found)")
             return
+        state = {}
+        if m.get("hotkey") and m.get("revision"):
+            state = await MinerStatsDAO().get_challenge_state(
+                m["hotkey"], m["revision"],
+            )
         for k in ("uid", "hotkey", "model", "revision", "is_valid",
-                  "challenge_status", "first_block", "block_number",
-                  "invalid_reason", "model_hash"):
+                  "first_block", "block_number", "invalid_reason", "model_hash"):
             if k in m and m[k] is not None:
                 print(f"  {k:<18} = {m[k]}")
+        for k in ("challenge_status", "termination_reason"):
+            if state.get(k):
+                print(f"  {k:<18} = {state[k]}")
     finally:
         await close_client()
 
@@ -787,7 +794,9 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
         now = time.time()
         worker_status: dict = {}
         for env_name in envs:
-            if envs[env_name].get("enabled"):
+            if envs[env_name].get(
+                "enabled_for_sampling", envs[env_name].get("enabled", True),
+            ):
                 worker_status[env_name] = await sc.get_param_value(f"worker_status_{env_name}")
 
         win_label = window_spec if win_secs > 0 else "all-time"
@@ -806,7 +815,9 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
 
             for env_name in sorted(envs.keys()):
                 cfg = envs[env_name]
-                if not cfg.get("enabled"):
+                if not cfg.get(
+                    "enabled_for_sampling", cfg.get("enabled", True),
+                ):
                     click.echo(f"{env_name:<14}  (disabled)")
                     continue
 
@@ -901,221 +912,6 @@ def sample_progress(window, miner):
       - timestamp of last write + freshness ``age`` of the worker status
     """
     asyncio.run(_cmd_sample_progress(window, miner))
-
-
-@db.command("bootstrap-legacy-terminated")
-@click.option(
-    "--release-uid", "release_uids", multiple=True, type=int,
-    help="UID to leave at challenge_status='pending' even if legacy "
-         "miner_stats says terminated. Repeatable.",
-)
-@click.option("--execute", is_flag=True, default=False,
-              help="Actually write. Default is dry-run.")
-def bootstrap_legacy_terminated(release_uids, execute):
-    """One-shot: read pre-refactor ``affine_miner_stats`` and set
-    ``miners.challenge_status='terminated_lost'`` for every (hotkey,
-    revision) that's still in the current subnet AND was 'terminated'
-    pre-refactor.
-
-    Old ``miner_stats`` table is the only place the pre-refactor scorer
-    persisted terminated state (the new flow keeps that state on
-    ``miners.challenge_status`` directly). Without this bootstrap, every
-    legacy miner re-enters the queue as 'pending' — including miners
-    that lost their one-shot challenge in the old system.
-
-    ``--release-uid`` overrides the legacy verdict for specific UIDs:
-    those rows are forced back to 'pending' (or left at 'pending' if
-    they would have been promoted to terminated_lost).
-
-    Idempotent: rerunning a second time finds the targets already
-    terminated_lost and skips them.
-    """
-    asyncio.run(_cmd_bootstrap_legacy_terminated(
-        release_uids=set(release_uids), execute=execute,
-    ))
-
-
-async def _cmd_bootstrap_legacy_terminated(
-    *, release_uids: set, execute: bool,
-) -> None:
-    from affine.database.client import get_client
-    from affine.database import init_client, close_client
-    await init_client()
-    c = get_client()
-
-    def u(v):
-        if not isinstance(v, dict) or len(v) != 1:
-            return v
-        (t, val), = v.items()
-        if t == "S":
-            return val
-        if t == "N":
-            try:
-                return int(val)
-            except ValueError:
-                return float(val)
-        if t == "BOOL":
-            return val
-        if t == "NULL":
-            return None
-        if t == "M":
-            return {k: u(x) for k, x in val.items()}
-        return val
-
-    # 1. Scan legacy miner_stats for terminated rows.
-    legacy_terminated = []
-    last = None
-    while True:
-        kwargs = {
-            "TableName": "affine_miner_stats",
-            "FilterExpression": "challenge_status = :t",
-            "ExpressionAttributeValues": {":t": {"S": "terminated"}},
-        }
-        if last:
-            kwargs["ExclusiveStartKey"] = last
-        r = await c.scan(**kwargs)
-        for it in r.get("Items", []):
-            legacy_terminated.append({
-                "hotkey": u(it.get("hotkey", {})),
-                "revision": u(it.get("revision", {})),
-                "reason": u(it.get("termination_reason", {})) or "",
-            })
-        last = r.get("LastEvaluatedKey")
-        if not last:
-            break
-
-    # 2. Scan current miners table (small — ≤256 rows).
-    current = {}
-    last = None
-    while True:
-        kwargs = {"TableName": "affine_miners"}
-        if last:
-            kwargs["ExclusiveStartKey"] = last
-        r = await c.scan(**kwargs)
-        for it in r.get("Items", []):
-            hk = u(it.get("hotkey", {}))
-            if hk:
-                current[hk] = {
-                    "uid": u(it.get("uid", {})),
-                    "revision": u(it.get("revision", {})),
-                    "challenge_status": u(it.get("challenge_status", {})),
-                }
-        last = r.get("LastEvaluatedKey")
-        if not last:
-            break
-
-    # 3. Plan.
-    will_terminate = []
-    will_release = []
-    skip_no_match = 0
-    skip_new_rev = 0
-    skip_already = 0
-
-    seen_uids = set()
-    for row in legacy_terminated:
-        hk = row["hotkey"]
-        rev = row["revision"]
-        if not hk:
-            continue
-        cur = current.get(hk)
-        if cur is None:
-            skip_no_match += 1
-            continue
-        if cur["revision"] != rev:
-            skip_new_rev += 1
-            continue
-        uid = cur["uid"]
-        seen_uids.add(uid)
-        if uid in release_uids:
-            will_release.append({
-                "uid": uid, "hotkey": hk, "revision": rev,
-                "reason": row["reason"],
-            })
-            continue
-        if cur["challenge_status"] == "terminated_lost":
-            skip_already += 1
-            continue
-        will_terminate.append({
-            "uid": uid, "hotkey": hk, "revision": rev,
-            "reason": row["reason"],
-        })
-
-    # Release UIDs the user explicitly listed even if they're not in
-    # legacy-terminated (they may already be 'pending'; explicit set
-    # makes the intent durable in the log).
-    for uid in sorted(release_uids):
-        if uid not in seen_uids and uid in {
-            cur["uid"] for cur in current.values()
-        }:
-            hk = next(
-                hk for hk, cur in current.items() if cur["uid"] == uid
-            )
-            will_release.append({
-                "uid": uid, "hotkey": hk,
-                "revision": current[hk]["revision"],
-                "reason": "(not in legacy terminated; explicit release)",
-            })
-
-    click.echo(f"legacy terminated rows:           {len(legacy_terminated)}")
-    click.echo(f"  hotkey no longer in subnet:     {skip_no_match}")
-    click.echo(f"  new revision (fresh chance):    {skip_new_rev}")
-    click.echo(f"  already terminated_lost:        {skip_already}")
-    click.echo(f"  RELEASE (--release-uid):        {len(will_release)}")
-    click.echo(f"  TERMINATE:                      {len(will_terminate)}")
-
-    if not execute:
-        click.echo("\n=== DRY RUN (use --execute to write) ===")
-        for it in will_terminate[:200]:
-            click.echo(
-                f"  TERMINATE uid={it['uid']:>3} hk={it['hotkey'][:8]} "
-                f"rev={it['revision'][:8]} reason={it['reason'][:60]}"
-            )
-        for it in will_release:
-            click.echo(
-                f"  RELEASE   uid={it['uid']:>3} hk={it['hotkey'][:8]} "
-                f"rev={it['revision'][:8]} reason={it['reason'][:60]}"
-            )
-        await close_client()
-        return
-
-    click.echo("\n=== EXECUTING ===")
-    for it in will_terminate:
-        try:
-            await c.update_item(
-                TableName="affine_miners",
-                Key={"pk": {"S": f"UID#{it['uid']}"}},
-                UpdateExpression=(
-                    "SET challenge_status = :s, "
-                    "termination_reason = :r, "
-                    "terminated_from_legacy = :t"
-                ),
-                ExpressionAttributeValues={
-                    ":s": {"S": "terminated_lost"},
-                    ":r": {"S": it["reason"]},
-                    ":t": {"BOOL": True},
-                },
-            )
-            click.echo(f"  terminated uid={it['uid']}")
-        except Exception as e:
-            click.echo(f"  uid={it['uid']} FAILED: {e}")
-    for it in will_release:
-        try:
-            await c.update_item(
-                TableName="affine_miners",
-                Key={"pk": {"S": f"UID#{it['uid']}"}},
-                UpdateExpression=(
-                    "SET challenge_status = :s "
-                    "REMOVE termination_reason, terminated_from_legacy"
-                ),
-                ExpressionAttributeValues={
-                    ":s": {"S": "pending"},
-                },
-            )
-            click.echo(f"  released   uid={it['uid']} → pending")
-        except Exception as e:
-            click.echo(f"  uid={it['uid']} FAILED: {e}")
-
-    await close_client()
 
 
 def main():

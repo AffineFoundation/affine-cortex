@@ -128,7 +128,13 @@ class TeacherMover:
         distill = environments.get(DISTILL_ENV_KEY)
         if not distill:
             return None
-        enabled = bool(distill.get("enabled", False))
+        # Pause the mover when the env's sampling pipeline is off — the
+        # bucket would just accumulate stale rollouts. Accepts the new
+        # ``enabled_for_sampling`` name plus the legacy ``enabled``
+        # alias so an unmigrated DB still drains correctly.
+        enabled = bool(distill.get(
+            "enabled_for_sampling", distill.get("enabled", False),
+        ))
         return MOVER_PROMOTE_INTERVAL_SEC, MOVER_PROMOTE_COUNT, enabled
 
     # ---------------- Listing & metadata ----------------

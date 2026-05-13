@@ -91,6 +91,56 @@ async def test_environments_filter_disabled():
 
 
 @pytest.mark.asyncio
+async def test_get_scoring_environments_filters_independently_from_sampling():
+    """``enabled_for_sampling`` gates the sampling pipeline;
+    ``enabled_for_scoring`` is independently checked at DECIDE so a
+    new env can collect data without affecting the comparator."""
+    kv = InMemoryConfigStore()
+    kv.data["environments"] = {
+        "SAMPLE_AND_SCORE": {
+            "display_name": "Both", "enabled_for_sampling": True,
+            "enabled_for_scoring": True,
+            "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]], "sampling_mode": "random"},
+        },
+        "SAMPLE_ONLY": {
+            "display_name": "Onboarding", "enabled_for_sampling": True,
+            "enabled_for_scoring": False,
+            "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]], "sampling_mode": "random"},
+        },
+        "DISABLED": {
+            "display_name": "Off", "enabled_for_sampling": False,
+            "enabled_for_scoring": False,
+            "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]], "sampling_mode": "random"},
+        },
+    }
+    store = StateStore(kv)
+
+    sampling = await store.get_environments()
+    scoring = await store.get_scoring_environments()
+
+    assert set(sampling.keys()) == {"SAMPLE_AND_SCORE", "SAMPLE_ONLY"}
+    assert set(scoring.keys()) == {"SAMPLE_AND_SCORE"}
+
+
+@pytest.mark.asyncio
+async def test_legacy_enabled_key_maps_to_enabled_for_sampling():
+    """Older system_config rows used a single ``enabled`` flag. The
+    parser should accept it and treat it as ``enabled_for_sampling``
+    so we don't drop active envs during the schema transition."""
+    kv = InMemoryConfigStore()
+    kv.data["environments"] = {
+        "LEGACY": {"display_name": "Legacy", "enabled": True,
+                   "sampling": {"sampling_count": 5, "dataset_range": [[0, 50]], "sampling_mode": "random"}},
+    }
+    store = StateStore(kv)
+    envs = await store.get_environments()
+    assert "LEGACY" in envs
+    # Default scoring flag is True so legacy envs behave as before.
+    scoring = await store.get_scoring_environments()
+    assert "LEGACY" in scoring
+
+
+@pytest.mark.asyncio
 async def test_environments_accepts_legacy_window_config_shape():
     """Old seed used ``environments[env].window_config`` instead of
     ``.sampling``. Coercion should accept both."""

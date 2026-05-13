@@ -40,7 +40,7 @@ Every ~7200 blocks (~24h) the scorer opens a new "window". It picks the earliest
 
 **Q6: What if I lose?**
 
-You're out for good with that hotkey. The "multi-commit rule" prevents re-trying with a new revision on the same hotkey, so once a miner is `terminated_lost`, that hotkey can't compete again. Register a fresh hotkey to try a new model.
+You're out for good with that hotkey. The "multi-commit rule" prevents re-trying with a new revision on the same hotkey, so once a miner is `terminated`, that hotkey can't compete again. Register a fresh hotkey to try a new model.
 
 **Q7: What kind of tasks does the subnet evaluate?**
 
@@ -73,8 +73,8 @@ Two likely reasons:
 
 Run `af get-rank` to see whether you appear as the current battle's challenger. Two common failure modes:
 
-- **Provider allocation failed.** The validator's Targon couldn't get your model loaded within the model-load timeout (default 30 min). Your model may be too large, the HF download timed out, or sglang/vllm rejected your config. You're marked `terminated_failed` and the queue advances.
-- **Inference unreachable.** Targon launched the workload but per-task requests time out or 5xx. The executor still writes a sample row per task (with score 0 + error). Once all rows are in, the comparator sees the challenger far below the champion in every env and you're marked `terminated_lost`.
+- **Provider allocation failed.** The validator couldn't get your model loaded within the model-load timeout. Your model may be too large, the HF download timed out, or the inference server rejected your config. You're marked `terminated` with a deployment failure reason and the queue advances.
+- **Inference unreachable.** The workload launched but per-task requests time out or 5xx. The executor still writes a sample row per task (with score 0 + error). Once all rows are in, the comparator sees the challenger far below the champion in every env and you're marked `terminated` with a loss reason.
 
 ---
 

@@ -6,9 +6,10 @@ import pytest
 
 import affine.api.routers.config as config_router
 import affine.api.routers.rank as rank_router
+import affine.api.routers.scores as scores_router
 from affine.api.routers.miners import get_miner_by_hotkey, get_miner_by_uid
 from affine.api.routers.logs import get_miner_logs
-from affine.api.routers.scores import get_latest_weights
+from affine.api.routers.scores import get_latest_scores, get_latest_weights
 
 
 class _FakeMinersDAO:
@@ -20,6 +21,29 @@ class _FakeMinersDAO:
 
     async def get_miner_by_hotkey(self, hotkey):
         return self.rows.get(("hotkey", hotkey))
+
+    async def get_all_miners(self):
+        return list(self.rows.values())
+
+
+class _FakeMinerStatsDAO:
+    def __init__(self, states):
+        self.states = states
+
+    async def get_challenge_state(self, hotkey, revision):
+        return self.states.get((hotkey, revision), {
+            "challenge_status": "sampling",
+            "termination_reason": "",
+        })
+
+    async def build_challenge_state_map(self, miners):
+        return {
+            (m.get("hotkey"), m.get("revision")): await self.get_challenge_state(
+                m.get("hotkey"), m.get("revision"),
+            )
+            for m in miners
+            if m.get("hotkey") and m.get("revision")
+        }
 
 
 class _FakeExecutionLogsDAO:
@@ -38,6 +62,14 @@ class _FakeScoreSnapshotsDAO:
 
     async def get_latest_snapshot(self):
         return self.snapshot
+
+
+class _FakeScoresDAO:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def get_latest_scores(self, limit=None):
+        return self.payload
 
 
 class _FakeSystemConfigDAO:
@@ -68,7 +100,14 @@ def test_public_server_does_not_mount_internal_logs_by_default():
 
 
 @pytest.mark.asyncio
-async def test_miners_router_returns_basic_public_metadata_by_uid():
+async def test_miners_router_returns_basic_public_metadata_by_uid(monkeypatch):
+    monkeypatch.setattr(
+        "affine.api.routers.miners.MinerStatsDAO",
+        lambda: _FakeMinerStatsDAO({("hk", "abc"): {
+            "challenge_status": "sampling",
+            "termination_reason": "",
+        }}),
+    )
     dao = _FakeMinersDAO({
         ("uid", 7): {
             "uid": 7,
@@ -76,7 +115,6 @@ async def test_miners_router_returns_basic_public_metadata_by_uid():
             "model": "org/model",
             "revision": "abc",
             "is_valid": "true",
-            "challenge_status": "pending",
             "first_block": 100,
             "block_number": 120,
             "invalid_reason": None,
@@ -91,15 +129,22 @@ async def test_miners_router_returns_basic_public_metadata_by_uid():
     assert response.model == "org/model"
     assert response.revision == "abc"
     assert response.is_valid is True
-    assert response.challenge_status == "pending"
+    assert response.challenge_status == "sampling"
     assert response.model_hash == "hash"
 
 
 @pytest.mark.asyncio
-async def test_miners_router_returns_termination_reason_when_set():
-    """When a miner has been terminated (DECIDE or legacy bootstrap),
+async def test_miners_router_returns_termination_reason_when_set(monkeypatch):
+    """When a miner has been terminated,
     ``af get-miner`` should be able to read both the status and the
     human-readable reason via the same endpoint."""
+    monkeypatch.setattr(
+        "affine.api.routers.miners.MinerStatsDAO",
+        lambda: _FakeMinerStatsDAO({("hk-lost", "r"): {
+            "challenge_status": "terminated",
+            "termination_reason": "lost_to_champion:5GepM|DISTILL:0.75vs0.76",
+        }}),
+    )
     dao = _FakeMinersDAO({
         ("uid", 9): {
             "uid": 9,
@@ -107,19 +152,24 @@ async def test_miners_router_returns_termination_reason_when_set():
             "model": "org/m",
             "revision": "r",
             "is_valid": "true",
-            "challenge_status": "terminated_lost",
-            "termination_reason": "lost_to_champion:5GepM|DISTILL:0.75vs0.76",
         }
     })
 
     response = await get_miner_by_uid(9, dao=dao)
 
-    assert response.challenge_status == "terminated_lost"
+    assert response.challenge_status == "terminated"
     assert response.termination_reason.startswith("lost_to_champion:")
 
 
 @pytest.mark.asyncio
-async def test_miners_router_returns_basic_public_metadata_by_hotkey():
+async def test_miners_router_returns_basic_public_metadata_by_hotkey(monkeypatch):
+    monkeypatch.setattr(
+        "affine.api.routers.miners.MinerStatsDAO",
+        lambda: _FakeMinerStatsDAO({("hk", "def"): {
+            "challenge_status": "sampling",
+            "termination_reason": "",
+        }}),
+    )
     dao = _FakeMinersDAO({
         ("hotkey", "hk"): {
             "uid": 8,
@@ -193,6 +243,68 @@ async def test_rank_router_aggregates_rank_payload(monkeypatch):
         "queue": [{"position": 1, "uid": 8, "limit_seen": 5}],
         "scores": {"scores": [{"uid": 7}], "top_seen": 32},
     }
+
+
+@pytest.mark.asyncio
+async def test_scores_latest_filters_to_current_miners(monkeypatch):
+    monkeypatch.setattr(
+        scores_router,
+        "MinersDAO",
+        lambda: _FakeMinersDAO({
+            ("uid", 7): {
+                "uid": 7,
+                "hotkey": "current-hk",
+                "revision": "current-rev",
+                "is_valid": "true",
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        scores_router,
+        "MinerStatsDAO",
+        lambda: _FakeMinerStatsDAO({
+            ("current-hk", "current-rev"): {
+                "challenge_status": "terminated",
+                "termination_reason": "lost_to_champion:abc",
+            },
+        }),
+    )
+
+    response = await get_latest_scores(
+        top=256,
+        dao=_FakeScoresDAO({
+            "block_number": 123,
+            "calculated_at": 456,
+            "scores": [
+                {
+                    "uid": 99,
+                    "miner_hotkey": "offline-hk",
+                    "model_revision": "old",
+                    "model": "org/offline",
+                    "first_block": 1,
+                    "overall_score": 1.0,
+                    "average_score": 1.0,
+                    "scores_by_env": {},
+                    "total_samples": 10,
+                },
+                {
+                    "uid": 7,
+                    "miner_hotkey": "current-hk",
+                    "model_revision": "current-rev",
+                    "model": "org/current",
+                    "first_block": 2,
+                    "overall_score": 0.0,
+                    "average_score": 0.0,
+                    "scores_by_env": {},
+                    "total_samples": 0,
+                },
+            ],
+        }),
+    )
+
+    assert [row.uid for row in response.scores] == [7]
+    assert response.scores[0].challenge_status == "terminated"
+    assert response.scores[0].termination_reason == "lost_to_champion:abc"
 
 
 @pytest.mark.asyncio
