@@ -204,6 +204,7 @@ def test_rank_table_sorts_miners_by_status_then_uid_not_score():
     assert out.index("uid3") < out.index("uid9")
     assert out.index("uid9") < out.index("invalid")
     assert out.index("uid9") < out.index("terminated")
+    assert out.index("terminated") < out.index("invalid")
 
 
 def test_rank_table_shows_terminated_for_terminated_status():

@@ -193,8 +193,10 @@ def _sort_scores(
             bucket = 1
         elif uid in queue_positions:
             bucket = 2
-        elif row.get("is_valid") is False or chal_status == "terminated":
+        elif chal_status == "terminated":
             bucket = 4
+        elif row.get("is_valid") is False:
+            bucket = 5
         else:
             bucket = 3
         return (
