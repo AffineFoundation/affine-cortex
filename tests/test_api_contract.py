@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+import affine.api.routers.config as config_router
 from affine.api.routers.miners import get_miner_by_hotkey, get_miner_by_uid
 from affine.api.routers.logs import get_miner_logs
 
@@ -27,6 +28,17 @@ class _FakeExecutionLogsDAO:
     async def get_recent_logs(self, miner_hotkey, limit=1000, status=None):
         self.calls.append((miner_hotkey, limit, status))
         return self.logs
+
+
+class _FakeSystemConfigDAO:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def get_all_params(self):
+        return self.rows
+
+    async def get_param(self, key):
+        return self.rows.get(key)
 
 
 def test_public_server_does_not_mount_internal_logs_by_default():
@@ -89,6 +101,39 @@ async def test_miners_router_returns_basic_public_metadata_by_hotkey():
     assert response.uid == 8
     assert response.is_valid is False
     assert response.invalid_reason == "model_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_config_router_only_returns_public_config_keys(monkeypatch):
+    monkeypatch.setattr(
+        config_router,
+        "config_dao",
+        _FakeSystemConfigDAO({
+            "validator_burn_percentage": 0.25,
+            "current_task_ids": {"task_ids": {"SWE": [1, 2, 3]}},
+            "champion": {"uid": 1},
+        }),
+    )
+
+    response = await config_router.get_all_configs()
+
+    assert response == {"configs": {"validator_burn_percentage": 0.25}}
+
+
+@pytest.mark.asyncio
+async def test_config_router_blocks_internal_config_keys(monkeypatch):
+    monkeypatch.setattr(
+        config_router,
+        "config_dao",
+        _FakeSystemConfigDAO({
+            "current_task_ids": {"task_ids": {"SWE": [1, 2, 3]}},
+        }),
+    )
+
+    with pytest.raises(config_router.HTTPException) as exc:
+        await config_router.get_config("current_task_ids")
+
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio

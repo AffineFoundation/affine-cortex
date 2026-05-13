@@ -55,9 +55,8 @@ app = FastAPI(
 
 setup_middleware(app)
 
-# Read-only public endpoints. There is no /samples and no /tasks — the
-# queue-window scorer collects samples in-process via DAO writes, and any
-# external publication of yesterday's samples is handled outside this API.
+# Read-only public endpoints: live state, miner metadata, scores/weights,
+# and public validator configuration.
 app.include_router(windows_router, prefix="/api/v1")
 app.include_router(miners_router, prefix="/api/v1")
 app.include_router(scores_router, prefix="/api/v1")
