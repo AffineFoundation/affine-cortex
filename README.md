@@ -8,9 +8,9 @@ Mine open reasoning.
 
 Affine is an incentivized RL environment that pays miners who make incremental improvements on a set of tasks (such as program abduction or coding). The mechanism is sybil-proof, decoy-proof, copy-proof, and overfitting-proof.
 
-**How does Affine work?** 
+**How does Affine work?**
 
-Affine validators incentivize miners to submit models to Subnet 64 on Bittensor (a.k.a Chutes) where they are inference load balanced and publicly available. These models are evaluated on a set of RL environments, with validators looking for models that dominate the Pareto frontier—namely, models that outcompete all other models across all environments. The network uses a winners-take-all mechanism where miners are incentivized to copy, download, and improve the Pareto frontier model.
+Affine validators incentivize miners to submit models on Bittensor. Miners commit a HuggingFace `(model, revision)` pair on chain; validators host the inference (currently via Targon, optionally an operator-managed B300 fleet). The validator-side scheduler walks the queue of pending miners in `first_block` order — each one faces the current champion across every evaluation environment in a single back-to-back contest. The challenger only dethrones the champion when they win **strictly** across all environments by a per-env margin; otherwise they're permanently terminated and the queue advances to the next miner. Every ~7200 blocks (~24h) the per-env task-id pool is refreshed and the (current) champion is re-sampled before the queue continues. The winner-takes-all weight goes to the champion until they're dethroned.
 
 **Why Affine?** 
 
@@ -51,8 +51,8 @@ Learn how to:
 - Set up your environment and configure API keys
 - Pull models from the network
 - Improve models with reinforcement learning
-- Deploy to Chutes and commit on-chain
-- Use CLI commands to query your mining status
+- Upload to HuggingFace and commit on-chain (validator hosts inference)
+- Use CLI commands to query public rank/status and miner metadata
 
 ### For Validators
 

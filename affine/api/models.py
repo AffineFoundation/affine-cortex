@@ -1,84 +1,22 @@
 """
 API Request/Response Models
 
-Pydantic models for request validation and response serialization.
+Pydantic models for response serialization.
 """
 
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List, Optional
+
 from pydantic import BaseModel
-
-class SampleSubmitResponse(BaseModel):
-    """Response after submitting a sample."""
-
-    task_id: str
-    created_at: int
-    message: str
-
-
-class ExtraData(BaseModel):
-    """Extra data with dynamic fields.
-    
-    Common fields:
-    - conversation: List of message dicts with {"role": "user/assistant", "content": "..."}
-    - request: Request parameters dict
-    - image: Docker image used for evaluation
-    
-    Note: This model accepts any additional fields dynamically.
-    """
-
-    class Config:
-        extra = "allow"  # Allow additional fields beyond defined ones
-
-    conversation: Optional[List[Dict[str, Any]]] = None
-    request: Optional[Dict[str, Any]] = None
-    image: Optional[str] = None
-
-
-class SampleFullResponse(BaseModel):
-    """Full sample details from sample_results table."""
-
-    miner_hotkey: str
-    model_revision: str
-    model: str
-    env: str
-    task_id: int
-    score: float
-    timestamp: int
-    block_number: int
-    latency_ms: Optional[int] = None
-    extra: Optional[ExtraData] = None
-
-
-class TaskPoolResponse(BaseModel):
-    """Task pool entry details."""
-
-    task_uuid: str
-    task_id: int
-    miner_hotkey: str
-    model_revision: str
-    model: str
-    env: str
-    chute_id: str
-    status: str
-    created_at: int
-    assigned_to: Optional[str] = None
-    assigned_at: Optional[int] = None
-    retry_count: int
-    max_retries: int
-    last_error: Optional[str] = None
-    last_error_code: Optional[str] = None
-    last_failed_at: Optional[int] = None
-    ttl: int
-
-
-class TaskFetchResponse(BaseModel):
-    """Response from task fetch endpoint."""
-
-    tasks: List[Dict[str, Any]] = []
 
 
 class MinerScore(BaseModel):
-    """Score details for a miner."""
+    """Score details for a miner.
+
+    Reflects what the new ``scorer`` writes into the ``scores`` table —
+    one row per miner per window with ``overall_score`` ∈ {0.0, 1.0}.
+    The CLI surfaces ``is_valid`` alongside so a miner sidelined by the
+    monitor (model_mismatch, plagiarism, …) doesn't read as competing.
+    """
 
     miner_hotkey: str
     uid: int
@@ -89,20 +27,6 @@ class MinerScore(BaseModel):
     average_score: float
     scores_by_env: Dict[str, Dict[str, Any]]
     total_samples: int
-    challenge_info: Optional[Dict[str, Any]] = None
-    # Targon acceleration status for this (hotkey, revision):
-    #   "active"    — Targon workload is up and serving inference
-    #   "deploying" — Targon workload exists, still loading model weights
-    #   None        — no Targon deployment for this revision (Chutes-only)
-    # Read by the CLI to mark which miners the Targon pool is hosting.
-    targon_status: Optional[str] = None
-    # Validator-side admissibility, sourced from the miners table.
-    # is_valid=False means the validator has invalidated this miner
-    # (anticopy cheat, model_mismatch, repo-name violation, etc.) —
-    # sampling scheduler stops sampling them via get_valid_miners(),
-    # so their challenge_status may still read 'sampling' from a stale
-    # scoring snapshot. The CLI surfaces this so a miner that's been
-    # silently sidelined isn't shown as actively competing.
     is_valid: Optional[bool] = None
     invalid_reason: Optional[str] = None
 
@@ -115,7 +39,25 @@ class ScoresResponse(BaseModel):
     scores: List[MinerScore]
 
 
-# Execution Logs
+class MinerInfo(BaseModel):
+    """Public miner metadata.
+
+    Basic identity, model, validity, queue status, and commit block fields
+    for a miner.
+    """
+
+    uid: int
+    hotkey: str
+    model: Optional[str] = None
+    revision: Optional[str] = None
+    is_valid: Optional[bool] = None
+    challenge_status: Optional[str] = None
+    first_block: Optional[int] = None
+    block_number: Optional[int] = None
+    invalid_reason: Optional[str] = None
+    model_hash: Optional[str] = None
+
+
 class ExecutionLog(BaseModel):
     """Execution log entry."""
 
@@ -123,7 +65,7 @@ class ExecutionLog(BaseModel):
     timestamp: int
     task_id: str
     env: str
-    status: str  # 'success' or 'failed'
+    status: str
     error_type: Optional[str] = None
     error_message: Optional[str] = None
     latency_ms: int
@@ -133,20 +75,3 @@ class ExecutionLogsResponse(BaseModel):
     """List of execution logs."""
 
     logs: List[ExecutionLog]
-
-
-class MinerResponse(BaseModel):
-    """Miner information response."""
-
-    model: Optional[str] = None
-    chute_id: Optional[str] = None
-    hotkey: str
-    revision: Optional[str] = None
-    block_number: Optional[int] = None
-    first_block: Optional[int] = None
-    uid: int
-    invalid_reason: Optional[str] = None
-    model_hash: Optional[str] = None
-    chute_slug: Optional[str] = None
-    chute_status: Optional[str] = None
-    is_valid: Optional[str] = None

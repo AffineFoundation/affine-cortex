@@ -1,435 +1,357 @@
 """
-Executor Worker - Individual Task Executor (Subprocess Mode)
+Executor worker — one per env, DB-poll mode.
 
-Each worker runs in its own subprocess and executes tasks for a specific environment.
-Environment creation and task execution happen entirely within the subprocess.
+Each subprocess owns one env (its own Docker container + SSH tunnel +
+paramiko Transport). It polls ``system_config``; whenever the saved
+state has a champion (with a deployment URL) it makes sure that champion
+has a sample row for every task_id in the current pool. When there's
+also an in-flight battle, the challenger gets the same treatment.
+
+No phase enum, no window_id — just look at the state and fill in what's
+missing.
 """
 
+from __future__ import annotations
+
 import asyncio
+import random
 import time
-from typing import Optional, Dict, Any
-import bittensor as bt
-from affine.core.models import SampleSubmission
-from affine.utils.api_client import create_api_client, APIClient
-from affine.src.executor.metrics import WorkerMetrics
+from typing import Any, Dict, List, Optional
+
+from affine.core.setup import logger
+from affine.database.dao.sample_results import SampleResultsDAO
+from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.executor.logging_utils import safe_log
+from affine.src.executor.metrics import WorkerMetrics
+from affine.src.scorer.dao_adapters import SampleResultsAdapter
+from affine.src.scorer.window_state import (
+    DeploymentRecord,
+    MinerSnapshot,
+    StateStore,
+    SystemConfigKVAdapter,
+)
 
 
 class ExecutorWorker:
-    """Worker that executes sampling tasks for a specific environment in subprocess."""
-    
+    """One worker = one env. Polls state, runs sampling for its env."""
+
     def __init__(
         self,
         worker_id: int,
         env: str,
-        wallet: bt.Wallet,
-        max_concurrent_tasks: int = 5,
-        batch_size: int = 20,
+        *,
+        max_concurrent: int = 60,
+        poll_interval_sec: float = 5.0,
+        idle_sleep_sec: float = 10.0,
+        warmup_sec: float = 180.0,
     ):
-        """Initialize executor worker.
-        
-        Args:
-            worker_id: Unique worker ID
-            env: Environment to execute tasks for (e.g., "affine:sat")
-            wallet: Bittensor wallet for signing
-            max_concurrent_tasks: Maximum number of concurrent task executions
-            batch_size: Number of tasks to fetch per request
-        """
         self.worker_id = worker_id
         self.env = env
-        self.wallet = wallet
-        self.hotkey = wallet.hotkey.ss58_address
-        self.max_concurrent_tasks = max_concurrent_tasks
-        self.batch_size = batch_size
-        
+        self.max_concurrent = max_concurrent
+        self.poll_interval_sec = poll_interval_sec
+        self.idle_sleep_sec = idle_sleep_sec
+        # ``warmup_sec``: env containers report "ready" before they are
+        # fully serving — affinetes finishes SSH tunnel + container startup
+        # but the env's own app-level init (e.g. liveweb's Stooq lock /
+        # cache build, memorygym worker boot) can still be running. With
+        # 60s the first tick after a restart historically slammed into the
+        # tail of that init and produced a flood of empty ReadErrors;
+        # 180s gives external data sources + uvicorn worker fanout enough
+        # time to settle.
+        self.warmup_sec = warmup_sec
+
         self.running = False
-        self.metrics = WorkerMetrics(
-            worker_id=worker_id,
-            env=env,
-        )
-        
-        self.api_client: Optional[APIClient] = None
-        self.env_executor = None
-        
-        self.task_queue: asyncio.Queue = asyncio.Queue()
-        self.execution_semaphore: Optional[asyncio.Semaphore] = None
-        self.executor_tasks = []
+        self.metrics = WorkerMetrics(worker_id=worker_id, env=env)
 
-    async def _init_env_executor(self):
-        """Initialize environment executor in subprocess.
-        
-        Reuses SDKEnvironment's _load_environment logic for consistency.
-        The executor mode is determined by affinetes_hosts.json configuration.
-        """
-        if self.env_executor is not None:
-            return
+        self._env_executor = None
+        self._state: Optional[StateStore] = None
+        self._samples: Optional[SampleResultsAdapter] = None
 
-        try:
-            from affine.core.environments import SDKEnvironment
+    # ---- lifecycle ---------------------------------------------------------
 
-            self.env_executor = SDKEnvironment(self.env)
-            
-            # Log the mode being used
-            _, execution_mode = self.env_executor._get_hosts_and_mode()
-            safe_log(
-                f"[{self.env}] Environment initialized using {execution_mode} mode "
-                f"(via SDKEnvironment)",
-                "INFO"
+    async def initialize(self) -> None:
+        safe_log(f"[{self.env}] worker init", "INFO")
+        # Each subprocess (spawn context) starts with a fresh Python module
+        # state — the parent process's init_client() doesn't carry over.
+        # Initialize the DynamoDB client here so the first DAO call doesn't
+        # raise ``RuntimeError("DynamoDB client not initialized")``.
+        from affine.database import init_client
+        await init_client()
+        self._state = StateStore(
+            SystemConfigKVAdapter(
+                SystemConfigDAO(), updated_by=f"executor-{self.env}",
             )
-            
-        except Exception as e:
-            safe_log(f"[{self.env}] Failed to initialize environment: {e}", "ERROR")
-            raise
-    
-    async def initialize(self):
-        """Initialize the worker (environment and API client)."""
-        safe_log(f"[{self.env}] Initializing worker...", "INFO")
-
-        if not self.wallet or not self.hotkey:
-            raise RuntimeError("Wallet not configured for worker")
-        
-        self.api_client = await create_api_client()
+        )
+        self._samples = SampleResultsAdapter(
+            dao=SampleResultsDAO(),
+            validator_hotkey=f"executor-{self.env}",
+        )
         await self._init_env_executor()
-        
-        safe_log(f"[{self.env}] Worker initialized", "INFO")
-    
-    def start(self):
-        """Start the worker fetch and execution loops."""
+        safe_log(f"[{self.env}] worker ready", "INFO")
+
+    async def _init_env_executor(self) -> None:
+        if self._env_executor is not None:
+            return
+        from affine.core.environments import SDKEnvironment
+
+        self._env_executor = SDKEnvironment(self.env)
+        _, mode = self._env_executor._get_hosts_and_mode()
+        safe_log(f"[{self.env}] env mode={mode}", "INFO")
+
+    def start(self) -> None:
         self.running = True
-        self.execution_semaphore = asyncio.Semaphore(self.max_concurrent_tasks)
-        
-        asyncio.create_task(self._fetch_loop())
-        
-        for i in range(self.max_concurrent_tasks):
-            task = asyncio.create_task(self._execution_worker(i))
-            self.executor_tasks.append(task)
-        
-        safe_log(
-            f"[{self.env}] Started fetch loop (batch_size: {self.batch_size}) "
-            f"and {self.max_concurrent_tasks} executor workers",
-            "INFO"
-        )
-    
-    async def stop(self):
-        """Stop the worker and all executor tasks."""
-        safe_log(f"[{self.env}] Stopping worker...", "INFO")
+
+    def stop(self) -> None:
         self.running = False
-        
-        for task in self.executor_tasks:
-            if not task.done():
-                task.cancel()
-        
-        if self.executor_tasks:
-            await asyncio.gather(*self.executor_tasks, return_exceptions=True)
-        
-        safe_log(f"[{self.env}] Worker stopped", "INFO")
-    
-    def _sign_message(self, message: str) -> str:
-        """Sign a message using the wallet."""
-        if not self.wallet:
-            raise RuntimeError("Wallet not configured")
-        
-        signature = self.wallet.hotkey.sign(message.encode())
-        return signature.hex()
-    
-    def _get_auth_headers(self, message: Optional[str] = None) -> Dict[str, str]:
-        """Get authentication headers for API requests."""
-        if message is None:
-            message = str(int(time.time()))
-        
-        signature = self._sign_message(message)
-        
-        return {
-            "X-Hotkey": self.hotkey,
-            "X-Signature": signature,
-            "X-Message": message,
-        }
-    
-    async def _fetch_tasks_batch(self):
-        """Fetch batch of tasks from API with latency tracking."""
-        start_time = time.time()
-        
-        try:
-            headers = self._get_auth_headers()
-            response = await self.api_client.post(
-                "/tasks/fetch",
-                params={"env": self.env, "batch_size": self.batch_size},
-                headers=headers
-            )
 
-            if not isinstance(response, dict):
-                return []
-            
-            tasks = response.get("tasks", [])
-            
-            if not tasks:
-                return []
-
-            safe_log(
-                f"[{self.env}] Fetched {len(tasks)} tasks (requested {self.batch_size})",
-                "DEBUG"
-            )
-            return tasks
-
-        except Exception as e:
-            safe_log(f"[{self.env}] Failed to fetch tasks: {e}", "DEBUG")
-            return []
-        
-        finally:
-            fetch_time = (time.time() - start_time) * 1000
-            self.metrics.fetch_count += 1
-            self.metrics.total_fetch_time += fetch_time
-
-    
-    async def _execute_task(self, task: Dict) -> SampleSubmission:
-        """Execute a sampling task."""
-        start_time = time.time()
-        
-        try:
-            model = task["model"]
-            task_id = int(task["task_id"])
-            task_uuid = task.get("task_uuid", "")
-            miner_hotkey = task["miner_hotkey"]
-            chute_slug = task.get("chute_slug", "") or ""
-            base_url = task.get("base_url")
-            public_base_url = task.get("public_base_url")
-            inference_model = task.get("inference_model")
-            provider = task.get("provider", "chutes" if chute_slug else "unknown")
-
-            safe_log(
-                f"[{self.env}] Executing task: "
-                f"uuid={task_uuid[:8]}... miner={miner_hotkey[:12]}... model={model} "
-                f"task_id={task_id} provider={provider}",
-                "DEBUG"
-            )
-
-            if not base_url and not chute_slug:
-                raise ValueError(
-                    f"neither base_url nor chute_slug present for task {task_uuid[:8]}... "
-                    f"miner={miner_hotkey[:12]}..."
-                )
-
-            # Create a minimal miner object for evaluate()
-            class MinimalMiner:
-                def __init__(self, model, slug, hotkey, base_url, public_base_url, inference_model):
-                    self.model = model
-                    self.slug = (slug.replace('.chutes.ai', '').replace('https://', '')
-                                 if slug else None)
-                    self.hotkey = hotkey
-                    self.revision = ""
-                    self.base_url = base_url
-                    self.public_base_url = public_base_url
-                    self.inference_model = inference_model
-
-            miner = MinimalMiner(model, chute_slug, miner_hotkey, base_url, public_base_url, inference_model)
-            
-            # Call SDKEnvironment.evaluate() which returns a Result object
-            result = await self.env_executor.evaluate(
-                miner=miner,
-                task_id=task_id,
-            )
-            
-            execution_time = time.time() - start_time
-            self.metrics.total_execution_time += execution_time
-            
-            extra = result.extra or {}
-            if result.error:
-                extra["error"] = result.error
-            elif isinstance(extra.get("conversation"), list) and len(extra["conversation"]) <= 1:
-                # Chute died before producing any model turn — drop, don't
-                # save. The submit endpoint routes extra["error"] to
-                # log_task_failure → save_sample skipped → task can retry.
-                extra["error"] = "sampling_failed: model produced no output"
-
-            submission = SampleSubmission(
-                task_uuid=task_uuid,
-                score=float(result.score),
-                latency_ms=int(result.latency_seconds * 1000),
-                extra=extra,
-                signature="",
-            )
-            
-            submission.sign(self.wallet)
-
-            has_error = extra.get("error")
-            if has_error:
-                error_brief = str(has_error).replace('\n', ' ').replace('\r', ' ')[:300]
-                safe_log(
-                    f"[FAILED] U{task.get('miner_uid'):<4} │ {self.env:<20} │ {submission.score:10.3f} │ "
-                    f"task_id={task_id:<6} │ {execution_time:6.3f}s │ via={task.get('provider', '?')} │ error={error_brief}",
-                    "INFO"
-                )
-            else:
-                safe_log(
-                    f"[RESULT] U{task.get('miner_uid'):<4} │ {self.env:<20} │ {submission.score:10.3f} │ "
-                    f"task_id={task_id:<6} │ {execution_time:6.3f}s │ via={task.get('provider', '?')}",
-                    "INFO"
-                )
-            
-            return submission
-        
-        except Exception:
-            raise
-    
-    async def _submit_result(self, task: Dict, submission: SampleSubmission) -> bool:
-        """Submit task result to API with authentication."""
-        try:
-            headers = self._get_auth_headers()
-            
-            submit_data = {
-                "task_uuid": submission.task_uuid,
-                "score": submission.score,
-                "latency_ms": submission.latency_ms,
-                "extra": submission.extra,
-                "signature": submission.signature,
-            }
-            
-            await self.api_client.post(
-                "/tasks/submit",
-                json=submit_data,
-                headers=headers
-            )
-            
-            has_error = submission.extra.get("error") if submission.extra else None
-            if has_error:
-                self.metrics.tasks_failed += 1
-            else:
-                self.metrics.tasks_succeeded += 1
-
-            return True
-
-        except Exception:
-            self.metrics.submit_failed += 1
-            raise
-    
-    async def _fetch_loop(self):
-        """Fetch loop driven by queue size."""
-        while self.running:
-            try:
-                current_queue_size = self.task_queue.qsize()
-                
-                if current_queue_size >= self.max_concurrent_tasks:
-                    await asyncio.sleep(1)
-                    continue
-
-                tasks = await self._fetch_tasks_batch()
-                
-                num_tasks = len(tasks)
-                if num_tasks > 0:
-                    for task in tasks:
-                        await self.task_queue.put(task)
-                    
-                    safe_log(
-                        f"[{self.env}] Queued {num_tasks} tasks (queue_size={self.task_queue.qsize()})",
-                        "DEBUG"
-                    )
-                else:
-                    await asyncio.sleep(1)
-            
-            except asyncio.CancelledError:
-                break
-            
-            except Exception as e:
-                safe_log(f"[{self.env}] Error in fetch loop: {e}", "ERROR")
-                await asyncio.sleep(1)
-        
-        safe_log(f"[{self.env}] Fetch loop stopped", "INFO")
-    
-    async def _execution_worker(self, worker_idx: int):
-        """Execution worker that processes tasks from queue concurrently."""
-        safe_log(f"[{self.env}] Execution worker {worker_idx} started", "DEBUG")
-        
-        while self.running:
-            try:
-                try:
-                    task = await asyncio.wait_for(self.task_queue.get(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-                
-                async with self.execution_semaphore:
-                    safe_log(
-                        f"[{self.env}] Worker {worker_idx} executing task "
-                        f"uuid={task.get('task_uuid', 'unknown')[:8]}...",
-                        "DEBUG"
-                    )
-                    
-                    task_start_time = time.time()
-                    submission = None
-                    execution_error = None
-                    
-                    try:
-                        submission = await self._execute_task(task)
-                    except Exception as e:
-                        execution_error = e
-                        execution_time = time.time() - task_start_time
-                        
-                        # Create a failed submission with error details
-                        error_brief = str(e).replace('\n', ' ').replace('\r', ' ')[:300]
-                        safe_log(
-                            f"[FAILED] U{task.get('miner_uid'):<4} │ {self.env:<20} │     FAILED │ "
-                            f"task_id={task.get('task_id', 'N/A'):<6} │ {execution_time:6.3f}s │ {error_brief}",
-                            "INFO"
-                        )
-                        
-                        # Construct a failed submission
-                        submission = SampleSubmission(
-                            task_uuid=task.get('task_uuid', ''),
-                            score=0.0,
-                            latency_ms=int(execution_time * 1000),
-                            extra={"error": str(e)},
-                            signature="",
-                        )
-                        
-                        submission.sign(self.wallet)
-                    
-                    # Always submit result if we have a submission
-                    try:
-                        if submission:
-                            await self._submit_result(task, submission)
-                    except Exception as submit_error:
-                        safe_log(
-                            f"[{self.env}] Failed to submit result for task {task.get('task_uuid', 'unknown')[:8]}...: {submit_error}",
-                            "ERROR"
-                        )
-                    finally:
-                        self.task_queue.task_done()
-                        self.metrics.last_task_at = time.time()
-            
-            except asyncio.CancelledError:
-                break
-            
-            except Exception as e:
-                safe_log(f"[{self.env}] Error in execution worker {worker_idx}: {e}", "ERROR")
-                await asyncio.sleep(1)
-        
-        safe_log(f"[{self.env}] Execution worker {worker_idx} stopped", "DEBUG")
-    
     def get_metrics(self) -> Dict[str, Any]:
-        """Get worker metrics."""
-        total_tasks = self.metrics.tasks_succeeded + self.metrics.tasks_failed
-        avg_time = (
-            self.metrics.total_execution_time / total_tasks
-            if total_tasks > 0
-            else 0
+        return self.metrics.to_dict()
+
+    # ---- main loop ---------------------------------------------------------
+
+    async def run(self) -> None:
+        assert self._state and self._samples, "call initialize() first"
+        # Publish status to DB in the background so ``af db worker-status``
+        # can read live in-flight / succeeded / failed counters.
+        status_task = asyncio.create_task(self._publish_status_loop())
+        try:
+            if self.warmup_sec > 0:
+                logger.info(
+                    f"[{self.env}] warmup: sleeping {self.warmup_sec:.0f}s before "
+                    f"first tick (let env containers finish app-level boot)"
+                )
+                await asyncio.sleep(self.warmup_sec)
+            while self.running:
+                try:
+                    worked = await self._tick()
+                except Exception as e:
+                    logger.error(
+                        f"[{self.env}] tick raised: {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    worked = False
+                await asyncio.sleep(self.poll_interval_sec if worked else self.idle_sleep_sec)
+        finally:
+            status_task.cancel()
+
+    async def _publish_status_loop(self, interval_sec: float = 10.0) -> None:
+        """Periodically write this worker's metrics to ``system_config`` under
+        ``worker_status_<env>``. ``af db worker-status`` reads these rows so
+        operators can see live in-flight concurrency without docker-exec
+        spelunking. Uses the asyncio loop directly — never multiprocessing.Queue
+        (that path historically segfaulted under paramiko + nest_asyncio)."""
+        import time as _t
+        from affine.src.scorer.window_state import SystemConfigKVAdapter
+        from affine.database.dao.system_config import SystemConfigDAO
+        kv = SystemConfigKVAdapter(SystemConfigDAO(), updated_by=f"executor-{self.env}")
+        while self.running:
+            try:
+                payload = self.metrics.to_dict()
+                payload["reported_at"] = _t.time()
+                await kv.set(f"worker_status_{self.env}", payload)
+            except Exception as e:
+                logger.debug(f"[{self.env}] status publish failed: {e}")
+            await asyncio.sleep(interval_sec)
+
+    async def _tick(self) -> bool:
+        """One poll cycle. Returns True if any sampling work was attempted.
+
+        Sampling policy is asymmetric between subjects:
+          - **Champion** keeps draining the full pool (sampling_count *
+            1.1 from Stage AF). The extra 10% gives later contests more
+            comparison data and a buffer against task-ids that the env
+            can't process (~5% expected); a champion sticks around for
+            many battles, so investing in deeper samples pays off.
+          - **Challenger** stops at the base ``sampling_count``. Once
+            the overlap with champion can possibly clear the comparator
+            threshold there's no value in continuing — the challenger
+            either wins and the rotation moves on, or loses and gets
+            torn down.
+        """
+        task_state = await self._state.get_task_state()
+        if task_state is None:
+            return False
+        task_ids = task_state.task_ids.get(self.env) or []
+        if not task_ids:
+            return False
+        refresh_block = task_state.refreshed_at_block
+
+        envs = await self._state.get_environments()
+        env_cfg = envs.get(self.env)
+        if env_cfg is None:
+            return False  # env disabled / removed from config
+        sampling_count = env_cfg.sampling_count
+
+        champion = await self._state.get_champion()
+        champion_urls = _base_urls(champion.deployments if champion else [], champion.base_url if champion else None)
+        if champion is None or not champion_urls:
+            return False
+
+        pending: List[tuple] = []  # (miner_snapshot, task_id, base_url)
+
+        # Champion: drain the full pool (no cap). A persistently-failing
+        # task_id keeps reappearing in ``pending`` each tick — that's
+        # acceptable because env-level failures eat constant low-grade
+        # capacity and the 10% buffer + 5% miss tolerance absorbs them.
+        champ_snap = MinerSnapshot(
+            uid=champion.uid, hotkey=champion.hotkey,
+            revision=champion.revision, model=champion.model,
         )
-        
-        avg_fetch_time = (
-            self.metrics.total_fetch_time / self.metrics.fetch_count
-            if self.metrics.fetch_count > 0
-            else 0
+        for idx, tid in enumerate(task_ids):
+            if not await self._samples.has_sample(
+                champion.hotkey, champion.revision, self.env, tid,
+                refresh_block=refresh_block,
+            ):
+                pending.append((champ_snap, tid, _pick_url(champion_urls, tid, idx)))
+
+        # Battle in flight → cap challenger at ``sampling_count``.
+        battle = await self._state.get_battle()
+        battle_urls = _base_urls(battle.deployments if battle else [], battle.base_url if battle else None)
+        if battle is not None and battle_urls:
+            chal_have = await self._samples.count_samples_for_tasks(
+                battle.challenger.hotkey, battle.challenger.revision, self.env,
+                task_ids, refresh_block=refresh_block,
+            )
+            if chal_have < sampling_count:
+                remaining = sampling_count - chal_have
+                for idx, tid in enumerate(task_ids):
+                    if remaining <= 0:
+                        break
+                    if not await self._samples.has_sample(
+                        battle.challenger.hotkey, battle.challenger.revision,
+                        self.env, tid, refresh_block=refresh_block,
+                    ):
+                        pending.append((battle.challenger, tid, _pick_url(battle_urls, tid, idx)))
+                        remaining -= 1
+
+        if not pending:
+            return False
+
+        # Shuffle so the same slow-tail task_ids don't always end up last
+        # across ticks / executor restarts. The task pool's deterministic
+        # order would otherwise pin which task is the slowest to finish.
+        # The contest's 10% buffer + overlap-readiness can then release
+        # ``decide`` sooner once enough overlap appears anywhere in the pool.
+        random.shuffle(pending)
+
+        sem = asyncio.Semaphore(self.max_concurrent)
+
+        async def _run_one(miner: MinerSnapshot, task_id: int, base_url: str) -> None:
+            async with sem:
+                await self._evaluate_and_persist(
+                    miner=miner, task_id=task_id, base_url=base_url,
+                    refresh_block=refresh_block,
+                )
+
+        await asyncio.gather(
+            *(_run_one(m, tid, url) for m, tid, url in pending),
+            return_exceptions=True,
         )
-        
-        running_tasks = 0
-        if self.execution_semaphore is not None:
-            running_tasks = self.max_concurrent_tasks - self.execution_semaphore._value
-        
-        pending_tasks = self.task_queue.qsize()
-        
-        self.metrics.running_tasks = running_tasks
-        self.metrics.pending_tasks = pending_tasks
-        
-        metrics_dict = self.metrics.to_dict()
-        metrics_dict['avg_execution_time'] = avg_time
-        metrics_dict['avg_fetch_time_ms'] = avg_fetch_time
-        
-        return metrics_dict
+        return True
+
+    async def _evaluate_and_persist(
+        self, *, miner: MinerSnapshot, task_id: int, base_url: str,
+        refresh_block: int,
+    ) -> None:
+        """Run one (env, task_id, miner) through affinetes, write result
+        tagged with the task-id pool's ``refresh_block`` so the scheduler
+        only counts current-refresh samples.
+
+        Failure handling distinguishes two cases:
+
+          - ``evaluate`` raises an exception (network glitch, Targon 5xx,
+            container restart mid-call): infrastructure-level failure.
+            **Don't persist** — let the next ``_tick`` re-attempt this
+            task_id. The shuffle keeps us from always blocking on the
+            same flaky task. Permanent failures (>10% of pool) eventually
+            exceed the refresh's buffer and operator intervention is
+            required.
+          - ``evaluate`` returns ``success=False``: semantic failure (the
+            env's verdict that the miner's response was wrong). Persist
+            with score=0 — that's the env's judgment, not a retry signal.
+        """
+        miner_obj = _Miner(
+            hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
+            base_url=base_url,
+        )
+        started = time.monotonic()
+        # Track real in-flight concurrency so ``af db worker-status`` can
+        # report it. Increment before the blocking evaluate() call, decrement
+        # in the finally below.
+        self.metrics.tasks_in_flight += 1
+        try:
+            try:
+                result = await self._env_executor.evaluate(
+                    miner=miner_obj, task_id=task_id,
+                )
+            except Exception as e:
+                latency_s = time.monotonic() - started
+                latency_ms = int(latency_s * 1000)
+                error_brief = str(e).replace("\n", " ").replace("\r", " ")[:200]
+                logger.info(
+                    f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
+                    f"task_id={task_id:<8} │ {latency_s:6.3f}s │ {type(e).__name__}: {error_brief}"
+                )
+                self.metrics.record_completion(success=False, latency_ms=latency_ms)
+                return
+        finally:
+            self.metrics.tasks_in_flight -= 1
+
+        score = float(getattr(result, "score", 0.0))
+        success = bool(getattr(result, "success", True))
+        error = getattr(result, "error", None)
+        extra = dict(getattr(result, "extra", {}) or {})
+        latency_ms = int((time.monotonic() - started) * 1000)
+        if not success:
+            extra.setdefault("error", error)
+        await self._samples.persist(
+            miner_hotkey=miner.hotkey,
+            model_revision=miner.revision,
+            model=miner.model,
+            env=self.env,
+            task_id=task_id,
+            score=score,
+            latency_ms=latency_ms,
+            extra=extra,
+            block_number=0,  # block tracking moved to scheduler/snapshot side
+            refresh_block=refresh_block,
+        )
+        self.metrics.record_completion(success=success, latency_ms=latency_ms)
+        # Observable success signal in the legacy executor's line format:
+        # [RESULT] U<uid> │ <env>           │      0.500 │ task_id=12345 │   1.234s
+        latency_s = latency_ms / 1000.0
+        logger.info(
+            f"[RESULT] U{miner.uid:<4} │ {self.env:<20} │ {score:10.3f} │ "
+            f"task_id={task_id:<8} │ {latency_s:6.3f}s"
+        )
+
+
+class _Miner:
+    """Duck-typed miner shim SDKEnvironment.evaluate expects."""
+
+    __slots__ = (
+        "hotkey", "model", "revision", "base_url",
+        "inference_model", "public_base_url",
+    )
+
+    def __init__(self, *, hotkey: str, model: str, revision: str, base_url: str):
+        self.hotkey = hotkey
+        self.model = model
+        self.revision = revision
+        self.base_url = base_url
+        self.inference_model = None
+        self.public_base_url = None
+
+
+def _base_urls(deployments: List[DeploymentRecord], fallback: Optional[str]) -> List[str]:
+    urls = [d.base_url for d in deployments if d.base_url]
+    if not urls and fallback:
+        urls = [fallback]
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(urls))
+
+
+def _pick_url(urls: List[str], task_id: int, index: int) -> str:
+    if len(urls) == 1:
+        return urls[0]
+    return urls[(int(task_id) + index) % len(urls)]

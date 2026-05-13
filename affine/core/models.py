@@ -14,23 +14,24 @@ def _truncate(text: Optional[str], max_len: int = 80) -> str:
 
 
 class Miner(BaseModel):
-    """Miner information."""
-    
+    """Miner identity as committed on chain.
+
+    The queue-window scorer hosts inference itself, so a miner row is
+    just ``(uid, hotkey, model, revision)`` plus the on-chain block when
+    the commit landed.
+    """
+
     uid: int
     hotkey: str
     model: Optional[str] = None
     revision: Optional[str] = None
     block: Optional[int] = None
-    chute: Optional[Dict[str, Any]] = None
-    slug: Optional[str] = None
-    weights_shas: Optional[list[str]] = None
-    
+
     class Config:
         validate_assignment = True
-    
+
     @property
     def model_dump(self):
-        """Alias for dict() for pydantic v2 compatibility."""
         return self.dict
 
 

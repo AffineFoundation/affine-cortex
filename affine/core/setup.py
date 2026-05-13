@@ -25,18 +25,16 @@ logger = logging.getLogger("affine")
 
 
 def _get_component_name() -> str:
+    """Identify component name from command line arguments.
+
+    Used to pick the log directory: ``/var/log/affine/{component}/``.
+    Anything not in the known set falls back to ``affine``.
     """
-    Identify component name from command line arguments.
-    Supported components: api, scheduler, executor, monitor, scorer, validator
-    """
-    # Get component name from command line arguments
     if len(sys.argv) > 1:
         component = sys.argv[-1].lower()
-        valid_components = ["api", "scheduler", "executor", "monitor", "scorer", "validator"]
+        valid_components = ["api", "monitor", "scorer", "teacher", "validator"]
         if component in valid_components:
             return component
-    
-    # Default to affine
     return "affine"
 
 

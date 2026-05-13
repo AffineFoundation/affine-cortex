@@ -22,7 +22,6 @@ class APIConfig:
         os.getenv("API_RATE_LIMIT_ENABLED", "false").lower() == "true"
     )
     RATE_LIMIT_READ: int = int(os.getenv("API_RATE_LIMIT_READ", "10"))  # per min
-    RATE_LIMIT_WRITE: int = int(os.getenv("API_RATE_LIMIT_WRITE", "10"))  # per min
 
     # CORS
     CORS_ORIGINS: List[str] = [
@@ -34,19 +33,9 @@ class APIConfig:
     # Logging
     LOG_LEVEL: str = os.getenv("API_LOG_LEVEL", "INFO")
 
-    # Request settings
-    REQUEST_TIMEOUT: int = int(os.getenv("API_REQUEST_TIMEOUT", "60"))
-    MAX_REQUEST_SIZE: int = int(
-        os.getenv("API_MAX_REQUEST_SIZE", str(10 * 1024 * 1024))
-    )  # 10MB
-
-    # Services settings
-    SERVICES_ENABLED: bool = (
-        os.getenv("API_SERVICES_ENABLED", "false").lower() == "true"
-    )
-
-    FULL_DATA_ENABLED: bool = (
-        os.getenv("API_FULL_DATA_ENABLED", "false").lower() == "true"
+    # Optional operator-only diagnostics. This mounts non-public read endpoints.
+    INTERNAL_ENDPOINTS_ENABLED: bool = (
+        os.getenv("API_INTERNAL_ENDPOINTS_ENABLED", "false").lower() == "true"
     )
 
     # App metadata

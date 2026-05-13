@@ -1,6 +1,10 @@
-# Affine Miner Guide
+# Miner Guide
 
-This document provides a complete guide for mining on the Affine subnet (Subnet 120).
+How to participate in Affine as a miner.
+
+> The validator now hosts inference for you. You commit a HuggingFace
+> `(model, revision)` pair on chain and the validator-side scheduler
+> deploys your weights when your queue slot comes up.
 
 ## Table of Contents
 
@@ -8,350 +12,155 @@ This document provides a complete guide for mining on the Affine subnet (Subnet 
 - [Environment Setup](#environment-setup)
 - [Mining Workflow](#mining-workflow)
 - [CLI Reference](#cli-reference)
-- [Common Issues](#common-issues)
+- [Multi-commit Rule](#multi-commit-rule)
+- [Tips](#tips)
 
 ## Prerequisites
 
-1. **Hugging Face Account**: For hosting models
-2. **Chutes.ai Account**: Register using the **same hotkey** as your mining hotkey (no developer deposit required)
-3. **Chutes Account Funding**: TAO required to pay for GPU time when your model is running
-4. **Bittensor Wallet**: Hotkey registered to Subnet 120
+1. **Bittensor wallet** — coldkey + hotkey, registered on subnet 120.
+2. **HuggingFace account** with a personal access token that has *Write*
+   scope (you'll upload model weights through it).
+
+That's all you need to submit a model.
 
 ## Environment Setup
 
 ### 1. Install Affine
 
 ```bash
-# Install uv package manager
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Clone and install Affine
-git clone https://github.com/AffineFoundation/affine.git
-cd affine
+git clone https://github.com/AffineFoundation/affine-cortex.git
+cd affine-cortex
 uv venv && source .venv/bin/activate && uv pip install -e .
-
-# Verify installation
-af
+af --help
 ```
 
-### 2. Configure Environment Variables
+### 2. Configure environment variables
 
-Copy and edit the `.env` file:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` file with required variables:
+Copy `.env.example` to `.env` and fill in:
 
 ```bash
-# Chutes API key (get from chutes.ai, format: cpk_...)
-CHUTES_API_KEY=cpk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx.xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# Bittensor wallet aliases (names, not SS58 addresses)
+BT_WALLET_COLD=mywallet
+BT_WALLET_HOT=myhotkey
 
-# Bittensor wallet configuration
-BT_WALLET_COLD=your_coldkey_name
-BT_WALLET_HOT=your_hotkey_name
+# Subtensor endpoint
+SUBTENSOR_ENDPOINT="finney"
 
-# Hugging Face token (needs Write permission to upload models)
+# HuggingFace token (Write scope; starts with hf_...)
 HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-
-# Chutes username
-CHUTE_USER=your_username
-
-# Subtensor configuration (optional)
-SUBTENSOR_ENDPOINT=finney
-SUBTENSOR_FALLBACK=wss://lite.sub.latent.to:443
 ```
 
-### 3. Register Chutes Account
+### 3. Register on subnet 120
 
 ```bash
-chutes register
-```
-
-After registration, view your payment address and fund it with TAO:
-
-```bash
-cat ~/.chutes/config.ini
-```
-
-Send TAO to the displayed address to pay for Chute running costs.
-
-### 4. Register to Subnet 120
-
-```bash
-btcli subnet register --wallet.name <your_coldkey> --wallet.hotkey <your_hotkey>
+btcli subnet register --netuid 120
 ```
 
 ## Mining Workflow
 
-### Step 1: Pull an Existing Model
+### Step 1 — Get a baseline model
 
-Pull an existing model from the network as a starting point:
-
-```bash
-af pull <UID> --model-path ./my_model
-```
-
-**Parameters:**
-- `<UID>`: UID of the miner to pull from
-- `--model-path`: Local directory path to save the model (optional, default: `./model_path`)
-- `--hf-token`: Hugging Face token (optional, reads from environment variable)
-
-**Example:**
-```bash
-# Pull model from UID 42 to ./my_model directory
-af pull 42 --model-path ./my_model
-```
-
-### Step 2: Improve the Model
-
-Improve model performance using reinforcement learning or other methods. This is the core of mining:
-
-- Train the model on Affine's evaluation environments
-- Optimize model performance across multiple tasks
-- Ensure your model is competitive on the Pareto frontier
-
-### Step 3: Upload Model to Hugging Face
-
-Manually upload your improved model to Hugging Face:
-
-1. Create or select an HF repository (e.g., `<username>/Affine-<repo>`)
-2. Push your model using `huggingface-cli` or `git lfs`
-3. Obtain the commit SHA
-
-**Example:**
-```bash
-# Upload using huggingface-cli
-huggingface-cli upload <username>/Affine-model ./my_model
-
-# Or using git
-cd ./my_model
-git init
-git lfs install
-git lfs track "*.safetensors"
-git add .
-git commit -m "Initial model commit"
-git remote add origin https://huggingface.co/<username>/Affine-model
-git push origin main
-```
-
-### Step 4: Deploy to Chutes
-
-Deploy your Hugging Face model as a Chute:
+Pull a recent on-chain model as your starting point:
 
 ```bash
-af chutes_push --repo <username/repo> --revision <SHA>
+af pull <UID> --model-path ./model_path
 ```
 
-**Parameters:**
-- `--repo`: Hugging Face repository ID (required)
-- `--revision`: Git commit SHA (required)
-- `--chutes-api-key`: Chutes API key (optional, reads from environment variable)
-- `--chute-user`: Chutes username (optional, reads from environment variable)
+This reads UID's commit, fetches the model from HuggingFace at the committed
+revision, and saves to the local path. Iterate on this checkpoint.
 
-**Example:**
-```bash
-af chutes_push --repo myuser/Affine-model --revision abc123def456
-```
+### Step 2 — Improve
 
-This command outputs a JSON response containing `chute_id`. Save this ID for the next step.
+Train, fine-tune, distill — whatever produces a model that beats the
+current champion on every evaluation environment. Validate locally with
+`af eval --env <ENV> --base-url <local-vllm> --model <name>` (see [CLI
+Reference](#cli-reference)).
 
-**Customize Chute Configuration:**
+### Step 3 — Upload to HuggingFace and commit
 
-To customize deployment settings (GPU type, concurrency, etc.), edit the `deploy_to_chutes()` function in [`affine/affine/cli.py`](../affine/cli.py:124).
-
-Refer to the [official Chutes documentation](https://github.com/chutesai/chutes) for all configuration options.
-
-### Step 5: Commit On-Chain
-
-Commit the deployment information to the blockchain:
+One command does both:
 
 ```bash
-af commit --repo <username/repo> --revision <SHA> --chute-id <chute_id>
+af miner-deploy --repo myuser/affine-model-<hotkey> -p ./model_path
 ```
 
-**Parameters:**
-- `--repo`: Hugging Face repository ID (required)
-- `--revision`: Git commit SHA (required)
-- `--chute-id`: Chutes deployment ID (required)
-- `--coldkey`: Coldkey name (optional, reads from environment variable)
-- `--hotkey`: Hotkey name (optional, reads from environment variable)
+This:
+1. Uploads `./model_path` to `myuser/affine-model-<hotkey>` on HuggingFace
+   (creates the repo if needed).
+2. Reads the resulting commit SHA.
+3. Writes `{"model": "myuser/affine-model-<hotkey>", "revision": "<SHA>"}`
+   on chain via `bittensor.set_reveal_commitment`.
 
-**Example:**
+The repo name **must end with your hotkey** (case-insensitive) after
+block 7,290,000 — the monitor rejects miners that don't follow this rule.
+
+If you already uploaded out of band:
+
 ```bash
-af commit --repo myuser/Affine-model --revision abc123def456 --chute-id chute_789xyz
+af commit --repo myuser/affine-model-<hotkey> --revision <SHA>
 ```
 
-> **Note:** Each hotkey can only have one commit on-chain. If you want to run new models, you need to register and use separate hotkeys.
+`af commit` is a single-shot: each hotkey can commit **exactly once**. Any
+second commit invalidates the miner permanently (see [Multi-commit Rule](#multi-commit-rule)).
 
 ## CLI Reference
 
-### Query Commands
+### Status queries
 
-#### Query Sample Result
+| Command | What it shows |
+| --- | --- |
+| `af get-rank` | One-stop public rank/status table |
+| `af get-miner --uid UID` | Public miner metadata: model, revision, validity, queue status, and commit blocks |
+| `af get-weights` | Latest on-chain-bound weights only |
+| `af get-scores --top N` | Top N miners from the latest snapshot |
+| `af get-score <UID>` | One miner's score |
 
-```bash
-af get-sample <UID> <environment> <task_id>
-```
+`af get-rank` is the main status command; the others are focused query
+helpers. `af get-miner` exposes public miner metadata.
 
-Query sample result for a specific miner on a specific environment and task.
+### Local evaluation
 
-**Examples:**
-```bash
-af get-sample 42 affine:ded task_123
-af get-sample 100 agentgym:webshop 456
-```
-
-#### Query Miner Information
-
-```bash
-af get-miner <UID>
-```
-
-Query complete miner information including hotkey, model, revision, chute_id, validation status, and timestamps.
-
-**Example:**
-```bash
-af get-miner 42
-```
-
-#### Query Weights
+`af eval` is a developer tool to sanity-check a model against an Affine
+environment without going through the validator. You bring up an
+OpenAI-compatible inference server (vllm/sglang locally, or any
+OpenAI-compatible host) and point at it:
 
 ```bash
-af get-weights
+af eval --env affine:ded-v2 \
+        --base-url http://localhost:8000/v1 \
+        --model myuser/affine-model \
+        --samples 10
 ```
 
-Query the latest normalized weights for on-chain weight setting.
+`af eval --list-envs` enumerates the available environments.
 
-#### Query Scores
+### Service commands
 
-```bash
-af get-scores [--top N]
-```
+Miners don't run any of the backend services; those are for validators.
 
-Query top N miners by score.
+## Multi-commit Rule
 
-**Parameters:**
-- `--top, -t`: Return top N miners (default: 10)
+**The single biggest gotcha.** Once a hotkey commits a revision, that
+hotkey cannot commit again. The monitor's validator checks
+`commit_count > 1` and marks the miner `permanently invalid` with
+reason `multiple_commits:count=N`. You will be excluded from the
+challenger queue and never recover with that hotkey.
 
-**Examples:**
-```bash
-af get-scores
-af get-scores --top 20
-```
+If you need to try a different model, register a fresh hotkey.
 
-#### Query Task Pool
+## Tips
 
-```bash
-af get-pool <UID> <environment> [--full]
-```
-
-Query the list of pending task IDs for a miner in a specific environment.
-
-**Parameters:**
-- `--full`: Display full task ID list without truncation
-
-**Examples:**
-```bash
-af get-pool 100 agentgym:webshop
-af get-pool 100 agentgym:webshop --full
-```
-
-#### Query Ranking Table
-
-```bash
-af get-rank
-```
-
-Fetch and display the latest miner ranking table in the same format as scorer output.
-
-### Verbose Logging
-
-All commands support increased logging verbosity:
-
-```bash
-# INFO level
-af -v pull 42
-
-# DEBUG level
-af -vv commit --repo myuser/model --revision abc123 --chute-id xyz789
-
-# TRACE level
-af -vvv chutes_push --repo myuser/model --revision abc123
-```
-
-## Common Issues
-
-### Q: My Chute is "cold" and not receiving validator requests?
-
-**A:** Chutes automatically shut down after a period of inactivity (default 5-10 minutes) to save costs. Solutions:
-
-1. **Increase shutdown time**: Increase the `shutdown_after_seconds` parameter in your Chute config (e.g., set to `1800` for 30 minutes)
-2. **Keep it warm**: Write a script to send requests to your Chute every few minutes to keep it active
-
-### Q: Chute deployment fails or won't activate?
-
-**A:** This is usually a configuration issue:
-
-1. **Check logs**: Retrieve live logs using Instance ID and Chutes API key (detailed guide on Discord)
-2. **Common errors**:
-   - Invalid `engine_args` parameters or comma errors
-   - Outdated image version, need to update `image` parameter
-   - Corrupted `model.safetensors` file or upload error
-
-### Q: New model doesn't appear on leaderboard?
-
-**A:** The system needs time to evaluate models (e.g., 10,000 blocks, which can be over a day). If still not appearing:
-
-1. Confirm on-chain commit was successful
-2. Check that the committed model revision matches the Chute deployment
-
-### Q: How to view my model's performance across environments?
-
-**A:** Use query commands:
-
-```bash
-# View rankings
-af get-rank
-
-# View sample results for specific environment
-af get-sample <your_UID> agentgym:webshop <task_id>
-
-# View pending tasks
-af get-pool <your_UID> agentgym:webshop
-```
-
-### Q: Can environment variables be overridden via command-line arguments?
-
-**A:** Yes, most commands support overriding environment variables with parameters:
-
-```bash
-# Using command-line arguments
-af commit --repo myuser/model --revision abc123 --chute-id xyz789 --coldkey mywallet --hotkey myhotkey
-
-# Or rely on environment variables
-af commit --repo myuser/model --revision abc123 --chute-id xyz789
-```
-
-### Q: How to check the rollouts?
-
-**A:** Each rollout is synced in the R2, so without the rate-limit of cortex, you can download each rollout from R2, which will fundamentally reinforce the transparent of affine.(plz notice R2 might have sync error, so cortex is the auth source)
-
-```bash
-# R2 Link
-https://pub-70dee0143439462a9928118289b0b9c7.r2.dev/
-
-#storage arch: 
-affine-sample-results/{hotkey}-{revision}/{env}/{task_id}.json
-
-#For Instance,
-https://pub-70dee0143439462a9928118289b0b9c7.r2.dev/5Ckqjq8Sskd2JNvG2NY1kKjF3ToDsvGY5FK5vTQZtrwwFrnR-4b38b269705a6b7594c3770e7ef778a40bfaa9da/CDE/2.json?include_extra=true
-```
-
-## Related Documentation
-
-- [Main Documentation](../README.md) - Affine project overview
-- [Validator Guide](VALIDATOR.md) - Validator operation guide
-- [FAQ](FAQ.md) - Frequently Asked Questions
-- [Chutes Documentation](https://github.com/chutesai/chutes) - Official Chutes platform documentation
+- **Repo name ends with hotkey** — case-insensitive. Easiest way: name
+  your HF repo `affine-model-<hotkey-suffix>`.
+- **Repo must be public** when you commit — the validator pulls weights
+  via the public HuggingFace API.
+- **Model size** is checked by the monitor (`check_model_size`). Stick
+  with Qwen3-32B-class models; oversized models are rejected at
+  validation time.
+- **Chat template safety** is also checked (`check_template_safety`).
+  Don't ship chat templates with arbitrary code execution; they will
+  trip the `malicious_template:*` invalidation.
+- **Patience.** Each window is ~24h and processes one challenger.
+  `af get-rank` shows the queue head; once you're at the top of the
+  queue, expect your turn within the next window.

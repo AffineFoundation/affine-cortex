@@ -57,11 +57,22 @@ class ValidatorService:
         self.api_client = None
         self.running = False
         self.weight_setter = WeightSetter(self.wallet, self.netuid)
-        
+
         # Watchdog state
         self.last_block_update_time = time.time()
         self.last_block_number = None
         self.watchdog_task = None
+
+        # Weight-snapshot dedup. The scheduler writes a fresh score_snapshot
+        # every time the champion changes (Stage U flow — could be several
+        # times within a 7200-block task-id window, or zero if no challenger
+        # ever wins). On-chain set_weights has a per-hotkey rate limit, so
+        # re-emitting the *same* snapshot block wastes the slot.
+        # ``last_set_snapshot_block`` records the scores row we last
+        # committed so we can skip identical follow-up polls. Each new
+        # championship transition has its own ``block_number``, so the
+        # dedup only fires when nothing actually changed since last write.
+        self.last_set_snapshot_block: Optional[int] = None
         
     async def fetch_weights_from_api(self, max_retries: int = 12, retry_interval: int = 3) -> Optional[Dict]:
         """Fetch latest weights from backend API with retry logic
@@ -128,7 +139,7 @@ class ValidatorService:
             try:
                 response = await self.api_client.get("/config")
                 
-                if not isinstance(response, dict) or not response.get("configs"):
+                if not isinstance(response, dict) or "configs" not in response:
                     logger.warning(f"Invalid or empty config from API (attempt {attempt}/{max_retries})")
                     if attempt < max_retries:
                         logger.info(f"Retrying in {retry_interval}s...")
@@ -231,35 +242,46 @@ class ValidatorService:
         return next_window_start
 
     async def run_iteration(self):
-        """Run one iteration of weight setting"""
-        # 1. Fetch weights
+        """Run one iteration of weight setting."""
         self.update_watchdog("fetching weights")
         weights_data = await self.fetch_weights_from_api()
         if not weights_data:
             return
 
-        # 2. Get config from API
+        # Dedup: only one snapshot per scorer window — skip if we've
+        # already committed this snapshot. A None block_number is treated
+        # as "always emit" so a misbehaving endpoint doesn't accidentally
+        # halt us forever.
+        snapshot_block = weights_data.get("block_number")
+        if snapshot_block is not None and snapshot_block == self.last_set_snapshot_block:
+            logger.info(
+                f"Weights at scorer snapshot block {snapshot_block} already "
+                f"committed; skipping this iteration"
+            )
+            return
+
         self.update_watchdog("fetching config")
         config = await self.fetch_config_from_api()
         if not config:
             logger.warning("Failed to fetch config, using default burn_percentage=0.0")
             burn_percentage = 0.0
         else:
-            burn_percentage = config.get("validator_burn_percentage", 0.0)
-            burn_percentage = float(burn_percentage)
+            burn_percentage = float(config.get("validator_burn_percentage", 0.0))
 
-        # 3. Set weights using WeightSetter with timeout
         self.update_watchdog("setting weights")
         try:
-            # Timeout set to 8 minutes (less than 10min watchdog timeout)
-            await asyncio.wait_for(
+            # Timeout is less than the 10-min watchdog so a hung set_weights
+            # call surfaces here rather than at the watchdog SIGTERM.
+            success = await asyncio.wait_for(
                 self.weight_setter.set_weights(
                     weights_data.get("weights", {}),
-                    burn_percentage
+                    burn_percentage,
                 ),
-                timeout=480
+                timeout=480,
             )
             self.update_watchdog("weights set completed")
+            if success and snapshot_block is not None:
+                self.last_set_snapshot_block = snapshot_block
         except asyncio.TimeoutError:
             logger.error("set_weights timed out after 480s")
             self.update_watchdog("weights set timeout")

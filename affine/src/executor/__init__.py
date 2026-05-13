@@ -1,10 +1,9 @@
 """
-Executor Service - Sampling Task Execution
-
-Fetches pending tasks from API and executes sampling evaluations.
+Executor service — one subprocess per env, polls system_config and writes
+sample_results directly. Pure DB-driven; no HTTP fetch/submit round-trip.
 """
 
-from affine.src.executor.main import ExecutorManager
-from affine.src.executor.worker import ExecutorWorker
+from .main import ExecutorManager
+from .worker import ExecutorWorker
 
 __all__ = ["ExecutorManager", "ExecutorWorker"]

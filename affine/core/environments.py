@@ -321,7 +321,7 @@ _ENV_CONFIGS_CANONICAL = {
     "memory": EnvConfig(
         name="memory",
         docker_image="affinefoundation/memorygym:latest",
-        env_vars={"UVICORN_WORKERS": "8"},
+        env_vars={"UVICORN_WORKERS": "16"},
         mem_limit="12g",
         eval_params={
             "tier": "standard",
@@ -359,7 +359,10 @@ _ENV_CONFIGS_CANONICAL = {
         docker_image="affinefoundation/navworld:latest",
         env_type="navworld",
         mem_limit="5g",
-        env_vars={"QQR_CACHE_DIR": "/var/lib/navworld/cache"},
+        env_vars={
+            "QQR_CACHE_DIR": "/var/lib/navworld/cache",
+            "UVICORN_WORKERS": "4",
+        },
         required_env_vars=["AMAP_MAPS_API_KEY"],
         optional_env_vars=["DASHSCOPE_API_KEY"],
         volumes={
@@ -497,11 +500,10 @@ class SDKEnvironment:
     
     def _get_env_vars(self) -> Dict[str, str]:
         """Get environment variables for this environment"""
-        api_key = os.getenv("CHUTES_API_KEY")
-        if not api_key:
-            raise ValueError("CHUTES_API_KEY environment variable is required")
-        
-        env_vars = {"CHUTES_API_KEY": api_key, "API_KEY": api_key}
+        env_vars: Dict[str, str] = {}
+        api_key = os.getenv("API_KEY")
+        if api_key:
+            env_vars["API_KEY"] = api_key
 
         # Forward any required host env vars into the container for this environment
         for key in self.config.required_env_vars:
@@ -709,23 +711,21 @@ class SDKEnvironment:
         start = time.monotonic()
         kwargs = self._prepare_eval_kwargs(**kwargs)
 
-        # Build payload with miner info. Prefer explicit base_url (provider-routed)
-        # and fall back to deriving Chutes URL from slug for backward compatibility.
+        # Build payload with miner info. The scheduler routes inference
+        # exclusively through a provider-supplied base_url.
         payload = kwargs.copy()
         if miner:
             base_url = getattr(miner, "base_url", None)
             inference_model = getattr(miner, "inference_model", None)
-            slug = getattr(miner, "slug", None)
-            if base_url:
-                payload.update({
-                    "model": inference_model or miner.model,
-                    "base_url": base_url,
-                })
-            elif slug:
-                payload.update({
-                    "model": miner.model,
-                    "base_url": f"https://{slug}.chutes.ai/v1",
-                })
+            if not base_url:
+                raise ValueError(
+                    f"miner {getattr(miner, 'hotkey', '?')[:12]}... has no base_url; "
+                    "inference now requires an explicit provider-supplied URL"
+                )
+            payload.update({
+                "model": inference_model or miner.model,
+                "base_url": base_url,
+            })
 
         result = await self._env.evaluate(_timeout=self.config.proxy_timeout, **payload)
         
@@ -733,17 +733,16 @@ class SDKEnvironment:
     
     def _build_result(self, result: Dict[str, Any], miner: Optional["Miner"],
                      payload: Dict[str, Any], start_time: float) -> Result:
-        """Build Result object from evaluation result"""
+        """Build Result object from evaluation result."""
         extra = result.get("extra", {}).copy()
         extra["image"] = self.docker_image
-        # For sample persistence, only Chutes' base_url stays in the record:
-        # it points at a public miner-owned slug that is discoverable on
-        # chutes.ai anyway. Any non-Chutes provider (Targon today) routes
-        # through a private workload endpoint that must not leak via the
-        # public /samples API, and a generic placeholder URL carries no
-        # useful information — strip the field entirely. We use
-        # ``public_base_url`` as the signal: Chutes leaves it None, every
-        # private provider sets it to something non-None.
+        # Strip the wire ``base_url`` from the persisted ``extra.request``
+        # when the miner is served by a private provider (Targon today,
+        # B300 tomorrow) — those URLs carry tenant-specific paths and
+        # shouldn't be redistributable. Detect via the optional
+        # ``public_base_url`` slot the queue-window scorer sets on its
+        # ``_Miner`` shim; SDK callers without a miner object leave the
+        # full URL in the record (useful for local replay).
         sanitized = payload.copy()
         public_url = getattr(miner, "public_base_url", None) if miner else None
         if public_url is not None:
@@ -785,12 +784,10 @@ class SDKEnvironment:
     
     @staticmethod
     def _validate_miner(miner: Any) -> bool:
-        """Validate miner object. Either a slug (legacy Chutes) or base_url is enough."""
+        """Validate miner object."""
         if not hasattr(miner, "model") or not miner.model:
             return False
-        has_slug = getattr(miner, "slug", None)
-        has_base_url = getattr(miner, "base_url", None)
-        return bool(has_slug or has_base_url)
+        return bool(getattr(miner, "base_url", None))
 
 
 # ========================= Factory Functions =========================

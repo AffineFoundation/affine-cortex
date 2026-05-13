@@ -44,7 +44,7 @@ class ScoreSnapshotsDAO(BaseDAO):
         
         Args:
             block_number: Block number for this snapshot
-            scorer_hotkey: Hotkey of the scorer service
+            scorer_hotkey: Hotkey of the scheduler service
             config: Configuration used for this scoring
                 {
                     "environments": [env1, env2, ...],

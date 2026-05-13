@@ -1,18 +1,11 @@
 """
-Task Scheduler Service
+Queue-window scheduler.
 
-Independent background service for generating sampling tasks.
+Drives one challenger-vs-champion contest per ~7200-block window:
+  - pick the earliest pending challenger
+  - deploy champion + challenger on Targon
+  - write per-env task assignments to system_config
+  - wait for executors to fill sample_results
+  - hand off to scorer (DECIDE + WEIGHT_SET)
+  - tear down Targon workloads on finalize
 """
-
-from affine.src.scheduler.task_generator import TaskGeneratorService, MinerInfo, TaskGenerationResult
-from affine.src.scheduler.sampling_scheduler import SamplingScheduler, PerMinerSamplingScheduler
-from affine.src.scheduler.slots_adjuster import MinerSlotsAdjuster
-
-__all__ = [
-    'TaskGeneratorService',
-    'MinerInfo',
-    'TaskGenerationResult',
-    'SamplingScheduler',
-    'PerMinerSamplingScheduler',
-    'MinerSlotsAdjuster',
-]

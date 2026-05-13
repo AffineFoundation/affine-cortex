@@ -2,19 +2,29 @@
 Executor configuration for different environments
 """
 
-# Max concurrent tasks for each environment
+# Max concurrent tasks for each environment.
+#
+# Per-env affinetes pool typically has 2-4 instances (env containers).
+# Each container can realistically handle ~5 concurrent evaluations
+# before the HTTP server queues up requests and the client sees
+# ReadError. The numbers below target ~5 concurrent per container.
+#
+# Tuning history: the old executor was throttled by the scheduler's HTTP
+# task fan-out (/tasks/fetch + rate limiter). The new DB-driven executor
+# scans the full task pool at once, so explicit per-env concurrency caps
+# replace that throttle.
 ENV_MAX_CONCURRENT = {
-    "GAME": 500,
-    "LGC-v2": 300,
-    "LIVEWEB": 50,
+    "LIVEWEB": 100,
     "NAVWORLD": 100,
-    "SWE-PRO": 80,
-    "SWE-SYNTH": 80,
-    "SWE-INFINITE": 80,
+    "SWE-INFINITE": 100,
+    "MEMORY": 100,
+    "DISTILL": 100,
+    "TERMINAL": 100,
+    "LOGPROBS": 100,       # currently disabled in environments.enabled
 }
 
-# Default max concurrent tasks if environment not found in config
-DEFAULT_MAX_CONCURRENT = 200
+# Default for any env not listed above.
+DEFAULT_MAX_CONCURRENT = 100
 
 
 def get_max_concurrent(env: str) -> int:

@@ -79,21 +79,21 @@ class TemplateChecker:
     def __init__(
         self,
         api_key: Optional[str] = None,
-        api_url: str = "https://llm.chutes.ai/v1/chat/completions",
-        model: str = "deepseek-ai/DeepSeek-V3-0324",
+        api_url: Optional[str] = None,
+        model: Optional[str] = None,
         hf_token: Optional[str] = None,
     ):
         """Initialize template checker.
 
         Args:
-            api_key: Chutes API key (defaults to CHUTES_API_KEY env var)
+            api_key: LLM audit API key (defaults to TEMPLATE_AUDIT_API_KEY)
             api_url: LLM API endpoint
             model: Model to use for auditing
             hf_token: HuggingFace token (defaults to HF_TOKEN env var)
         """
-        self.api_key = api_key or os.getenv("CHUTES_API_KEY")
-        self.api_url = api_url
-        self.model = model
+        self.api_key = api_key or os.getenv("TEMPLATE_AUDIT_API_KEY")
+        self.api_url = api_url or os.getenv("TEMPLATE_AUDIT_API_URL")
+        self.model = model or os.getenv("TEMPLATE_AUDIT_MODEL")
         self.hf_token = hf_token or os.getenv("HF_TOKEN")
 
     async def check(self, model_id: str, revision: str) -> TemplateCheckResult:
@@ -221,9 +221,9 @@ class TemplateChecker:
         Returns:
             Dict with audit result
         """
-        if not self.api_key:
-            logger.warning("No API key configured for LLM audit")
-            return {"is_malicious": None, "error": "no_api_key"}
+        if not self.api_key or not self.api_url or not self.model:
+            logger.warning("LLM audit is not configured")
+            return {"is_malicious": None, "error": "audit_not_configured"}
 
         # Truncate if too long
         if len(template) > 50000:

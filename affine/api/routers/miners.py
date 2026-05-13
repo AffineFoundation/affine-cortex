@@ -1,143 +1,75 @@
-"""
-Miner Status Router
+"""Read-only miner metadata endpoints."""
 
-Endpoints for querying miner status and execution logs.
+from __future__ import annotations
 
-Note: Miner metadata (uid, stake, etc.) is queried directly from bittensor metagraph,
-not stored in database. This router focuses on execution logs and sampling statistics.
-"""
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from affine.api.dependencies import (
-    rate_limit_read,
+from affine.api.dependencies import get_miners_dao, rate_limit_read
+from affine.api.models import MinerInfo
+from affine.database.dao.miners import MinersDAO
+
+
+router = APIRouter(
+    prefix="/miners",
+    tags=["Miners"],
+    dependencies=[Depends(rate_limit_read)],
 )
-from affine.api.models import MinerResponse
 
-router = APIRouter(prefix="/miners", tags=["Miners"])
 
-@router.get("/uid/{uid}", response_model=MinerResponse, dependencies=[Depends(rate_limit_read)])
+def _bool_or_none(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    return None
+
+
+def _miner_info(row: Dict[str, Any]) -> MinerInfo:
+    return MinerInfo(
+        uid=int(row["uid"]),
+        hotkey=row["hotkey"],
+        model=row.get("model"),
+        revision=row.get("revision"),
+        is_valid=_bool_or_none(row.get("is_valid")),
+        challenge_status=row.get("challenge_status"),
+        first_block=row.get("first_block"),
+        block_number=row.get("block_number"),
+        invalid_reason=row.get("invalid_reason"),
+        model_hash=row.get("model_hash"),
+    )
+
+
+@router.get("/uid/{uid}", response_model=MinerInfo)
 async def get_miner_by_uid(
     uid: int,
-):
-    """
-    Get miner information by UID from MinersMonitor.
-    
-    Returns complete miner info including:
-    - hotkey: Miner's hotkey
-    - uid: Miner's UID
-    - model: Model name (HuggingFace repo)
-    - revision: Model revision hash
-    - chute_id: Chute deployment ID
-    - block_number: Block number when discovered
-    - first_block: First block number when discovered
-    - is_valid: Validation status
-    - invalid_reason: Reason for validation failure (if any)
-    - model_hash: Hash of model weights for plagiarism detection
-    - chute_slug: Chute slug identifier
-    - chute_status: Chute deployment status
-    """
-    try:
-        # Query miner by UID from database
-        from affine.database.dao.miners import MinersDAO
-        miners_dao = MinersDAO()
-        
-        miner = await miners_dao.get_miner_by_uid(uid)
-        
-        if not miner:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Miner with UID {uid} not found"
-            )
-
-        # Build response using MinerResponse model (automatically excludes 'pk')
-        return MinerResponse(**miner)
-        
-    except HTTPException:
-        raise
-    except Exception as e:
+    dao: MinersDAO = Depends(get_miners_dao),
+) -> MinerInfo:
+    row = await dao.get_miner_by_uid(uid)
+    if not row:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve miner info: {str(e)}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Miner not found for UID={uid}",
         )
+    return _miner_info(row)
 
 
-@router.get("/uid/{uid}/stats", dependencies=[Depends(rate_limit_read)])
-async def get_miner_stats_by_uid(
-    uid: int,
-):
-    """
-    Get miner sampling statistics by UID.
-    
-    Returns sampling statistics including:
-    - Global aggregated statistics across all environments
-    - Per-environment statistics
-    - Time windows: last_15min, last_1hour, last_6hours, last_24hours
-    """
-    try:
-        from affine.database.dao.miners import MinersDAO
-        from affine.database.dao.miner_stats import MinerStatsDAO
-        
-        # First get miner info to get hotkey and revision
-        miners_dao = MinersDAO()
-        miner = await miners_dao.get_miner_by_uid(uid)
-        
-        if not miner:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Miner with UID {uid} not found"
-            )
-        
-        hotkey = miner.get('hotkey')
-        revision = miner.get('revision')
-        
-        if not hotkey or not revision:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Miner missing hotkey or revision"
-            )
-        
-        # Get sampling statistics
-        stats_dao = MinerStatsDAO()
-        stats = await stats_dao.get_miner_stats(hotkey, revision)
-        
-        if not stats:
-            return {
-                "uid": uid,
-                "hotkey": hotkey,
-                "revision": revision,
-                "sampling_stats": None,
-                "env_stats": None
-            }
-        
-        # Replace env_stats keys with display_name if available
-        env_stats = stats.get('env_stats', {})
-        if env_stats:
-            from affine.database.dao.system_config import SystemConfigDAO
-            config_dao = SystemConfigDAO()
-            environments = await config_dao.get_param_value('environments', {})
-            env_stats = {
-                (environments.get(k, {}).get('display_name', k)
-                 if isinstance(environments.get(k), dict) else k): v
-                for k, v in env_stats.items()
-            }
-
-        # Include challenge state
-        challenge_state = await stats_dao.get_challenge_state(hotkey, revision)
-
-        return {
-            "uid": uid,
-            "hotkey": hotkey,
-            "revision": revision,
-            "sampling_stats": stats.get('sampling_stats', {}),
-            "env_stats": env_stats,
-            "challenge_state": challenge_state,
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
+@router.get("/hotkey/{hotkey}", response_model=MinerInfo)
+async def get_miner_by_hotkey(
+    hotkey: str,
+    dao: MinersDAO = Depends(get_miners_dao),
+) -> MinerInfo:
+    row = await dao.get_miner_by_hotkey(hotkey)
+    if not row:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve miner stats: {str(e)}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Miner not found for hotkey={hotkey}",
         )
+    return _miner_info(row)

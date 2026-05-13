@@ -20,8 +20,6 @@ from affine.core.setup import logger
 
 
 DEFAULT_API_URL = "https://api.targon.com/tha/v2"
-# Parity with Chutes: miners deploy via build_sglang_chute, so our Targon
-# deployments default to sglang too (different vendor image, same engine).
 DEFAULT_ENGINE = "sglang"
 DEFAULT_IMAGE_BY_ENGINE = {
     "sglang": "lmsysorg/sglang:latest",
@@ -64,14 +62,8 @@ TARGON_GPU_TYPE = "h200"
 def fixed_gpu_count() -> Optional[int]:
     """Operator override for per-deployment GPU count.
 
-    When set, the deployer ignores the miner's chute ``node_selector.gpu_count``
-    and pins every Targon workload to this many GPUs (TP=count, DP=1). Lets the
-    operator size the pool to their physical capacity without depending on
-    whatever the miner happened to build for.
-
-    Default 2 because the operator scenario this exists for is "I have N
-    H200 boxes, run K miners on each" — 2 GPUs/miner doubles the parallel
-    miners we can host versus the 4-GPU chute defaults common in the network.
+    When set, every Targon workload is pinned to this many GPUs (TP=count,
+    DP=1). This lets operators size the pool to their physical capacity.
     """
     raw = os.getenv("TARGON_FIXED_GPU_COUNT", "2").strip()
     if not raw or raw.lower() in ("0", "off", "false", "none", ""):
@@ -83,52 +75,9 @@ def fixed_gpu_count() -> Optional[int]:
         return None
 
 
-def derive_deployment_args_from_chute(
-    chute_info: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Mirror a miner's Chutes deployment shape on Targon.
-
-    Reads the Chutes API response and returns kwargs to splat into
-    ``TargonClient.create_deployment``. Silently drops any field the chute
-    config doesn't expose — callers fall back to env-driven defaults.
-
-    Fields mapped:
-        node_selector.gpu_count    -> gpu_count (= tensor_parallel)
-        image.name (sglang|vllm)   -> engine
-        (gpu_type pinned to h200)  -> resource_name
-
-    Not mapped (Chutes API doesn't expose them):
-        --max-model-len / --mem-fraction / --chunked-prefill-size etc.
-    """
-    if not chute_info:
-        return {}
-    out: Dict[str, Any] = {}
-    ns = chute_info.get("node_selector") or {}
-
-    gpu_count = ns.get("gpu_count")
-    if isinstance(gpu_count, int) and gpu_count > 0:
-        out["gpu_count"] = gpu_count
-        resolved = resource_name_for(TARGON_GPU_TYPE, gpu_count)
-        if resolved:
-            out["resource_name"] = resolved
-
-    # Engine: image.name is the actual runtime. standard_template is always
-    # "vllm" for Affine chutes regardless of what they actually run, so
-    # prefer image.name.
-    img_name = ((chute_info.get("image") or {}).get("name") or "").lower()
-    if img_name in ("sglang", "vllm"):
-        out["engine"] = img_name
-
-    return out
-
-
-# All Affine miners on the network are Qwen fine-tunes, so we hard-code
-# the legacy `qwen` parser instead of inferring per-model. The newer `qwen3`
-# parser was tried but caused early sglang lifecycle issues on the
-# lmsysorg/sglang:latest image; the legacy parser is what every miner ran
-# successfully through Chutes for months. Operators with a non-Qwen miner
-# can override via TARGON_SGLANG_TOOL_CALL_PARSER, or set it to ``none``
-# to skip the flag entirely.
+# All current Affine miners are Qwen fine-tunes by convention. Operators
+# can override via TARGON_SGLANG_TOOL_CALL_PARSER, or set it to ``none`` to
+# skip the flag entirely.
 DEFAULT_SGLANG_TOOL_CALL_PARSER = "qwen"
 
 
@@ -320,10 +269,7 @@ class TargonClient:
             {"name": "MODEL_ID", "value": model_hf_repo},
             {"name": "MODEL_REVISION", "value": revision},
             # Allow sglang to honor a context_length larger than the model's
-            # derived max_position_embeddings. Required for any miner whose
-            # Chutes config sets a >40k context (most do, even when the HF
-            # config caps at 40960). Chutes' nightly sglang images have this
-            # ON by default; the public lmsysorg image needs the env flag.
+            # derived max_position_embeddings.
             {"name": "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", "value": "1"},
         ]
         hf_token = os.getenv("HF_TOKEN", "")
@@ -338,10 +284,9 @@ class TargonClient:
         commands: Optional[List[str]] = (
             ["python", "-m", "sglang.launch_server"] if eng == "sglang" else None
         )
-        # Default 65536: matches Chutes-side production deploys for current
-        # Affine miners (Qwen3-based). sglang would reject context-length >
-        # model's max_position_embeddings without the
-        # SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 env var injected below.
+        # Default 65536 for current Affine miners. sglang would reject
+        # context-length > model's max_position_embeddings without the
+        # SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 env var injected above.
         # 40k was too tight for SWE-INFINITE agent traces.
         max_model_len = os.getenv("TARGON_MAX_MODEL_LEN") or os.getenv("TARGON_VLLM_MAX_MODEL_LEN", "65536")
         # Default 0.8 is conservative enough to avoid KV cache OOM across the

@@ -1,10 +1,12 @@
 """
-Miner Commands Module
+Miner-side commands.
 
-Provides commands for miners to interact with the network:
-- commit: Commit model to blockchain
-- pull: Pull model from Hugging Face
-- chutes_push: Deploy model to Chutes
+Provides the CLI surface miners use to participate:
+  - pull          : fetch a UID's committed model from HuggingFace
+  - commit        : write {model, revision} on chain (one-shot per hotkey)
+  - miner-deploy  : convenience wrapper (HF upload → commit)
+  - get-rank      : one-stop status (rank/status table)
+  - get-weights / get-scores / get-score / get-miner
 """
 
 __version__ = "1.0.0"

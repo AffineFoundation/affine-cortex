@@ -3,95 +3,65 @@
   "environments": {
     "SWE-INFINITE": {
       "display_name": "SWE",
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
-      "accelerated": true,
-      "sampling_config": {
-        "dataset_range": [[1616, 1716]],
-        "dataset_range_source": {
-          "url": "https://pub-7882418a56434a479bf9a7febd660b36.r2.dev/bugs/metadata.json",
-          "field": "tasks.completed_up_to",
-          "range_type": "zero_to_value"
-        },
-        "sampling_count": 30,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 360
-      }
-    },
-    "LIVEWEB": {
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
-      "accelerated": true,
-      "sampling_config": {
-        "dataset_range": [[0, 78060000]],
-        "sampling_count": 40,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 270
-      }
-    },
-    "LOGPROBS": {
-      "enabled_for_sampling": false,
-      "enabled_for_scoring": false,
-      "sampling_config": {
-        "dataset_range": [[100000000, 300000000], [400000000, 500000000]],
-        "sampling_count": 50,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 21600
-      }
-    },
-    "NAVWORLD": {
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
-      "accelerated": true,
-      "sampling_config": {
-        "dataset_range": [[0, 1000000000]],
-        "sampling_count": 40,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 270
-      }
-    },
-    "MEMORY": {
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
-      "accelerated": true,
-      "sampling_config": {
-        "dataset_range": [[0, 1000000000]],
-        "sampling_count": 20,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 540
+      "enabled": true,
+      "sampling": {
+        "sampling_count": 300,
+        "dataset_range": [[0, 5000]],
+        "sampling_mode": "latest"
       }
     },
     "DISTILL": {
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
-      "sampling_config": {
-        "dataset_range": [[30, 110]],
-        "dataset_range_source": {
-          "url": "https://pub-4546777cb27840ec91b892f19eb5742b.r2.dev/metadata.json",
-          "field": "completed_up_to",
-          "range_type": "zero_to_value"
-        },
-        "sampling_count": 30,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 360
+      "display_name": "DISTILL",
+      "enabled": true,
+      "sampling": {
+        "sampling_count": 300,
+        "dataset_range": [[0, 1000]],
+        "sampling_mode": "latest"
+      }
+    },
+    "LIVEWEB": {
+      "display_name": "LIVEWEB",
+      "enabled": true,
+      "sampling": {
+        "sampling_count": 400,
+        "dataset_range": [[0, 78060000]],
+        "sampling_mode": "random"
+      }
+    },
+    "LOGPROBS": {
+      "display_name": "LOGPROBS",
+      "enabled": true,
+      "sampling": {
+        "sampling_count": 500,
+        "dataset_range": [[100000000, 300000000], [400000000, 500000000]],
+        "sampling_mode": "random"
+      }
+    },
+    "NAVWORLD": {
+      "display_name": "NAVWORLD",
+      "enabled": true,
+      "sampling": {
+        "sampling_count": 400,
+        "dataset_range": [[0, 1000000000]],
+        "sampling_mode": "random"
+      }
+    },
+    "MEMORY": {
+      "display_name": "MEMORY",
+      "enabled": true,
+      "sampling": {
+        "sampling_count": 200,
+        "dataset_range": [[0, 1000000000]],
+        "sampling_mode": "random"
       }
     },
     "TERMINAL": {
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
-      "accelerated": true,
-      "sampling_config": {
+      "display_name": "TERMINAL",
+      "enabled": true,
+      "sampling": {
+        "sampling_count": 300,
         "dataset_range": [[0, 132000000]],
-        "sampling_count": 30,
-        "rotation_enabled": true,
-        "rotation_count": 1,
-        "rotation_interval": 360
+        "sampling_mode": "random"
       }
     }
   }

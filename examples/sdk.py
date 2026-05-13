@@ -1,50 +1,61 @@
+"""Affine SDK example — evaluate a model on one environment.
+
+The SDK exposes ``af.miners(uid)`` to look up what model a UID committed
+on chain, and per-environment factories (``af.DED()``, ``af.ABD()``, etc.)
+that wrap the Affinetes evaluation containers.
+
+In the queue-window flow, validators host inference per-window via
+Targon, so there's no shared per-miner endpoint anymore. To evaluate
+locally you bring up your own OpenAI-compatible inference server
+(vLLM / sglang) for the model and pass its URL as ``base_url``.
+"""
+
 import asyncio
-import affine as af
-from dotenv import load_dotenv
-import sys
-import os
 import json
+import sys
+
+from dotenv import load_dotenv
+
+import affine as af
+
 
 af.trace()
-
 load_dotenv()
 
 
-async def main():
-    api_key = os.getenv("CHUTES_API_KEY")
-    if not api_key:
-        print("\n   ❌ CHUTES_API_KEY environment variable not set")
-        print("   Please set: export CHUTES_API_KEY='your-key'")
-        print("   Or create .env file with: CHUTES_API_KEY=your-key")
-        sys.exit(1)
+# Where your local model server is listening (vLLM / sglang / ollama-with-
+# openai-shim / anything OpenAI-compatible). Adjust to taste.
+BASE_URL = "http://localhost:8000/v1"
 
-    # Get miner info for UID = 160
-    # NOTE: HF_USER and HF_TOKEN .env value is required for this command.
+
+async def main() -> None:
+    # 1) Read a miner's on-chain commitment to learn which model they
+    #    submitted. ``af.miners()`` returns a slim record — just
+    #    (uid, hotkey, model, revision, block).
     uid = 243
-    miner = await af.miners(uid)
-    assert miner, "Unable to obtain miner, please check if registered"
+    miners = await af.miners(uid)
+    if not miners or uid not in miners:
+        print(f"Miner uid={uid} not found on chain")
+        sys.exit(1)
+    miner = miners[uid]
+    print(f"Miner uid={miner.uid} model={miner.model}@{(miner.revision or '')[:8]}")
 
-    # Generate and evaluate a DED challenge
-    # All environment logic is now encapsulated in Docker images via affinetes
-    ded_env = af.DED()
-    evaluation = await ded_env.evaluate(miner, task_id=20100)
-    print("=" * 50)
-    print(json.dumps(evaluation[uid].dict(), indent=2, ensure_ascii=False))
+    # 2) Evaluate that model on DED-V2 / ABD-V2. The SDK never connects
+    #    to the validator's inference; you point at your own server.
+    ded = af.DED()
+    result = await ded.evaluate(model=miner.model, base_url=BASE_URL, task_id=20100)
+    print("DED:", json.dumps(result.dict(), indent=2, ensure_ascii=False))
 
-    # Generate and evaluate an ABD challenge
-    abd_env = af.ABD()
-    evaluation = await abd_env.evaluate(miner, task_id=20200)
-    print("=" * 50)
-    print(json.dumps(evaluation[uid].dict(), indent=2, ensure_ascii=False))
+    abd = af.ABD()
+    result = await abd.evaluate(model=miner.model, base_url=BASE_URL, task_id=20200)
+    print("ABD:", json.dumps(result.dict(), indent=2, ensure_ascii=False))
 
-    # List all available environments
-    print("=" * 50)
-    print("\nAll Available Environments:")
-    envs = af.tasks.list_available_environments()
-    for env_type, env_names in envs.items():
-        print(f"\n{env_type}:")
-        for name in env_names:
-            print(f"  - {name}")
+    # 3) List the environments the SDK knows about.
+    print("Available environments:")
+    for env_type, names in af.tasks.list_available_environments().items():
+        print(f"  {env_type}:")
+        for name in names:
+            print(f"    - {name}")
 
 
 if __name__ == "__main__":

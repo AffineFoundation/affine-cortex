@@ -1,61 +1,51 @@
-#!/usr/bin/env python3
-"""
-Affine SDK Example - GAME Environment with Basilica Mode
+"""Affine SDK example — GAME environment in Basilica mode.
 
-This example demonstrates how to use the GAME environment with Basilica mode,
-where each evaluation task runs in a temporary Kubernetes pod.
+Basilica runs each evaluation task in a temporary cloud pod instead of a
+local Docker container. Useful for environments that need more RAM/CPU
+than your laptop has. Requires ``BASILICA_API_TOKEN``.
 
-Mode Selection Priority:
-1. Explicit mode parameter: af.GAME(mode="basilica")
-2. affinetes_hosts.json configuration
-3. AFFINETES_MODE environment variable
-4. Default: docker mode
+Mode selection priority:
+  1. Explicit ``mode="basilica"`` argument (used here)
+  2. ``affinetes_hosts.json`` config
+  3. ``AFFINETES_MODE`` env var
+  4. Default: ``docker``
 """
 
 import asyncio
+import json
 import os
 import sys
-import json
+
 from dotenv import load_dotenv
 
 import affine as af
 
-# Enable tracing
-af.trace()
 
-# Load environment variables
+af.trace()
 load_dotenv()
 
 
-async def main():
-    """Main example using GAME environment with basilica mode"""
-    
-    # Check required environment variable
-    chutes_api_key = os.getenv("CHUTES_API_KEY")
-    
-    if not chutes_api_key:
-        print("\n   ❌ CHUTES_API_KEY environment variable not set")
-        print("   Please set: export CHUTES_API_KEY='your-key'")
-        sys.exit(1)
-    
-    uid = 94
-    miner = await af.miners(uid)
-    if not miner:
-        print("   ❌ Miner not found")
-        print("   Please check if the miner is registered")
+# OpenAI-compatible base URL serving the model below.
+BASE_URL = os.getenv("AFFINE_SDK_BASE_URL", "http://localhost:8000/v1")
+MODEL = os.getenv("AFFINE_SDK_MODEL", "deepseek-ai/DeepSeek-V3")
+
+
+async def main() -> None:
+    if not os.getenv("BASILICA_API_TOKEN"):
+        print("BASILICA_API_TOKEN not set — Basilica mode requires it.")
         sys.exit(1)
 
-    game_env = af.GAME(mode="basilica")
+    game = af.GAME(mode="basilica")
+    print("Starting GAME evaluation on Basilica...")
     try:
-        print("🚀 Starting evaluation...")
-        evaluation = await game_env.evaluate(miner, task_id=388240510)
-        
-        print("\n✅ Evaluation completed!")
-        print(json.dumps(evaluation[uid].dict(), indent=2, ensure_ascii=False))
+        result = await game.evaluate(
+            model=MODEL, base_url=BASE_URL, task_id=388_240_510,
+        )
+        print(json.dumps(result.dict(), indent=2, ensure_ascii=False))
     except Exception as e:
-        print(f"\n❌ Evaluation failed: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Evaluation failed: {type(e).__name__}: {e}")
         sys.exit(1)
+
+
 if __name__ == "__main__":
     asyncio.run(main())

@@ -4,14 +4,9 @@ Miners DAO
 Manages miner validation state and anti-plagiarism tracking.
 """
 
-import time
-import logging
 from typing import Dict, Any, List, Optional
 from affine.database.base_dao import BaseDAO
 from affine.database.schema import get_table_name
-
-
-from affine.core.setup import logger
 
 
 class MinersDAO(BaseDAO):
@@ -37,37 +32,27 @@ class MinersDAO(BaseDAO):
         hotkey: str,
         model: str,
         revision: str,
-        chute_id: str,
-        chute_slug: str,
         model_hash: str,
-        chute_status: str,
         is_valid: bool,
         invalid_reason: Optional[str],
         block_number: int,
         first_block: int,
-        template_check_result: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Save or update miner validation state.
 
         Directly updates the record for this UID (no history tracking).
+        Inference is provider-routed by the scheduler service per window.
 
         Args:
-            uid: Miner UID (0-255 for regular miners, > 1000 for system miners)
-            hotkey: Miner's SS58 hotkey (or virtual hotkey like "SYSTEM-1" for system miners)
-            model: HuggingFace model repo
-            revision: Git commit hash
-            chute_id: Chutes deployment ID
-            chute_slug: Chutes URL slug
-            model_hash: SHA256 hash of all model weights
-            chute_status: "hot" or "cold"
-            is_valid: Overall validation result (boolean)
-            invalid_reason: Reason if invalid (null if valid)
-            block_number: Current block when this record was updated
-            first_block: Block when miner first committed
-            template_check_result: Template check result ("safe", "unsafe:reason", or null)
-
-        Returns:
-            Saved miner record
+            uid: Miner UID (0-255 regular, > 1000 system).
+            hotkey: SS58 hotkey (or virtual hotkey for system miners).
+            model: HuggingFace model repo.
+            revision: Git commit hash.
+            model_hash: SHA256 hash of all model weights (for plagiarism check).
+            is_valid: Overall validation result.
+            invalid_reason: Reason if invalid.
+            block_number: Current block when this record was updated.
+            first_block: Block when this (hotkey, revision) was first committed.
         """
         item = {
             'pk': self._make_pk(uid),
@@ -75,17 +60,12 @@ class MinersDAO(BaseDAO):
             'hotkey': hotkey,
             'model': model,
             'revision': revision,
-            'chute_id': chute_id,
-            'chute_slug': chute_slug,
             'model_hash': model_hash,
-            'chute_status': chute_status,
-            'is_valid': 'true' if is_valid else 'false',  # Store as string for GSI
+            'is_valid': 'true' if is_valid else 'false',  # Stored as string for GSI
             'invalid_reason': invalid_reason,
             'block_number': block_number,
             'first_block': first_block,
-            'template_check_result': template_check_result,
         }
-
         return await self.put(item)
     
     async def get_miner_by_uid(

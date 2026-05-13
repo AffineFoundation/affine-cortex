@@ -5,7 +5,6 @@ Provides singleton client instance and connection pooling.
 """
 
 import os
-from typing import Optional
 import aiobotocore.session
 from botocore.config import Config
 

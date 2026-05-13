@@ -1,28 +1,34 @@
 """
-Executor Metrics - Data structures for tracking worker performance
+Executor worker metrics.
+
+Minimal counters reported to the manager process via the stats queue.
+The old fetch_count / total_fetch_time / pending_tasks columns are gone —
+no HTTP fetch loop in the DB-poll design.
 """
 
 from dataclasses import dataclass, asdict
-from typing import Optional, Dict, Any
+import time
+from typing import Any, Dict, Optional
 
 
 @dataclass
 class WorkerMetrics:
-    """Metrics for a worker."""
-    
     worker_id: int
     env: str
     running: bool = True
     tasks_succeeded: int = 0
     tasks_failed: int = 0
-    submit_failed: int = 0
-    total_execution_time: float = 0.0
+    tasks_in_flight: int = 0
+    total_execution_ms: int = 0
     last_task_at: Optional[float] = None
-    fetch_count: int = 0
-    total_fetch_time: float = 0.0
-    running_tasks: int = 0
-    pending_tasks: int = 0
-    
+
+    def record_completion(self, *, success: bool, latency_ms: int) -> None:
+        self.last_task_at = time.time()
+        self.total_execution_ms += int(latency_ms)
+        if success:
+            self.tasks_succeeded += 1
+        else:
+            self.tasks_failed += 1
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert metrics to dictionary."""
         return asdict(self)

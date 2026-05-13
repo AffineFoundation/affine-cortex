@@ -6,23 +6,21 @@ Provides a single entry point for all Affine components:
 
 Server Services (af servers):
 - af servers api       : Start API server
-- af servers executor  : Start executor service
 - af servers monitor   : Start monitor service (miners monitoring)
-- af servers anticopy  : Start anti-copy detection service
-- af servers scorer    : Start scorer service
-- af servers scheduler : Start scheduler service
+- af servers scheduler : Start flow scheduler (block-tick contest driver)
+- af servers executor  : Start per-env executor manager (subprocess per env)
+- af servers teacher   : Start teacher rollout worker + R2 mover (DISTILL)
 - af servers validator : Start validator service
 
 Miner Commands:
-- af miner-deploy: One-command deployment (upload → deploy → commit)
-- af commit      : Commit model to blockchain (miner)
+- af miner-deploy: One-command deployment (HF push → on-chain commit)
+- af commit      : Commit model+revision to blockchain (miner)
 - af pull        : Pull model from Hugging Face (miner)
-- af chutes_push : Deploy model to Chutes (miner)
-- af get-sample  : Query sample by UID, env, and task ID
-- af get-miner   : Query miner status by UID
 - af get-weights : Query latest normalized weights
 - af get-scores  : Query latest scores for top N miners
-- af get-rank    : Query and display miner ranking table
+- af get-score   : Query score for a specific miner
+- af get-miner   : Query public miner metadata
+- af get-rank    : Query the public rank/status table
 
 Docker Commands:
 - af deploy : Deploy docker containers (validator/backend)
@@ -35,7 +33,9 @@ Database Commands:
 import sys
 import os
 import subprocess
+import asyncio
 import click
+from affine.cli.types import UID
 from affine.core.setup import setup_logging, logger
 
 # Check if admin commands should be visible
@@ -73,7 +73,7 @@ def servers():
 @servers.command()
 def api():
     """Start API server."""
-    from affine.api.server import app, config
+    from affine.api.server import config
     import uvicorn
 
     setup_logging(verbosity=1, component="api")
@@ -91,11 +91,30 @@ def api():
 
 @servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.pass_context
+def monitor(ctx):
+    """Start monitor service."""
+    from affine.src.monitor.main import main as monitor_main
+
+    sys.argv = ["monitor"] + ctx.args
+    monitor_main.main(standalone_mode=False)
+
+
+@servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.pass_context
+def scheduler(ctx):
+    """Start the flow scheduler (block-tick driver of the whole contest)."""
+    from affine.src.scheduler.main import main as scheduler_main
+
+    sys.argv = ["scheduler"] + ctx.args
+    scheduler_main.main(standalone_mode=False)
+
+
+@servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
+@click.pass_context
 def executor(ctx):
-    """Start executor service."""
+    """Start per-env executor manager (one subprocess per enabled env)."""
     from affine.src.executor.main import main as executor_main
-    
-    # Forward to original executor CLI with captured -v flags
+
     sys.argv = ["executor"] + ctx.args
     executor_main.main(standalone_mode=False)
 
@@ -103,51 +122,11 @@ def executor(ctx):
 @servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.pass_context
 def teacher(ctx):
-    """Start teacher worker service."""
-    from affine.src.executor.teacher_worker import main as teacher_main
+    """Start teacher rollout worker + R2 mover (feeds the DISTILL env)."""
+    from affine.src.teacher.main import main as teacher_main
 
     sys.argv = ["teacher"] + ctx.args
     teacher_main.main(standalone_mode=False)
-
-
-@servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def monitor(ctx):
-    """Start monitor service."""
-    from affine.src.monitor.main import main as monitor_main
-    
-    sys.argv = ["monitor"] + ctx.args
-    monitor_main.main(standalone_mode=False)
-
-
-@servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def anticopy(ctx):
-    """Start anti-copy detection service."""
-    from affine.src.anticopy.main import main as anticopy_main
-
-    sys.argv = ["anticopy"] + ctx.args
-    anticopy_main.main(standalone_mode=False)
-
-
-@servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def scorer(ctx):
-    """Start scorer service."""
-    from affine.src.scorer.main import main as scorer_main
-    
-    sys.argv = ["scorer"] + ctx.args
-    scorer_main.main(standalone_mode=False)
-
-
-@servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def scheduler(ctx):
-    """Start scheduler service."""
-    from affine.src.scheduler.main import main as scheduler_main
-    
-    sys.argv = ["scheduler"] + ctx.args
-    scheduler_main.main(standalone_mode=False)
 
 
 @servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -158,19 +137,6 @@ def validator(ctx):
 
     sys.argv = ["validator"] + ctx.args
     validator_main.main(standalone_mode=False)
-
-
-@servers.command(
-    "targon-deployer",
-    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
-)
-@click.pass_context
-def targon_deployer(ctx):
-    """Start Targon deployer reconciler service."""
-    from affine.src.targon_deployer.__main__ import main as targon_main
-
-    sys.argv = ["targon-deployer"] + ctx.args
-    targon_main.main(standalone_mode=False)
 
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -213,48 +179,6 @@ def pull(ctx):
     
     sys.argv = ["pull"] + ctx.args
     miner_pull.main(standalone_mode=False)
-
-
-@cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def chutes_push(ctx):
-    """Deploy model to Chutes."""
-    from affine.src.miner.main import chutes_push as miner_chutes_push
-    
-    sys.argv = ["chutes_push"] + ctx.args
-    miner_chutes_push.main(standalone_mode=False)
-
-
-@cli.command("get-sample", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def get_sample(ctx):
-    """Query sample result by UID, environment, and task ID.
-    
-    Example:
-        af get-sample 42 affine task_123
-    """
-    from affine.src.miner.main import get_sample as miner_get_sample
-    
-    sys.argv = ["get-sample"] + ctx.args
-    miner_get_sample.main(standalone_mode=False)
-
-
-@cli.command("get-miner", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def get_miner(ctx):
-    """Query miner status and information by UID.
-
-    Returns complete miner info including hotkey, model, revision,
-    chute_id, validation status, and timestamps.
-
-    Examples:
-        af get-miner 42
-        af get-miner n1  (n1 means UID -1)
-    """
-    from affine.src.miner.main import get_miner as miner_get_miner
-
-    sys.argv = ["get-miner"] + ctx.args
-    miner_get_miner.main(standalone_mode=False)
 
 
 @cli.command("get-weights", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -307,73 +231,55 @@ def get_score(ctx):
     miner_get_score.main(standalone_mode=False)
 
 
-@cli.command("get-pool", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def get_pool(ctx):
-    """Query pending task IDs for a miner in an environment.
-
-    Returns the list of task IDs currently in the sampling queue.
+@cli.command("get-miner")
+@click.argument("uid_arg", required=False, type=UID)
+@click.option("--uid", type=UID, help="Miner UID")
+@click.option("--hotkey", help="Miner hotkey")
+def get_miner(uid_arg, uid, hotkey):
+    """Query public miner metadata by UID or hotkey.
 
     Example:
-        af get-pool 100 agentgym:webshop
+        af get-miner 42
+        af get-miner --uid 42
+        af get-miner --hotkey 5F...
     """
-    from affine.src.miner.main import get_pool as miner_get_pool
+    from affine.src.miner.commands import get_miner_command
 
-    sys.argv = ["get-pool"] + ctx.args
-    miner_get_pool.main(standalone_mode=False)
+    asyncio.run(get_miner_command(uid=uid if uid is not None else uid_arg, hotkey=hotkey))
 
 
 @cli.command("get-rank", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.pass_context
 def get_rank(ctx):
     """Query and display miner ranking table.
-    
-    Fetches the latest score snapshot from the API and displays
-    it in the same format as the scorer's detailed table output.
-    
+
+    Shows the live window state (champion/challenger/phase/progress),
+    the public rank/status snapshot.
+
     Example:
         af get-rank
     """
     from affine.src.miner.main import get_rank as miner_get_rank
-    
+
     sys.argv = ["get-rank"] + ctx.args
     miner_get_rank.main(standalone_mode=False)
-
-
-@cli.command("get-envs", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def get_envs(ctx):
-    """Query current environment configurations.
-    
-    Returns all environment configurations including sampling settings,
-    rotation settings, and enabled flags.
-    
-    Example:
-        af get-envs
-    """
-    from affine.src.miner.main import get_envs as miner_get_envs
-    
-    sys.argv = ["get-envs"] + ctx.args
-    miner_get_envs.main(standalone_mode=False)
 
 
 @cli.command("miner-deploy", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
 @click.pass_context
 def miner_deploy(ctx):
-    """One-command deployment: Upload -> Deploy -> Commit.
-    
-    Combines the three-step miner deployment process into a single command:
-    1. Upload model to HuggingFace (skip with --skip-upload)
-    2. Deploy to Chutes (skip with --skip-chutes)
-    3. Commit on-chain (skip with --skip-commit)
-    
+    """One-command miner deployment: HF upload → on-chain commit.
+
+    The scheduler service hosts inference per window, so miners only upload
+    weights and commit the model snapshot.
+
     Examples:
         af miner-deploy -r myuser/model -p ./my_model
         af miner-deploy -r myuser/model --skip-upload --revision abc123
         af miner-deploy -r myuser/model -p ./my_model --dry-run
     """
     from affine.src.miner.main import deploy as miner_deploy_cmd
-    
+
     sys.argv = ["miner-deploy"] + ctx.args
     miner_deploy_cmd.main(standalone_mode=False)
 
@@ -386,22 +292,6 @@ def miner_deploy(ctx):
 from affine.database.cli import db
 db.hidden = not SHOW_ADMIN_COMMANDS
 cli.add_command(db)
-
-
-# ============================================================================
-# Miner Stats Management Commands
-# ============================================================================
-
-# Import and register miner_stats commands
-from affine.cli.miner_stats import miner_stats
-miner_stats.hidden = not SHOW_ADMIN_COMMANDS
-cli.add_command(miner_stats)
-
-
-# Targon provider management commands
-from affine.cli.targon import targon as targon_group
-targon_group.hidden = not SHOW_ADMIN_COMMANDS
-cli.add_command(targon_group)
 
 
 # ============================================================================
@@ -465,7 +355,7 @@ def deploy(service, local, recreate, restart):
     logger.info(f"Running: {' '.join(cmd)}")
     
     try:
-        result = subprocess.run(
+        subprocess.run(
             cmd,
             cwd=affine_dir,
             check=True,
@@ -522,7 +412,7 @@ def down(service, local, volumes):
     logger.info(f"Running: {' '.join(cmd)}")
     
     try:
-        result = subprocess.run(
+        subprocess.run(
             cmd,
             cwd=affine_dir,
             check=True,

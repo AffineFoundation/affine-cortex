@@ -1,1213 +1,259 @@
 """
-Miner Commands Implementation
+Miner-side CLI command implementations.
 
-Provides command functions for miners:
-- commit_command: Commit model to blockchain
-- pull_command: Pull model from Hugging Face
-- chutes_push_command: Deploy model to Chutes
-- deploy_command: One-command deployment (upload → deploy → commit)
+After the queue-window refactor, the miner-side surface is purely:
+  - pull              : fetch the on-chain model snapshot for a UID
+  - commit            : write {model, revision} on chain
+  - miner-deploy      : convenience wrapper (HF upload → commit)
+  - get-weights       : pretty-print the latest weight snapshot
+  - get-scores / get-score : score table / single-miner score
+  - get-miner         : basic public miner metadata
+  - get-rank          : one-stop status — rank/status table
+
+The validator hosts inference per window via the scorer service; miners
+upload to HuggingFace and commit their model snapshot.
 """
 
+from __future__ import annotations
+
+import json
 import os
 import sys
-import json
-import asyncio
-import textwrap
-from pathlib import Path
 from typing import Optional
+
+from affine.core.setup import NETUID, logger
 from affine.utils.api_client import cli_api_client
-from affine.core.setup import logger, NETUID
 from affine.utils.subtensor import get_subtensor
 
 
-def get_conf(key: str, default: Optional[str] = None) -> Optional[str]:
-    """Get configuration value from environment variable."""
+def _conf(key: str, default: Optional[str] = None) -> Optional[str]:
     return os.getenv(key, default)
 
 
-# ============================================================================
-# Private HuggingFace Repo Workflow Helpers
-# ============================================================================
-# 
-# This workflow prevents cheaters from copying your model before commit:
-# 1. Upload to PRIVATE HuggingFace repo
-# 2. Pre-generate chute_id (deterministic from username + repo)
-# 3. COMMIT FIRST to blockchain with pre-generated chute_id
-# 4. Make HF repo PUBLIC after commit confirmed
-# 5. Deploy to Chutes (chute_id will match pre-generated one)
-# ============================================================================
-
-def generate_chute_id(username: str, repo_name: str) -> str:
-    """Pre-generate chute_id before deployment.
-    
-    Uses same formula as Chutes: uuid5(NAMESPACE_OID, "{username}::chute::{name}")
-    This allows committing to blockchain BEFORE deploying.
-    
-    Args:
-        username: Chutes username
-        repo_name: HuggingFace repo name (e.g., "username/model-name")
-        
-    Returns:
-        Pre-generated chute_id (UUID string)
-    """
-    import uuid
-    return str(uuid.uuid5(uuid.NAMESPACE_OID, f"{username}::chute::{repo_name}"))
+# --------------------------------------------------------------------------- #
+# pull
+# --------------------------------------------------------------------------- #
 
 
-def create_private_hf_repo(repo_id: str, hf_token: str) -> bool:
-    """Create a private HuggingFace repository.
-    
-    Args:
-        repo_id: Repository ID (e.g., "username/model-name")
-        hf_token: HuggingFace API token
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        from huggingface_hub import HfApi
-        api = HfApi(token=hf_token)
-        api.create_repo(
-            repo_id=repo_id,
-            exist_ok=True,
-            repo_type="model",
-            private=True
-        )
-        logger.info(f"Created/verified private repo: {repo_id}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to create private repo {repo_id}: {e}")
-        return False
-
-
-def upload_to_private_repo(
-    repo_id: str,
-    folder_path: str,
-    hf_token: str,
-    commit_message: str = "Model update"
-) -> Optional[str]:
-    """Upload model to private HuggingFace repo.
-    
-    Args:
-        repo_id: Repository ID
-        folder_path: Local path to model folder
-        hf_token: HuggingFace API token
-        commit_message: Commit message
-        
-    Returns:
-        Revision SHA if successful, None otherwise
-    """
-    try:
-        from huggingface_hub import HfApi
-        api = HfApi(token=hf_token)
-        api.upload_folder(
-            folder_path=folder_path,
-            repo_id=repo_id,
-            commit_message=commit_message
-        )
-        info = api.repo_info(repo_id, repo_type="model")
-        revision = info.sha
-        logger.info(f"Uploaded to {repo_id}, revision: {revision[:12]}...")
-        return revision
-    except Exception as e:
-        logger.error(f"Failed to upload to {repo_id}: {e}")
-        return None
-
-
-def make_hf_repo_public(repo_id: str, hf_token: str) -> bool:
-    """Make a HuggingFace repository public.
-    
-    Args:
-        repo_id: Repository ID
-        hf_token: HuggingFace API token
-        
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        from huggingface_hub import update_repo_settings
-        update_repo_settings(
-            repo_id=repo_id,
-            private=False,
-            token=hf_token
-        )
-        logger.info(f"Made {repo_id} public")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to make {repo_id} public: {e}")
-        return False
-
-
-async def execute_private_upload(
-    repo_id: str,
-    folder_path: str,
-    hf_token: str,
-    commit_message: str = "Model update"
-) -> Optional[str]:
-    """Execute private upload workflow: create private repo + upload.
-    
-    Args:
-        repo_id: Repository ID
-        folder_path: Local path to model folder
-        hf_token: HuggingFace API token
-        commit_message: Commit message
-        
-    Returns:
-        Revision SHA if successful, None otherwise
-    """
-    if not create_private_hf_repo(repo_id, hf_token):
-        return None
-    
-    return upload_to_private_repo(repo_id, folder_path, hf_token, commit_message)
-
-
-# ============================================================================
-# Command Implementations
-# ============================================================================
-
-async def pull_command(uid: int, model_path: str, hf_token: Optional[str] = None):
-    """Pull model from Hugging Face.
-    
-    Args:
-        uid: Miner UID
-        model_path: Local directory to save model
-        hf_token: Hugging Face API token (optional, from env if not provided)
-    """
+async def pull_command(uid: int, model_path: str, hf_token: Optional[str] = None) -> None:
+    """Fetch the model committed by ``uid`` from HuggingFace."""
     from huggingface_hub import snapshot_download
 
-    hf_token = hf_token or get_conf("HF_TOKEN")
-    
-    # Get miner info directly from subtensor
+    hf_token = hf_token or _conf("HF_TOKEN")
+
     try:
         subtensor = await get_subtensor()
         meta = await subtensor.metagraph(NETUID)
         commits = await subtensor.get_all_revealed_commitments(NETUID)
-        
-        if uid >= len(meta.hotkeys):
-            logger.error(f"Invalid UID {uid}")
-            print(json.dumps({"success": False, "error": f"Invalid UID {uid}"}))
-            sys.exit(1)
-        
-        hotkey = meta.hotkeys[uid]
-        
-        if hotkey not in commits:
-            logger.error(f"No commit found for UID {uid}")
-            print(json.dumps({"success": False, "error": f"No commit found for UID {uid}"}))
-            sys.exit(1)
-        
-        _, commit_data = commits[hotkey][-1]
-        data = json.loads(commit_data)
-        
-        repo_name = data.get("model")
-        revision = data.get("revision")
-        
-        if not repo_name:
-            logger.error(f"Miner {uid} has no model configured")
-            print(json.dumps({"success": False, "error": "No model configured"}))
-            sys.exit(1)
     except Exception as e:
-        logger.error(f"Failed to get miner info: {e}")
+        logger.error(f"Failed to read chain: {e}")
         print(json.dumps({"success": False, "error": str(e)}))
         sys.exit(1)
-    
-    logger.info(f"Pulling model {repo_name}@{revision} for UID {uid} into {model_path}")
-    
+
+    if uid >= len(meta.hotkeys):
+        print(json.dumps({"success": False, "error": f"Invalid UID {uid}"}))
+        sys.exit(1)
+    hotkey = meta.hotkeys[uid]
+    if hotkey not in commits:
+        print(json.dumps({"success": False, "error": f"No commit for UID {uid}"}))
+        sys.exit(1)
+
+    _, commit_data = commits[hotkey][-1]
+    try:
+        data = json.loads(commit_data)
+    except json.JSONDecodeError:
+        print(json.dumps({"success": False, "error": "commit is not valid JSON"}))
+        sys.exit(1)
+    repo = data.get("model")
+    revision = data.get("revision")
+    if not repo or not revision:
+        print(json.dumps({"success": False, "error": "commit missing model/revision"}))
+        sys.exit(1)
+
+    logger.info(f"Pulling {repo}@{revision[:8]}... → {model_path}")
     try:
         snapshot_download(
-            repo_id=repo_name,
+            repo_id=repo,
             repo_type="model",
             local_dir=model_path,
             token=hf_token,
             resume_download=True,
             revision=revision,
         )
-        
-        result = {
-            "success": True,
-            "uid": uid,
-            "repo": repo_name,
-            "revision": revision,
-            "path": model_path
-        }
-        print(json.dumps(result))
-        logger.info(f"Model {repo_name} pulled successfully")
-    
     except Exception as e:
-        logger.error(f"Failed to download {repo_name}: {e}")
+        logger.error(f"snapshot_download failed: {e}")
         print(json.dumps({"success": False, "error": str(e)}))
         sys.exit(1)
 
-
-async def get_latest_chute_id(repo: str, api_key: str) -> Optional[str]:
-    """Get latest chute ID for a repository.
-    
-    Args:
-        repo: HF repository name
-        api_key: Chutes API key
-    
-    Returns:
-        Chute ID or None if not found
-    """
-    token = api_key or os.getenv("CHUTES_API_KEY", "")
-    if not token:
-        return None
-    
-    try:
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.chutes.ai/chutes/", headers={"Authorization": token}
-            ) as r:
-                if r.status != 200:
-                    return None
-                data = await r.json()
-    except Exception:
-        return None
-    
-    chutes = data.get("items", data) if isinstance(data, dict) else data
-    if not isinstance(chutes, list):
-        return None
-    
-    for chute in reversed(chutes):
-        if any(chute.get(k) == repo for k in ("model_name", "name", "readme")):
-            return chute.get("chute_id")
-    return None
+    print(json.dumps({
+        "success": True, "uid": uid, "repo": repo, "revision": revision, "path": model_path,
+    }))
 
 
-async def chutes_push_command(
-    repo: str,
-    revision: str,
-    chutes_api_key: Optional[str] = None,
-    chute_user: Optional[str] = None
-):
-    """Deploy model to Chutes.
-    
-    Args:
-        repo: HF repository ID
-        revision: HF commit SHA
-        chutes_api_key: Chutes API key (optional, from env if not provided)
-        chute_user: Chutes username (optional, from env if not provided)
-    """
-    chutes_api_key = chutes_api_key or get_conf("CHUTES_API_KEY")
-    chute_user = chute_user or get_conf("CHUTE_USER")
-    
-    if not chutes_api_key:
-        logger.error("CHUTES_API_KEY not configured")
-        print(json.dumps({"success": False, "error": "CHUTES_API_KEY not configured"}))
-        sys.exit(1)
-    
-    if not chute_user:
-        logger.error("CHUTE_USER not configured")
-        print(json.dumps({"success": False, "error": "CHUTE_USER not configured"}))
-        sys.exit(1)
-    
-    logger.debug(f"Building Chute config for repo={repo} revision={revision}")
-    
-    # Generate Chute configuration
-    chutes_config = textwrap.dedent(
-        f"""
-import os
-from chutes.chute import NodeSelector
-from chutes.chute.template.sglang import build_sglang_chute
-os.environ["NO_PROXY"] = "localhost,127.0.0.1"
-
-chute = build_sglang_chute(
-    username="{chute_user}",
-    readme="{repo}",
-    model_name="{repo}",
-    image="chutes/sglang:nightly-2025081600",
-    concurrency=40,
-    revision="{revision}",
-    node_selector=NodeSelector(
-        gpu_count=4,
-        include=["h200"],
-    ),
-    scaling_threshold=0.5,
-    max_instances=2,
-    shutdown_after_seconds=28800,
-)
-"""
-    )
-    
-    tmp_file = Path("tmp_chute.py")
-    tmp_file.write_text(chutes_config)
-    logger.debug(f"Wrote Chute config to {tmp_file}")
-    
-    # Deploy to Chutes
-    cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--accept-fee"]
-    env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
-    
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            stdin=asyncio.subprocess.PIPE,
-        )
-        
-        if proc.stdin:
-            proc.stdin.write(b"y\n")
-            await proc.stdin.drain()
-            proc.stdin.close()
-        
-        stdout, _ = await proc.communicate()
-        output = stdout.decode(errors="ignore")
-        logger.trace(output)
-        
-        # Check for errors
-        import re
-        match = re.search(
-            r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
-        )
-        if match and match.group(2) == "ERROR":
-            logger.debug("Chutes deploy failed with error log")
-            raise RuntimeError("Chutes deploy failed")
-        
-        if proc.returncode != 0:
-            logger.debug(f"Chutes deploy failed with code {proc.returncode}")
-            raise RuntimeError("Chutes deploy failed")
-        
-        tmp_file.unlink(missing_ok=True)
-        logger.debug("Chute deployment successful")
-        
-        # Get chute info
-        from affine.utils.api_client import get_chute_info
-        chute_id = await get_latest_chute_id(repo, api_key=chutes_api_key)
-        chute_info = await get_chute_info(chute_id) if chute_id else None
-        
-        result = {
-            "success": bool(chute_id),
-            "chute_id": chute_id,
-            "chute": chute_info,
-            "repo": repo,
-            "revision": revision,
-        }
-        print(json.dumps(result))
-        logger.info(f"Deployed to Chutes: {chute_id}")
-    
-    except Exception as e:
-        logger.error(f"Chutes deployment failed: {e}")
-        print(json.dumps({"success": False, "error": str(e)}))
-        tmp_file.unlink(missing_ok=True)
-        sys.exit(1)
+# --------------------------------------------------------------------------- #
+# commit
+# --------------------------------------------------------------------------- #
 
 
 async def commit_command(
     repo: str,
     revision: str,
-    chute_id: str,
     coldkey: Optional[str] = None,
-    hotkey: Optional[str] = None
-):
-    """Commit model to blockchain.
-
-    Args:
-        repo: HF repository ID
-        revision: HF commit SHA
-        chute_id: Chutes deployment ID
-        coldkey: Wallet coldkey name (optional, from env if not provided)
-        hotkey: Wallet hotkey name (optional, from env if not provided)
-    """
+    hotkey: Optional[str] = None,
+) -> None:
+    """Write ``{model, revision}`` to the chain commitment slot."""
     import bittensor as bt
     from bittensor.core.errors import MetadataError
-    from affine.utils.subtensor import get_subtensor
 
-    cold = coldkey or get_conf("BT_WALLET_COLD", "default")
-    hot = hotkey or get_conf("BT_WALLET_HOT", "default")
+    cold = coldkey or _conf("BT_WALLET_COLD", "default")
+    hot = hotkey or _conf("BT_WALLET_HOT", "default")
     wallet = bt.Wallet(name=cold, hotkey=hot)
-    
-    logger.info(f"Committing: {repo}@{revision} (chute: {chute_id})")
-    logger.info(f"Using wallet: {wallet.hotkey.ss58_address[:16]}...")
+    payload = json.dumps({"model": repo, "revision": revision})
 
-    async def _commit():
+    logger.info(
+        f"Committing {repo}@{revision[:8]}... as "
+        f"{wallet.hotkey.ss58_address[:16]}..."
+    )
+
+    try:
         sub = await get_subtensor()
-        data = json.dumps({
-            "model": repo,
-            "revision": revision,
-            "chute_id": chute_id
-        })
-        
         while True:
             try:
                 await sub.set_reveal_commitment(
                     wallet=wallet,
                     netuid=NETUID,
-                    data=data,
-                    blocks_until_reveal=1
+                    data=payload,
+                    blocks_until_reveal=1,
                 )
                 break
             except MetadataError as e:
                 if "SpaceLimitExceeded" in str(e):
-                    logger.warning("Space limit exceeded, waiting for next block...")
+                    logger.warning("commitment slot full, waiting next block...")
                     await sub.wait_for_block()
                 else:
                     raise
-    
-    try:
-        await _commit()
-        
-        result = {
-            "success": True,
-            "repo": repo,
-            "revision": revision,
-            "chute_id": chute_id,
-        }
-        print(json.dumps(result))
-        logger.info("Commit successful")
-    
     except Exception as e:
         logger.error(f"Commit failed: {e}")
         print(json.dumps({"success": False, "error": str(e)}))
         sys.exit(1)
 
-
-async def get_sample_command(
-    uid: int,
-    env: str,
-    task_id: str,
-):
-    """Query sample result by UID, environment, and task ID.
-    
-    Args:
-        uid: Miner UID
-        env: Environment name
-        task_id: Task ID
-    """
-    
-    async with cli_api_client() as client:
-        endpoint = f"/samples/uid/{uid}/{env}/{task_id}"
-        data = await client.get(endpoint)
-        
-        if data:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+    print(json.dumps({"success": True, "repo": repo, "revision": revision}))
 
 
-async def get_miner_command(uid: int):
-    """Query miner status and information by UID.
-    
-    Args:
-        uid: Miner UID
-    """
-    async with cli_api_client() as client:
-        endpoint = f"/miners/uid/{uid}"
-        data = await client.get(endpoint)
-        if data:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-
-            # Fetch and display sampling stats via API
-            stats_endpoint = f"/miners/uid/{uid}/stats"
-            stats_data = await client.get(stats_endpoint)
-
-            cs = stats_data.get('challenge_state') if stats_data else None
-
-            # Effective status: is_valid (validator-side admissibility,
-            # set by miners-monitor for anticopy / model_mismatch /
-            # repo-name / hf-fetch / etc.) gates whether sampling is
-            # actually happening — get_valid_miners() filters it.
-            # challenge_status (sampling/terminated) only reflects
-            # challenge-game outcome, so a miner can read 'sampling'
-            # there while is_valid=False has silently sidelined them.
-            # Surface the combined effective state up front so an
-            # operator doesn't have to cross-reference the JSON above
-            # with the CHAMPION CHALLENGE STATE section below.
-            is_valid_raw = data.get('is_valid')
-            is_valid = str(is_valid_raw or '').lower() == 'true'
-            invalid_reason = data.get('invalid_reason') or ''
-            chal_status = (cs or {}).get('challenge_status', 'sampling')
-            term_reason = (cs or {}).get('termination_reason') or ''
-
-            if not is_valid:
-                effective = f"TERMINATED (invalid: {invalid_reason or 'no reason recorded'})"
-            elif chal_status == 'terminated':
-                effective = f"TERMINATED (challenge: {term_reason or 'no reason recorded'})"
-            else:
-                effective = "SAMPLING"
-
-            print("\n" + "=" * 80)
-            print("EFFECTIVE STATUS")
-            print("=" * 80)
-            print(f"  Status:              {effective}")
-            print(f"  Validator admits:    is_valid={is_valid_raw if is_valid_raw is not None else '-'}"
-                  + (f"  reason={invalid_reason}" if invalid_reason else ""))
-
-            if cs:
-                print("\n" + "="*80)
-                print("CHAMPION CHALLENGE STATE")
-                print("="*80)
-                status = cs.get('challenge_status', 'sampling')
-                print(f"  Status:              {status}")
-                print(f"  Checkpoints passed:  {cs.get('challenge_checkpoints_passed', 0)}")
-                print(f"  Consecutive wins:    {cs.get('challenge_consecutive_wins', 0)}")
-                print(f"  Total wins:          {cs.get('challenge_total_wins', 0)}")
-                print(f"  Total losses:        {cs.get('challenge_total_losses', 0)}")
-                print(f"  Consecutive losses:  {cs.get('challenge_consecutive_losses', 0)}")
-                if status == 'terminated':
-                    reason = cs.get('termination_reason', 'unknown')
-                    print(f"  Termination reason:  {reason}")
-
-            if stats_data and stats_data.get('sampling_stats'):
-                print("\n" + "="*80)
-                print("GLOBAL SAMPLING STATISTICS")
-                print("="*80)
-                
-                sampling_stats = stats_data['sampling_stats']
-                
-                for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
-                    if window in sampling_stats:
-                        wstats = sampling_stats[window]
-                        print(f"\n{window}:")
-                        print(f"  Samples: {wstats.get('samples', 0)}")
-                        print(f"  Success: {wstats.get('success', 0)}")
-                        print(f"  Success rate: {wstats.get('success_rate', 0.0):.2%}")
-                        print(f"  Samples/min: {wstats.get('samples_per_min', 0.0):.2f}")
-                        print(f"  Rate limit errors: {wstats.get('rate_limit_errors', 0)}")
-                        print(f"  Timeout errors: {wstats.get('timeout_errors', 0)}")
-                        print(f"  Other errors: {wstats.get('other_errors', 0)}")
-                
-                # Display per-environment statistics
-                if stats_data.get('env_stats'):
-                    print("\n" + "="*80)
-                    print("PER-ENVIRONMENT STATISTICS")
-                    print("="*80)
-
-                    env_stats = stats_data['env_stats']
-                    for env_name, env_data in env_stats.items():
-                        print(f"\n[{env_name}]")
-                        for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
-                            if window in env_data:
-                                wstats = env_data[window]
-                                print(f"  {window}:")
-                                print(f"    Samples: {wstats.get('samples', 0)}")
-                                print(f"    Success: {wstats.get('success', 0)}")
-                                print(f"    Success rate: {wstats.get('success_rate', 0.0):.2%}")
-                                print(f"    Samples/min: {wstats.get('samples_per_min', 0.0):.2f}")
-                                print(f"    Rate limit errors: {wstats.get('rate_limit_errors', 0)}")
-                                print(f"    Timeout errors: {wstats.get('timeout_errors', 0)}")
-                                print(f"    Other errors: {wstats.get('other_errors', 0)}")
-            else:
-                print("\n" + "="*80)
-                print("No sampling statistics available for this miner.")
-                print("="*80)
-
-
-
-async def get_weights_command():
-    """Query latest normalized weights for on-chain weight setting.
-    
-    Returns the most recent score snapshot with normalized weights
-    for all miners.
-    """
-    async with cli_api_client() as client:
-        endpoint = "/scores/weights/latest"
-        data = await client.get(endpoint)
-        
-        if data:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-
-
-async def get_scores_command(top: int = 32):
-    """Query latest scores for top N miners.
-    
-    Args:
-        top: Number of top miners to return (default: 256)
-    """
-    async with cli_api_client() as client:
-        endpoint = f"/scores/latest?top={top}"
-        data = await client.get(endpoint)
-        
-        if data:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-
-
-async def get_score_command(uid: int):
-    """Query score for a specific miner by UID.
-    
-    Args:
-        uid: Miner UID
-    """
-    async with cli_api_client() as client:
-        endpoint = f"/scores/uid/{uid}"
-        data = await client.get(endpoint)
-        
-        if data:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
-
-
-async def get_pool_command(uid: int, env: str, full: bool = False):
-    """Query task pool status for a miner in an environment.
-    
-    Args:
-        uid: Miner UID
-        env: Environment name (e.g., agentgym:webshop)
-        full: If True, print full task_ids lists without truncation
-    """
-    async with cli_api_client() as client:
-        endpoint = f"/samples/pool/uid/{uid}/{env}"
-        data = await client.get(endpoint)
-        
-        if data:
-            if data.get("success") is False:
-                print(json.dumps({
-                    "error": data.get("error"),
-                    "status_code": data.get("status_code")
-                }, indent=2, ensure_ascii=False))
-                return
-            if full:
-                # Print full data without truncation
-                print(json.dumps(data, indent=2, ensure_ascii=False))
-            else:
-                # Format output for better readability
-                # Show summary first, then task_ids ranges instead of full lists
-                summary = {
-                    "uid": data.get("uid"),
-                    "hotkey": data.get("hotkey"),
-                    "model_revision": data.get("model_revision"),
-                    "env": data.get("env"),
-                    "sampling_config": data.get("sampling_config", {}),
-                    "total_tasks": data.get("total_tasks"),
-                    "sampled_count": data.get("sampled_count"),
-                    "pool_count": data.get("pool_count"),
-                    "missing_count": data.get("missing_count"),
-                }
-                
-                # Helper function to format task_id list as ranges
-                def format_task_ids(task_ids):
-                    if not task_ids:
-                        return "[]"
-                    if len(task_ids) <= 10:
-                        return str(task_ids)
-                    # Show first 5 and last 5
-                    return f"[{', '.join(map(str, task_ids[:5]))}, ..., {', '.join(map(str, task_ids[-5:]))}] (total: {len(task_ids)})"
-                
-                summary["sampled_task_ids"] = format_task_ids(data.get("sampled_task_ids", []))
-                summary["pool_task_ids"] = format_task_ids(data.get("pool_task_ids", []))
-                summary["missing_task_ids"] = format_task_ids(data.get("missing_task_ids", []))
-                
-                print(json.dumps(summary, indent=2, ensure_ascii=False))
-
-
-async def get_envs_command():
-    """Query current environment configurations.
-    
-    Returns all environment configurations including sampling settings,
-    rotation settings, and enabled flags.
-    """
-    async with cli_api_client() as client:
-        endpoint = "/config/environments"
-        data = await client.get(endpoint)
-        
-        if data:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+# --------------------------------------------------------------------------- #
+# miner-deploy
+# --------------------------------------------------------------------------- #
 
 
 async def deploy_command(
     repo: str,
-    model_path: Optional[str] = None,
-    revision: Optional[str] = None,
-    chute_id: Optional[str] = None,
-    message: str = "Model update",
-    dry_run: bool = False,
-    skip_upload: bool = False,
-    skip_chutes: bool = False,
-    skip_commit: bool = False,
-    chutes_api_key: Optional[str] = None,
-    chute_user: Optional[str] = None,
-    coldkey: Optional[str] = None,
-    hotkey: Optional[str] = None,
-    hf_token: Optional[str] = None,
-    private_repo: bool = False,
-):
-    """One-command deployment: Upload to HuggingFace -> Deploy to Chutes -> Commit on-chain.
-    
-    This combines the three-step deployment process into a single command:
-    1. Upload model to HuggingFace (skip with --skip-upload if already uploaded)
-    2. Deploy to Chutes (skip with --skip-chutes if already deployed)
-    3. Commit on-chain (skip with --skip-commit to test without committing)
-    4. Make HF repo public (if --private-repo was used)
-    
-    Private Repo Workflow (--private-repo):
-    Prevents other miners from monitoring and copying your model before commit.
-    The workflow creates a private HF repo, stores HF_TOKEN as a Chutes secret,
-    deploys, commits, then makes the repo public.
-    
-    Args:
-        repo: HuggingFace repository ID (e.g., "username/model-name")
-        model_path: Path to local model directory (required unless --skip-upload)
-        revision: HuggingFace revision SHA (required if --skip-upload)
-        chute_id: Chutes deployment ID (required if --skip-chutes)
-        message: Commit message for HuggingFace upload
-        dry_run: If True, show what would be done without executing
-        skip_upload: Skip HuggingFace upload (requires --revision)
-        skip_chutes: Skip Chutes deployment (requires --chute-id)
-        skip_commit: Skip on-chain commit
-        chutes_api_key: Chutes API key (optional, from env if not provided)
-        chute_user: Chutes username (optional, from env if not provided)
-        coldkey: Wallet coldkey name (optional, from env if not provided)
-        hotkey: Wallet hotkey name (optional, from env if not provided)
-        hf_token: HuggingFace token (optional, from env if not provided)
-        private_repo: Use private HF repo workflow (publish after commit)
+    model_path: Optional[str],
+    revision: Optional[str],
+    message: str,
+    dry_run: bool,
+    skip_upload: bool,
+    skip_commit: bool,
+    coldkey: Optional[str],
+    hotkey: Optional[str],
+    hf_token: Optional[str],
+) -> None:
+    """One-shot: upload to HF (optional) → commit ``{model, revision}``.
+
+    Inference is hosted by the scorer service per window, so the miner-side
+    action is HuggingFace upload plus on-chain commit.
     """
-    from huggingface_hub import HfApi
-    
-    chutes_api_key = chutes_api_key or get_conf("CHUTES_API_KEY")
-    chute_user = chute_user or get_conf("CHUTE_USER")
-    hf_token = hf_token or get_conf("HF_TOKEN")
-    
-    # Validate arguments based on skip flags
-    if not skip_upload and not model_path:
-        logger.error("--model-path is required unless --skip-upload is set")
-        print(json.dumps({"success": False, "error": "--model-path is required unless --skip-upload is set"}))
-        sys.exit(1)
-    
-    if skip_upload and not revision:
-        logger.error("--revision is required when --skip-upload is set")
-        print(json.dumps({"success": False, "error": "--revision is required when --skip-upload is set"}))
-        sys.exit(1)
-    
-    if skip_chutes and not chute_id:
-        logger.error("--chute-id is required when --skip-chutes is set")
-        print(json.dumps({"success": False, "error": "--chute-id is required when --skip-chutes is set"}))
-        sys.exit(1)
-    
-    # Validate required credentials
-    if not dry_run:
-        if not skip_upload and not hf_token:
-            logger.error("HF_TOKEN not configured")
-            print(json.dumps({"success": False, "error": "HF_TOKEN not configured"}))
+    hf_token = hf_token or _conf("HF_TOKEN")
+
+    if not skip_upload:
+        if not model_path:
+            print(json.dumps({
+                "success": False,
+                "error": "model_path required unless --skip-upload",
+            }))
             sys.exit(1)
-        
-        if not skip_chutes:
-            if not chutes_api_key:
-                logger.error("CHUTES_API_KEY not configured")
-                print(json.dumps({"success": False, "error": "CHUTES_API_KEY not configured"}))
-                sys.exit(1)
-            
-            if not chute_user:
-                logger.error("CHUTE_USER not configured")
-                print(json.dumps({"success": False, "error": "CHUTE_USER not configured"}))
-                sys.exit(1)
-    
-    # Determine which steps to run
-    # For private_repo workflow: upload -> commit -> make_public -> deploy
-    # For normal workflow: upload -> deploy -> commit
-    steps = []
-    if not skip_upload:
-        steps.append("upload")
-    if private_repo:
-        # Private workflow: commit BEFORE deploy
-        if not skip_commit:
-            steps.append("commit")
-            steps.append("make_public")  # Only make public after commit
-        if not skip_chutes:
-            steps.append("chutes")
-    else:
-        # Normal workflow: deploy before commit
-        if not skip_chutes:
-            steps.append("chutes")
-        if not skip_commit:
-            steps.append("commit")
-    
-    total_steps = len(steps)
-    current_step = 0
-    
-    logger.info("=" * 60)
-    logger.info("AFFINE DEPLOYMENT")
-    logger.info("=" * 60)
-    logger.info(f"  Repository: {repo}")
-    if model_path:
-        logger.info(f"  Model Path: {model_path}")
-    if revision:
-        logger.info(f"  Revision: {revision}")
-    if chute_id:
-        logger.info(f"  Chute ID: {chute_id}")
-    logger.info(f"  Steps: {' -> '.join(steps) if steps else 'none'}")
-    if private_repo:
-        logger.info("  Mode: PRIVATE REPO (commit first, then publish + deploy)")
-    if dry_run:
-        logger.info("  Mode: DRY RUN")
-    logger.info("=" * 60)
-    
-    # Note: private_repo workflow uses standalone functions instead of class
-    
-    # =========================================================================
-    # Step 1: Upload to HuggingFace
-    # =========================================================================
-    if not skip_upload:
-        current_step += 1
-        upload_mode = "PRIVATE" if private_repo else "public"
-        logger.info(f"[{current_step}/{total_steps}] Uploading to HuggingFace ({repo}) [{upload_mode}]...")
-        
         if dry_run:
-            logger.info(f"  [DRY RUN] Would upload {model_path} to {repo} (private={private_repo})")
-            revision = "dry-run-revision-sha"
+            logger.info(f"[dry-run] would upload {model_path} → {repo}")
+            # Placeholder so subsequent dry-run messaging carries a value;
+            # never actually commits anything.
+            revision = revision or "<dry-run-pending-upload>"
         else:
+            from huggingface_hub import HfApi
+
             try:
-                # Use private upload if enabled
-                if private_repo:
-                    logger.info("  Using private repo workflow...")
-                    revision = await execute_private_upload(
-                        repo_id=repo,
-                        folder_path=model_path,
-                        hf_token=hf_token,
-                        commit_message=message
-                    )
-                    if not revision:
-                        raise RuntimeError("Private upload workflow failed")
-                    logger.info(f"  Private upload complete. Revision: {revision[:12]}...")
-                else:
-                    # Standard public upload
-                    api = HfApi(token=hf_token)
-                    
-                    # Create repo if doesn't exist
-                    try:
-                        api.create_repo(repo, exist_ok=True, repo_type="model")
-                        logger.debug(f"Repository {repo} ready")
-                    except Exception as e:
-                        logger.debug(f"Repo creation note: {e}")
-                    
-                    # Upload folder
-                    logger.info(f"  Uploading {model_path}...")
-                    api.upload_folder(
-                        folder_path=model_path,
-                        repo_id=repo,
-                        commit_message=message
-                    )
-                    
-                    # Get latest commit SHA
-                    info = api.repo_info(repo, repo_type="model")
-                    revision = info.sha
-                    
-                    logger.info(f"  Upload complete. Revision: {revision[:12]}...")
-                
+                api = HfApi(token=hf_token)
+                api.create_repo(repo_id=repo, exist_ok=True, repo_type="model")
+                api.upload_folder(folder_path=model_path, repo_id=repo, commit_message=message)
+                info = api.repo_info(repo, repo_type="model")
+                revision = info.sha
+                logger.info(f"Uploaded {model_path} → {repo}@{revision[:8]}...")
             except Exception as e:
-                logger.error(f"HuggingFace upload failed: {e}")
-                print(json.dumps({"success": False, "error": f"HuggingFace upload failed: {str(e)}"}))
+                logger.error(f"HF upload failed: {e}")
+                print(json.dumps({"success": False, "error": str(e)}))
                 sys.exit(1)
-    else:
-        logger.info(f"Skipping upload, using revision: {revision[:12]}...")
-    
-    # =========================================================================
-    # PRIVATE REPO WORKFLOW: Pre-generate chute_id, commit first, then deploy
-    # =========================================================================
-    if private_repo:
-        # Pre-generate chute_id (same formula as Chutes uses internally)
-        if not chute_id and not skip_chutes:
-            chute_id = generate_chute_id(chute_user, repo)
-            logger.info(f"  Pre-generated chute_id: {chute_id}")
-        
-        # Step: Commit on-chain FIRST (before deploy)
-        if not skip_commit:
-            current_step += 1
-            logger.info(f"[{current_step}/{total_steps}] Committing on-chain (before deploy)...")
-            
-            if dry_run:
-                logger.info(f"  [DRY RUN] Would commit {repo}@{revision[:12]}... with chute {chute_id}")
-            else:
-                try:
-                    import bittensor as bt
-                    from bittensor.core.errors import MetadataError
-                    from affine.utils.subtensor import get_subtensor
-                    
-                    cold = coldkey or get_conf("BT_WALLET_COLD", "default")
-                    hot = hotkey or get_conf("BT_WALLET_HOT", "default")
-                    wallet = bt.Wallet(name=cold, hotkey=hot)
-                    
-                    logger.info(f"  Using wallet: {wallet.hotkey.ss58_address[:16]}...")
-                    
-                    sub = await get_subtensor()
-                    data = json.dumps({
-                        "model": repo,
-                        "revision": revision,
-                        "chute_id": chute_id
-                    })
-                    
-                    while True:
-                        try:
-                            await sub.set_reveal_commitment(
-                                wallet=wallet,
-                                netuid=NETUID,
-                                data=data,
-                                blocks_until_reveal=1
-                            )
-                            break
-                        except MetadataError as e:
-                            if "SpaceLimitExceeded" in str(e):
-                                logger.warning("Space limit exceeded, waiting for next block...")
-                                await sub.wait_for_block()
-                            else:
-                                raise
-                    
-                    logger.info("  Commit successful")
-                    
-                except Exception as e:
-                    logger.error(f"On-chain commit failed: {e}")
-                    print(json.dumps({"success": False, "error": f"On-chain commit failed: {str(e)}"}))
-                    sys.exit(1)
-        else:
-            logger.info("Skipping on-chain commit")
-            logger.warning("Private repo workflow: HF repo remains PRIVATE since commit was skipped")
-        
-        # Step: Make HF repo public (after commit)
-        if "make_public" in steps:
-            current_step += 1
-            logger.info(f"[{current_step}/{total_steps}] Making HF repo public...")
-            
-            if dry_run:
-                logger.info(f"  [DRY RUN] Would make {repo} public")
-            else:
-                if not make_hf_repo_public(repo, hf_token):
-                    logger.warning("Failed to make repo public - manual intervention may be required")
-                    logger.warning(f"Run: huggingface-cli repo visibility {repo} --public")
-                else:
-                    logger.info(f"  Repository {repo} is now public")
-        
-        # Step: Deploy to Chutes (after commit and make public)
-        if not skip_chutes:
-            current_step += 1
-            logger.info(f"[{current_step}/{total_steps}] Deploying to Chutes...")
-            
-            if dry_run:
-                logger.info(f"  [DRY RUN] Would deploy {repo}@{revision[:12]}...")
-            else:
-                try:
-                    chutes_config = textwrap.dedent(
-                        f"""
-import os
-from chutes.chute import NodeSelector
-from chutes.chute.template.sglang import build_sglang_chute
-os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+    elif not revision:
+        print(json.dumps({
+            "success": False,
+            "error": "--skip-upload requires --revision",
+        }))
+        sys.exit(1)
 
-chute = build_sglang_chute(
-    username="{chute_user}",
-    readme="{repo}",
-    model_name="{repo}",
-    image="chutes/sglang:nightly-2025081600",
-    concurrency=40,
-    revision="{revision}",
-    node_selector=NodeSelector(
-        gpu_count=4,
-        include=["h200"],
-    ),
-    scaling_threshold=0.5,
-    max_instances=2,
-    shutdown_after_seconds=28800,
-)
-"""
-                    )
-                    
-                    tmp_file = Path("tmp_chute.py")
-                    tmp_file.write_text(chutes_config)
-                    logger.debug(f"Wrote Chute config to {tmp_file}")
-                    
-                    cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--accept-fee"]
-                    env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
-                    
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        env=env,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                        stdin=asyncio.subprocess.PIPE,
-                    )
-                    
-                    if proc.stdin:
-                        proc.stdin.write(b"y\n")
-                        await proc.stdin.drain()
-                        proc.stdin.close()
-                    
-                    stdout, _ = await proc.communicate()
-                    output = stdout.decode(errors="ignore")
-                    logger.trace(output)
-                    
-                    import re
-                    match = re.search(
-                        r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
-                    )
-                    if match and match.group(2) == "ERROR":
-                        logger.debug("Chutes deploy failed with error log")
-                        raise RuntimeError("Chutes deploy failed")
-                    
-                    if proc.returncode != 0:
-                        logger.debug(f"Chutes deploy failed with code {proc.returncode}")
-                        raise RuntimeError("Chutes deploy failed")
-                    
-                    tmp_file.unlink(missing_ok=True)
-                    logger.info(f"  Chutes deployment complete. Chute ID: {chute_id}")
-                    
-                except Exception as e:
-                    logger.error(f"Chutes deployment failed: {e}")
-                    if 'tmp_file' in locals():
-                        tmp_file.unlink(missing_ok=True)
-                    print(json.dumps({"success": False, "error": f"Chutes deployment failed: {str(e)}"}))
-                    sys.exit(1)
-    
-    # =========================================================================
-    # NORMAL WORKFLOW: Deploy first, then commit
-    # =========================================================================
-    else:
-        # Step: Deploy to Chutes
-        if not skip_chutes:
-            current_step += 1
-            logger.info(f"[{current_step}/{total_steps}] Deploying to Chutes...")
-            
-            if dry_run:
-                logger.info(f"  [DRY RUN] Would deploy {repo}@{revision[:12]}...")
-                chute_id = "dry-run-chute-id"
-            else:
-                try:
-                    chutes_config = textwrap.dedent(
-                        f"""
-import os
-from chutes.chute import NodeSelector
-from chutes.chute.template.sglang import build_sglang_chute
-os.environ["NO_PROXY"] = "localhost,127.0.0.1"
+    if skip_commit:
+        print(json.dumps({
+            "success": True, "repo": repo, "revision": revision, "committed": False,
+        }))
+        return
 
-chute = build_sglang_chute(
-    username="{chute_user}",
-    readme="{repo}",
-    model_name="{repo}",
-    image="chutes/sglang:nightly-2025081600",
-    concurrency=40,
-    revision="{revision}",
-    node_selector=NodeSelector(
-        gpu_count=4,
-        include=["h200"],
-    ),
-    scaling_threshold=0.5,
-    max_instances=2,
-    shutdown_after_seconds=28800,
-)
-"""
-                    )
-                    
-                    tmp_file = Path("tmp_chute.py")
-                    tmp_file.write_text(chutes_config)
-                    logger.debug(f"Wrote Chute config to {tmp_file}")
-                    
-                    cmd = ["chutes", "deploy", f"{tmp_file.stem}:chute", "--accept-fee"]
-                    env = {**os.environ, "CHUTES_API_KEY": chutes_api_key}
-                    
-                    proc = await asyncio.create_subprocess_exec(
-                        *cmd,
-                        env=env,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.STDOUT,
-                        stdin=asyncio.subprocess.PIPE,
-                    )
-                    
-                    if proc.stdin:
-                        proc.stdin.write(b"y\n")
-                        await proc.stdin.drain()
-                        proc.stdin.close()
-                    
-                    stdout, _ = await proc.communicate()
-                    output = stdout.decode(errors="ignore")
-                    logger.trace(output)
-                    
-                    import re
-                    match = re.search(
-                        r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d{3})\s+\|\s+(\w+)", output
-                    )
-                    if match and match.group(2) == "ERROR":
-                        logger.debug("Chutes deploy failed with error log")
-                        raise RuntimeError("Chutes deploy failed")
-                    
-                    if proc.returncode != 0:
-                        logger.debug(f"Chutes deploy failed with code {proc.returncode}")
-                        raise RuntimeError("Chutes deploy failed")
-                    
-                    tmp_file.unlink(missing_ok=True)
-                    logger.debug("Chute deployment successful")
-                    
-                    chute_id = await get_latest_chute_id(repo, api_key=chutes_api_key)
-                    
-                    if not chute_id:
-                        raise RuntimeError("Failed to get chute_id after deployment")
-                    
-                    logger.info(f"  Chutes deployment complete. Chute ID: {chute_id}")
-                    
-                except Exception as e:
-                    logger.error(f"Chutes deployment failed: {e}")
-                    if 'tmp_file' in locals():
-                        tmp_file.unlink(missing_ok=True)
-                    print(json.dumps({"success": False, "error": f"Chutes deployment failed: {str(e)}"}))
-                    sys.exit(1)
-        else:
-            logger.info(f"Skipping Chutes deployment, using chute_id: {chute_id}")
-        
-        # Step: Commit on-chain
-        if not skip_commit:
-            current_step += 1
-            logger.info(f"[{current_step}/{total_steps}] Committing on-chain...")
-            
-            if dry_run:
-                logger.info(f"  [DRY RUN] Would commit {repo}@{revision[:12]}... with chute {chute_id}")
-            else:
-                try:
-                    import bittensor as bt
-                    from bittensor.core.errors import MetadataError
-                    from affine.utils.subtensor import get_subtensor
-                    
-                    cold = coldkey or get_conf("BT_WALLET_COLD", "default")
-                    hot = hotkey or get_conf("BT_WALLET_HOT", "default")
-                    wallet = bt.Wallet(name=cold, hotkey=hot)
-                    
-                    logger.info(f"  Using wallet: {wallet.hotkey.ss58_address[:16]}...")
-                    
-                    sub = await get_subtensor()
-                    data = json.dumps({
-                        "model": repo,
-                        "revision": revision,
-                        "chute_id": chute_id
-                    })
-                    
-                    while True:
-                        try:
-                            await sub.set_reveal_commitment(
-                                wallet=wallet,
-                                netuid=NETUID,
-                                data=data,
-                                blocks_until_reveal=1
-                            )
-                            break
-                        except MetadataError as e:
-                            if "SpaceLimitExceeded" in str(e):
-                                logger.warning("Space limit exceeded, waiting for next block...")
-                                await sub.wait_for_block()
-                            else:
-                                raise
-                    
-                    logger.info("  Commit successful")
-                    
-                except Exception as e:
-                    logger.error(f"On-chain commit failed: {e}")
-                    print(json.dumps({"success": False, "error": f"On-chain commit failed: {str(e)}"}))
-                    sys.exit(1)
-        else:
-            logger.info("Skipping on-chain commit")
-    
-    # =========================================================================
-    # Summary
-    # =========================================================================
-    logger.info("=" * 60)
     if dry_run:
-        logger.info("DRY RUN COMPLETE - No changes were made")
-    else:
-        logger.info("DEPLOYMENT COMPLETE")
-    logger.info("=" * 60)
-    logger.info(f"  Repository: {repo}")
-    logger.info(f"  Revision: {revision[:12] if revision and len(revision) > 12 else revision}...")
-    logger.info(f"  Chute ID: {chute_id}")
-    logger.info("=" * 60)
-    
-    result = {
-        "success": True,
-        "repo": repo,
-        "revision": revision,
-        "chute_id": chute_id,
-        "dry_run": dry_run,
-        "private_repo": private_repo,
-        "repo_visibility": "public" if (private_repo and not skip_commit and not dry_run) else ("private" if private_repo else "public")
-    }
-    print(json.dumps(result))
+        logger.info(f"[dry-run] would commit {repo}@{revision}")
+        print(json.dumps({
+            "success": True, "repo": repo, "revision": revision, "dry_run": True,
+        }))
+        return
+
+    await commit_command(repo=repo, revision=revision, coldkey=coldkey, hotkey=hotkey)
+
+
+# --------------------------------------------------------------------------- #
+# query commands
+# --------------------------------------------------------------------------- #
+
+
+async def get_weights_command() -> None:
+    async with cli_api_client() as client:
+        data = await client.get("/scores/weights/latest")
+        if data:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+async def get_scores_command(top: int = 32) -> None:
+    async with cli_api_client() as client:
+        data = await client.get(f"/scores/latest?top={top}")
+        if data:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+async def get_score_command(uid: int) -> None:
+    async with cli_api_client() as client:
+        data = await client.get(f"/scores/uid/{uid}")
+        if data:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+async def get_miner_command(uid: Optional[int], hotkey: Optional[str]) -> None:
+    if uid is None and not hotkey:
+        print(json.dumps({
+            "success": False,
+            "error": "uid argument, --uid, or --hotkey required",
+        }))
+        sys.exit(1)
+    if uid is not None and hotkey:
+        print(json.dumps({
+            "success": False,
+            "error": "provide either uid or --hotkey, not both",
+        }))
+        sys.exit(1)
+    endpoint = f"/miners/uid/{uid}" if uid is not None else f"/miners/hotkey/{hotkey}"
+    async with cli_api_client() as client:
+        data = await client.get(endpoint)
+        if data:
+            print(json.dumps(data, indent=2, ensure_ascii=False))

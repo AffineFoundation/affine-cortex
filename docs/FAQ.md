@@ -4,96 +4,100 @@
 
 **Q1: What is the purpose of the Affine subnet?**
 
-A: Affine is a Bittensor subnet designed to incentivize the creation of advanced reasoning models. The goal is to push the state-of-the-art (SOTA) in Reinforcement Learning (RL) and drive the development of more intelligent models by rewarding miners for improving performance on a variety of challenging tasks.
+Affine is a Bittensor subnet designed to incentivize the creation of advanced reasoning models. The goal is to push the state-of-the-art in Reinforcement Learning and drive the development of more intelligent models by rewarding miners for improving performance on a variety of challenging tasks.
 
-**Q2: How does a miner work on this subnet?**
+**Q2: How does mining work on this subnet?**
 
-A: Miners on Affine do not run mining hardware directly. Instead, the process is:
-1. **Train a Model:** You find or train a machine learning model to perform well on the subnet's environments.
-2. **Upload to Hugging Face:** You upload your trained model weights to a Hugging Face repository.
-3. **Deploy on Chutes:** You deploy your model as a "Chute," which is a serverless inference endpoint. Affine's validators then send tasks to your Chute to evaluate your model's performance.
-4. **Commit to Affine:** You commit your model's information (Chute ID, Hugging Face revision) to the Bittensor blockchain on subnet 120.
+The validator hosts inference, so miners submit model weights rather than running serving infrastructure:
+
+1. **Train a model.** Improve a Qwen3-based model on the subnet's evaluation environments.
+2. **Upload to HuggingFace.** Push the weights to a public HuggingFace repo whose name ends with your hotkey.
+3. **Commit on chain.** Run `af commit --repo user/repo-hotkey --revision <SHA>` once. Each hotkey can commit exactly one revision — any second commit permanently invalidates the miner.
+
+The validator pulls your weights from HuggingFace, runs them through its configured inference provider, and evaluates them against the current champion when your slot comes up in the daily queue.
 
 **Q3: What are the requirements to start mining?**
 
-A: You will need:
-* A Hugging Face account to host your models.
-* A Chutes.ai account. You must register this account using the **same hotkey** you use to mine on Affine. This removes the need for a developer deposit.
-* Funds in your Chutes account to pay for the GPU hours your model uses when it's active.
+* A HuggingFace account to host your model weights.
+* A registered Bittensor coldkey + hotkey.
+* The validator handles inference compute for scheduled evaluations.
 
-**Q4: Where can I find the official code and leaderboard?**
+**Q4: Where can I find the code and leaderboard?**
 
-* **GitHub Repository:** [https://github.com/AffineFoundation/affine](https://github.com/AffineFoundation/affine)
+* **GitHub:** [https://github.com/AffineFoundation/affine-cortex](https://github.com/AffineFoundation/affine-cortex)
 * **Live Dashboard:** [https://www.affine.io/](https://www.affine.io/)
 
 ---
 
-## Mining, Models, and Environments
+## How challenges work
 
-**Q5: What kind of tasks (environments) does the subnet use for evaluation?**
+**Q5: How does the queue work?**
 
-A: The environments are under active development and change frequently. The subnet has moved from simpler environments (like SAT, ABD, DED) to more complex, multi-turn tasks from the **AgentGym** suite, including `webshop`, `alfworld`, `babyai`, and `sciworld`. The goal is to use challenging benchmarks where models cannot easily achieve 100% accuracy out of the box.
+Every ~7200 blocks (~24h) the scorer opens a new "window". It picks the earliest-submitted not-yet-challenged miner (ordered by `first_block` on chain) and runs both that challenger and the current champion through every environment in parallel on Targon. After all sampling completes, the comparator applies a strict **all-envs-better** rule:
 
-**Q6: What is the "model copying" problem everyone talks about?**
+- For the challenger to dethrone the champion, **every** environment's mean score must beat the champion's by at least the per-env `margin`, **and** the challenger must have collected at least `min_tasks_per_env` successful samples.
+- Otherwise the challenger is permanently terminated (no second shot on the same hotkey).
 
-A: Model copying is a major issue where some miners download a successful model from another miner, make a trivial change to alter its hash, and redeploy it as their own. Due to statistical variance in scoring, these copies can sometimes outperform the original and "steal" emissions without contributing any new training or improvement.
+**Q6: What if I lose?**
 
-**Q7: How is the team addressing the model copying exploit?**
+You're out for good with that hotkey. The "multi-commit rule" prevents re-trying with a new revision on the same hotkey, so once a miner is `terminated_lost`, that hotkey can't compete again. Register a fresh hotkey to try a new model.
 
-A: The team has implemented and is continuing to develop several measures:
-* **Statistical Significance:** The scoring algorithm was updated to use Beta distribution confidence intervals. A new model must show a statistically significant improvement over an existing one to be considered better, rather than winning due to random variance.
-* **First Commit Advantage:** The system tracks the block number of a model's first submission. In the case of a tie, the earlier submission wins.
-* **Future Plans:** The team is working on solutions like private evaluation windows, more advanced model fingerprinting (analyzing responses and internal states), and leveraging new security features from Chutes (like TEEs) to make copying ineffective.
+**Q7: What kind of tasks does the subnet evaluate?**
 
----
+The environments are configured in `system_config.environments` and currently include SWE-INFINITE, LIVEWEB, NAVWORLD, MEMORY, DISTILL, TERMINAL (LOGPROBS is disabled by default). Each environment evaluates several hundred tasks per window (e.g. SWE evaluates 300 of its latest task IDs; LIVEWEB samples 400 deterministically-random task IDs).
 
-## Troubleshooting and Technical FAQ
+**Q8: How does the subnet handle model copying?**
 
-**Q8: I'm getting an error running the `af weights` command. How do I fix it?**
+The design limits copying through three current controls:
 
-A: This is a common issue. Try these steps:
-1. **Update Your Repo:** Make sure you have the latest code: `git pull`.
-2. **Re-install Dependencies:** The requirements can change: `uv pip install -e .`.
-3. **Check Environment Variables:** Ensure you have a `.env` file with the correct, up-to-date values copied from the `.env.example` file in the repository.
-4. If it still fails with errors like `Unclosed client session` or `ValueError: max() arg is an empty sequence`, the data endpoints may be temporarily down for maintenance.
-
-**Q9: My Chute is "cold" and I'm not getting any requests from validators. What's wrong?**
-
-A: This happens for a few reasons:
-* **Automatic Shutdown:** Chutes are designed to shut down if they are inactive for a period (default is 5-10 minutes) to save costs.
-* **Validator Sampling:** Validators only check for "hot" (active) miners periodically. If your Chute is cold when they check, you won't get any tasks.
-
-**How to fix it:**
-1. **Increase Shutdown Time:** In your Chute configuration file, increase the `shutdown_after_seconds` parameter (e.g., to `1800` for 30 minutes) to keep your instance alive longer.
-2. **Keep it Warm:** You can write a simple script to send a request to your own Chute every few minutes to prevent it from going cold.
-
-**Q10: My Chute fails to deploy or won't become active. What should I do?**
-
-A: This is almost always an issue with your Chute configuration.
-* **Check the Logs!** This is the most critical step. A pinned message in the Discord provides a detailed guide on how to retrieve live logs from your Chute instance using its Instance ID and your Chutes API key.
-* **Common Errors:**
-  * **Invalid `engine_args`:** Ensure there are no typos or commas between arguments.
-  * **Outdated Image:** The error `Must use image="chutes/sglang:YYYYMMDDHH" (or more recent...)` means you must update the `image` parameter in your Chute configuration to the specified version or a newer one.
-  * **Corrupted Model:** Your `model.safetensors` file might be corrupted or uploaded incorrectly to Hugging Face.
-
-**Q11: My new model has been submitted but doesn't appear on the leaderboard. Why?**
-
-A: It can take time. The system evaluates models over a large window of blocks (e.g., 10,000 blocks, which can be over a day). If your model still doesn't appear, double-check that your on-chain commit was successful and that there isn't a mismatch between the model revision you committed and the one deployed on your Chute.
+- Public status commands show ranking, queue, weights, and miner metadata. Current-window task details stay internal to the validator.
+- The challenge is sequential and bounded: each hotkey gets exactly one shot at the throne, ever. There's no leaderboard climbing by repeatedly submitting variants.
+- Plagiarism detection compares `model_hash` (sha256 of weight shards): the earliest committer wins; any later miner with an identical hash is marked `invalid` by the monitor.
 
 ---
 
-## Subnet Mechanics
+## Troubleshooting
 
-**Q12: Why are emissions often at 10% or burning completely (0% to miners)?**
+**Q9: My model committed but doesn't show in `af get-rank`. Why?**
 
-A: The team deliberately reduces or "burns" emissions by sending them to UID 0 when there are critical issues. This is done to ensure fairness and prevent exploiters from profiting. Reasons for burning have included:
-* Fixing major security exploits (e.g., a Chutes vulnerability that allowed routing requests to GPT-4o).
-* Correcting bugs in the scoring mechanism.
-* Rolling out significant infrastructure changes that require validators to update.
-* General network instability or downtime.
+Two likely reasons:
 
-**Q13: How does the scoring and weight system work? What are the `L1` to `L8` columns?**
+- The monitor refresh hasn't run since you committed (refreshes every ~5 min). `af get-rank` includes the queue head — wait one refresh and re-check.
+- The monitor's `_validate_miner` rejected your commit. Common reasons:
+  - HuggingFace can't resolve your repo at that revision (404)
+  - Repo name doesn't end with your hotkey (after block 7,290,000)
+  - Multi-commit rule: you committed twice (any hotkey with `commit_count > 1` past block 7,710,000 is permanently invalid)
+  - Plagiarism: another miner submitted the same `model_hash` earlier
 
-A: Affine uses a **Pareto dominance** scoring system. Instead of one model being the "winner-takes-all," the system identifies winners across all possible subsets of the available environments.
-* The `L1` through `L8` columns show the points a miner has earned for being dominant on subsets of that corresponding size. For example, `L2` shows points for winning on two-environment combinations, while `L8` is for winning across all eight environments simultaneously.
-* This encourages miners to develop models that are specialized and perform well on different combinations of tasks, not just a single generalist model.
+**Q10: My slot finally came up but my evaluation failed. What happened?**
+
+Run `af get-rank` to see whether you appear as the current battle's challenger. Two common failure modes:
+
+- **Provider allocation failed.** The validator's Targon couldn't get your model loaded within the model-load timeout (default 30 min). Your model may be too large, the HF download timed out, or sglang/vllm rejected your config. You're marked `terminated_failed` and the queue advances.
+- **Inference unreachable.** Targon launched the workload but per-task requests time out or 5xx. The executor still writes a sample row per task (with score 0 + error). Once all rows are in, the comparator sees the challenger far below the champion in every env and you're marked `terminated_lost`.
+
+---
+
+## Subnet mechanics
+
+**Q11: How is the weight allocated?**
+
+Winner-takes-all. The current champion holds `overall_score=1.0`; every other miner is at `0.0`. The validator writes that to chain once per window via `af servers validator`.
+
+**Q12: Why are emissions sometimes burned to UID 0?**
+
+The validator can be configured with a `validator_burn_percentage` (in `system_config`) which routes that fraction of weight to UID 0. Used to ensure fairness and prevent exploiters from profiting while the team rolls out fixes, mitigates downtime, or handles network instability.
+
+**Q13: How can I see the live state?**
+
+```
+af get-rank      # one-stop rank/status table
+af get-scores    # top-N scores from the latest snapshot
+af get-score 42  # one miner's score
+af get-weights   # latest normalized weights (what the validator sets on chain)
+```
+
+`af get-rank` is the only status command you usually need; everything else
+is a narrow helper.
+
+There is no per-miner "stats" command and no way to query sample data through the API — that's intentional. Yesterday's samples may be published by an external frontend, but this codebase never serves them.

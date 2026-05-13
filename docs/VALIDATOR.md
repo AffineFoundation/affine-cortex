@@ -20,7 +20,8 @@ The main responsibilities of an Affine validator are:
 2. **Apply Burn Mechanism**: Allocate a percentage of weights to UID 0 based on configuration
 3. **Set On-Chain**: Submit weights to the Bittensor blockchain
 
-Validators no longer need to run evaluation or scoring logic directly. All complex computations are handled by backend services.
+Evaluation and scoring run in backend services. The validator service reads
+the resulting weights and submits them on chain.
 
 ## Prerequisites
 
@@ -245,11 +246,11 @@ af get-weights
 # View top 10 miners
 af get-scores --top 10
 
-# View full ranking table
+# One-stop rank/status table
 af get-rank
 
-# View specific miner info
-af get-miner <UID>
+# Inspect one miner's public metadata
+af get-miner --uid <UID>
 ```
 
 ## Monitoring & Maintenance

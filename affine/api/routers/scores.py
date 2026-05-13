@@ -18,37 +18,8 @@ from affine.api.dependencies import (
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.miners import MinersDAO
-from affine.database.dao.targon_deployments import TargonDeploymentsDAO
 
 router = APIRouter(prefix="/scores", tags=["Scores"])
-
-
-async def _build_targon_status_map() -> dict:
-    """Map (hotkey, revision) -> 'active' | 'deploying' for live Targon deployments.
-
-    Two GSI queries (status='active', status='deploying'); cheap because
-    each return at most a handful of rows. Returns an empty map on any
-    DAO error so a Targon-table outage doesn't 500 the rank endpoint —
-    the CLI just shows no acceleration markers.
-    """
-    try:
-        dao = TargonDeploymentsDAO()
-        active = await dao.list_by_status("active")
-        deploying = await dao.list_by_status("deploying")
-    except Exception:
-        return {}
-    out: dict = {}
-    # Active wins over deploying when both exist for the same key (a
-    # restart can briefly leave two rows).
-    for r in deploying:
-        hk, rev = r.get("hotkey"), r.get("revision")
-        if hk and rev:
-            out[(hk, rev)] = "deploying"
-    for r in active:
-        hk, rev = r.get("hotkey"), r.get("revision")
-        if hk and rev:
-            out[(hk, rev)] = "active"
-    return out
 
 
 async def _build_validity_map() -> dict:
@@ -110,7 +81,6 @@ async def get_latest_scores(
         scores_list.sort(key=lambda x: x.get("overall_score", 0.0), reverse=True)
         scores_list = scores_list[:top]
 
-        targon_status = await _build_targon_status_map()
         validity = await _build_validity_map()
 
         # Convert to response models with safe field access
@@ -128,10 +98,6 @@ async def get_latest_scores(
                 average_score=s.get("average_score"),
                 scores_by_env=s.get("scores_by_env"),
                 total_samples=s.get("total_samples"),
-                challenge_info=s.get("challenge_info"),
-                targon_status=targon_status.get(
-                    (hk, s.get("model_revision"))
-                ),
                 is_valid=is_valid,
                 invalid_reason=invalid_reason,
             ))
@@ -197,9 +163,10 @@ async def get_score_by_uid(
                 detail=f"Score not found for UID={uid}"
             )
         
-        targon_status = await _build_targon_status_map()
+        hk = miner_score.get("miner_hotkey")
+        is_valid, invalid_reason = (await _build_validity_map()).get(hk, (None, None))
         return MinerScore(
-            miner_hotkey=miner_score.get("miner_hotkey"),
+            miner_hotkey=hk,
             uid=miner_score.get("uid"),
             model_revision=miner_score.get("model_revision"),
             model=miner_score.get("model"),
@@ -208,10 +175,8 @@ async def get_score_by_uid(
             average_score=miner_score.get("average_score"),
             scores_by_env=miner_score.get("scores_by_env"),
             total_samples=miner_score.get("total_samples"),
-            challenge_info=miner_score.get("challenge_info"),
-            targon_status=targon_status.get(
-                (miner_score.get("miner_hotkey"), miner_score.get("model_revision"))
-            ),
+            is_valid=is_valid,
+            invalid_reason=invalid_reason,
         )
 
     except HTTPException:
@@ -227,67 +192,38 @@ async def get_score_by_uid(
 async def get_latest_weights(
     snapshots_dao: ScoreSnapshotsDAO = Depends(get_score_snapshots_dao),
 ):
+    """Return the latest snapshot's per-UID weights.
+
+    The queue-window scorer writes ``statistics.final_weights`` as
+    ``{uid_str: weight_str}`` — exactly one uid carries ``"1.0"`` (the
+    champion) and everyone else carries ``"0.0"``. We reshape into
+    ``{uid_str: {"weight": float}}`` so :class:`WeightSetter` can consume
+    it directly.
     """
-    Get the latest normalized weights from scoring calculation.
-    
-    Returns the most recent score snapshot with normalized weights
-    for all miners, suitable for setting on-chain weights.
-    
-    Response format:
-    {
-        "block_number": 12345,
-        "config": {
-            "error_rate_reduction": 0.2,
-            "min_improvement": 0.02,
-            "min_completeness": 0.99,
-            ...
-        },
-        "weights": {
-            "0": {"hotkey": "5...", "weight": 0.15},
-            "1": {"hotkey": "5...", "weight": 0.12},
-            ...
-        }
-    }
-    """
-    try:
-        # Get latest snapshot
-        snapshot = await snapshots_dao.get_latest_snapshot()
-        
-        if not snapshot:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No score snapshots found"
-            )
-        
-        # Extract weights from statistics
-        statistics = snapshot.get('statistics', {})
-        miner_weights = statistics.get('miner_final_scores', {})
-        
-        if not miner_weights:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="No weights found in latest snapshot"
-            )
-        
-        # Format response according to design document
-        weights_response = {}
-        for uid_str, weight in miner_weights.items():
-            # Get hotkey from snapshot metadata if available
-            # For now, use uid as key
-            weights_response[uid_str] = {
-                "weight": weight
-            }
-        
-        return {
-            "block_number": snapshot.get('block_number'),
-            "config": snapshot.get('config', {}),
-            "weights": weights_response
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
+    snapshot = await snapshots_dao.get_latest_snapshot()
+    if not snapshot:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve latest weights: {str(e)}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No score snapshots found",
         )
+
+    statistics = snapshot.get("statistics", {}) or {}
+    raw_weights = statistics.get("final_weights") or {}
+    if not raw_weights:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No weights found in latest snapshot",
+        )
+
+    weights_response: dict = {}
+    for uid_str, weight in raw_weights.items():
+        try:
+            w = float(weight)
+        except (TypeError, ValueError):
+            continue
+        weights_response[str(uid_str)] = {"weight": w}
+
+    return {
+        "block_number": snapshot.get("block_number"),
+        "weights": weights_response,
+    }

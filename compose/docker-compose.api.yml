@@ -12,7 +12,6 @@ services:
     mem_limit: "16g"
     environment:
       - API_HOST=0.0.0.0
-      - API_SERVICES_ENABLED=false
       - API_RATE_LIMIT_ENABLED=true
       - API_LOG_LEVEL=INFO
       - API_RELOAD=true
