@@ -195,12 +195,19 @@ class ExecutorManager:
 
 
 async def _enabled_envs() -> List[str]:
-    """Read system_config.environments and return enabled env keys."""
+    """Read system_config.environments and return sampling-enabled env keys.
+
+    Accepts both the new ``enabled_for_sampling`` key and the legacy
+    ``enabled`` alias so an unmigrated DB doesn't go silent.
+    """
     config_dao = SystemConfigDAO()
     envs_raw = await config_dao.get_param_value("environments", default={}) or {}
     out = []
     for name, cfg in envs_raw.items():
-        if isinstance(cfg, dict) and cfg.get("enabled", True):
+        if not isinstance(cfg, dict):
+            continue
+        sampling_flag = cfg.get("enabled_for_sampling", cfg.get("enabled", True))
+        if sampling_flag:
             out.append(name)
     return out
 

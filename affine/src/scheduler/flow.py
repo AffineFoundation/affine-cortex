@@ -200,7 +200,14 @@ class FlowScheduler:
             return
 
         # 9. Sufficient overlap — run the contest on overlap task_ids only.
-        await self._decide(champion, battle, envs, task_state, current_block)
+        # The comparator sees only envs whose ``enabled_for_scoring`` is
+        # true; sampling-only envs accumulate data without affecting
+        # DECIDE. Same ``envs`` dict object stays in use for any tick
+        # paths that need the full sampling set.
+        scoring_envs = await self.state.get_scoring_environments()
+        await self._decide(
+            champion, battle, scoring_envs, task_state, current_block,
+        )
 
     # ---- helpers ----------------------------------------------------------
 
