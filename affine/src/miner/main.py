@@ -7,6 +7,7 @@ Surfaced via ``affine/cli/main.py``:
   - deploy        (alias: miner-deploy)
   - get-weights
   - get-scores / get-score
+  - get-miner
   - get-rank      (one-stop: window + queue + weight table)
 """
 
@@ -21,6 +22,7 @@ from affine.src.miner.commands import (
     commit_command,
     deploy_command,
     get_score_command,
+    get_miner_command,
     get_scores_command,
     get_weights_command,
     pull_command,
@@ -68,6 +70,14 @@ def get_scores(top):
 def get_score(uid):
     """Show one miner's score from the latest snapshot."""
     asyncio.run(get_score_command(uid=uid))
+
+
+@click.command("get-miner")
+@click.option("--uid", type=UID, help="Miner UID")
+@click.option("--hotkey", help="Miner hotkey")
+def get_miner(uid, hotkey):
+    """Show one miner's public metadata."""
+    asyncio.run(get_miner_command(uid=uid, hotkey=hotkey))
 
 
 @click.command("get-rank")

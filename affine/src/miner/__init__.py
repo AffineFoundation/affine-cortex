@@ -6,7 +6,7 @@ Provides the CLI surface miners use to participate:
   - commit        : write {model, revision} on chain (one-shot per hotkey)
   - miner-deploy  : convenience wrapper (HF upload → commit)
   - get-rank      : one-stop status (window + queue + weights)
-  - get-weights / get-scores / get-score
+  - get-weights / get-scores / get-score / get-miner
 """
 
 __version__ = "1.0.0"

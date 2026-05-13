@@ -113,15 +113,15 @@ second commit invalidates the miner permanently (see [Multi-commit Rule](#multi-
 | Command | What it shows |
 | --- | --- |
 | `af get-rank` | One-stop status — current state (champion + in-flight battle), challenger queue head, and weight snapshot table |
+| `af get-miner --uid UID` | Public miner metadata: model, revision, validity, queue status, and commit blocks |
 | `af get-weights` | Latest on-chain-bound weights only |
 | `af get-scores --top N` | Top N miners from the latest snapshot |
 | `af get-score <UID>` | One miner's score |
 
 `af get-rank` is the only status command you usually need; the others
-are narrow query helpers. There is intentionally **no** `af get-miner`,
-`af get-pool`, or `af get-sample` — exposing per-miner challenge state
-or sample data would let competitors infer who is being evaluated this
-window.
+are narrow query helpers. `af get-miner` exposes only basic miner metadata;
+there is intentionally no `af get-pool` or `af get-sample`, and no public
+sampling-rate statistics or sample rows.
 
 ### Local evaluation
 

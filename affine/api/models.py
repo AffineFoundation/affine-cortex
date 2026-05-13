@@ -39,6 +39,26 @@ class ScoresResponse(BaseModel):
     scores: List[MinerScore]
 
 
+class MinerInfo(BaseModel):
+    """Public miner metadata.
+
+    This is the same basic record operators historically inspected via
+    ``get-miner``. It intentionally excludes sample rows and sampling-rate
+    counters; those no longer belong to the public API surface.
+    """
+
+    uid: int
+    hotkey: str
+    model: Optional[str] = None
+    revision: Optional[str] = None
+    is_valid: Optional[bool] = None
+    challenge_status: Optional[str] = None
+    first_block: Optional[int] = None
+    block_number: Optional[int] = None
+    invalid_reason: Optional[str] = None
+    model_hash: Optional[str] = None
+
+
 class ExecutionLog(BaseModel):
     """Execution log entry."""
 

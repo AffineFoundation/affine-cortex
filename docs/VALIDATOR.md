@@ -248,8 +248,8 @@ af get-scores --top 10
 # One-stop: window state + queue head + weights table
 af get-rank
 
-# Inspect one miner from the validator side (admin command)
-AFFINE_SHOW_ADMIN_COMMANDS=true af db get-miner --uid <UID>
+# Inspect one miner's public metadata
+af get-miner --uid <UID>
 ```
 
 ## Monitoring & Maintenance

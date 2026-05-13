@@ -19,6 +19,7 @@ Miner Commands:
 - af get-weights : Query latest normalized weights
 - af get-scores  : Query latest scores for top N miners
 - af get-score   : Query score for a specific miner
+- af get-miner   : Query public miner metadata
 - af get-rank    : Query window + queue + weights table (one-stop)
 
 Docker Commands:
@@ -32,6 +33,7 @@ Database Commands:
 import sys
 import os
 import subprocess
+import asyncio
 import click
 from affine.core.setup import setup_logging, logger
 
@@ -226,6 +228,21 @@ def get_score(ctx):
     
     sys.argv = ["get-score"] + ctx.args
     miner_get_score.main(standalone_mode=False)
+
+
+@cli.command("get-miner")
+@click.option("--uid", type=int, help="Miner UID")
+@click.option("--hotkey", help="Miner hotkey")
+def get_miner(uid, hotkey):
+    """Query public miner metadata by UID or hotkey.
+
+    Example:
+        af get-miner --uid 42
+        af get-miner --hotkey 5F...
+    """
+    from affine.src.miner.commands import get_miner_command
+
+    asyncio.run(get_miner_command(uid=uid, hotkey=hotkey))
 
 
 @cli.command("get-rank", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})

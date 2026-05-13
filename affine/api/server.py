@@ -13,6 +13,7 @@ from affine.api.config import config
 from affine.api.middleware import setup_middleware
 from affine.api.routers import (
     config_router,
+    miners_router,
     scores_router,
     windows_router,
 )
@@ -58,6 +59,7 @@ setup_middleware(app)
 # queue-window scorer collects samples in-process via DAO writes, and any
 # external publication of yesterday's samples is handled outside this API.
 app.include_router(windows_router, prefix="/api/v1")
+app.include_router(miners_router, prefix="/api/v1")
 app.include_router(scores_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
 if config.INTERNAL_ENDPOINTS_ENABLED:

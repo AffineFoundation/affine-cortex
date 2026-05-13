@@ -7,6 +7,7 @@ After the queue-window refactor, the miner-side surface is purely:
   - miner-deploy      : convenience wrapper (HF upload → commit)
   - get-weights       : pretty-print the latest weight snapshot
   - get-scores / get-score : score table / single-miner score
+  - get-miner         : basic public miner metadata
   - get-rank          : one-stop status — window state + queue head + weight table
 
 All Chutes / Targon / private-repo workflows that lived here previously
@@ -238,4 +239,17 @@ async def get_score_command(uid: int) -> None:
         if data:
             print(json.dumps(data, indent=2, ensure_ascii=False))
 
+
+async def get_miner_command(uid: Optional[int], hotkey: Optional[str]) -> None:
+    if uid is None and not hotkey:
+        print(json.dumps({
+            "success": False,
+            "error": "--uid or --hotkey required",
+        }))
+        sys.exit(1)
+    endpoint = f"/miners/uid/{uid}" if uid is not None else f"/miners/hotkey/{hotkey}"
+    async with cli_api_client() as client:
+        data = await client.get(endpoint)
+        if data:
+            print(json.dumps(data, indent=2, ensure_ascii=False))
 

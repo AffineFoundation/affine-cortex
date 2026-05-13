@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import pytest
 
+from affine.api.routers.miners import get_miner_by_hotkey, get_miner_by_uid
 from affine.api.routers.logs import get_miner_logs
+
+
+class _FakeMinersDAO:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def get_miner_by_uid(self, uid):
+        return self.rows.get(("uid", uid))
+
+    async def get_miner_by_hotkey(self, hotkey):
+        return self.rows.get(("hotkey", hotkey))
 
 
 class _FakeExecutionLogsDAO:
@@ -24,9 +36,59 @@ def test_public_server_does_not_mount_internal_logs_by_default():
     assert "/" in paths
     assert "/api/v1/health" in paths
     assert "/api/v1/windows/current" in paths
+    assert "/api/v1/miners/uid/{uid}" in paths
+    assert "/api/v1/miners/hotkey/{hotkey}" in paths
     assert "/api/v1/scores/latest" in paths
     assert "/api/v1/config" in paths
     assert "/api/v1/logs/miner/{hotkey}" not in paths
+
+
+@pytest.mark.asyncio
+async def test_miners_router_returns_basic_public_metadata_by_uid():
+    dao = _FakeMinersDAO({
+        ("uid", 7): {
+            "uid": 7,
+            "hotkey": "hk",
+            "model": "org/model",
+            "revision": "abc",
+            "is_valid": "true",
+            "challenge_status": "pending",
+            "first_block": 100,
+            "block_number": 120,
+            "invalid_reason": None,
+            "model_hash": "hash",
+        }
+    })
+
+    response = await get_miner_by_uid(7, dao=dao)
+
+    assert response.uid == 7
+    assert response.hotkey == "hk"
+    assert response.model == "org/model"
+    assert response.revision == "abc"
+    assert response.is_valid is True
+    assert response.challenge_status == "pending"
+    assert response.model_hash == "hash"
+
+
+@pytest.mark.asyncio
+async def test_miners_router_returns_basic_public_metadata_by_hotkey():
+    dao = _FakeMinersDAO({
+        ("hotkey", "hk"): {
+            "uid": 8,
+            "hotkey": "hk",
+            "model": "org/other",
+            "revision": "def",
+            "is_valid": "false",
+            "invalid_reason": "model_mismatch",
+        }
+    })
+
+    response = await get_miner_by_hotkey("hk", dao=dao)
+
+    assert response.uid == 8
+    assert response.is_valid is False
+    assert response.invalid_reason == "model_mismatch"
 
 
 @pytest.mark.asyncio
