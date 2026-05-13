@@ -31,24 +31,31 @@ def _get_env_vars_with(env_lookup: dict):
         return sdk._get_env_vars()
 
 
-def test_chutes_api_key_mirrors_api_key():
+def test_aliases_mirror_api_key():
     env_vars = _get_env_vars_with({"API_KEY": "k123"})
 
     assert env_vars["API_KEY"] == "k123"
     assert env_vars["CHUTES_API_KEY"] == "k123"
+    assert env_vars["OPENAI_API_KEY"] == "k123"
 
 
-def test_explicit_chutes_api_key_wins_over_alias():
+def test_explicit_alias_wins_over_api_key_value():
     env_vars = _get_env_vars_with(
-        {"API_KEY": "k123", "CHUTES_API_KEY": "chutes-explicit"},
+        {
+            "API_KEY": "k123",
+            "CHUTES_API_KEY": "chutes-explicit",
+            "OPENAI_API_KEY": "openai-explicit",
+        },
     )
 
     assert env_vars["API_KEY"] == "k123"
     assert env_vars["CHUTES_API_KEY"] == "chutes-explicit"
+    assert env_vars["OPENAI_API_KEY"] == "openai-explicit"
 
 
-def test_no_api_key_set_no_chutes_key_emitted():
+def test_no_api_key_set_no_aliases_emitted():
     env_vars = _get_env_vars_with({})
 
     assert "API_KEY" not in env_vars
     assert "CHUTES_API_KEY" not in env_vars
+    assert "OPENAI_API_KEY" not in env_vars
