@@ -20,9 +20,6 @@ services:
   executor:
     <<: *affine_image
 
-  teacher:
-    <<: *affine_image
-
   watchtower:
     profiles:
       - production
