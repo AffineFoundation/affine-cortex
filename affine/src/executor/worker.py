@@ -43,12 +43,18 @@ class ExecutorWorker:
         max_concurrent: int = 60,
         poll_interval_sec: float = 5.0,
         idle_sleep_sec: float = 10.0,
+        warmup_sec: float = 60.0,
     ):
         self.worker_id = worker_id
         self.env = env
         self.max_concurrent = max_concurrent
         self.poll_interval_sec = poll_interval_sec
         self.idle_sleep_sec = idle_sleep_sec
+        # ``warmup_sec``: env containers report "ready" before they are
+        # fully serving — the affinetes pool finishes deploy / ssh tunnel
+        # setup but the env's own app boot can lag. Sleep before the first
+        # tick so the initial batch doesn't hit a half-cold container.
+        self.warmup_sec = warmup_sec
 
         self.running = False
         self.metrics = WorkerMetrics(worker_id=worker_id, env=env)
@@ -101,6 +107,12 @@ class ExecutorWorker:
 
     async def run(self) -> None:
         assert self._state and self._samples, "call initialize() first"
+        if self.warmup_sec > 0:
+            logger.info(
+                f"[{self.env}] warmup: sleeping {self.warmup_sec:.0f}s before "
+                f"first tick (let env containers finish app-level boot)"
+            )
+            await asyncio.sleep(self.warmup_sec)
         while self.running:
             try:
                 worked = await self._tick()
@@ -115,11 +127,18 @@ class ExecutorWorker:
     async def _tick(self) -> bool:
         """One poll cycle. Returns True if any sampling work was attempted.
 
-        Stops dispatching for a (subject, env) pair once the subject has
-        ``sampling_count`` rows in the current refresh — the 10% pool
-        oversampling is buffer for slow/erroring task_ids, not an
-        instruction to fully drain the pool. Once base count is met the
-        scheduler's overlap check will release ``_decide``."""
+        Sampling policy is asymmetric between subjects:
+          - **Champion** keeps draining the full pool (sampling_count *
+            1.1 from Stage AF). The extra 10% gives later contests more
+            comparison data and a buffer against task-ids that the env
+            can't process (~5% expected); a champion sticks around for
+            many battles, so investing in deeper samples pays off.
+          - **Challenger** stops at the base ``sampling_count``. Once
+            the overlap with champion can possibly clear the comparator
+            threshold there's no value in continuing — the challenger
+            either wins and the rotation moves on, or loses and gets
+            torn down.
+        """
         task_state = await self._state.get_task_state()
         if task_state is None:
             return False
@@ -141,28 +160,22 @@ class ExecutorWorker:
 
         pending: List[tuple] = []  # (miner_snapshot, task_id, base_url)
 
-        # Champion: only build pending if we're still below the base count.
-        champ_have = await self._samples.count_samples_for_tasks(
-            champion.hotkey, champion.revision, self.env, task_ids,
-            refresh_block=refresh_block,
+        # Champion: drain the full pool (no cap). A persistently-failing
+        # task_id keeps reappearing in ``pending`` each tick — that's
+        # acceptable because env-level failures eat constant low-grade
+        # capacity and the 10% buffer + 5% miss tolerance absorbs them.
+        champ_snap = MinerSnapshot(
+            uid=champion.uid, hotkey=champion.hotkey,
+            revision=champion.revision, model=champion.model,
         )
-        if champ_have < sampling_count:
-            remaining = sampling_count - champ_have
-            champ_snap = MinerSnapshot(
-                uid=champion.uid, hotkey=champion.hotkey,
-                revision=champion.revision, model=champion.model,
-            )
-            for idx, tid in enumerate(task_ids):
-                if remaining <= 0:
-                    break
-                if not await self._samples.has_sample(
-                    champion.hotkey, champion.revision, self.env, tid,
-                    refresh_block=refresh_block,
-                ):
-                    pending.append((champ_snap, tid, _pick_url(champion_urls, tid, idx)))
-                    remaining -= 1
+        for idx, tid in enumerate(task_ids):
+            if not await self._samples.has_sample(
+                champion.hotkey, champion.revision, self.env, tid,
+                refresh_block=refresh_block,
+            ):
+                pending.append((champ_snap, tid, _pick_url(champion_urls, tid, idx)))
 
-        # Battle in flight → same cap for the challenger.
+        # Battle in flight → cap challenger at ``sampling_count``.
         battle = await self._state.get_battle()
         battle_urls = _base_urls(battle.deployments if battle else [], battle.base_url if battle else None)
         if battle is not None and battle_urls:
