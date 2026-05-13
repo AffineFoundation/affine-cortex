@@ -40,6 +40,7 @@ def _miner_info(row: Dict[str, Any]) -> MinerInfo:
         revision=row.get("revision"),
         is_valid=_bool_or_none(row.get("is_valid")),
         challenge_status=row.get("challenge_status"),
+        termination_reason=row.get("termination_reason"),
         first_block=row.get("first_block"),
         block_number=row.get("block_number"),
         invalid_reason=row.get("invalid_reason"),
