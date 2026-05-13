@@ -86,51 +86,63 @@ def test_is_zero_score_error_is_case_insensitive():
     assert _is_zero_score_error(Exception("EXCEEDS THE MAXIMUM CONTEXT LENGTH"))
 
 
-def test_refresh_dispatch_cap_picks_up_managers_value():
+def test_global_slot_acquire_release_round_trip():
+    import asyncio as _asyncio
     import multiprocessing as _mp
     from affine.src.executor.worker import ExecutorWorker
 
-    cap = _mp.get_context("spawn").Value("i", 60)
-    worker = ExecutorWorker(
-        worker_id=0, env="MEMORY", max_concurrent=60, cap_value=cap,
-    )
+    sem = _mp.get_context("spawn").BoundedSemaphore(2)
+    worker = ExecutorWorker(worker_id=0, env="MEMORY", global_sem=sem)
 
-    # No change when value matches.
-    worker._refresh_dispatch_cap()
-    assert worker.max_concurrent == 60
+    async def _drive():
+        await worker._acquire_global_slot()
+        await worker._acquire_global_slot()
+        # Both slots taken — non-blocking acquire from a peer should fail.
+        assert not sem.acquire(block=False)
+        worker._release_global_slot()
+        # One slot back — peer should be able to grab it now.
+        assert sem.acquire(block=False)
+        sem.release()
+        worker._release_global_slot()
 
-    # Manager rebalances downward.
-    cap.value = 25
-    worker._refresh_dispatch_cap()
-    assert worker.max_concurrent == 25
-
-    # Manager rebalances upward.
-    cap.value = 200
-    worker._refresh_dispatch_cap()
-    assert worker.max_concurrent == 200
+    _asyncio.run(_drive())
 
 
-def test_refresh_dispatch_cap_noop_when_unwired():
-    from affine.src.executor.worker import ExecutorWorker
-
-    worker = ExecutorWorker(
-        worker_id=0, env="MEMORY", max_concurrent=42, cap_value=None,
-    )
-    worker._refresh_dispatch_cap()
-    assert worker.max_concurrent == 42
-
-
-def test_refresh_dispatch_cap_ignores_zero_or_negative():
+def test_global_slot_acquire_polls_until_released():
+    """Coroutine should resume once a peer releases."""
+    import asyncio as _asyncio
     import multiprocessing as _mp
     from affine.src.executor.worker import ExecutorWorker
 
-    cap = _mp.get_context("spawn").Value("i", 0)
-    worker = ExecutorWorker(
-        worker_id=0, env="MEMORY", max_concurrent=60, cap_value=cap,
-    )
-    worker._refresh_dispatch_cap()
-    assert worker.max_concurrent == 60  # zero ignored
+    sem = _mp.get_context("spawn").BoundedSemaphore(1)
+    sem.acquire(block=False)  # exhaust it
+    worker = ExecutorWorker(worker_id=0, env="MEMORY", global_sem=sem)
 
-    cap.value = -1
-    worker._refresh_dispatch_cap()
-    assert worker.max_concurrent == 60  # negative ignored
+    async def _drive():
+        async def _waiter():
+            await worker._acquire_global_slot()
+
+        async def _releaser():
+            await _asyncio.sleep(0.15)  # let waiter spin a few polls
+            sem.release()
+
+        await _asyncio.wait_for(
+            _asyncio.gather(_waiter(), _releaser()),
+            timeout=2.0,
+        )
+        worker._release_global_slot()  # clean up
+
+    _asyncio.run(_drive())
+
+
+def test_global_slot_helpers_noop_when_unwired():
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+
+    worker = ExecutorWorker(worker_id=0, env="MEMORY", global_sem=None)
+
+    async def _drive():
+        await worker._acquire_global_slot()  # no-op, returns immediately
+        worker._release_global_slot()  # no-op
+
+    _asyncio.run(_drive())

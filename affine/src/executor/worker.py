@@ -44,15 +44,17 @@ class ExecutorWorker:
         poll_interval_sec: float = 5.0,
         idle_sleep_sec: float = 10.0,
         warmup_sec: float = 180.0,
-        cap_value: Any = None,
+        global_sem: Any = None,
     ):
         self.worker_id = worker_id
         self.env = env
         self.max_concurrent = max_concurrent
-        # Optional ``multiprocessing.Value(c_int)`` written by the manager
-        # for cross-env priority rebalancing. ``None`` in unit tests /
-        # standalone runs — worker just keeps the static ``max_concurrent``.
-        self._cap_value = cap_value
+        # Cross-process ``BoundedSemaphore`` (or ``None`` in unit tests /
+        # standalone runs). Real backpressure runs through this — see
+        # ``_acquire_global_slot`` below. The per-tick local semaphore
+        # is sized at ``max_concurrent`` and only exists as a defensive
+        # floor against scheduling tens of thousands of coroutines.
+        self._global_sem = global_sem
         self.poll_interval_sec = poll_interval_sec
         self.idle_sleep_sec = idle_sleep_sec
         # ``warmup_sec``: env containers report "ready" before they are
@@ -139,22 +141,30 @@ class ExecutorWorker:
         finally:
             status_task.cancel()
 
-    def _refresh_dispatch_cap(self) -> None:
-        """Sync ``self.max_concurrent`` from the shared atomic int the
-        manager broadcasts. No-op when ``cap_value`` isn't wired (unit
-        tests / standalone runs). Atomic ``c_int`` reads are lock-free
-        on CPython, so this is just an attribute access."""
-        if self._cap_value is None:
+    async def _acquire_global_slot(self) -> None:
+        """Block until the cross-process global dispatch semaphore yields
+        a slot. Poll with non-blocking ``acquire`` + ``asyncio.sleep`` so
+        we don't park a kernel thread per pending coroutine — there can
+        be thousands of pending coroutines across all envs and we still
+        want a single asyncio event loop per worker to stay responsive.
+        """
+        if self._global_sem is None:
+            return
+        while True:
+            if self._global_sem.acquire(block=False):
+                return
+            await asyncio.sleep(0.05)
+
+    def _release_global_slot(self) -> None:
+        """Return a global slot. Swallow ``ValueError`` from
+        ``BoundedSemaphore.release`` past its initial value — should not
+        happen but it's not worth crashing the worker over."""
+        if self._global_sem is None:
             return
         try:
-            new_cap = int(self._cap_value.value)
-        except Exception:
-            return
-        if new_cap > 0 and new_cap != self.max_concurrent:
-            logger.info(
-                f"[{self.env}] dispatch cap: {self.max_concurrent} → {new_cap}"
-            )
-            self.max_concurrent = new_cap
+            self._global_sem.release()
+        except ValueError:
+            logger.debug(f"[{self.env}] global sem release past bound")
 
     async def _publish_status_loop(self, interval_sec: float = 10.0) -> None:
         """Periodically write this worker's metrics to ``system_config`` under
@@ -190,13 +200,10 @@ class ExecutorWorker:
             either wins and the rotation moves on, or loses and gets
             torn down.
 
-        Before each tick we sample ``self._cap_value`` (a shared atomic
-        int the manager writes from ``ExecutorManager._cap_publisher``)
-        so the cross-env priority rebalancer can widen this worker's
-        dispatch when peers finish early.
+        The dispatch semaphore (``self.max_concurrent``) is a defensive
+        hygiene cap, not a throughput knob — real backpressure comes
+        from the env containers downstream. See ``executor/config.py``.
         """
-        self._refresh_dispatch_cap()
-
         task_state = await self._state.get_task_state()
         if task_state is None:
             return False
@@ -263,10 +270,15 @@ class ExecutorWorker:
         # ``decide`` sooner once enough overlap appears anywhere in the pool.
         random.shuffle(pending)
 
-        sem = asyncio.Semaphore(self.max_concurrent)
+        # Local asyncio semaphore is just a defensive floor — the real
+        # gate is the cross-process ``self._global_sem`` acquired inside
+        # ``_evaluate_and_persist``. Local cap >= pending size in normal
+        # operation, so this is effectively a no-op except as protection
+        # against runaway pending lists.
+        local_sem = asyncio.Semaphore(self.max_concurrent)
 
         async def _run_one(miner: MinerSnapshot, task_id: int, base_url: str) -> None:
-            async with sem:
+            async with local_sem:
                 await self._evaluate_and_persist(
                     miner=miner, task_id=task_id, base_url=base_url,
                     refresh_block=refresh_block,
@@ -308,6 +320,11 @@ class ExecutorWorker:
             hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
             base_url=base_url,
         )
+        # Wait until the cross-process global semaphore yields a slot.
+        # Envs with bigger pending lists submit more concurrent acquire
+        # attempts and so win a proportional share of the b300 budget —
+        # that's the cross-env priority, no explicit queue needed.
+        await self._acquire_global_slot()
         started = time.monotonic()
         # Track real in-flight concurrency so ``af db worker-status`` can
         # report it. Increment before the blocking evaluate() call, decrement
@@ -347,6 +364,7 @@ class ExecutorWorker:
                 return
         finally:
             self.metrics.tasks_in_flight -= 1
+            self._release_global_slot()
 
         score = float(getattr(result, "score", 0.0))
         success = bool(getattr(result, "success", True))
