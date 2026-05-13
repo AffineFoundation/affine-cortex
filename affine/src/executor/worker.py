@@ -44,10 +44,15 @@ class ExecutorWorker:
         poll_interval_sec: float = 5.0,
         idle_sleep_sec: float = 10.0,
         warmup_sec: float = 180.0,
+        cap_value: Any = None,
     ):
         self.worker_id = worker_id
         self.env = env
         self.max_concurrent = max_concurrent
+        # Optional ``multiprocessing.Value(c_int)`` written by the manager
+        # for cross-env priority rebalancing. ``None`` in unit tests /
+        # standalone runs — worker just keeps the static ``max_concurrent``.
+        self._cap_value = cap_value
         self.poll_interval_sec = poll_interval_sec
         self.idle_sleep_sec = idle_sleep_sec
         # ``warmup_sec``: env containers report "ready" before they are
@@ -134,6 +139,23 @@ class ExecutorWorker:
         finally:
             status_task.cancel()
 
+    def _refresh_dispatch_cap(self) -> None:
+        """Sync ``self.max_concurrent`` from the shared atomic int the
+        manager broadcasts. No-op when ``cap_value`` isn't wired (unit
+        tests / standalone runs). Atomic ``c_int`` reads are lock-free
+        on CPython, so this is just an attribute access."""
+        if self._cap_value is None:
+            return
+        try:
+            new_cap = int(self._cap_value.value)
+        except Exception:
+            return
+        if new_cap > 0 and new_cap != self.max_concurrent:
+            logger.info(
+                f"[{self.env}] dispatch cap: {self.max_concurrent} → {new_cap}"
+            )
+            self.max_concurrent = new_cap
+
     async def _publish_status_loop(self, interval_sec: float = 10.0) -> None:
         """Periodically write this worker's metrics to ``system_config`` under
         ``worker_status_<env>``. ``af db worker-status`` reads these rows so
@@ -167,7 +189,14 @@ class ExecutorWorker:
             threshold there's no value in continuing — the challenger
             either wins and the rotation moves on, or loses and gets
             torn down.
+
+        Before each tick we sample ``self._cap_value`` (a shared atomic
+        int the manager writes from ``ExecutorManager._cap_publisher``)
+        so the cross-env priority rebalancer can widen this worker's
+        dispatch when peers finish early.
         """
+        self._refresh_dispatch_cap()
+
         task_state = await self._state.get_task_state()
         if task_state is None:
             return False

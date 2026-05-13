@@ -84,3 +84,53 @@ def test_is_zero_score_error_walks_exception_chain():
 
 def test_is_zero_score_error_is_case_insensitive():
     assert _is_zero_score_error(Exception("EXCEEDS THE MAXIMUM CONTEXT LENGTH"))
+
+
+def test_refresh_dispatch_cap_picks_up_managers_value():
+    import multiprocessing as _mp
+    from affine.src.executor.worker import ExecutorWorker
+
+    cap = _mp.get_context("spawn").Value("i", 60)
+    worker = ExecutorWorker(
+        worker_id=0, env="MEMORY", max_concurrent=60, cap_value=cap,
+    )
+
+    # No change when value matches.
+    worker._refresh_dispatch_cap()
+    assert worker.max_concurrent == 60
+
+    # Manager rebalances downward.
+    cap.value = 25
+    worker._refresh_dispatch_cap()
+    assert worker.max_concurrent == 25
+
+    # Manager rebalances upward.
+    cap.value = 200
+    worker._refresh_dispatch_cap()
+    assert worker.max_concurrent == 200
+
+
+def test_refresh_dispatch_cap_noop_when_unwired():
+    from affine.src.executor.worker import ExecutorWorker
+
+    worker = ExecutorWorker(
+        worker_id=0, env="MEMORY", max_concurrent=42, cap_value=None,
+    )
+    worker._refresh_dispatch_cap()
+    assert worker.max_concurrent == 42
+
+
+def test_refresh_dispatch_cap_ignores_zero_or_negative():
+    import multiprocessing as _mp
+    from affine.src.executor.worker import ExecutorWorker
+
+    cap = _mp.get_context("spawn").Value("i", 0)
+    worker = ExecutorWorker(
+        worker_id=0, env="MEMORY", max_concurrent=60, cap_value=cap,
+    )
+    worker._refresh_dispatch_cap()
+    assert worker.max_concurrent == 60  # zero ignored
+
+    cap.value = -1
+    worker._refresh_dispatch_cap()
+    assert worker.max_concurrent == 60  # negative ignored

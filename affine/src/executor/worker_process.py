@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
-from typing import Optional
+from typing import Any, Optional
 
 from affine.core.setup import logger, setup_logging
 
@@ -20,9 +20,15 @@ def run_worker_subprocess(
     env: str,
     max_concurrent: int,
     stats_queue: multiprocessing.Queue,
+    cap_value: Any,
     verbosity: int = 1,
 ) -> None:
-    """Subprocess entry point — runs one ExecutorWorker until killed."""
+    """Subprocess entry point — runs one ExecutorWorker until killed.
+
+    ``cap_value`` is a ``multiprocessing.Value(c_int)`` the manager writes
+    to broadcast cross-env priority caps; the worker reads it at every
+    tick. Passed positionally so it survives the spawn-context pickle.
+    """
     from affine.src.executor.worker import ExecutorWorker
 
     setup_logging(verbosity, component="executor")
@@ -34,6 +40,7 @@ def run_worker_subprocess(
     try:
         worker = ExecutorWorker(
             worker_id=worker_id, env=env, max_concurrent=max_concurrent,
+            cap_value=cap_value,
         )
         loop.run_until_complete(worker.initialize())
         worker.start()
@@ -70,6 +77,7 @@ class WorkerProcess:
         worker_id: int,
         env: str,
         stats_queue: multiprocessing.Queue,
+        cap_value: Any,
         *,
         max_concurrent: int = 60,
         verbosity: int = 1,
@@ -78,6 +86,7 @@ class WorkerProcess:
         self.env = env
         self.max_concurrent = max_concurrent
         self.stats_queue = stats_queue
+        self.cap_value = cap_value
         self.verbosity = verbosity
         self._proc: Optional[multiprocessing.Process] = None
 
@@ -86,7 +95,7 @@ class WorkerProcess:
         self._proc = ctx.Process(
             target=run_worker_subprocess,
             args=(self.worker_id, self.env, self.max_concurrent,
-                  self.stats_queue, self.verbosity),
+                  self.stats_queue, self.cap_value, self.verbosity),
             name=f"executor-{self.env}",
             daemon=False,
         )
