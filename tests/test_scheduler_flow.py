@@ -21,7 +21,7 @@ from affine.src.scorer.challenger_queue import (
     ChallengerQueue,
     STATUS_CHAMPION,
     STATUS_IN_PROGRESS,
-    STATUS_PENDING,
+    STATUS_SAMPLING,
     STATUS_TERMINATED,
 )
 from affine.src.scorer.comparator import WindowComparator
@@ -46,7 +46,7 @@ class _InMemoryMinerStore:
     async def list_valid_pending(self) -> List[dict]:
         return [r for r in self.rows.values() if str(r.get("is_valid", "")).lower() == "true"]
 
-    async def claim_pending(self, uid: int, window_id: int, *, expected_status=STATUS_PENDING) -> bool:
+    async def claim_pending(self, uid: int, window_id: int, *, expected_status=STATUS_SAMPLING) -> bool:
         row = self.rows.get(uid)
         if row is None:
             return False
@@ -143,7 +143,7 @@ class _WeightWriterFake:
         self.calls.append(kwargs)
 
 
-def _make_miner(uid, hotkey, first_block, *, status=STATUS_PENDING, valid=True,
+def _make_miner(uid, hotkey, first_block, *, status=STATUS_SAMPLING, valid=True,
                 revision=None, model=None):
     return {
         "uid": uid,

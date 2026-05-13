@@ -8,14 +8,16 @@ DynamoDB adapters used by the flow scheduler and executor.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List, Optional
 
 from affine.core.setup import logger
+from affine.database.client import get_client
 from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.sample_results import SampleResultsDAO
 
-from .challenger_queue import STATUS_PENDING
+from .challenger_queue import STATUS_SAMPLING
 
 
 # --------------------------------------------------------------------------- #
@@ -54,7 +56,7 @@ class MinersQueueAdapter:
         return out
 
     async def claim_pending(
-        self, uid: int, window_id: int, *, expected_status: str = STATUS_PENDING,
+        self, uid: int, window_id: int, *, expected_status: str = STATUS_SAMPLING,
     ) -> bool:
         miner = await self._dao.get_miner_by_uid(uid)
         if not miner or str(miner.get("is_valid") or "").lower() != "true":
@@ -92,18 +94,12 @@ class MinersQueueAdapter:
                 "skipped: missing hotkey/revision"
             )
             return
-        try:
-            await self._stats.update_challenge_status(
-                hotkey=str(miner["hotkey"]),
-                revision=str(miner["revision"]),
-                status=new_status,
-                termination_reason=reason,
-            )
-        except Exception as e:
-            logger.warning(
-                f"MinersQueueAdapter.set_terminal(uid={uid}, status={new_status}) "
-                f"failed: {e}"
-            )
+        await self._stats.update_challenge_status(
+            hotkey=str(miner["hotkey"]),
+            revision=str(miner["revision"]),
+            status=new_status,
+            termination_reason=reason,
+        )
 
 
 # --------------------------------------------------------------------------- #

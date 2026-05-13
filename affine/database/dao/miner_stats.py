@@ -66,19 +66,104 @@ class MinerStatsDAO(BaseDAO):
                 return out
             params["ExclusiveStartKey"] = last_key
 
+    async def update_miner_info(
+        self,
+        *,
+        hotkey: str,
+        revision: str,
+        model: str,
+        uid: Optional[int] = None,
+        first_block: Optional[int] = None,
+        block_number: Optional[int] = None,
+        is_valid: Optional[bool] = None,
+        invalid_reason: Optional[str] = None,
+        model_hash: str = "",
+        is_online: bool = True,
+    ) -> None:
+        """Persist current miner metadata without overwriting lifecycle state.
+
+        ``miner_stats`` is the durable hotkey/revision history table. The
+        monitor calls this on every refresh so a miner's identity and validity
+        remain available after the UID leaves the current ``miners`` snapshot.
+        Challenge fields are initialized only for brand-new rows and otherwise
+        preserved.
+        """
+        from affine.database.client import get_client
+
+        now = int(time.time())
+        values = {
+            ":hotkey": {"S": hotkey},
+            ":revision": {"S": revision},
+            ":model": {"S": model},
+            ":now": {"N": str(now)},
+            ":online": {"BOOL": is_online},
+            ":sampling": {"S": self.STATUS_SAMPLING},
+            ":empty": {"S": ""},
+            ":zero": {"N": "0"},
+            ":model_hash": {"S": model_hash or ""},
+        }
+        update_parts = [
+            "hotkey = :hotkey",
+            "revision = :revision",
+            "model = :model",
+            "last_updated_at = :now",
+            "first_seen_at = if_not_exists(first_seen_at, :now)",
+            "is_currently_online = :online",
+            "model_hash = :model_hash",
+            "challenge_status = if_not_exists(challenge_status, :sampling)",
+            "termination_reason = if_not_exists(termination_reason, :empty)",
+            "challenge_consecutive_wins = if_not_exists(challenge_consecutive_wins, :zero)",
+            "challenge_total_wins = if_not_exists(challenge_total_wins, :zero)",
+            "challenge_total_losses = if_not_exists(challenge_total_losses, :zero)",
+            "challenge_consecutive_losses = if_not_exists(challenge_consecutive_losses, :zero)",
+            "challenge_checkpoints_passed = if_not_exists(challenge_checkpoints_passed, :zero)",
+        ]
+        if uid is not None:
+            values[":uid"] = {"N": str(uid)}
+            update_parts.append("#uid = :uid")
+        if first_block is not None:
+            values[":first_block"] = {"N": str(first_block)}
+            update_parts.append("first_block = :first_block")
+        if block_number is not None:
+            values[":block_number"] = {"N": str(block_number)}
+            update_parts.append("block_number = :block_number")
+        if is_valid is not None:
+            values[":is_valid"] = {"BOOL": bool(is_valid)}
+            update_parts.append("is_valid = :is_valid")
+        values[":invalid_reason"] = (
+            {"S": str(invalid_reason)}
+            if invalid_reason is not None
+            else {"NULL": True}
+        )
+        update_parts.append("invalid_reason = :invalid_reason")
+
+        params = {
+            "TableName": self.table_name,
+            "Key": {
+                "pk": {"S": self._make_pk(hotkey)},
+                "sk": {"S": self._make_sk(revision)},
+            },
+            "UpdateExpression": f"SET {', '.join(update_parts)}",
+            "ExpressionAttributeValues": values,
+        }
+        if uid is not None:
+            params["ExpressionAttributeNames"] = {"#uid": "uid"}
+        await get_client().update_item(**params)
+
     @classmethod
     def _extract_challenge_state(cls, row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        defaults = {
+            "challenge_consecutive_wins": 0,
+            "challenge_total_wins": 0,
+            "challenge_total_losses": 0,
+            "challenge_consecutive_losses": 0,
+            "challenge_checkpoints_passed": 0,
+            "challenge_status": cls.STATUS_SAMPLING,
+            "termination_reason": "",
+        }
         if not row:
-            return {
-                "challenge_consecutive_wins": 0,
-                "challenge_total_wins": 0,
-                "challenge_total_losses": 0,
-                "challenge_consecutive_losses": 0,
-                "challenge_checkpoints_passed": 0,
-                "challenge_status": cls.STATUS_SAMPLING,
-                "termination_reason": "",
-            }
-        return {field: row.get(field, cls._extract_challenge_state(None)[field])
+            return defaults
+        return {field: row.get(field, defaults[field])
                 for field in cls._CHALLENGE_FIELDS}
 
     @staticmethod
@@ -108,8 +193,10 @@ class MinerStatsDAO(BaseDAO):
         """Return lifecycle state for ``(hotkey, revision)``.
 
         The direct row wins. If it has no lifecycle fields yet, inherit the
-        latest state for the same hotkey so old-system terminated state is
-        still respected when the current snapshot is rebuilt.
+        latest state for the same hotkey. This fallback is policy, not just
+        display behavior: one hotkey gets one lifetime challenge opportunity,
+        so a terminated previous revision blocks claim_for_challenge for a
+        later revision too.
         """
         direct = await self.get_miner_stats(hotkey, revision)
         if self._has_challenge_state(direct):

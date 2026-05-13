@@ -11,7 +11,7 @@ from affine.src.scorer.challenger_queue import (
     OUTCOME_WON,
     STATUS_CHAMPION,
     STATUS_IN_PROGRESS,
-    STATUS_PENDING,
+    STATUS_SAMPLING,
     STATUS_TERMINATED,
 )
 
@@ -34,7 +34,7 @@ class InMemoryStore:
         return [r for r in self.rows.values() if _truthy(r.get("is_valid"))]
 
     async def claim_pending(
-        self, uid: int, window_id: int, *, expected_status: str = STATUS_PENDING
+        self, uid: int, window_id: int, *, expected_status: str = STATUS_SAMPLING
     ) -> bool:
         """Mirrors production: accept either attribute_not_exists OR matching expected_status."""
         self.claim_calls.append((uid, window_id))
@@ -81,7 +81,7 @@ def _truthy(value) -> bool:
     return False
 
 
-def _miner(uid, hotkey, first_block, *, status=STATUS_PENDING, valid=True, revision="r1"):
+def _miner(uid, hotkey, first_block, *, status=STATUS_SAMPLING, valid=True, revision="r1"):
     return {
         "uid": uid,
         "hotkey": hotkey,
@@ -129,7 +129,7 @@ async def test_skips_champion_uid():
     store = InMemoryStore(
         [
             _miner(1, "A", first_block=100, status=STATUS_CHAMPION),
-            _miner(2, "B", first_block=200, status=STATUS_PENDING),
+            _miner(2, "B", first_block=200, status=STATUS_SAMPLING),
         ]
     )
     q = ChallengerQueue(store)
@@ -143,7 +143,7 @@ async def test_skips_non_pending_status():
         [
             _miner(1, "A", first_block=100, status=STATUS_TERMINATED),
             _miner(2, "B", first_block=200, status=STATUS_CHAMPION),
-            _miner(3, "C", first_block=300, status=STATUS_PENDING),
+            _miner(3, "C", first_block=300, status=STATUS_SAMPLING),
         ]
     )
     q = ChallengerQueue(store)
@@ -244,7 +244,7 @@ async def test_mark_terminated_unknown_outcome_raises():
 async def test_pick_marks_status_in_db():
     store = InMemoryStore([_miner(7, "G", 100)])
     q = ChallengerQueue(store)
-    assert store.rows[7]["challenge_status"] == STATUS_PENDING
+    assert store.rows[7]["challenge_status"] == STATUS_SAMPLING
     cand = await q.pick_next(window_id=99, champion_uid=None)
     assert cand is not None and cand.uid == 7
     assert store.rows[7]["challenge_status"] == STATUS_IN_PROGRESS

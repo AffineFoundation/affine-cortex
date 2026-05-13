@@ -23,7 +23,7 @@ from typing import Optional, Protocol
 #   in_progress ─[mark_terminated(WON)]→  champion
 #               ─[mark_terminated(LOST/FAILED)]→ terminated
 #   champion ─[mark_terminated(LOST)]→ terminated
-STATUS_PENDING = "sampling"
+STATUS_SAMPLING = "sampling"
 STATUS_IN_PROGRESS = "in_progress"
 STATUS_CHAMPION = "champion"
 STATUS_TERMINATED = "terminated"
@@ -59,7 +59,7 @@ class MinerQueueStore(Protocol):
     async def list_valid_pending(self) -> list[dict]: ...
 
     async def claim_pending(
-        self, uid: int, window_id: int, *, expected_status: str = STATUS_PENDING
+        self, uid: int, window_id: int, *, expected_status: str = STATUS_SAMPLING
     ) -> bool:
         """Atomically transition ``uid`` from ``expected_status`` to ``in_progress``.
 
@@ -107,7 +107,7 @@ class ChallengerQueue:
             if uid is None or uid == champion_uid:
                 continue
             status = row.get("challenge_status")
-            if status is not None and status != STATUS_PENDING:
+            if status is not None and status != STATUS_SAMPLING:
                 continue
             if not _is_truthy(row.get("is_valid")):
                 continue

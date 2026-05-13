@@ -27,6 +27,7 @@ from typing import Dict, Optional, Tuple
 from huggingface_hub import HfApi
 
 from affine.core.setup import logger
+from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.utils.model_size_checker import check_model_size
@@ -64,13 +65,14 @@ class MinerInfo:
 
 
 class MinersMonitor:
-    """Refreshes the ``miners`` table from chain + HF, seeds challenge state."""
+    """Refreshes current miner snapshot and historical miner metadata."""
 
     _instance: Optional["MinersMonitor"] = None
     _lock = asyncio.Lock()
 
     def __init__(self, refresh_interval_seconds: int = 300):
         self.dao = MinersDAO()
+        self.stats_dao = MinerStatsDAO()
         self.config_dao = SystemConfigDAO()
         self.refresh_interval_seconds = refresh_interval_seconds
         self.last_update: int = 0
@@ -443,6 +445,19 @@ class MinersMonitor:
                 block_number=current_block,
                 first_block=miner.block,
             )
+            if miner.hotkey and miner.revision:
+                await self.stats_dao.update_miner_info(
+                    hotkey=miner.hotkey,
+                    revision=miner.revision,
+                    model=miner.model,
+                    uid=miner.uid,
+                    first_block=miner.block,
+                    block_number=current_block,
+                    is_valid=miner.is_valid,
+                    invalid_reason=miner.invalid_reason,
+                    model_hash=miner.model_hash,
+                    is_online=True,
+                )
             # template_check_result is a non-key attr we still want to keep
             # cached on the row — write it separately so the DAO signature
             # stays free of optional bric-à-brac.
