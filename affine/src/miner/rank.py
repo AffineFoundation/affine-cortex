@@ -324,59 +324,6 @@ def _print_rank_table(
         print(f"Queue: {head}")
     print(_ansi("=" * width, "2"))
 
-
-# Compatibility helpers used by unit tests and older callers.
-def _print_window(state: Optional[Dict[str, Any]]) -> None:
-    scores = {
-        "block_number": "-",
-        "calculated_at": None,
-        "scores": [],
-    }
-    champion = (state or {}).get("champion")
-    battle = ((state or {}).get("battle") or {}).get("challenger")
-    if champion:
-        scores["scores"].append({
-            "uid": champion.get("uid"),
-            "miner_hotkey": champion.get("hotkey"),
-            "model": champion.get("model"),
-            "overall_score": 1.0,
-            "is_valid": True,
-            "scores_by_env": {},
-        })
-    if battle:
-        scores["scores"].append({
-            "uid": battle.get("uid"),
-            "miner_hotkey": battle.get("hotkey"),
-            "model": battle.get("model"),
-            "overall_score": 0.0,
-            "is_valid": True,
-            "scores_by_env": {},
-        })
-    _print_rank_table(state, [], scores if scores["scores"] else None)
-
-
-def _print_queue(queue: Optional[List[Dict[str, Any]]]) -> None:
-    print("=" * 88)
-    print(f"CHALLENGER QUEUE (head {_QUEUE_PREVIEW})")
-    print("=" * 88)
-    if not queue:
-        print("  (queue empty)")
-        return
-    print(f"  {'pos':<5}{'uid':<6}{'first_block':<14}{'hotkey':<20}{'revision':<12}{'model'}")
-    for row in queue[:_QUEUE_PREVIEW]:
-        print(
-            f"  {row.get('position'):<5}{row.get('uid'):<6}"
-            f"{str(row.get('first_block', '')):<14}"
-            f"{_short(row.get('hotkey'), 18):<20}"
-            f"{_short(row.get('revision'), 10):<12}"
-            f"{_short(row.get('model'), 40)}"
-        )
-
-
-def _print_scores(scores_resp: Optional[Dict[str, Any]]) -> None:
-    _print_rank_table(None, [], scores_resp)
-
-
 async def get_rank_command() -> None:
     async with cli_api_client() as client:
         payload = await _safe_get(

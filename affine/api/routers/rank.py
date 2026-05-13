@@ -7,8 +7,8 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, Query
 
 from affine.api.dependencies import rate_limit_read
+from affine.api.rank_state import get_current_state, get_queue
 from affine.api.routers.scores import get_latest_scores
-from affine.api.routers.windows import get_current_state, get_queue
 from affine.database.dao.scores import ScoresDAO
 
 

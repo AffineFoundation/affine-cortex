@@ -1,37 +1,19 @@
-"""
-Read-only window state endpoints.
-
-The directory + URL prefix is ``/windows`` for backward compat with
-existing miner CLIs and external dashboards, but the underlying model
-is flow-based — there's no "window archive" anymore; every endpoint
-reads the current state directly.
-"""
+"""Internal helpers for the public rank payload."""
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
-
-from fastapi import APIRouter, Depends
-
-from affine.api.dependencies import rate_limit_read
 
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
 from affine.src.scorer.window_state import (
-    ChampionRecord,
     BattleRecord,
+    ChampionRecord,
     StateStore,
     SystemConfigKVAdapter,
     TaskIdState,
-)
-
-
-router = APIRouter(
-    prefix="/windows",
-    tags=["windows"],
-    dependencies=[Depends(rate_limit_read)],
 )
 
 
@@ -106,11 +88,8 @@ async def _sample_counts(
     return out
 
 
-@router.get("/current")
 async def get_current_state() -> Dict[str, Any]:
-    """Live public snapshot: champion, in-flight battle (if any), task-id
-    refresh block, and aggregate sample counts. Deployment URLs and task IDs
-    stay internal."""
+    """Build the live state section used by ``/rank/current``."""
     store = _state_store()
     champion = await store.get_champion()
     if champion is None:
@@ -128,9 +107,8 @@ async def get_current_state() -> Dict[str, Any]:
     }
 
 
-@router.get("/queue")
 async def get_queue(limit: int = 20) -> List[Dict[str, Any]]:
-    """Challenger queue head: pending miners ordered by (first_block, uid)."""
+    """Build the challenger queue head used by ``/rank/current``."""
     if limit <= 0 or limit > 100:
         limit = 20
     miners = await MinersDAO().get_valid_miners()
@@ -150,18 +128,3 @@ async def get_queue(limit: int = 20) -> List[Dict[str, Any]]:
             }
         )
     return out
-
-
-@router.get("/champion")
-async def get_champion() -> Dict[str, Any]:
-    """Current champion identity (mirrors ``system_config['champion']``)."""
-    champ = await _state_store().get_champion()
-    if champ is None:
-        return {"uid": None}
-    return {
-        "uid": champ.uid,
-        "hotkey": champ.hotkey,
-        "revision": champ.revision,
-        "model": champ.model,
-        "since_block": champ.since_block,
-    }

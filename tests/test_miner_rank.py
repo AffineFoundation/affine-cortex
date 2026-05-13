@@ -6,20 +6,13 @@ import io
 from contextlib import redirect_stdout
 
 import affine.src.miner.rank as rank
-from affine.src.miner.rank import _print_queue, _print_rank_table
+from affine.src.miner.rank import _print_rank_table
 
 
 def _render_rank(window, queue, scores):
     buf = io.StringIO()
     with redirect_stdout(buf):
         _print_rank_table(window, queue, scores)
-    return buf.getvalue()
-
-
-def _render_queue(queue):
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        _print_queue(queue)
     return buf.getvalue()
 
 
@@ -218,25 +211,6 @@ def test_rank_table_uses_live_count_only_for_non_threshold_cells():
 
     assert "80.00[70.00,90.00]/10" in out
     assert "80.00[70.00,90.00]/321" not in out
-
-
-def test_queue_renders_none_safely():
-    out = _render_queue(None)
-    assert "queue empty" in out
-
-
-def test_queue_renders_pending_entries():
-    queue = [
-        {"position": 1, "uid": 3, "hotkey": "hk_three", "revision": "r3", "model": "o/m3",
-         "first_block": 100, "enqueued_at": 1000},
-        {"position": 2, "uid": 7, "hotkey": "hk_seven", "revision": "r7", "model": "o/m7",
-         "first_block": 200, "enqueued_at": 1100},
-    ]
-    out = _render_queue(queue)
-    assert " 3 " in out
-    assert " 7 " in out
-    assert "100" in out
-    assert "200" in out
 
 
 def test_rank_table_uses_color_on_tty(monkeypatch):
