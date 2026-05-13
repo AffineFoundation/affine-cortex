@@ -43,7 +43,7 @@ class ExecutorWorker:
         max_concurrent: int = 60,
         poll_interval_sec: float = 5.0,
         idle_sleep_sec: float = 10.0,
-        warmup_sec: float = 180.0,
+        warmup_sec: float = 240.0,
         global_sem: Any = None,
         in_flight_value: Any = None,
     ):
@@ -66,11 +66,13 @@ class ExecutorWorker:
         # ``warmup_sec``: env containers report "ready" before they are
         # fully serving — affinetes finishes SSH tunnel + container startup
         # but the env's own app-level init (e.g. liveweb's Stooq lock /
-        # cache build, memorygym worker boot) can still be running. With
-        # 60s the first tick after a restart historically slammed into the
-        # tail of that init and produced a flood of empty ReadErrors;
-        # 180s gives external data sources + uvicorn worker fanout enough
-        # time to settle.
+        # cache build, memorygym worker boot, swebench:infinite's 3.5GB
+        # image + python deps) can still be running. 60s tripped a
+        # ReadError storm; 180s held for most envs but SWE-INFINITE
+        # consistently needed ~240s before serving (observed 166-task
+        # fail burst at the 180s mark on PR-#453 deploy). 240s clears
+        # all observed env images at the cost of one extra minute on
+        # cold restart.
         self.warmup_sec = warmup_sec
 
         self.running = False
