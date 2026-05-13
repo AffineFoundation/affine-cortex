@@ -315,12 +315,12 @@ class ExecutorWorker:
         sampling_count = env_cfg.sampling_count
 
         champion = await self._state.get_champion()
-        champion_urls = _base_urls(
-            champion.deployments if champion else [],
-            champion.base_url if champion else None,
-        )
-        if champion is None or not champion_urls:
+        if champion is None:
             return 0
+        champion_urls = _base_urls(
+            champion.deployments,
+            champion.base_url,
+        )
 
         battle = await self._state.get_battle()
         battle_urls = _base_urls(
@@ -328,24 +328,32 @@ class ExecutorWorker:
             battle.base_url if battle else None,
         )
 
+        # Single-instance providers deliberately clear champion.deployment_id
+        # at battle start (the host is now serving the challenger). In that
+        # state we still need to dispatch challenger samples — bail out
+        # only when nobody has a serving URL.
+        if not champion_urls and not battle_urls:
+            return 0
+
         # Build the candidate pool: champion drains everything; challenger
         # is capped by ``sampling_count``. We shuffle so persistently slow
         # task_ids don't always end up at the tail across worker restarts.
         candidates: List[tuple] = []
-        champ_snap = MinerSnapshot(
-            uid=champion.uid, hotkey=champion.hotkey,
-            revision=champion.revision, model=champion.model,
-        )
-        for idx, tid in enumerate(task_ids):
-            key = (champion.hotkey, champion.revision, int(tid))
-            if key in in_flight_keys:
-                continue
-            if await self._samples.has_sample(
-                champion.hotkey, champion.revision, self.env, tid,
-                refresh_block=refresh_block,
-            ):
-                continue
-            candidates.append((key, champ_snap, tid, _pick_url(champion_urls, tid, idx)))
+        if champion_urls:
+            champ_snap = MinerSnapshot(
+                uid=champion.uid, hotkey=champion.hotkey,
+                revision=champion.revision, model=champion.model,
+            )
+            for idx, tid in enumerate(task_ids):
+                key = (champion.hotkey, champion.revision, int(tid))
+                if key in in_flight_keys:
+                    continue
+                if await self._samples.has_sample(
+                    champion.hotkey, champion.revision, self.env, tid,
+                    refresh_block=refresh_block,
+                ):
+                    continue
+                candidates.append((key, champ_snap, tid, _pick_url(champion_urls, tid, idx)))
 
         if battle is not None and battle_urls:
             chal_have = await self._samples.count_samples_for_tasks(

@@ -66,12 +66,23 @@ class ChampionRecord:
 @dataclass
 class BattleRecord:
     """An in-flight contest. The challenger's Targon workload only lives
-    as long as this record does."""
+    as long as this record does.
+
+    ``previous_champion`` captures the champion's identity at the moment
+    ``_start_battle`` ran. We need this for recovery: if the scheduler
+    crashes between ``set_champion(new)`` and ``clear_battle()``, the
+    canonical champion record has already been overwritten with the
+    challenger, so we'd lose the old champion's UID/hotkey — and miss
+    marking them ``terminated`` and re-emitting weights. Optional only
+    for backward compat with battle rows written before this field
+    existed.
+    """
     challenger: MinerSnapshot
     deployment_id: str
     base_url: str
     started_at_block: int
     deployments: List[DeploymentRecord] = field(default_factory=list)
+    previous_champion: Optional[MinerSnapshot] = None
 
 
 @dataclass
@@ -332,13 +343,16 @@ def _champion_from_dict(raw: Dict[str, Any]) -> ChampionRecord:
 
 
 def _battle_to_dict(b: BattleRecord) -> Dict[str, Any]:
-    return {
+    out: Dict[str, Any] = {
         "challenger": asdict(b.challenger),
         "deployment_id": b.deployment_id,
         "base_url": b.base_url,
         "started_at_block": b.started_at_block,
         "deployments": [asdict(d) for d in b.deployments],
     }
+    if b.previous_champion is not None:
+        out["previous_champion"] = asdict(b.previous_champion)
+    return out
 
 
 def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
@@ -350,6 +364,13 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
         primary_id, primary_url = _primary_deployment(deployments)
         deployment_id = primary_id or ""
         base_url = primary_url or ""
+    prev_raw = raw.get("previous_champion") or {}
+    previous_champion: Optional[MinerSnapshot] = None
+    if isinstance(prev_raw, dict) and prev_raw.get("hotkey"):
+        previous_champion = MinerSnapshot(**{
+            k: prev_raw[k] for k in ("uid", "hotkey", "revision", "model")
+            if k in prev_raw
+        })
     return BattleRecord(
         challenger=MinerSnapshot(**{
             k: chal_raw[k] for k in ("uid", "hotkey", "revision", "model")
@@ -359,6 +380,7 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
         base_url=base_url,
         started_at_block=int(raw.get("started_at_block", 0)),
         deployments=deployments,
+        previous_champion=previous_champion,
     )
 
 

@@ -340,3 +340,146 @@ def test_adaptive_caps_release_completed_env_capacity():
 
     assert 1 < caps["MEMORY"] < caps["TERMINAL"]
     assert caps["TERMINAL"] > 150
+
+
+def test_dispatch_proceeds_when_only_battle_has_url():
+    """Regression: under SSH single-instance providers, ``_start_battle``
+    clears the champion's deployment so the host can serve the
+    challenger. Without this guard, ``_dispatch_new`` exits early
+    (no champion URL → return 0) and the challenger never gets sampled,
+    so ``_battle_overlap_ready`` never satisfies and the battle stalls.
+    """
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import (
+        BattleRecord, ChampionRecord, DeploymentRecord, EnvConfig,
+        MinerSnapshot, TaskIdState,
+    )
+
+    worker = ExecutorWorker(worker_id=0, env="ENV_A")
+    worker.warmup_sec = 0  # skip — not testing run-loop
+
+    class _StateStub:
+        async def get_task_state(self):
+            return TaskIdState(
+                task_ids={"ENV_A": [1, 2, 3]}, refreshed_at_block=0,
+            )
+
+        async def get_environments(self):
+            return {
+                "ENV_A": EnvConfig(
+                    display_name="ENV_A", enabled_for_sampling=True,
+                    sampling_count=3, dataset_range=[[0, 100]],
+                ),
+            }
+
+        async def get_champion(self):
+            # Champion exists but has no live deployment — exactly the
+            # state after single-instance ``_start_battle`` clears it.
+            return ChampionRecord(
+                uid=1, hotkey="champ_hk", revision="champ_rev",
+                model="org/m1", deployment_id=None, base_url=None,
+                deployments=[], since_block=0,
+            )
+
+        async def get_battle(self):
+            return BattleRecord(
+                challenger=MinerSnapshot(
+                    uid=2, hotkey="chal_hk", revision="chal_rev",
+                    model="org/m2",
+                ),
+                deployment_id="wrk-bat",
+                base_url="https://t/wrk-bat",
+                started_at_block=0,
+                deployments=[
+                    DeploymentRecord(
+                        endpoint_name="b300",
+                        deployment_id="wrk-bat",
+                        base_url="https://t/wrk-bat",
+                    ),
+                ],
+            )
+
+    class _SamplesStub:
+        async def has_sample(self, *a, **kw):
+            return False
+
+        async def count_samples_for_tasks(self, *a, **kw):
+            return 0
+
+    dispatched: list = []
+
+    async def _capture_dispatch_one(*, miner, task_id, base_url, **_kwargs):
+        dispatched.append((miner.uid, task_id, base_url))
+
+    worker._state = _StateStub()
+    worker._samples = _SamplesStub()
+    worker._dispatch_one = _capture_dispatch_one
+
+    async def _drive():
+        in_flight_keys: set = set()
+        in_flight_tasks: set = set()
+        n = await worker._dispatch_new(in_flight_keys, in_flight_tasks)
+        # All pending in-flight task wrappers are fire-and-forget — give
+        # them a tick to record into ``dispatched``.
+        await _asyncio.sleep(0)
+        return n
+
+    n = _asyncio.run(_drive())
+
+    # No champion candidates (no URL), but challenger candidates fire.
+    assert n == 3, f"expected 3 challenger dispatches, got {n}"
+    assert all(uid == 2 for uid, _, _ in dispatched), dispatched
+    assert all(url == "https://t/wrk-bat" for _, _, url in dispatched), dispatched
+
+
+def test_dispatch_skips_when_neither_has_url():
+    """If neither champion nor battle has a serving URL there's
+    genuinely nothing to dispatch — bail out fast."""
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import (
+        ChampionRecord, EnvConfig, TaskIdState,
+    )
+
+    worker = ExecutorWorker(worker_id=0, env="ENV_A")
+    worker.warmup_sec = 0
+
+    class _StateStub:
+        async def get_task_state(self):
+            return TaskIdState(
+                task_ids={"ENV_A": [1, 2, 3]}, refreshed_at_block=0,
+            )
+
+        async def get_environments(self):
+            return {
+                "ENV_A": EnvConfig(
+                    display_name="ENV_A", enabled_for_sampling=True,
+                    sampling_count=3, dataset_range=[[0, 100]],
+                ),
+            }
+
+        async def get_champion(self):
+            return ChampionRecord(
+                uid=1, hotkey="champ_hk", revision="champ_rev",
+                model="org/m1", deployment_id=None, base_url=None,
+                deployments=[], since_block=0,
+            )
+
+        async def get_battle(self):
+            return None
+
+    class _SamplesStub:
+        async def has_sample(self, *a, **kw):
+            return False
+
+        async def count_samples_for_tasks(self, *a, **kw):
+            return 0
+
+    worker._state = _StateStub()
+    worker._samples = _SamplesStub()
+
+    async def _drive():
+        return await worker._dispatch_new(set(), set())
+
+    assert _asyncio.run(_drive()) == 0

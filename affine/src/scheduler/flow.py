@@ -455,6 +455,13 @@ class FlowScheduler:
             base_url=result.base_url,
             started_at_block=current_block,
             deployments=_deployments_from_result(result),
+            # Captured BEFORE ``set_champion(new)`` ever runs so the
+            # _decide recovery branch can still terminate the old
+            # champion and re-emit weights after a mid-flow crash.
+            previous_champion=MinerSnapshot(
+                uid=champion.uid, hotkey=champion.hotkey,
+                revision=champion.revision, model=champion.model,
+            ),
         )
         await self.state.set_battle(battle)
         logger.info(
@@ -504,6 +511,57 @@ class FlowScheduler:
                 revision=champion.revision,
                 model=champion.model,
             )
+            # Old champion must also be flipped to ``terminated`` and the
+            # on-chain weight tx re-emitted — both got skipped if the
+            # crash happened between ``set_champion(new)`` and those
+            # steps. ``previous_champion`` is captured at battle start so
+            # we can still identify them after the canonical champion
+            # record was overwritten. The reason string mirrors the
+            # normal-path one in spirit but names the path explicitly:
+            # if the crash hit after ``mark_terminated(LOST)`` already
+            # ran, this write will overwrite the (more detailed) original
+            # reason — acceptable since both leave the row terminated.
+            prev = battle.previous_champion
+            prev_ready = (
+                prev is not None
+                and prev.uid != champion.uid
+                and prev.hotkey
+                and prev.revision
+            )
+            if prev_ready:
+                await self.queue.mark_terminated(
+                    prev.uid,
+                    OUTCOME_LOST,
+                    reason=f"dethroned_by:{champion.hotkey[:10]}:recovery",
+                    hotkey=prev.hotkey,
+                    revision=prev.revision,
+                    model=prev.model,
+                )
+                # ``result=None`` is fine — the comparator-derived per-env
+                # metadata becomes empty dicts; the actual weight tx
+                # (1.0 for champion, 0 for the rest) still happens.
+                try:
+                    await self._write_weights(
+                        champion, current_block, None, previous_champion=prev,
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"FlowScheduler: recovery weight write failed: "
+                        f"{type(e).__name__}: {e}"
+                    )
+            elif prev is None:
+                logger.warning(
+                    "FlowScheduler: recovery path lacked previous_champion "
+                    "(pre-fix battle record); old champion not terminated "
+                    "and weights not re-emitted — operator must verify."
+                )
+            else:
+                logger.warning(
+                    f"FlowScheduler: recovery saw malformed previous_champion "
+                    f"(uid={prev.uid}, hotkey={prev.hotkey!r}, "
+                    f"revision={prev.revision!r}); skipping termination + "
+                    f"weight re-emit, operator must verify."
+                )
             await self.state.clear_battle()
             return
 

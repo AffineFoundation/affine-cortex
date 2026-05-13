@@ -564,6 +564,182 @@ async def test_post_promotion_crash_recovery_does_not_self_demote():
 
 
 @pytest.mark.asyncio
+async def test_recovery_terminates_old_champion_and_writes_weights():
+    """When the crash window is hit (set_champion(new) ran, clear_battle
+    didn't), the recovery branch must:
+      - mark the new champion's miner_stats row as ``champion``
+      - mark the OLD champion's miner_stats row as ``terminated``
+        (otherwise two miners stay at status='champion' indefinitely)
+      - re-emit on-chain weights using the new champion (otherwise the
+        chain still credits the deposed miner)
+
+    Identifying the old champion requires ``BattleRecord.previous_champion``
+    — by the time recovery fires, system_config.champion already points at
+    the new winner, so the loser's UID has to live on the battle row.
+    """
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "loser_hk", 100,
+            status=STATUS_CHAMPION, revision="loser_rev",
+        ),
+        _make_miner(
+            2, "winner_hk", 200,
+            status=STATUS_IN_PROGRESS, revision="winner_rev",
+        ),
+    ])
+    kv.data["champion"] = {
+        "uid": 2, "hotkey": "winner_hk", "revision": "winner_rev",
+        "model": "org/m2",
+        "deployment_id": "wrk-002", "base_url": "https://t/wrk-002",
+        "since_block": 50,
+    }
+    kv.data["current_battle"] = {
+        "challenger": {
+            "uid": 2, "hotkey": "winner_hk", "revision": "winner_rev",
+            "model": "org/m2",
+        },
+        "deployment_id": "wrk-002",
+        "base_url": "https://t/wrk-002",
+        "started_at_block": 40,
+        "previous_champion": {
+            "uid": 1, "hotkey": "loser_hk", "revision": "loser_rev",
+            "model": "org/m1",
+        },
+    }
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 0,
+    }
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+    for env, tids in [("ENV_A", [1, 2, 3, 4]), ("ENV_B", [5, 6, 7, 8])]:
+        samples.set_samples("winner_hk", "winner_rev", env, tids, score=0.5)
+    weight_writer = _WeightWriterFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=deployer, samples=samples, weight_writer=weight_writer,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    # New champion preserved.
+    champ = await state.get_champion()
+    assert champ is not None and champ.uid == 2
+
+    # New champion marked champion.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_CHAMPION
+    # Old champion (uid 1) flipped to terminated with a recovery reason.
+    assert miner_store.rows[1]["challenge_status"] == STATUS_TERMINATED, (
+        "recovery must terminate the old champion's miner_stats row"
+    )
+    assert "recovery" in miner_store.rows[1]["termination_reason"]
+    # Weights re-emitted for the new champion (otherwise the on-chain
+    # weight tx still credits the deposed miner).
+    assert weight_writer.calls, "recovery must re-emit weights"
+    # Battle cleared.
+    assert await state.get_battle() is None
+
+
+@pytest.mark.asyncio
+async def test_recovery_without_previous_champion_still_safe():
+    """Backward-compat: battle records written before the
+    ``previous_champion`` field existed shouldn't crash recovery. We
+    can't terminate an unknown loser or re-emit weights without
+    knowing the previous champion, so the path logs and finalizes only
+    the bookkeeping it does have."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            2, "winner_hk", 200,
+            status=STATUS_IN_PROGRESS, revision="winner_rev",
+        ),
+    ])
+    kv.data["champion"] = {
+        "uid": 2, "hotkey": "winner_hk", "revision": "winner_rev",
+        "model": "org/m2",
+        "deployment_id": "wrk-002", "base_url": "https://t/wrk-002",
+        "since_block": 50,
+    }
+    # No previous_champion key — simulates an in-flight battle from a
+    # scheduler version that hadn't shipped the field yet.
+    kv.data["current_battle"] = {
+        "challenger": {
+            "uid": 2, "hotkey": "winner_hk", "revision": "winner_rev",
+            "model": "org/m2",
+        },
+        "deployment_id": "wrk-002",
+        "base_url": "https://t/wrk-002",
+        "started_at_block": 40,
+    }
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 0,
+    }
+    samples = _SamplesFake()
+    for env, tids in [("ENV_A", [1, 2, 3, 4]), ("ENV_B", [5, 6, 7, 8])]:
+        samples.set_samples("winner_hk", "winner_rev", env, tids, score=0.5)
+    weight_writer = _WeightWriterFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=weight_writer,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    # Doesn't crash; new champion preserved; battle cleared.
+    champ = await state.get_champion()
+    assert champ is not None and champ.uid == 2
+    assert await state.get_battle() is None
+    assert miner_store.rows[2]["challenge_status"] == STATUS_CHAMPION
+
+
+@pytest.mark.asyncio
+async def test_start_battle_captures_previous_champion():
+    """``_start_battle`` must seed ``BattleRecord.previous_champion`` so
+    a later crash + recovery can still terminate the loser. This pins
+    the seed write down so the field isn't accidentally dropped."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    # Tick 0: refresh task_ids.
+    await scheduler.tick(current_block=50)
+    # Tick 1: deploy champion.
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    rb = task_state.refreshed_at_block
+    # Fill champion samples so step 7 (start_battle) actually fires.
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env,
+            task_state.task_ids[env], score=0.9, refresh_block=rb,
+        )
+    # Tick 2: start battle. Should write a battle record with
+    # previous_champion populated from the current champion.
+    await scheduler.tick(current_block=52)
+
+    battle = await state.get_battle()
+    assert battle is not None, "battle should have started"
+    assert battle.previous_champion is not None, (
+        "_start_battle must capture previous_champion before set_champion(new)"
+    )
+    assert battle.previous_champion.uid == 1
+    assert battle.previous_champion.hotkey == "champ_hk"
+
+
+@pytest.mark.asyncio
 async def test_cold_start_set_champion_writes_before_mark_terminated():
     """The order of cold-start writes matters for crash recovery. If
     ``mark_terminated(WON)`` ran first and crashed before ``set_champion``,
