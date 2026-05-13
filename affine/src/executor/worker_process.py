@@ -21,8 +21,8 @@ def run_worker_subprocess(
     max_concurrent: int,
     global_sem: Any,
     in_flight_value: Any,
+    env_cap_value: Any,
     verbosity: int = 1,
-    env_concurrency_cap: Optional[int] = None,
 ) -> None:
     """Subprocess entry point — runs one ExecutorWorker until killed.
 
@@ -30,9 +30,8 @@ def run_worker_subprocess(
     worker contends on before each evaluate. It's the real concurrency
     gate; the per-worker ``max_concurrent`` is a defensive floor.
 
-    ``env_concurrency_cap`` is the optional per-env in-flight evaluate
-    cap (an asyncio semaphore inside this process). ``None`` means no
-    extra cap — only the global semaphore gates dispatch.
+    ``env_cap_value`` is a manager-updated ``multiprocessing.Value`` holding
+    this env's current dynamic cap.
 
     ``in_flight_value`` is a ``multiprocessing.Value(c_int, lock=False)``
     the worker increments/decrements around each evaluate so the manager
@@ -50,7 +49,7 @@ def run_worker_subprocess(
         worker = ExecutorWorker(
             worker_id=worker_id, env=env, max_concurrent=max_concurrent,
             global_sem=global_sem, in_flight_value=in_flight_value,
-            env_concurrency_cap=env_concurrency_cap,
+            env_cap_value=env_cap_value,
         )
         loop.run_until_complete(worker.initialize())
         worker.start()
@@ -88,18 +87,18 @@ class WorkerProcess:
         env: str,
         global_sem: Any,
         in_flight_value: Any,
+        env_cap_value: Any,
         *,
         max_concurrent: int = 60,
         verbosity: int = 1,
-        env_concurrency_cap: Optional[int] = None,
     ):
         self.worker_id = worker_id
         self.env = env
         self.max_concurrent = max_concurrent
         self.global_sem = global_sem
         self.in_flight_value = in_flight_value
+        self.env_cap_value = env_cap_value
         self.verbosity = verbosity
-        self.env_concurrency_cap = env_concurrency_cap
         self._proc: Optional[multiprocessing.Process] = None
 
     def start(self) -> None:
@@ -108,15 +107,12 @@ class WorkerProcess:
             target=run_worker_subprocess,
             args=(self.worker_id, self.env, self.max_concurrent,
                   self.global_sem, self.in_flight_value,
-                  self.verbosity, self.env_concurrency_cap),
+                  self.env_cap_value, self.verbosity),
             name=f"executor-{self.env}",
             daemon=False,
         )
         self._proc.start()
-        cap_str = (
-            f", env_cap={self.env_concurrency_cap}"
-            if self.env_concurrency_cap is not None else ""
-        )
+        cap_str = f", env_cap={int(self.env_cap_value.value)}"
         logger.info(
             f"[{self.env}] subprocess started pid={self._proc.pid}{cap_str}"
         )

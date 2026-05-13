@@ -129,11 +129,45 @@ async def _cmd_load_config(json_file: str) -> None:
                 description=f"Loaded from {os.path.basename(json_file)}",
                 updated_by="cli:load-config",
             )
-            preview = _preview(value)
-            print(f"  {key:<24} → {preview}")
+            if key == "environments" and isinstance(value, dict):
+                print(f"  {key} ({len(value)} envs):")
+                _print_env_summary(value)
+            else:
+                preview = _preview(value)
+                print(f"  {key:<24} → {preview}")
         print(f"✓ Loaded {len(payload)} keys")
     finally:
         await close_client()
+
+
+def _print_env_summary(environments: dict) -> None:
+    """One line per env with the fields operators actually need to verify."""
+    for env_name in sorted(environments):
+        cfg = environments.get(env_name) or {}
+        sampling = cfg.get("sampling") or {}
+        sampling_on = cfg.get("enabled_for_sampling", False)
+        scoring_on = cfg.get("enabled_for_scoring", True)
+        count = sampling.get("sampling_count", "?")
+        mode = sampling.get("sampling_mode", "?")
+        rng = sampling.get("dataset_range")
+        if sampling.get("dataset_range_source"):
+            rng_str = "resolved-at-refresh"
+        elif isinstance(rng, list) and rng:
+            try:
+                lo, hi = rng[0][0], rng[-1][1]
+                rng_str = f"[{lo},{hi}]" if len(rng) == 1 else f"{len(rng)} ranges"
+            except (IndexError, TypeError):
+                rng_str = "?"
+        else:
+            rng_str = "—"
+        print(
+            f"      {env_name:<14} "
+            f"sampling={'Y' if sampling_on else 'N'} "
+            f"scoring={'Y' if scoring_on else 'N'} "
+            f"count={count:<5} "
+            f"mode={mode:<7} "
+            f"range={rng_str}"
+        )
 
 
 async def _resolve_env_dataset_ranges(environments: dict) -> dict:

@@ -29,6 +29,26 @@ def test_executor_manager_ipc_handles_survive_spawn():
     manager.global_sem.release()
 
 
+def test_executor_manager_recovers_stale_slots_after_worker_death():
+    from affine.src.executor.config import GLOBAL_DISPATCH_BUDGET
+
+    manager = ExecutorManager(["ENV_A"])
+    # Simulate a worker dying while holding two dispatch slots.
+    assert manager.global_sem.acquire(block=False)
+    assert manager.global_sem.acquire(block=False)
+    manager.in_flight_values["ENV_A"].value = 2
+
+    manager._recover_dead_worker_slots("ENV_A")
+
+    assert manager.in_flight_values["ENV_A"].value == 0
+    acquired = 0
+    while manager.global_sem.acquire(block=False):
+        acquired += 1
+    assert acquired == GLOBAL_DISPATCH_BUDGET
+    for _ in range(acquired):
+        manager.global_sem.release()
+
+
 def test_base_urls_prefers_deployments_and_dedupes():
     deployments = [
         DeploymentRecord(endpoint_name="a", deployment_id="da", base_url="http://a/v1"),
@@ -159,144 +179,403 @@ def test_global_slot_helpers_noop_when_unwired():
     _asyncio.run(_drive())
 
 
-def test_env_concurrency_cap_none_means_no_env_semaphore():
+class _SharedInt:
+    def __init__(self, value: int):
+        self.value = value
+
+
+def test_dynamic_env_cap_defaults_to_max_concurrent_without_shared_value():
     from affine.src.executor.worker import ExecutorWorker
 
-    worker = ExecutorWorker(worker_id=0, env="MEMORY")
-    assert worker._env_sem is None
+    worker = ExecutorWorker(worker_id=0, env="MEMORY", max_concurrent=17)
+    assert worker._current_env_cap() == 17
 
 
-def test_env_concurrency_cap_creates_asyncio_semaphore():
-    import asyncio as _asyncio
+def test_dynamic_env_cap_reads_shared_value_live():
     from affine.src.executor.worker import ExecutorWorker
 
+    cap = _SharedInt(3)
     worker = ExecutorWorker(
-        worker_id=0, env="LIVEWEB", env_concurrency_cap=100,
-    )
-    assert isinstance(worker._env_sem, _asyncio.Semaphore)
-    # Acquire 100 times; the 101st should not be immediately available.
-    async def _drive():
-        for _ in range(100):
-            await worker._env_sem.acquire()
-        assert worker._env_sem.locked()
-
-    _asyncio.run(_drive())
-
-
-def test_env_sem_caps_in_flight_evaluate_and_persist():
-    """Per-env cap must serialise concurrent evaluate calls inside one
-    worker. Without it, a flaky env's infra-retry storm can occupy the
-    entire global dispatch budget — exactly the LIVEWEB Stooq-lock
-    incident this knob exists to prevent."""
-    import asyncio as _asyncio
-    from affine.src.executor.worker import ExecutorWorker
-    from affine.src.scorer.window_state import MinerSnapshot
-
-    worker = ExecutorWorker(
-        worker_id=0, env="LIVEWEB", env_concurrency_cap=2,
+        worker_id=0, env="LIVEWEB", max_concurrent=500, env_cap_value=cap,
     )
 
-    observed_peak = {"value": 0}
-    in_flight = {"value": 0}
-
-    async def _fake_gated(**_kwargs):
-        in_flight["value"] += 1
-        observed_peak["value"] = max(observed_peak["value"], in_flight["value"])
-        try:
-            await _asyncio.sleep(0.05)
-        finally:
-            in_flight["value"] -= 1
-
-    worker._evaluate_and_persist_gated = _fake_gated
-
-    miner = MinerSnapshot(uid=1, hotkey="hk", model="m", revision="r")
-
-    async def _drive():
-        # Five concurrent calls; cap=2 should keep peak at 2.
-        await _asyncio.gather(*[
-            worker._evaluate_and_persist(
-                miner=miner, task_id=i, base_url="http://x",
-                refresh_block=0,
-            )
-            for i in range(5)
-        ])
-        assert observed_peak["value"] == 2
-
-    _asyncio.run(_drive())
+    assert worker._current_env_cap() == 3
+    cap.value = 8
+    assert worker._current_env_cap() == 8
 
 
-def test_env_sem_unset_does_not_serialise_calls():
-    """Without a cap, the outer wrapper must be a no-op — concurrent
-    evaluate calls all proceed in parallel up to the global semaphore."""
+def test_dynamic_dispatch_slot_waits_for_env_cap_room():
     import asyncio as _asyncio
     from affine.src.executor.worker import ExecutorWorker
-    from affine.src.scorer.window_state import MinerSnapshot
 
-    worker = ExecutorWorker(worker_id=0, env="MEMORY")  # no cap
-    observed_peak = {"value": 0}
-    in_flight = {"value": 0}
+    cap = _SharedInt(2)
+    in_flight = _SharedInt(2)
+    worker = ExecutorWorker(
+        worker_id=0, env="LIVEWEB", env_cap_value=cap, in_flight_value=in_flight,
+    )
+    acquired = {"value": 0}
 
-    async def _fake_gated(**_kwargs):
-        in_flight["value"] += 1
-        observed_peak["value"] = max(observed_peak["value"], in_flight["value"])
-        try:
-            await _asyncio.sleep(0.05)
-        finally:
-            in_flight["value"] -= 1
+    async def _fake_global():
+        acquired["value"] += 1
 
-    worker._evaluate_and_persist_gated = _fake_gated
-
-    miner = MinerSnapshot(uid=1, hotkey="hk", model="m", revision="r")
+    worker._acquire_global_slot = _fake_global
 
     async def _drive():
-        await _asyncio.gather(*[
-            worker._evaluate_and_persist(
-                miner=miner, task_id=i, base_url="http://x",
-                refresh_block=0,
-            )
-            for i in range(5)
-        ])
-        assert observed_peak["value"] == 5
+        waiter = _asyncio.create_task(worker._acquire_dispatch_slot())
+        await _asyncio.sleep(0.12)
+        assert acquired["value"] == 0
+        assert not waiter.done()
+
+        in_flight.value = 1
+        await _asyncio.wait_for(waiter, timeout=1.0)
+        assert acquired["value"] == 1
 
     _asyncio.run(_drive())
 
 
-def test_env_from_payload_parses_max_concurrent():
+def test_dynamic_dispatch_slot_releases_global_if_cap_drops_after_acquire():
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+
+    cap = _SharedInt(2)
+    in_flight = _SharedInt(1)
+    worker = ExecutorWorker(
+        worker_id=0, env="LIVEWEB", env_cap_value=cap, in_flight_value=in_flight,
+    )
+    acquired = {"value": 0}
+    released = {"value": 0}
+
+    async def _fake_global():
+        acquired["value"] += 1
+        cap.value = 1
+
+    def _fake_release():
+        released["value"] += 1
+        in_flight.value = 0
+
+    worker._acquire_global_slot = _fake_global
+    worker._release_global_slot = _fake_release
+
+    async def _drive():
+        await _asyncio.wait_for(worker._acquire_dispatch_slot(), timeout=1.0)
+        assert acquired["value"] == 2
+        assert released["value"] == 1
+
+    _asyncio.run(_drive())
+
+
+def test_env_from_payload_ignores_static_max_concurrent():
     from affine.src.scorer.window_state import _env_from_payload
 
     cfg = _env_from_payload({
         "display_name": "LIVEWEB",
         "enabled_for_sampling": True,
-        "sampling": {
-            "sampling_count": 400,
-            "dataset_range": [[0, 100]],
-            "sampling_mode": "random",
-            "max_concurrent": 100,
+        "sampling": {"sampling_count": 400, "max_concurrent": 100},
+    })
+    assert not hasattr(cfg, "max_concurrent")
+
+
+def test_adaptive_caps_keep_probe_floor_for_backlogged_envs():
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    caps = _compute_adaptive_env_caps(
+        ["LIVEWEB", "MEMORY", "NAVWORLD", "SWE-INFINITE"],
+        {
+            env: {"target": 100, "done": 0, "running": 0, "delta": 0}
+            for env in ["LIVEWEB", "MEMORY", "NAVWORLD", "SWE-INFINITE"]
         },
-    })
-    assert cfg.max_concurrent == 100
+        {},
+        global_budget=600,
+    )
+
+    assert all(caps[env] >= 1 for env in caps)
+    assert sum(caps.values()) < 600
 
 
-def test_env_from_payload_max_concurrent_defaults_to_none():
-    from affine.src.scorer.window_state import _env_from_payload
+def test_adaptive_caps_shift_capacity_from_underused_to_saturated_backlog():
+    from affine.src.executor.main import _compute_adaptive_env_caps
 
-    cfg = _env_from_payload({
-        "display_name": "MEMORY",
-        "enabled_for_sampling": True,
-        "sampling": {"sampling_count": 200, "dataset_range": [[0, 10]]},
-    })
-    assert cfg.max_concurrent is None
+    caps = _compute_adaptive_env_caps(
+        ["LIVEWEB", "MEMORY", "NAVWORLD"],
+        {
+            "LIVEWEB": {"target": 400, "done": 20, "running": 5, "delta": 0},
+            "MEMORY": {"target": 200, "done": 60, "running": 120, "delta": 3},
+            "NAVWORLD": {"target": 400, "done": 100, "running": 120, "delta": 6},
+        },
+        {"LIVEWEB": 120, "MEMORY": 120, "NAVWORLD": 120},
+        global_budget=300,
+    )
+
+    assert caps["LIVEWEB"] < caps["MEMORY"]
+    assert caps["LIVEWEB"] < caps["NAVWORLD"]
+    assert sum(caps.values()) <= 300
 
 
-def test_env_from_payload_rejects_nonpositive_max_concurrent():
-    from affine.src.scorer.window_state import _env_from_payload
+def test_adaptive_caps_prioritize_lagging_saturated_env():
+    from affine.src.executor.main import _compute_adaptive_env_caps
 
-    # Negative / zero / non-numeric all fall back to None to avoid
-    # silently uncapping or deadlocking an env with cap=0.
-    for bad in (-1, 0, "abc", None, "0"):
-        cfg = _env_from_payload({
-            "display_name": "x",
-            "enabled_for_sampling": True,
-            "sampling": {"max_concurrent": bad},
-        })
-        assert cfg.max_concurrent is None, f"bad input {bad!r} leaked through"
+    caps = _compute_adaptive_env_caps(
+        ["MEMORY", "TERMINAL"],
+        {
+            "MEMORY": {"target": 500, "done": 100, "running": 150, "delta": 1},
+            "TERMINAL": {"target": 500, "done": 450, "running": 150, "delta": 10},
+        },
+        {"MEMORY": 150, "TERMINAL": 150},
+        global_budget=300,
+    )
+
+    assert caps["MEMORY"] > caps["TERMINAL"]
+    assert sum(caps.values()) <= 300
+
+
+def test_adaptive_caps_do_not_expand_zero_progress_saturated_env():
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    caps = _compute_adaptive_env_caps(
+        ["LIVEWEB", "TERMINAL"],
+        {
+            "LIVEWEB": {"target": 500, "done": 50, "running": 180, "delta": 0},
+            "TERMINAL": {"target": 500, "done": 250, "running": 120, "delta": 5},
+        },
+        {"LIVEWEB": 120, "TERMINAL": 120},
+        global_budget=300,
+    )
+
+    assert caps["LIVEWEB"] == 120
+    assert caps["TERMINAL"] > caps["LIVEWEB"]
+
+
+def test_adaptive_caps_decay_inflated_zero_progress_saturated_env_to_fair_share():
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    caps = _compute_adaptive_env_caps(
+        ["LIVEWEB", "TERMINAL"],
+        {
+            "LIVEWEB": {"target": 500, "done": 50, "running": 240, "delta": 0},
+            "TERMINAL": {"target": 500, "done": 250, "running": 120, "delta": 5},
+        },
+        {"LIVEWEB": 240, "TERMINAL": 120},
+        global_budget=300,
+    )
+
+    assert caps["LIVEWEB"] == 150
+    assert caps["TERMINAL"] >= caps["LIVEWEB"]
+
+
+def test_adaptive_caps_release_completed_env_capacity():
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    caps = _compute_adaptive_env_caps(
+        ["MEMORY", "TERMINAL"],
+        {
+            "MEMORY": {"target": 200, "done": 200, "running": 0, "delta": 0},
+            "TERMINAL": {"target": 500, "done": 50, "running": 150, "delta": 5},
+        },
+        {"MEMORY": 150, "TERMINAL": 150},
+        global_budget=300,
+    )
+
+    assert 1 < caps["MEMORY"] < caps["TERMINAL"]
+    assert caps["TERMINAL"] > 150
+
+
+def test_sampling_count_for_env_reads_current_config():
+    from affine.src.executor.main import _sampling_count_for_env
+
+    envs = {
+        "ENV_A": {
+            "sampling": {
+                "sampling_count": 400,
+            },
+        },
+    }
+
+    assert _sampling_count_for_env(envs, "ENV_A", 441) == 400
+    assert _sampling_count_for_env(envs, "MISSING", 441) == 441
+    envs["ENV_A"]["sampling"]["sampling_count"] = 0
+    assert _sampling_count_for_env(envs, "ENV_A", 441) == 0
+
+
+def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
+    import asyncio as _asyncio
+
+    manager = ExecutorManager(["ENV_A"])
+    ids = list(range(441))
+
+    class _SC:
+        async def get_param_value(self, name, default=None):
+            values = {
+                "current_task_ids": {
+                    "task_ids": {"ENV_A": ids},
+                    "refreshed_at_block": 123,
+                },
+                "champion": {"hotkey": "champ_hk", "revision": "champ_rev"},
+                "current_battle": {
+                    "challenger": {
+                        "hotkey": "chal_hk",
+                        "revision": "chal_rev",
+                    },
+                },
+                "environments": {
+                    "ENV_A": {"sampling": {"sampling_count": 400}},
+                },
+            }
+            return values.get(name, default)
+
+    class _Samples:
+        async def count_samples_for_tasks(
+            self, hotkey, revision, env, task_ids, *, refresh_block
+        ):
+            if hotkey == "champ_hk":
+                return 441
+            if hotkey == "chal_hk":
+                return 400
+            return 0
+
+    _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
+
+    assert manager._last_done["ENV_A"] == 841
+    assert manager.env_cap_values["ENV_A"].value == 600
+
+
+def test_dispatch_proceeds_when_only_battle_has_url():
+    """Regression: under SSH single-instance providers, ``_start_battle``
+    clears the champion's deployment so the host can serve the
+    challenger. Without this guard, ``_dispatch_new`` exits early
+    (no champion URL → return 0) and the challenger never gets sampled,
+    so ``_battle_overlap_ready`` never satisfies and the battle stalls.
+    """
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import (
+        BattleRecord, ChampionRecord, DeploymentRecord, EnvConfig,
+        MinerSnapshot, TaskIdState,
+    )
+
+    worker = ExecutorWorker(worker_id=0, env="ENV_A")
+    worker.warmup_sec = 0  # skip — not testing run-loop
+
+    class _StateStub:
+        async def get_task_state(self):
+            return TaskIdState(
+                task_ids={"ENV_A": [1, 2, 3]}, refreshed_at_block=0,
+            )
+
+        async def get_environments(self):
+            return {
+                "ENV_A": EnvConfig(
+                    display_name="ENV_A", enabled_for_sampling=True,
+                    sampling_count=3, dataset_range=[[0, 100]],
+                ),
+            }
+
+        async def get_champion(self):
+            # Champion exists but has no live deployment — exactly the
+            # state after single-instance ``_start_battle`` clears it.
+            return ChampionRecord(
+                uid=1, hotkey="champ_hk", revision="champ_rev",
+                model="org/m1", deployment_id=None, base_url=None,
+                deployments=[], since_block=0,
+            )
+
+        async def get_battle(self):
+            return BattleRecord(
+                challenger=MinerSnapshot(
+                    uid=2, hotkey="chal_hk", revision="chal_rev",
+                    model="org/m2",
+                ),
+                deployment_id="wrk-bat",
+                base_url="https://t/wrk-bat",
+                started_at_block=0,
+                deployments=[
+                    DeploymentRecord(
+                        endpoint_name="b300",
+                        deployment_id="wrk-bat",
+                        base_url="https://t/wrk-bat",
+                    ),
+                ],
+            )
+
+    class _SamplesStub:
+        async def has_sample(self, *a, **kw):
+            return False
+
+        async def count_samples_for_tasks(self, *a, **kw):
+            return 0
+
+    dispatched: list = []
+
+    async def _capture_dispatch_one(*, miner, task_id, base_url, **_kwargs):
+        dispatched.append((miner.uid, task_id, base_url))
+
+    worker._state = _StateStub()
+    worker._samples = _SamplesStub()
+    worker._dispatch_one = _capture_dispatch_one
+
+    async def _drive():
+        in_flight_keys: set = set()
+        in_flight_tasks: set = set()
+        n = await worker._dispatch_new(in_flight_keys, in_flight_tasks)
+        # All pending in-flight task wrappers are fire-and-forget — give
+        # them a tick to record into ``dispatched``.
+        await _asyncio.sleep(0)
+        return n
+
+    n = _asyncio.run(_drive())
+
+    # No champion candidates (no URL), but challenger candidates fire.
+    assert n == 3, f"expected 3 challenger dispatches, got {n}"
+    assert all(uid == 2 for uid, _, _ in dispatched), dispatched
+    assert all(url == "https://t/wrk-bat" for _, _, url in dispatched), dispatched
+
+
+def test_dispatch_skips_when_neither_has_url():
+    """If neither champion nor battle has a serving URL there's
+    genuinely nothing to dispatch — bail out fast."""
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import (
+        ChampionRecord, EnvConfig, TaskIdState,
+    )
+
+    worker = ExecutorWorker(worker_id=0, env="ENV_A")
+    worker.warmup_sec = 0
+
+    class _StateStub:
+        async def get_task_state(self):
+            return TaskIdState(
+                task_ids={"ENV_A": [1, 2, 3]}, refreshed_at_block=0,
+            )
+
+        async def get_environments(self):
+            return {
+                "ENV_A": EnvConfig(
+                    display_name="ENV_A", enabled_for_sampling=True,
+                    sampling_count=3, dataset_range=[[0, 100]],
+                ),
+            }
+
+        async def get_champion(self):
+            return ChampionRecord(
+                uid=1, hotkey="champ_hk", revision="champ_rev",
+                model="org/m1", deployment_id=None, base_url=None,
+                deployments=[], since_block=0,
+            )
+
+        async def get_battle(self):
+            return None
+
+    class _SamplesStub:
+        async def has_sample(self, *a, **kw):
+            return False
+
+        async def count_samples_for_tasks(self, *a, **kw):
+            return 0
+
+    worker._state = _StateStub()
+    worker._samples = _SamplesStub()
+
+    async def _drive():
+        return await worker._dispatch_new(set(), set())
+
+    assert _asyncio.run(_drive()) == 0

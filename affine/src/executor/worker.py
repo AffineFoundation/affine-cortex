@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 from affine.core.setup import logger
@@ -47,28 +46,21 @@ class ExecutorWorker:
         warmup_sec: float = 240.0,
         global_sem: Any = None,
         in_flight_value: Any = None,
-        env_concurrency_cap: Optional[int] = None,
+        env_cap_value: Any = None,
     ):
         self.worker_id = worker_id
         self.env = env
         self.max_concurrent = max_concurrent
         # Cross-process ``BoundedSemaphore`` (or ``None`` in unit tests /
         # standalone runs). Real backpressure runs through this — see
-        # ``_acquire_global_slot`` below. The per-tick local semaphore
-        # is sized at ``max_concurrent`` and only exists as a defensive
-        # floor against scheduling tens of thousands of coroutines.
+        # ``_acquire_global_slot`` below. ``max_concurrent`` remains as a
+        # standalone fallback for tests/local runs; production workers read
+        # their live cap from ``_env_cap_value``.
         self._global_sem = global_sem
-        # Optional in-process asyncio semaphore that caps concurrent
-        # evaluate() calls for THIS env's worker. Set from
-        # ``EnvConfig.max_concurrent`` so a flaky env can't burn the
-        # whole global dispatch budget retrying — see LIVEWEB
-        # Stooq-lock incident, PR #459. None = no per-env cap.
-        self.env_concurrency_cap = env_concurrency_cap
-        self._env_sem: Optional[asyncio.Semaphore] = (
-            asyncio.Semaphore(env_concurrency_cap)
-            if env_concurrency_cap is not None and env_concurrency_cap > 0
-            else None
-        )
+        # Manager-updated dynamic cap for this env. The worker reads this
+        # before acquiring the global semaphore, so cap changes take effect
+        # without restarting the subprocess.
+        self._env_cap_value = env_cap_value
         # Per-env ``mp.Value(c_int, lock=False)`` for the manager's
         # ``[STATUS]`` printer to read live in-flight without IPC ping.
         # Single writer (this worker), single reader (manager); aligned
@@ -155,9 +147,8 @@ class ExecutorWorker:
 
         Net effect: a tick that contains 200 SWE-INFINITE tasks no
         longer waits for the slowest task to finish before dispatching
-        peer task_ids. The global ``BoundedSemaphore(480)`` remains the
-        only concurrency gate; per-env env-container capacity is the
-        downstream physical bottleneck (operator dial).
+        peer task_ids. The per-env cap is applied before the shared
+        global semaphore so fast-cycling envs cannot monopolize it.
         """
         assert self._state and self._samples, "call initialize() first"
         status_task = asyncio.create_task(self._publish_status_loop())
@@ -296,11 +287,10 @@ class ExecutorWorker:
             that, overlap is sufficient and continuing adds no
             comparator signal.
 
-        Concurrency: the cross-process ``self._global_sem`` (480 by
-        default = b300 saturation) is the only gate. No per-env local
-        semaphore — env-container capacity is the physical bottleneck
-        downstream, and we want every un-sampled task_id contending for
-        a global slot so slow peers can't hide free capacity.
+        Concurrency: candidates pass the optional per-env semaphore first,
+        then the shared cross-process global semaphore. This keeps all
+        envs streaming while bounding how much of the global budget one
+        env can occupy.
         """
         task_state = await self._state.get_task_state()
         if task_state is None:
@@ -325,12 +315,12 @@ class ExecutorWorker:
         sampling_count = env_cfg.sampling_count
 
         champion = await self._state.get_champion()
-        champion_urls = _base_urls(
-            champion.deployments if champion else [],
-            champion.base_url if champion else None,
-        )
-        if champion is None or not champion_urls:
+        if champion is None:
             return 0
+        champion_urls = _base_urls(
+            champion.deployments,
+            champion.base_url,
+        )
 
         battle = await self._state.get_battle()
         battle_urls = _base_urls(
@@ -338,24 +328,32 @@ class ExecutorWorker:
             battle.base_url if battle else None,
         )
 
+        # Single-instance providers deliberately clear champion.deployment_id
+        # at battle start (the host is now serving the challenger). In that
+        # state we still need to dispatch challenger samples — bail out
+        # only when nobody has a serving URL.
+        if not champion_urls and not battle_urls:
+            return 0
+
         # Build the candidate pool: champion drains everything; challenger
         # is capped by ``sampling_count``. We shuffle so persistently slow
         # task_ids don't always end up at the tail across worker restarts.
         candidates: List[tuple] = []
-        champ_snap = MinerSnapshot(
-            uid=champion.uid, hotkey=champion.hotkey,
-            revision=champion.revision, model=champion.model,
-        )
-        for idx, tid in enumerate(task_ids):
-            key = (champion.hotkey, champion.revision, int(tid))
-            if key in in_flight_keys:
-                continue
-            if await self._samples.has_sample(
-                champion.hotkey, champion.revision, self.env, tid,
-                refresh_block=refresh_block,
-            ):
-                continue
-            candidates.append((key, champ_snap, tid, _pick_url(champion_urls, tid, idx)))
+        if champion_urls:
+            champ_snap = MinerSnapshot(
+                uid=champion.uid, hotkey=champion.hotkey,
+                revision=champion.revision, model=champion.model,
+            )
+            for idx, tid in enumerate(task_ids):
+                key = (champion.hotkey, champion.revision, int(tid))
+                if key in in_flight_keys:
+                    continue
+                if await self._samples.has_sample(
+                    champion.hotkey, champion.revision, self.env, tid,
+                    refresh_block=refresh_block,
+                ):
+                    continue
+                candidates.append((key, champ_snap, tid, _pick_url(champion_urls, tid, idx)))
 
         if battle is not None and battle_urls:
             chal_have = await self._samples.count_samples_for_tasks(
@@ -443,26 +441,41 @@ class ExecutorWorker:
             hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
             base_url=base_url,
         )
-        # Per-env cap (if configured) is acquired BEFORE the global slot
-        # so a flaky env can't transiently hold global capacity while
-        # waiting on its own sem. ``nullcontext`` makes this a no-op for
-        # envs without a cap.
-        env_gate = self._env_sem if self._env_sem is not None else nullcontext()
-        async with env_gate:
-            await self._evaluate_and_persist_gated(
-                miner=miner, task_id=task_id, base_url=base_url,
-                refresh_block=refresh_block, miner_obj=miner_obj,
-            )
+        await self._evaluate_and_persist_gated(
+            miner=miner, task_id=task_id, base_url=base_url,
+            refresh_block=refresh_block, miner_obj=miner_obj,
+        )
+
+    def _current_env_cap(self) -> int:
+        if self._env_cap_value is None:
+            return max(1, int(self.max_concurrent))
+        return max(1, int(self._env_cap_value.value))
+
+    def _current_env_in_flight(self) -> int:
+        if self._in_flight_value is not None:
+            return max(0, int(self._in_flight_value.value))
+        return max(0, int(self.metrics.tasks_in_flight))
+
+    async def _acquire_dispatch_slot(self) -> None:
+        """Acquire this env's dynamic share, then one global slot.
+
+        The cap is rechecked after acquiring the global slot because the
+        manager can lower it while this coroutine is waiting.
+        """
+        while True:
+            while self._current_env_in_flight() >= self._current_env_cap():
+                await asyncio.sleep(0.05)
+            await self._acquire_global_slot()
+            if self._current_env_in_flight() < self._current_env_cap():
+                return
+            self._release_global_slot()
+            await asyncio.sleep(0.05)
 
     async def _evaluate_and_persist_gated(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, miner_obj: "_Miner",
     ) -> None:
-        # Wait until the cross-process global semaphore yields a slot.
-        # Envs with bigger pending lists submit more concurrent acquire
-        # attempts and so win a proportional share of the b300 budget —
-        # that's the cross-env priority, no explicit queue needed.
-        await self._acquire_global_slot()
+        await self._acquire_dispatch_slot()
         started = time.monotonic()
         # Track real in-flight concurrency. Two counters intentionally:
         # ``metrics.tasks_in_flight`` is in-process for ``af db worker-status``
