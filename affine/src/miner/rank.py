@@ -13,7 +13,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from affine.core.setup import logger
 from affine.utils.api_client import cli_api_client
 
 
@@ -34,12 +33,13 @@ def _ansi(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
-async def _safe_get(client, path: str) -> Optional[Any]:
-    try:
-        return await client.get(path)
-    except Exception as e:
-        logger.warning(f"rank: GET {path} failed: {type(e).__name__}: {e}")
-        return None
+async def _fetch_rank_payload(client) -> Dict[str, Any]:
+    payload = await client.get(
+        f"/rank/current?top={_RANK_FETCH_LIMIT}&queue_limit={_QUEUE_PREVIEW}",
+    )
+    if isinstance(payload, dict) and isinstance(payload.get("scores"), dict):
+        return payload
+    return payload if isinstance(payload, dict) else {}
 
 
 def _short(value: Any, n: int) -> str:
@@ -325,12 +325,12 @@ def _print_rank_table(
     print(_ansi("=" * width, "2"))
 
 async def get_rank_command() -> None:
-    async with cli_api_client() as client:
-        payload = await _safe_get(
-            client,
-            f"/rank/current?top={_RANK_FETCH_LIMIT}&queue_limit={_QUEUE_PREVIEW}",
-        )
-    payload = payload if isinstance(payload, dict) else {}
+    try:
+        async with cli_api_client() as client:
+            payload = await _fetch_rank_payload(client)
+    except Exception as e:
+        print(f"Error: failed to fetch /rank/current: {e}", file=sys.stderr)
+        sys.exit(1)
 
     _print_rank_table(
         payload.get("window") if isinstance(payload.get("window"), dict) else None,

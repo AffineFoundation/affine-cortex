@@ -1,4 +1,4 @@
-from affine.src.executor.worker import _base_urls, _pick_url
+from affine.src.executor.worker import _base_urls, _is_zero_score_error, _pick_url
 from affine.src.executor.main import ExecutorManager
 from affine.src.scorer.window_state import DeploymentRecord
 
@@ -46,3 +46,41 @@ def test_pick_url_stably_shards_tasks_across_urls():
         urls[(12 + 2) % 3],
         urls[(13 + 3) % 3],
     ]
+
+
+def test_is_zero_score_error_matches_context_overflow_patterns():
+    cases = [
+        "BadRequest: This model's maximum context length is 65536 tokens, but the input is longer than the model can handle",
+        "HTTP 400: prompt exceeds the maximum allowed length",
+        "Error: exceeds the maximum context length of 32000 tokens",
+    ]
+    for msg in cases:
+        assert _is_zero_score_error(Exception(msg)), msg
+
+
+def test_is_zero_score_error_rejects_transport_and_env_failures():
+    cases = [
+        "ReadError: connection reset by peer",
+        "Remote execution failed: {'status': 'failed', 'error': 'worker crashed'}",
+        "BackendError: Method call failed: Failed to call method 'evaluate'",
+        "EnvironmentError: Method 'evaluate' failed on environment 'liveweb-pool-2'",
+        "HTTP 503: service unavailable",
+    ]
+    for msg in cases:
+        assert not _is_zero_score_error(Exception(msg)), msg
+
+
+def test_is_zero_score_error_walks_exception_chain():
+    # Affinetes wraps the original error several layers deep — the pattern
+    # can live on any cause/context node.
+    leaf = ValueError("prompt is longer than the model context window")
+    middle = RuntimeError("Method call failed")
+    middle.__cause__ = leaf
+    top = RuntimeError("Method 'evaluate' failed on environment")
+    top.__cause__ = middle
+
+    assert _is_zero_score_error(top)
+
+
+def test_is_zero_score_error_is_case_insensitive():
+    assert _is_zero_score_error(Exception("EXCEEDS THE MAXIMUM CONTEXT LENGTH"))

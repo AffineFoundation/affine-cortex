@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 import affine.src.miner.rank as rank
 from affine.src.miner.rank import _print_rank_table
@@ -14,6 +15,30 @@ def _render_rank(window, queue, scores):
     with redirect_stdout(buf):
         _print_rank_table(window, queue, scores)
     return buf.getvalue()
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    async def get(self, path):
+        self.calls.append(path)
+        response = self.responses[path]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class _FakeClientContext:
+    def __init__(self, client):
+        self.client = client
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
@@ -277,3 +302,22 @@ def test_rank_table_respects_no_color(monkeypatch):
         )
 
     assert "\033[" not in buf.getvalue()
+
+
+def test_get_rank_reports_aggregate_endpoint_errors_without_fallback(monkeypatch):
+    client = _FakeClient({
+        "/rank/current?top=256&queue_limit=10": RuntimeError("HTTP 404"),
+    })
+    monkeypatch.setattr(rank, "cli_api_client", lambda: _FakeClientContext(client))
+
+    err = io.StringIO()
+    with redirect_stderr(err):
+        try:
+            asyncio.run(rank.get_rank_command())
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("expected get_rank_command to exit")
+
+    assert client.calls == ["/rank/current?top=256&queue_limit=10"]
+    assert "failed to fetch /rank/current" in err.getvalue()

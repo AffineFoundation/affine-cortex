@@ -93,3 +93,19 @@ async def global_exception_handler(request: Request, exc: Exception):
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "Internal server error"},
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    # Note: workers=1 for development
+    # In production, can use multiple workers.
+
+    uvicorn.run(
+        "affine.api.server:app",
+        host=config.HOST,
+        port=config.PORT,
+        reload=config.RELOAD,
+        log_level=config.LOG_LEVEL.lower(),
+        workers=config.WORKERS,
+    )
