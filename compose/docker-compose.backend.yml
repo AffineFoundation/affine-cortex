@@ -53,6 +53,10 @@ services:
       - .env
     volumes:
       - /var/log/affine/scheduler:/var/log/affine/scheduler
+      # SSH key needed by the ssh provider (paramiko) to deploy sglang on
+      # operator-managed GPU hosts (e.g. b300). Targon-only setups can drop
+      # this mount, but it's harmless when unused.
+      - ~/.ssh:/root/.ssh:ro
     command: ["-v", "servers", "scheduler"]
 
   # Executor — per-env subprocess manager. The container forks one
