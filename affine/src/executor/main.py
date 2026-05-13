@@ -32,7 +32,7 @@ from affine.src.scorer.dao_adapters import SampleResultsAdapter
 
 
 HEALTH_CHECK_INTERVAL_SEC = 10
-STATUS_PRINT_INTERVAL_SEC = 30
+STATUS_PRINT_INTERVAL_SEC = 60
 
 
 class ExecutorManager:
