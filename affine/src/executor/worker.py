@@ -45,6 +45,7 @@ class ExecutorWorker:
         idle_sleep_sec: float = 10.0,
         warmup_sec: float = 180.0,
         global_sem: Any = None,
+        in_flight_value: Any = None,
     ):
         self.worker_id = worker_id
         self.env = env
@@ -55,6 +56,11 @@ class ExecutorWorker:
         # is sized at ``max_concurrent`` and only exists as a defensive
         # floor against scheduling tens of thousands of coroutines.
         self._global_sem = global_sem
+        # Per-env ``mp.Value(c_int, lock=False)`` for the manager's
+        # ``[STATUS]`` printer to read live in-flight without IPC ping.
+        # Single writer (this worker), single reader (manager); aligned
+        # c_int reads are atomic on CPython so no lock needed.
+        self._in_flight_value = in_flight_value
         self.poll_interval_sec = poll_interval_sec
         self.idle_sleep_sec = idle_sleep_sec
         # ``warmup_sec``: env containers report "ready" before they are
@@ -326,10 +332,13 @@ class ExecutorWorker:
         # that's the cross-env priority, no explicit queue needed.
         await self._acquire_global_slot()
         started = time.monotonic()
-        # Track real in-flight concurrency so ``af db worker-status`` can
-        # report it. Increment before the blocking evaluate() call, decrement
-        # in the finally below.
+        # Track real in-flight concurrency. Two counters intentionally:
+        # ``metrics.tasks_in_flight`` is in-process for ``af db worker-status``
+        # back-compat; ``self._in_flight_value`` is shared with the manager
+        # for the ``[STATUS]`` printer.
         self.metrics.tasks_in_flight += 1
+        if self._in_flight_value is not None:
+            self._in_flight_value.value += 1
         try:
             try:
                 result = await self._env_executor.evaluate(
@@ -364,6 +373,8 @@ class ExecutorWorker:
                 return
         finally:
             self.metrics.tasks_in_flight -= 1
+            if self._in_flight_value is not None:
+                self._in_flight_value.value -= 1
             self._release_global_slot()
 
         score = float(getattr(result, "score", 0.0))

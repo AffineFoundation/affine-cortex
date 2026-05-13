@@ -21,6 +21,7 @@ def run_worker_subprocess(
     max_concurrent: int,
     stats_queue: multiprocessing.Queue,
     global_sem: Any,
+    in_flight_value: Any,
     verbosity: int = 1,
 ) -> None:
     """Subprocess entry point — runs one ExecutorWorker until killed.
@@ -28,6 +29,10 @@ def run_worker_subprocess(
     ``global_sem`` is the cross-process ``BoundedSemaphore`` every
     worker contends on before each evaluate. It's the real concurrency
     gate; the per-worker ``max_concurrent`` is a defensive floor.
+
+    ``in_flight_value`` is a ``multiprocessing.Value(c_int, lock=False)``
+    the worker increments/decrements around each evaluate so the manager
+    can read live concurrency for the ``[STATUS]`` printer.
     """
     from affine.src.executor.worker import ExecutorWorker
 
@@ -40,7 +45,7 @@ def run_worker_subprocess(
     try:
         worker = ExecutorWorker(
             worker_id=worker_id, env=env, max_concurrent=max_concurrent,
-            global_sem=global_sem,
+            global_sem=global_sem, in_flight_value=in_flight_value,
         )
         loop.run_until_complete(worker.initialize())
         worker.start()
@@ -78,6 +83,7 @@ class WorkerProcess:
         env: str,
         stats_queue: multiprocessing.Queue,
         global_sem: Any,
+        in_flight_value: Any,
         *,
         max_concurrent: int = 60,
         verbosity: int = 1,
@@ -87,6 +93,7 @@ class WorkerProcess:
         self.max_concurrent = max_concurrent
         self.stats_queue = stats_queue
         self.global_sem = global_sem
+        self.in_flight_value = in_flight_value
         self.verbosity = verbosity
         self._proc: Optional[multiprocessing.Process] = None
 
@@ -95,7 +102,8 @@ class WorkerProcess:
         self._proc = ctx.Process(
             target=run_worker_subprocess,
             args=(self.worker_id, self.env, self.max_concurrent,
-                  self.stats_queue, self.global_sem, self.verbosity),
+                  self.stats_queue, self.global_sem, self.in_flight_value,
+                  self.verbosity),
             name=f"executor-{self.env}",
             daemon=False,
         )
