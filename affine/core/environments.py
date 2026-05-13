@@ -504,6 +504,16 @@ class SDKEnvironment:
         api_key = os.getenv("API_KEY")
         if api_key:
             env_vars["API_KEY"] = api_key
+        # Legacy alias kept for env containers that haven't been rebuilt
+        # after the Chutes removal (PR #449). The post-refactor inference
+        # call doesn't read ``CHUTES_API_KEY`` itself, but some env image
+        # tags (e.g. ``swebench:infinite``) still check for it on the
+        # request path and reject the call with HTTP 500 if unset. Mirror
+        # ``API_KEY`` here so those images keep working until rebuilt;
+        # an explicit ``CHUTES_API_KEY`` on the host wins if set.
+        chutes_api_key = os.getenv("CHUTES_API_KEY") or api_key
+        if chutes_api_key:
+            env_vars["CHUTES_API_KEY"] = chutes_api_key
 
         # Forward any required host env vars into the container for this environment
         for key in self.config.required_env_vars:
