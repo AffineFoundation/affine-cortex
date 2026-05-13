@@ -142,6 +142,11 @@ def _status_for(
     if row.get("is_valid") is False:
         reason = str(row.get("invalid_reason") or "invalid")
         return reason.split(":", 1)[0][:11]
+    # Terminated by DECIDE (new flow) or by the legacy-terminated
+    # bootstrap CLI — out of the queue regardless of is_valid.
+    chal_status = str(row.get("challenge_status") or "")
+    if chal_status.startswith("terminated_"):
+        return "TERMINATED"
     if uid == battle_uid:
         return "BATTLING"
     if uid in queue_positions:
@@ -157,6 +162,8 @@ def _colored_status(status: str, *, is_invalid: bool) -> str:
         return _ansi(text, "1;96")
     if status.startswith("QUEUE #"):
         return _ansi(text, "1;94")
+    if status == "TERMINATED":
+        return _ansi(text, "1;91")  # bright red — same as monitor-invalid
     if is_invalid:
         return _ansi(text, "1;91")
     if status == "VALID":
