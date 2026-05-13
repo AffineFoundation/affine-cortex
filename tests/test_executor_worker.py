@@ -3,19 +3,30 @@ from affine.src.executor.main import ExecutorManager
 from affine.src.scorer.window_state import DeploymentRecord
 
 
-def _queue_probe(q):
-    q.put("ok")
+def _in_flight_probe(v):
+    v.value = 42
 
 
-def test_executor_manager_stats_queue_can_be_passed_to_spawn_process():
+def test_executor_manager_ipc_handles_survive_spawn():
+    """Regression: manager's mp.Value / BoundedSemaphore must round-trip
+    through a spawn-context child. Spawn re-imports modules and pickles
+    args; mp primitives have to carry their underlying handle correctly
+    or the child gets a useless copy."""
     manager = ExecutorManager(["affine:ded-v2"])
-    proc = manager.mp_ctx.Process(target=_queue_probe, args=(manager.stats_queue,))
+    env = "affine:ded-v2"
+    val = manager.in_flight_values[env]
 
+    proc = manager.mp_ctx.Process(target=_in_flight_probe, args=(val,))
     proc.start()
     proc.join(timeout=10)
 
     assert proc.exitcode == 0
-    assert manager.stats_queue.get(timeout=1) == "ok"
+    assert val.value == 42
+
+    # Global sem must also be usable from the parent — its acquire
+    # accounting is what gates production dispatch.
+    assert manager.global_sem.acquire(block=False)
+    manager.global_sem.release()
 
 
 def test_base_urls_prefers_deployments_and_dedupes():
@@ -84,3 +95,65 @@ def test_is_zero_score_error_walks_exception_chain():
 
 def test_is_zero_score_error_is_case_insensitive():
     assert _is_zero_score_error(Exception("EXCEEDS THE MAXIMUM CONTEXT LENGTH"))
+
+
+def test_global_slot_acquire_release_round_trip():
+    import asyncio as _asyncio
+    import multiprocessing as _mp
+    from affine.src.executor.worker import ExecutorWorker
+
+    sem = _mp.get_context("spawn").BoundedSemaphore(2)
+    worker = ExecutorWorker(worker_id=0, env="MEMORY", global_sem=sem)
+
+    async def _drive():
+        await worker._acquire_global_slot()
+        await worker._acquire_global_slot()
+        # Both slots taken — non-blocking acquire from a peer should fail.
+        assert not sem.acquire(block=False)
+        worker._release_global_slot()
+        # One slot back — peer should be able to grab it now.
+        assert sem.acquire(block=False)
+        sem.release()
+        worker._release_global_slot()
+
+    _asyncio.run(_drive())
+
+
+def test_global_slot_acquire_polls_until_released():
+    """Coroutine should resume once a peer releases."""
+    import asyncio as _asyncio
+    import multiprocessing as _mp
+    from affine.src.executor.worker import ExecutorWorker
+
+    sem = _mp.get_context("spawn").BoundedSemaphore(1)
+    sem.acquire(block=False)  # exhaust it
+    worker = ExecutorWorker(worker_id=0, env="MEMORY", global_sem=sem)
+
+    async def _drive():
+        async def _waiter():
+            await worker._acquire_global_slot()
+
+        async def _releaser():
+            await _asyncio.sleep(0.15)  # let waiter spin a few polls
+            sem.release()
+
+        await _asyncio.wait_for(
+            _asyncio.gather(_waiter(), _releaser()),
+            timeout=2.0,
+        )
+        worker._release_global_slot()  # clean up
+
+    _asyncio.run(_drive())
+
+
+def test_global_slot_helpers_noop_when_unwired():
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+
+    worker = ExecutorWorker(worker_id=0, env="MEMORY", global_sem=None)
+
+    async def _drive():
+        await worker._acquire_global_slot()  # no-op, returns immediately
+        worker._release_global_slot()  # no-op
+
+    _asyncio.run(_drive())
