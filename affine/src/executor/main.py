@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import signal
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import click
 
@@ -36,9 +36,19 @@ STATUS_PRINT_INTERVAL_SEC = 30
 
 
 class ExecutorManager:
-    def __init__(self, envs: List[str], *, verbosity: int = 1):
+    def __init__(
+        self,
+        envs: List[str],
+        *,
+        verbosity: int = 1,
+        env_concurrency_caps: Optional[Dict[str, int]] = None,
+    ):
         self.envs = envs
         self.verbosity = verbosity
+        # Optional per-env evaluate-concurrency caps. Sourced from
+        # ``EnvConfig.max_concurrent`` (system_config). Envs absent
+        # from this dict only contend on the global semaphore.
+        self.env_concurrency_caps = env_concurrency_caps or {}
         self.mp_ctx = multiprocessing.get_context("spawn")
         # Single cross-process bounded semaphore = the real concurrency
         # gate. Sized to the b300 saturation point so the inference
@@ -75,6 +85,7 @@ class ExecutorManager:
                 in_flight_value=self.in_flight_values[env],
                 max_concurrent=get_max_concurrent(env),
                 verbosity=self.verbosity,
+                env_concurrency_cap=self.env_concurrency_caps.get(env),
             )
             wp.start()
             self.workers.append(wp)
@@ -211,6 +222,26 @@ async def _enabled_envs() -> List[str]:
     return out
 
 
+async def _env_concurrency_caps(envs: List[str]) -> Dict[str, int]:
+    """Read ``EnvConfig.max_concurrent`` for the named envs. Returns a
+    dict of only the envs that have a positive cap configured."""
+    config_dao = SystemConfigDAO()
+    envs_raw = await config_dao.get_param_value("environments", default={}) or {}
+    out: Dict[str, int] = {}
+    for name in envs:
+        cfg = envs_raw.get(name) or {}
+        sampling = cfg.get("sampling") or cfg.get("window_config") or {}
+        raw = sampling.get("max_concurrent")
+        cap: Optional[int] = None
+        if isinstance(raw, int) and raw > 0:
+            cap = raw
+        elif isinstance(raw, str) and raw.isdigit() and int(raw) > 0:
+            cap = int(raw)
+        if cap is not None:
+            out[name] = cap
+    return out
+
+
 async def _run() -> None:
     await init_client()
     envs = await _enabled_envs()
@@ -220,7 +251,13 @@ async def _run() -> None:
         )
         return
 
-    manager = ExecutorManager(envs=envs, verbosity=1)
+    caps = await _env_concurrency_caps(envs)
+    if caps:
+        logger.info(f"executor: per-env concurrency caps = {caps}")
+
+    manager = ExecutorManager(
+        envs=envs, verbosity=1, env_concurrency_caps=caps,
+    )
     await manager.start()
 
     stop_event = asyncio.Event()
