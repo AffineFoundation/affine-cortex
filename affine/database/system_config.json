@@ -12,7 +12,7 @@
     },
     "DISTILL": {
       "display_name": "DISTILL",
-      "enabled": true,
+      "enabled": false,
       "sampling": {
         "sampling_count": 300,
         "dataset_range": [[0, 1000]],
@@ -30,7 +30,7 @@
     },
     "LOGPROBS": {
       "display_name": "LOGPROBS",
-      "enabled": true,
+      "enabled": false,
       "sampling": {
         "sampling_count": 500,
         "dataset_range": [[100000000, 300000000], [400000000, 500000000]],
