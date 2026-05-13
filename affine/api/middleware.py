@@ -6,7 +6,6 @@ Request logging, error handling, CORS, etc.
 
 import time
 import uuid
-import logging
 from typing import Callable
 from fastapi import Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,10 +24,6 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         request_id = str(uuid.uuid4())
         request.state.request_id = request_id
 
-        # Log request
-        start_time = time.time()
-
-        # Process request
         try:
             response = await call_next(request)
         except Exception as e:

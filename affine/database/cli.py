@@ -1,2386 +1,654 @@
 """
-Database CLI tool for management and testing
+Database admin CLI.
 
-Provides commands for initializing, testing, and managing DynamoDB tables.
+Slim, focused on operations that still make sense post-refactor:
+  - Bootstrap / inspect DynamoDB tables
+  - Seed system_config from a JSON file (new flat shape: every top-level
+    key is stored verbatim under ``CONFIG#PARAM#<key>``)
+  - Seed/inspect the current champion
+  - Maintain the miner blacklist and validator burn percentage
+  - Drop sample_results rows by env+task range
+  - Inspect, register, or remove individual miners (incl. system miners)
+
+Removed: every command tied to the dead per-miner slot scheduler, the
+sampling-list rotation, MinerStatsDAO, TaskPoolDAO, AntiCopyDAO, or the
+targon_deployer reconciler. Those concepts no longer exist.
 """
 
+from __future__ import annotations
+
 import asyncio
+import json
+import os
 import sys
 from typing import Optional
-import os
+
 import click
 
-from affine.database import init_client, close_client, init_tables
-from affine.database.tables import list_tables, reset_tables, delete_table
-from affine.database.dao import (
-    SampleResultsDAO,
-    TaskPoolDAO,
-    ExecutionLogsDAO,
-    ScoresDAO,
-    SystemConfigDAO,
-    MinersDAO,
-)
 from affine.cli.types import UID
+from affine.database import close_client, init_client, init_tables
+from affine.database.dao import MinersDAO, SampleResultsDAO, SystemConfigDAO
+from affine.database.tables import delete_table, list_tables, reset_tables
 
 
-async def cmd_init():
-    """Initialize all DynamoDB tables."""
-    print("Initializing DynamoDB tables...")
+# --------------------------------------------------------------------------- #
+# Tables
+# --------------------------------------------------------------------------- #
+
+
+async def _cmd_init() -> None:
     await init_client()
-    
     try:
         await init_tables()
-        print("✓ Tables initialized successfully")
+        print("✓ Tables initialized")
     finally:
         await close_client()
 
 
-async def cmd_list():
-    """List all tables."""
+async def _cmd_list() -> None:
     await init_client()
-    
     try:
         tables = await list_tables()
         print(f"Found {len(tables)} tables:")
-        for table in tables:
-            print(f"  - {table}")
+        for t in tables:
+            print(f"  - {t}")
     finally:
         await close_client()
 
 
-async def cmd_reset():
-    """Reset all tables (delete and recreate)."""
-    confirm = input("WARNING: This will delete all data. Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
-    
+async def _cmd_reset(force: bool) -> None:
+    if not force:
+        if input("WARNING: this deletes ALL data. Type 'yes' to confirm: ").lower() != "yes":
+            print("Aborted")
+            return
     await init_client()
-    
     try:
         await reset_tables()
-        print("✓ Tables reset successfully")
+        print("✓ Tables reset")
     finally:
         await close_client()
 
 
-async def cmd_reset_table(table_name: str):
-    """Reset a single table (delete and recreate)."""
+async def _cmd_reset_table(table_name: str, force: bool) -> None:
     from affine.database.schema import get_table_name
-    
-    # Get full table name with environment prefix
-    full_table_name = get_table_name(table_name)
-    
-    confirm = input(f"WARNING: This will delete all data in '{full_table_name}'. Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
-    
-    await init_client()
-    
-    try:
-        print(f"Deleting table '{full_table_name}'...")
-        await delete_table(full_table_name)
-        
-        print(f"Recreating table '{full_table_name}'...")
-        await init_tables()
-        
-        print(f"✓ Table '{full_table_name}' reset successfully")
-    except Exception as e:
-        print(f"✗ Failed to reset table: {e}")
-        sys.exit(1)
-    finally:
-        await close_client()
 
-
-async def cmd_migrate(tail: int, max_results: Optional[int]):
-    """Run migration from R2 to DynamoDB."""
-    from affine.database.migrate import run_migration
-    
-    print(f"Starting migration (tail={tail}, max_results={max_results or 'all'})")
-    await run_migration(tail_blocks=tail, max_results=max_results)
-
-
-async def cmd_load_config(json_file: str):
-    """Load system configuration from JSON file.
-    
-    Supports smooth transition with optional initial_range:
-    - If initial_range exists: Use it to initialize sampling_list
-    - If initial_range missing: Keep existing sampling_list in database (no override)
-    """
-    import json
-    import os
-    import time
-    
-    print(f"Loading configuration from {json_file}...")
-    
-    # Check file exists
-    if not os.path.exists(json_file):
-        print(f"Error: File '{json_file}' not found")
-        sys.exit(1)
-    
-    # Load JSON
-    try:
-        with open(json_file, 'r') as f:
-            config = json.load(f)
-    except json.JSONDecodeError as e:
-        print(f"Error: Invalid JSON format: {e}")
-        sys.exit(1)
-    
-    await init_client()
-    
-    try:
-        config_dao = SystemConfigDAO()
-        
-        # Load validator burn percentage if present
-        if 'validator_burn_percentage' in config:
-            burn_percentage = float(config['validator_burn_percentage'])
-            
-            await config_dao.set_param(
-                param_name='validator_burn_percentage',
-                param_value=burn_percentage,
-                param_type='float',
-                description='Percentage of weight to burn (allocate to UID 0)',
-                updated_by='cli_load_config'
-            )
-            
-            print(f"✓ Loaded validator burn percentage: {burn_percentage:.1%}")
-        
-        # Load environments configuration
-        if 'environments' in config:
-            from affine.core.sampling_list import SamplingListManager
-            import random
-            
-            environments = config['environments']
-            existing_envs = await config_dao.get_param_value('environments', default={})
-            manager = SamplingListManager()
-            
-            from affine.core.dataset_range_resolver import resolve_dataset_range_source
-
-            for env_name, env_config in environments.items():
-                sampling_config = env_config.get('sampling_config')
-                if not sampling_config:
-                    print(f"  Warning: {env_name} missing sampling_config, skipping")
-                    continue
-
-                # Resolve dynamic dataset_range: preserve DB expansion, only fresh-build if no existing range
-                range_source = sampling_config.get('dataset_range_source')
-                existing_env = existing_envs.get(env_name, {})
-                existing_config = existing_env.get('sampling_config', {})
-                existing_range = existing_config.get('dataset_range')
-
-                if range_source:
-                    if existing_range:
-                        resolved_range = await resolve_dataset_range_source(range_source, old_range=existing_range)
-                    else:
-                        resolved_range = await resolve_dataset_range_source(range_source)
-                    if resolved_range is not None:
-                        sampling_config['dataset_range'] = resolved_range
-                        print(f"  {env_name}: Resolved dataset_range from remote source: {resolved_range}")
-                    elif existing_range:
-                        sampling_config['dataset_range'] = existing_range
-                        print(f"  {env_name}: Preserved existing dataset_range from database: {existing_range}")
-                    else:
-                        print(f"  {env_name}: Failed to resolve dataset_range_source, using fallback: {sampling_config.get('dataset_range')}")
-
-                # Check if initial_range is provided
-                if 'initial_range' in sampling_config:
-                    # Use initial_range to generate sampling_list
-                    initial_range = sampling_config['initial_range']
-                    sampling_count = sampling_config.get('sampling_count', 0)
-                    
-                    # Generate sampling_list from initial_range
-                    sampling_list = await manager.initialize_sampling_list(
-                        env=env_name,
-                        initial_range=initial_range,
-                        sampling_size=sampling_count
-                    )
-                    
-                    sampling_config['sampling_list'] = sampling_list
-                    sampling_config['last_rotation_at'] = int(time.time())
-                    
-                    # Remove initial_range after use (keep config clean)
-                    del sampling_config['initial_range']
-                    
-                    print(f"  {env_name}: Initialized sampling_list from initial_range (size={len(sampling_list)})")
-                
-                else:
-                    # No initial_range: preserve existing sampling_list from database
-                    existing_env = existing_envs.get(env_name, {})
-                    existing_config = existing_env.get('sampling_config', {})
-                    existing_list = existing_config.get('sampling_list')
-                    
-                    if existing_list:
-                        sampling_config['sampling_list'] = existing_list
-                        sampling_config['last_rotation_at'] = existing_config.get('last_rotation_at', int(time.time()))
-                        print(f"  {env_name}: Preserved existing sampling_list from database (size={len(existing_list)})")
-                    else:
-                        # No existing list: generate from dataset_range using RangeSet-based manager
-                        dataset_range = sampling_config.get('dataset_range', [[0, 0]])
-                        sampling_count = sampling_config.get('sampling_count', 0)
-                        
-                        # Use SamplingListManager which uses RangeSet for efficient handling
-                        sampling_list = await manager.initialize_sampling_list(
-                            env=env_name,
-                            initial_range=dataset_range,
-                            sampling_size=sampling_count
-                        )
-
-                        sampling_config['sampling_list'] = sampling_list
-                        sampling_config['last_rotation_at'] = int(time.time())
-                        
-                        print(f"  {env_name}: Generated new sampling_list from dataset_range (size={len(sampling_list)})")
-            
-            # Save to database
-            await config_dao.set_param(
-                param_name='environments',
-                param_value=environments,
-                param_type='dict',
-                description='Environment configurations with dynamic sampling',
-                updated_by='cli_load_config'
-            )
-            
-            print(f"\n✓ Loaded configuration for {len(environments)} environments:")
-            
-            for env_name, env_config in environments.items():
-                enabled_sampling = env_config.get('enabled_for_sampling', False)
-                enabled_scoring = env_config.get('enabled_for_scoring', False)
-                
-                sampling_config = env_config.get('sampling_config')
-                if sampling_config:
-                    sampling_list = sampling_config.get('sampling_list', [])
-                    dataset_range = sampling_config.get('dataset_range', [])
-                    rotation_count = sampling_config.get('rotation_count', 0)
-                    status = f"dataset_range={dataset_range}, sampling_list={len(sampling_list)} tasks"
-                    if rotation_count > 0:
-                        status += f", rotation={rotation_count} tasks/hour"
-                    else:
-                        status += ", rotation=disabled"
-                else:
-                    status = "no sampling_config"
-                
-                flags = []
-                if enabled_sampling:
-                    flags.append("sampling")
-                if enabled_scoring:
-                    flags.append("scoring")
-                flags_str = "+".join(flags) if flags else "disabled"
-                
-                print(f"  {env_name} [{flags_str}]: {status}")
-        
-        print("\n✓ Configuration loaded successfully!")
-        
-    finally:
-        await close_client()
-
-
-async def cmd_blacklist_list():
-    """List all blacklisted hotkeys."""
-    print("Fetching blacklist...")
-    await init_client()
-    
-    try:
-        config_dao = SystemConfigDAO()
-        blacklist = await config_dao.get_blacklist()
-        
-        if not blacklist:
-            print("Blacklist is empty")
-        else:
-            print(f"Blacklist contains {len(blacklist)} hotkey(s):")
-            for i, hotkey in enumerate(blacklist, 1):
-                print(f"  {i}. {hotkey}")
-    
-    finally:
-        await close_client()
-
-
-async def cmd_blacklist_add(hotkeys: list):
-    """Add hotkeys to blacklist."""
-    print(f"Adding {len(hotkeys)} hotkey(s) to blacklist...")
-    await init_client()
-    
-    try:
-        config_dao = SystemConfigDAO()
-        
-        # Get current blacklist
-        current = await config_dao.get_blacklist()
-        print(f"Current blacklist size: {len(current)}")
-        
-        # Add new hotkeys
-        result = await config_dao.add_to_blacklist(
-            hotkeys=hotkeys,
-            updated_by='cli_blacklist_add'
-        )
-        
-        new_blacklist = result.get('param_value', [])
-        print(f"✓ Updated blacklist size: {len(new_blacklist)}")
-        print(f"  Added: {len(new_blacklist) - len(current)} new hotkey(s)")
-        
-    finally:
-        await close_client()
-
-
-async def cmd_blacklist_remove(hotkeys: list):
-    """Remove hotkeys from blacklist."""
-    print(f"Removing {len(hotkeys)} hotkey(s) from blacklist...")
-    await init_client()
-    
-    try:
-        config_dao = SystemConfigDAO()
-        
-        # Get current blacklist
-        current = await config_dao.get_blacklist()
-        print(f"Current blacklist size: {len(current)}")
-        
-        # Remove hotkeys
-        result = await config_dao.remove_from_blacklist(
-            hotkeys=hotkeys,
-            updated_by='cli_blacklist_remove'
-        )
-        
-        new_blacklist = result.get('param_value', [])
-        print(f"✓ Updated blacklist size: {len(new_blacklist)}")
-        print(f"  Removed: {len(current) - len(new_blacklist)} hotkey(s)")
-        
-    finally:
-        await close_client()
-
-
-async def cmd_blacklist_clear():
-    """Clear all hotkeys from blacklist."""
-    confirm = input("WARNING: This will clear the entire blacklist. Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
-    
-    print("Clearing blacklist...")
-    await init_client()
-    
-    try:
-        config_dao = SystemConfigDAO()
-        
-        result = await config_dao.set_blacklist(
-            hotkeys=[],
-            updated_by='cli_blacklist_clear'
-        )
-        
-        print("✓ Blacklist cleared successfully")
-        
-    finally:
-        await close_client()
-
-
-async def cmd_set_burn_percentage(burn_percentage: float):
-    """Set validator burn percentage."""
-    if burn_percentage < 0 or burn_percentage > 1:
-        print(f"Error: Burn percentage must be between 0 and 1 (got {burn_percentage})")
-        sys.exit(1)
-    
-    print(f"Setting burn percentage to {burn_percentage:.1%}...")
-    await init_client()
-    
-    try:
-        config_dao = SystemConfigDAO()
-        
-        result = await config_dao.set_param(
-            param_name='validator_burn_percentage',
-            param_value=burn_percentage,
-            param_type='float',
-            description='Percentage of weight to burn (allocate to UID 0)',
-            updated_by='cli_set_burn_percentage'
-        )
-        
-        print(f"✓ Burn percentage set to {burn_percentage:.1%}")
-        
-    finally:
-        await close_client()
-
-
-async def cmd_get_burn_percentage():
-    """Get current validator burn percentage."""
-    print("Fetching burn percentage...")
-    await init_client()
-    
-    try:
-        config_dao = SystemConfigDAO()
-        config = await config_dao.get_param('validator_burn_percentage')
-        
-        if not config:
-            print("Burn percentage not set (default: 0.0)")
-        else:
-            burn_percentage = config.get('param_value', 0.0)
-            print(f"Current burn percentage: {burn_percentage:.1%}")
-            print(f"Last updated: {config.get('updated_at', 'unknown')}")
-            print(f"Updated by: {config.get('updated_by', 'unknown')}")
-    
-    finally:
-        await close_client()
-
-
-async def cmd_get_config():
-    """Get and print current system configuration."""
-    import json
-    
-    print("Fetching system configuration...\n")
-    await init_client()
-    
-    try:
-        config_dao = SystemConfigDAO()
-        
-        # Fetch all configuration parameters
-        burn_config = await config_dao.get_param('validator_burn_percentage')
-        environments = await config_dao.get_param_value('environments', default={})
-        blacklist = await config_dao.get_blacklist()
-        
-        # Print burn percentage
-        print("=" * 80)
-        print("VALIDATOR BURN PERCENTAGE")
-        print("=" * 80)
-        if burn_config:
-            burn_percentage = burn_config.get('param_value', 0.0)
-            print(f"Value: {burn_percentage:.1%}")
-            print(f"Updated: {burn_config.get('updated_at', 'unknown')}")
-            print(f"Updated by: {burn_config.get('updated_by', 'unknown')}")
-        else:
-            print("Not set (default: 0.0)")
-        
-        # Print blacklist
-        print("\n" + "=" * 80)
-        print("BLACKLIST")
-        print("=" * 80)
-        if blacklist:
-            print(f"Count: {len(blacklist)} hotkey(s)")
-            for i, hotkey in enumerate(blacklist, 1):
-                print(f"  {i}. {hotkey}")
-        else:
-            print("Empty")
-        
-        # Print environments configuration
-        print("\n" + "=" * 80)
-        print("ENVIRONMENTS CONFIGURATION")
-        print("=" * 80)
-        if not environments:
-            print("No environments configured")
-        else:
-            print(f"Total environments: {len(environments)}\n")
-            
-            for env_name, env_config in environments.items():
-                print(f"{'─' * 80}")
-                print(f"Environment: {env_name}")
-                print(f"{'─' * 80}")
-                
-                # Status flags
-                enabled_sampling = env_config.get('enabled_for_sampling', False)
-                enabled_scoring = env_config.get('enabled_for_scoring', False)
-                flags = []
-                if enabled_sampling:
-                    flags.append("sampling")
-                if enabled_scoring:
-                    flags.append("scoring")
-                status = "+".join(flags) if flags else "disabled"
-                print(f"Status: [{status}]")
-                
-                # Sampling configuration
-                sampling_config = env_config.get('sampling_config')
-                if sampling_config:
-                    print(f"\nSampling Configuration:")
-                    
-                    # Dataset range
-                    dataset_range = sampling_config.get('dataset_range', [])
-                    print(f"  Dataset range: {dataset_range}")
-                    
-                    # Sampling count
-                    sampling_count = sampling_config.get('sampling_count', 0)
-                    print(f"  Sampling count: {sampling_count}")
-                    
-                    # Sampling list
-                    sampling_list = sampling_config.get('sampling_list', [])
-                    print(f"  Sampling list: {len(sampling_list)} tasks")
-                    if sampling_list:
-                        # Show first and last few items
-                        if len(sampling_list) <= 10:
-                            print(f"    Tasks: {sampling_list}")
-                        else:
-                            preview = sampling_list[:5] + ["..."] + sampling_list[-5:]
-                            print(f"    Tasks: {preview}")
-                    
-                    # Rotation settings
-                    rotation_enabled = sampling_config.get('rotation_enabled', False)
-                    rotation_count = sampling_config.get('rotation_count', 0)
-                    rotation_interval = sampling_config.get('rotation_interval', 3600)
-                    
-                    print(f"  Rotation enabled: {rotation_enabled}")
-                    if rotation_enabled:
-                        print(f"  Rotation count: {rotation_count} tasks/rotation")
-                        print(f"  Rotation interval: {rotation_interval}s ({rotation_interval/3600:.1f} hours)")
-                    
-                    # Last rotation
-                    last_rotation = sampling_config.get('last_rotation_at')
-                    if last_rotation:
-                        import time
-                        elapsed = int(time.time()) - last_rotation
-                        print(f"  Last rotation: {elapsed}s ago ({elapsed/3600:.1f} hours)")
-                
-                # Scoring configuration
-                scoring_config = env_config.get('scoring_config')
-                if scoring_config:
-                    print(f"\nScoring Configuration:")
-                    weights = scoring_config.get('weights', {})
-                    print(f"  Weights: {json.dumps(weights, indent=4)}")
-                
-                print()  # Blank line between environments
-        
-        print("=" * 80)
-        print("✓ Configuration printed successfully")
-        
-    finally:
-        await close_client()
-
-
-async def cmd_delete_samples_by_range(
-    hotkey: Optional[str],
-    revision: Optional[str],
-    env: str,
-    start_task_id: int,
-    end_task_id: int
-):
-    """Delete samples within a task_id range.
-    
-    If hotkey and revision are provided, deletes samples for that specific miner.
-    If they are not provided, deletes all samples in the environment and range.
-    """
-    if hotkey and revision:
-        print(f"Deleting samples for hotkey={hotkey[:12]}..., revision={revision[:8]}..., env={env}, task_id range=[{start_task_id}, {end_task_id})...")
-        confirm = input(f"WARNING: This will delete samples for specific miner in range [{start_task_id}, {end_task_id}). Type 'yes' to confirm: ")
-    else:
-        print(f"Deleting ALL samples for env={env}, task_id range=[{start_task_id}, {end_task_id})...")
-        confirm = input(f"WARNING: This will delete ALL samples across all miners/revisions for env={env} in range [{start_task_id}, {end_task_id}). Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
-    
-    await init_client()
-    
-    try:
-        sample_dao = SampleResultsDAO()
-        
-        if hotkey and revision:
-            # Delete for specific miner
-            deleted_count = await sample_dao.delete_samples_by_task_range(
-                miner_hotkey=hotkey,
-                model_revision=revision,
-                env=env,
-                start_task_id=start_task_id,
-                end_task_id=end_task_id
-            )
-        else:
-            # Delete for all miners in the environment
-            deleted_count = await sample_dao.delete_all_samples_by_task_range(
-                env=env,
-                start_task_id=start_task_id,
-                end_task_id=end_task_id
-            )
-        
-        print(f"✓ Deleted {deleted_count} samples")
-    
-    except Exception as e:
-        print(f"✗ Failed to delete samples: {e}")
-        sys.exit(1)
-    finally:
-        await close_client()
-
-
-async def cmd_delete_samples_empty_conversation():
-    """Delete all samples with empty conversation across the entire database."""
-    print("Scanning entire sample database for invalid samples (empty conversation)...")
-    
-    confirm = input("WARNING: This will scan and delete ALL samples with empty conversation in the database. Type 'yes' to confirm: ")
-    
-    if confirm.lower() != 'yes':
-        print("Aborted")
-        return
-    
-    await init_client()
-    
-    try:
-        sample_dao = SampleResultsDAO()
-        deleted_count = await sample_dao.delete_all_samples_with_empty_conversation()
-        
-        print(f"\n✓ Scan complete. Deleted {deleted_count} samples with empty conversation")
-    
-    except Exception as e:
-        print(f"\n✗ Failed to delete samples: {e}")
-        sys.exit(1)
-    finally:
-        await close_client()
-
-
-async def cmd_cleanup_inactive_miners(days: int):
-    """Cleanup long-inactive miners.
-    
-    Finds miners that haven't been updated for the specified number of days
-    and have never had any weight (best_weight == 0).
-    """
-    from affine.database.dao.miner_stats import MinerStatsDAO
-    from datetime import datetime
-    
-    await init_client()
-    
-    try:
-        dao = MinerStatsDAO()
-        
-        # Get inactive miners (dry-run)
-        inactive_miners = await dao.cleanup_inactive_miners(
-            inactive_days=days,
-            dry_run=True
-        )
-        
-        if not inactive_miners:
-            print("No inactive miners found.")
+    full = get_table_name(table_name)
+    if not force:
+        if input(f"WARNING: delete all data in '{full}'. Type 'yes' to confirm: ").lower() != "yes":
+            print("Aborted")
             return
-        
-        # Display results
-        print(f"\nFound {len(inactive_miners)} inactive miners (>{days} days, zero weight):\n")
-        
-        for i, miner in enumerate(inactive_miners[:10], 1):
-            last_updated = datetime.fromtimestamp(miner['last_updated_at'])
-            print(
-                f"{i}. {miner['hotkey'][:16]}...#{miner['revision'][:8]}... "
-                f"(last_updated: {last_updated.strftime('%Y-%m-%d')}, "
-                f"weight: {miner['best_weight']})"
-            )
-        
-        if len(inactive_miners) > 10:
-            print(f"... and {len(inactive_miners) - 10} more")
-        
-        # Confirm deletion
-        confirm = input(f"\nWARNING: Delete {len(inactive_miners)} miners? Type 'yes' to confirm: ")
-        
-        if confirm.lower() == 'yes':
-            await dao.cleanup_inactive_miners(inactive_days=days, dry_run=False)
-            print(f"✓ Cleanup completed: {len(inactive_miners)} miners deleted")
-        else:
-            print("Cleanup cancelled")
-    
-    finally:
-        await close_client()
-
-
-async def cmd_update_miners():
-    """Initialize/update miner_stats from sample_results using batch scan.
-    
-    Uses batch scanning to handle millions of samples efficiently:
-    - Scans in batches to avoid memory overflow
-    - Updates miner_stats incrementally per batch
-    - Only updates updatable fields (first_seen_at, last_updated_at)
-    - Skips immutable fields like best_rank (requires online data)
-    """
-    from affine.database.dao.sample_results import SampleResultsDAO
-    from affine.database.dao.miner_stats import MinerStatsDAO
-    from affine.database.tables import table_exists, create_table
-    from affine.database.schema import MINER_STATS_SCHEMA, get_table_name
-    from datetime import datetime
-    
-    print("Initializing miner_stats from sample_results...")
-    print("Note: Only updates timestamps (first_seen_at, last_updated_at)")
-    print("      Historical best_rank is not updated (requires online data)\n")
-    
     await init_client()
-    
     try:
-        # Check if miner_stats table exists
-        miner_stats_table = get_table_name("miner_stats")
-        if not await table_exists(miner_stats_table):
-            print(f"Table '{miner_stats_table}' does not exist. Creating it...")
-            await create_table(MINER_STATS_SCHEMA)
-            print(f"✓ Table '{miner_stats_table}' created successfully\n")
-    
-        sample_dao = SampleResultsDAO()
-        miner_dao = MinerStatsDAO()
-        
-        from affine.database.client import get_client
-        client = get_client()
-        
-        # Batch scan configuration
-        batch_size = 1000  # Process 1000 samples per batch
-        total_samples = 0
-        total_batches = 0
-        miners_created = 0
-        miners_updated = 0
-        
-        # Track miners across batches to detect new ones
-        seen_miners = set()
-        
-        print("Scanning sample_results table in batches...")
-        
-        params = {
-            'TableName': sample_dao.table_name,
-            'Limit': batch_size,
-            'ProjectionExpression': 'miner_hotkey, model_revision, #model, #ts',
-            'ExpressionAttributeNames': {
-                '#model': 'model',
-                '#ts': 'timestamp'
-            }
-        }
-        
-        while True:
-            response = await client.scan(**params)
-            items = response.get('Items', [])
-            
-            if not items:
-                break
-            
-            # Process this batch
-            batch_miners = {}  # {(hotkey, revision): {model, first_seen, last_seen}}
-            
-            for item in items:
-                sample = sample_dao._deserialize(item)
-                hotkey = sample.get('miner_hotkey')
-                revision = sample.get('model_revision')
-                model = sample.get('model', '')
-                timestamp = sample.get('timestamp', 0)
-                
-                if not hotkey or not revision:
-                    continue
-                
-                key = (hotkey, revision)
-                if key not in batch_miners:
-                    batch_miners[key] = {
-                        'model': model,
-                        'first_seen': timestamp,
-                        'last_seen': timestamp
-                    }
-                else:
-                    batch_miners[key]['first_seen'] = min(batch_miners[key]['first_seen'], timestamp)
-                    batch_miners[key]['last_seen'] = max(batch_miners[key]['last_seen'], timestamp)
-            
-            # Update miner_stats for this batch
-            for (hotkey, revision), info in batch_miners.items():
-                existing = await miner_dao.get_miner_stats(hotkey, revision)
-                
-                if existing:
-                    # Update timestamps only (don't touch best_rank/best_weight)
-                    first_seen_ms = info['first_seen']
-                    last_seen_ms = info['last_seen']
-                    
-                    # Convert milliseconds to seconds
-                    first_seen_sec = first_seen_ms // 1000 if first_seen_ms > 1e10 else first_seen_ms
-                    last_seen_sec = last_seen_ms // 1000 if last_seen_ms > 1e10 else last_seen_ms
-                    
-                    # Update first_seen_at if this sample is older
-                    needs_update = False
-                    updates = {}
-                    
-                    current_first_seen = existing.get('first_seen_at', float('inf'))
-                    if first_seen_sec < current_first_seen:
-                        updates['first_seen_at'] = first_seen_sec
-                        needs_update = True
-                    
-                    current_last_updated = existing.get('last_updated_at', 0)
-                    if last_seen_sec > current_last_updated:
-                        updates['last_updated_at'] = last_seen_sec
-                        needs_update = True
-                    
-                    if needs_update:
-                        # Atomic update of timestamps only
-                        pk = miner_dao._make_pk(hotkey)
-                        sk = miner_dao._make_sk(revision)
-                        
-                        update_parts = []
-                        expr_names = {}
-                        expr_values = {}
-                        
-                        if 'first_seen_at' in updates:
-                            update_parts.append('#first_seen = :first_seen')
-                            expr_names['#first_seen'] = 'first_seen_at'
-                            expr_values[':first_seen'] = {'N': str(updates['first_seen_at'])}
-                        
-                        if 'last_updated_at' in updates:
-                            update_parts.append('#last_updated = :last_updated')
-                            expr_names['#last_updated'] = 'last_updated_at'
-                            expr_values[':last_updated'] = {'N': str(updates['last_updated_at'])}
-                        
-                        await client.update_item(
-                            TableName=miner_dao.table_name,
-                            Key={'pk': {'S': pk}, 'sk': {'S': sk}},
-                            UpdateExpression=f"SET {', '.join(update_parts)}",
-                            ExpressionAttributeNames=expr_names,
-                            ExpressionAttributeValues=expr_values
-                        )
-                        miners_updated += 1
-                else:
-                    # Create new record
-                    first_seen_ms = info['first_seen']
-                    last_seen_ms = info['last_seen']
-                    
-                    # Convert milliseconds to seconds
-                    first_seen_sec = first_seen_ms // 1000 if first_seen_ms > 1e10 else first_seen_ms
-                    last_seen_sec = last_seen_ms // 1000 if last_seen_ms > 1e10 else last_seen_ms
-                    
-                    await miner_dao.update_miner_info(
-                        hotkey=hotkey,
-                        revision=revision,
-                        model=info['model'],
-                        rank=None,
-                        weight=None,
-                        is_online=False
-                    )
-                    
-                    # Update timestamps to historical values
-                    pk = miner_dao._make_pk(hotkey)
-                    sk = miner_dao._make_sk(revision)
-                    
-                    await client.update_item(
-                        TableName=miner_dao.table_name,
-                        Key={'pk': {'S': pk}, 'sk': {'S': sk}},
-                        UpdateExpression='SET #first_seen = :first_seen, #last_updated = :last_updated',
-                        ExpressionAttributeNames={
-                            '#first_seen': 'first_seen_at',
-                            '#last_updated': 'last_updated_at'
-                        },
-                        ExpressionAttributeValues={
-                            ':first_seen': {'N': str(first_seen_sec)},
-                            ':last_updated': {'N': str(last_seen_sec)}
-                        }
-                    )
-                    
-                    miners_created += 1
-                
-                seen_miners.add((hotkey, revision))
-            
-            total_samples += len(items)
-            total_batches += 1
-            
-            # Progress update
-            print(
-                f"  Batch {total_batches}: Processed {len(items)} samples "
-                f"(total: {total_samples}, unique miners: {len(seen_miners)}, "
-                f"created: {miners_created}, updated: {miners_updated})"
-            )
-            
-            # Check for next page
-            last_key = response.get('LastEvaluatedKey')
-            if not last_key:
-                break
-            
-            params['ExclusiveStartKey'] = last_key
-        
-        print(f"\n✓ Initialization complete:")
-        print(f"  - Total samples scanned: {total_samples}")
-        print(f"  - Total batches: {total_batches}")
-        print(f"  - Unique miners found: {len(seen_miners)}")
-        print(f"  - New records created: {miners_created}")
-        print(f"  - Existing records updated: {miners_updated}")
-        print(f"\nNote: Only timestamps were updated. Historical best_rank requires online miner data.")
-    
-    except Exception as e:
-        print(f"\n✗ Failed to initialize miner_stats: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        await delete_table(full)
+        await init_tables()
+        print(f"✓ Reset '{full}'")
     finally:
         await close_client()
+
+
+# --------------------------------------------------------------------------- #
+# system_config load / get
+# --------------------------------------------------------------------------- #
+
+
+async def _cmd_load_config(json_file: str) -> None:
+    """Upsert every top-level key from a JSON file into system_config.
+
+    No sampling-list rotation, no smooth-transition logic — the new flow
+    treats each entry as a plain KV pair. Existing keys are overwritten.
+    """
+    if not os.path.exists(json_file):
+        print(f"Error: file '{json_file}' not found")
+        sys.exit(1)
+    try:
+        with open(json_file) as f:
+            payload = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"Error: invalid JSON: {e}")
+        sys.exit(1)
+    if not isinstance(payload, dict):
+        print("Error: top-level JSON must be an object")
+        sys.exit(1)
+
+    await init_client()
+    try:
+        dao = SystemConfigDAO()
+        for key, value in payload.items():
+            param_type = _param_type_of(value)
+            await dao.set_param(
+                param_name=key,
+                param_value=value,
+                param_type=param_type,
+                description=f"Loaded from {os.path.basename(json_file)}",
+                updated_by="cli:load-config",
+            )
+            preview = _preview(value)
+            print(f"  {key:<24} → {preview}")
+        print(f"✓ Loaded {len(payload)} keys")
+    finally:
+        await close_client()
+
+
+def _param_type_of(value) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, int):
+        return "int"
+    if isinstance(value, float):
+        return "float"
+    if isinstance(value, list):
+        return "list"
+    if isinstance(value, dict):
+        return "dict"
+    return "str"
+
+
+def _preview(value) -> str:
+    s = json.dumps(value, separators=(",", ":"))
+    return s if len(s) <= 80 else s[:77] + "..."
+
+
+async def _cmd_get_config() -> None:
+    await init_client()
+    try:
+        dao = SystemConfigDAO()
+        params = await dao.list_all_configs()
+        if not params:
+            print("(empty)")
+            return
+        for p in sorted(params, key=lambda x: x.get("param_name", "")):
+            name = p.get("param_name", "?")
+            preview = _preview(p.get("param_value"))
+            print(f"  {name:<24} = {preview}")
+    finally:
+        await close_client()
+
+
+# --------------------------------------------------------------------------- #
+# Champion
+# --------------------------------------------------------------------------- #
+
+
+async def _cmd_set_champion(hotkey: str, revision: str, since_block: Optional[int]) -> None:
+    """Write the champion record. Looks up uid+model from miners table."""
+    from affine.utils.subtensor import get_subtensor
+
+    await init_client()
+    try:
+        miners = MinersDAO()
+        all_miners = await miners.get_all_miners()
+        matched = [m for m in all_miners
+                   if m.get("hotkey") == hotkey and m.get("revision") == revision]
+        if not matched:
+            print(f"Error: no miner found with hotkey={hotkey[:16]}... revision={revision[:8]}...")
+            sys.exit(1)
+        m = matched[0]
+        uid = int(m["uid"])
+        model = m.get("model", "")
+
+        if since_block is None:
+            subtensor = await get_subtensor()
+            since_block = int(await subtensor.get_current_block())
+
+        cfg = SystemConfigDAO()
+        existing = await cfg.get_param_value("champion", default=None)
+        if existing:
+            print(f"Replacing existing champion uid={existing.get('uid')} "
+                  f"hotkey={existing.get('hotkey', '')[:12]}...")
+
+        # ChampionRecord shape — Stage U dropped since_window_id (no
+        # window-id concept anymore). deployment_id/base_url are populated
+        # by the scheduler on the next tick when it brings up Targon.
+        payload = {
+            "uid": uid,
+            "hotkey": hotkey,
+            "revision": revision,
+            "model": model,
+            "deployment_id": None,
+            "base_url": None,
+            "since_block": since_block,
+        }
+        await cfg.set_param(
+            param_name="champion",
+            param_value=payload,
+            param_type="dict",
+            description="Current champion identity",
+            updated_by="cli:set-champion",
+        )
+        print(f"✓ Champion set: uid={uid} since_block={since_block}")
+    finally:
+        await close_client()
+
+
+# --------------------------------------------------------------------------- #
+# Blacklist
+# --------------------------------------------------------------------------- #
+
+
+async def _cmd_blacklist_list() -> None:
+    await init_client()
+    try:
+        items = await SystemConfigDAO().get_blacklist()
+        if not items:
+            print("(empty)")
+            return
+        for hk in items:
+            print(f"  {hk}")
+        print(f"({len(items)} entries)")
+    finally:
+        await close_client()
+
+
+async def _cmd_blacklist_add(hotkeys: list) -> None:
+    await init_client()
+    try:
+        await SystemConfigDAO().add_to_blacklist(hotkeys, updated_by="cli")
+        print(f"✓ Added {len(hotkeys)} hotkey(s)")
+    finally:
+        await close_client()
+
+
+async def _cmd_blacklist_remove(hotkeys: list) -> None:
+    await init_client()
+    try:
+        await SystemConfigDAO().remove_from_blacklist(hotkeys, updated_by="cli")
+        print(f"✓ Removed {len(hotkeys)} hotkey(s)")
+    finally:
+        await close_client()
+
+
+async def _cmd_blacklist_clear() -> None:
+    if input("Clear ALL blacklist entries. Type 'yes' to confirm: ").lower() != "yes":
+        print("Aborted")
+        return
+    await init_client()
+    try:
+        await SystemConfigDAO().set_blacklist([], updated_by="cli")
+        print("✓ Blacklist cleared")
+    finally:
+        await close_client()
+
+
+# --------------------------------------------------------------------------- #
+# Burn
+# --------------------------------------------------------------------------- #
+
+
+async def _cmd_set_burn(pct: float) -> None:
+    if not 0.0 <= pct <= 1.0:
+        print("Error: burn percentage must be in [0.0, 1.0]")
+        sys.exit(1)
+    await init_client()
+    try:
+        await SystemConfigDAO().set_param(
+            param_name="validator_burn_percentage",
+            param_value=pct,
+            param_type="float",
+            description="Validator burn percentage",
+            updated_by="cli",
+        )
+        print(f"✓ Burn percentage set to {pct}")
+    finally:
+        await close_client()
+
+
+async def _cmd_get_burn() -> None:
+    await init_client()
+    try:
+        v = await SystemConfigDAO().get_param_value("validator_burn_percentage", default=0.0)
+        print(f"validator_burn_percentage = {v}")
+    finally:
+        await close_client()
+
+
+# --------------------------------------------------------------------------- #
+# Sample maintenance
+# --------------------------------------------------------------------------- #
+
+
+async def _cmd_delete_samples_by_range(
+    hotkey: Optional[str], revision: Optional[str], env: str,
+    start_task_id: int, end_task_id: int, force: bool,
+) -> None:
+    if not force:
+        scope = (f"miner={hotkey[:12]}... rev={revision[:8]}..."
+                 if hotkey and revision else "ALL miners")
+        prompt = (f"WARNING: delete samples for {scope} in env={env} "
+                  f"task_id=[{start_task_id}, {end_task_id}). Type 'yes' to confirm: ")
+        if input(prompt).lower() != "yes":
+            print("Aborted")
+            return
+    await init_client()
+    try:
+        dao = SampleResultsDAO()
+        if hotkey and revision:
+            n = await dao.delete_samples_by_task_range(
+                miner_hotkey=hotkey, model_revision=revision, env=env,
+                start_task_id=start_task_id, end_task_id=end_task_id,
+            )
+        else:
+            n = await dao.delete_all_samples_by_task_range(
+                env=env, start_task_id=start_task_id, end_task_id=end_task_id,
+            )
+        print(f"✓ Deleted {n} samples")
+    finally:
+        await close_client()
+
+
+# --------------------------------------------------------------------------- #
+# Miner lookup / system miners
+# --------------------------------------------------------------------------- #
+
+
+async def _cmd_get_miner(hotkey: Optional[str], uid: Optional[int]) -> None:
+    await init_client()
+    try:
+        dao = MinersDAO()
+        if uid is not None:
+            m = await dao.get_miner_by_uid(uid)
+        elif hotkey:
+            m = await dao.get_miner_by_hotkey(hotkey)
+        else:
+            print("Error: --hotkey or --uid required")
+            sys.exit(1)
+        if not m:
+            print("(not found)")
+            return
+        for k in ("uid", "hotkey", "model", "revision", "is_valid",
+                  "challenge_status", "first_block", "block_number",
+                  "invalid_reason", "model_hash"):
+            if k in m and m[k] is not None:
+                print(f"  {k:<18} = {m[k]}")
+    finally:
+        await close_client()
+
+
+async def _cmd_list_system_miners() -> None:
+    await init_client()
+    try:
+        rows = await SystemConfigDAO().get_system_miners()
+        if not rows:
+            print("(empty)")
+            return
+        for uid_str, payload in sorted(rows.items(), key=lambda x: int(x[0])):
+            print(f"  UID {uid_str:<6} → {payload.get('model', '?')}")
+    finally:
+        await close_client()
+
+
+async def _cmd_set_miner(uid: int, model: str) -> None:
+    """Register a system miner (UID > 1000)."""
+    if uid <= 1000:
+        # Auto-shift small UIDs into the system range — matches the old
+        # behavior documented in the SystemConfigDAO.set_system_miner check.
+        uid = 1000 + uid
+        print(f"(auto-shifted UID into system range: {uid})")
+    await init_client()
+    try:
+        await SystemConfigDAO().set_system_miner(uid=uid, model=model, updated_by="cli")
+        print(f"✓ System miner UID={uid} set to model={model}")
+    finally:
+        await close_client()
+
+
+async def _cmd_delete_miner(uid: int) -> None:
+    if uid <= 1000:
+        uid = 1000 + uid
+    await init_client()
+    try:
+        deleted = await SystemConfigDAO().delete_system_miner(uid=uid, updated_by="cli")
+        print("✓ Deleted" if deleted else "(not found)")
+    finally:
+        await close_client()
+
+
+# --------------------------------------------------------------------------- #
+# Click wiring
+# --------------------------------------------------------------------------- #
 
 
 @click.group()
 def db():
-    """Database management commands."""
-    pass
+    """Database admin commands."""
 
 
-@db.command()
+@db.command("init")
 def init():
     """Initialize all DynamoDB tables."""
-    asyncio.run(cmd_init())
+    asyncio.run(_cmd_init())
 
 
 @db.command("list")
 def list_cmd():
     """List all tables."""
-    asyncio.run(cmd_list())
+    asyncio.run(_cmd_list())
 
 
-@db.command()
-def reset():
+@db.command("reset")
+@click.option("--yes", "force", is_flag=True, help="Skip confirmation")
+def reset(force):
     """Reset all tables (delete and recreate)."""
-    asyncio.run(cmd_reset())
+    asyncio.run(_cmd_reset(force))
 
 
 @db.command("reset-table")
-@click.option("--table", required=True, help="Table name to reset (e.g., task_queue, sample_results)")
-def reset_table(table):
-    """Reset a single table (delete and recreate)."""
-    asyncio.run(cmd_reset_table(table))
-
-
-@db.command()
-@click.option("--tail", type=int, default=100000, help="Number of blocks to look back")
-@click.option("--max-results", type=int, default=None, help="Maximum results to migrate")
-def migrate(tail, max_results):
-    """Migrate data from R2."""
-    asyncio.run(cmd_migrate(tail, max_results))
+@click.option("--table", required=True, help="Base table name (e.g. miners)")
+@click.option("--yes", "force", is_flag=True, help="Skip confirmation")
+def reset_table(table, force):
+    """Reset a single table."""
+    asyncio.run(_cmd_reset_table(table, force))
 
 
 @db.command("load-config")
 @click.option(
     "--json-file",
     default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_config.json"),
-    help="Path to JSON configuration file"
+    help="Path to JSON config file",
 )
 def load_config(json_file):
-    """Load system configuration from JSON file."""
-    asyncio.run(cmd_load_config(json_file))
+    """Upsert every top-level key into system_config."""
+    asyncio.run(_cmd_load_config(json_file))
+
+
+@db.command("get-config")
+def get_config():
+    """Print every system_config key."""
+    asyncio.run(_cmd_get_config())
+
+
+@db.command("set-champion")
+@click.option("--hotkey", required=True, help="Champion miner's hotkey")
+@click.option("--revision", required=True, help="Model revision hash")
+@click.option("--since-block", type=int, default=None,
+              help="Block to record as champion start (default: current block)")
+def set_champion(hotkey, revision, since_block):
+    """Set the initial champion before the first scorer run."""
+    asyncio.run(_cmd_set_champion(hotkey, revision, since_block))
 
 
 @db.group()
 def blacklist():
     """Manage miner blacklist."""
-    pass
 
 
 @blacklist.command("list")
 def blacklist_list():
-    """List all blacklisted hotkeys."""
-    asyncio.run(cmd_blacklist_list())
+    asyncio.run(_cmd_blacklist_list())
 
 
-@blacklist.command()
+@blacklist.command("add")
 @click.argument("hotkeys", nargs=-1, required=True)
-def add(hotkeys):
-    """Add hotkeys to blacklist."""
-    asyncio.run(cmd_blacklist_add(list(hotkeys)))
+def blacklist_add(hotkeys):
+    asyncio.run(_cmd_blacklist_add(list(hotkeys)))
 
 
-@blacklist.command()
+@blacklist.command("remove")
 @click.argument("hotkeys", nargs=-1, required=True)
-def remove(hotkeys):
-    """Remove hotkeys from blacklist."""
-    asyncio.run(cmd_blacklist_remove(list(hotkeys)))
+def blacklist_remove(hotkeys):
+    asyncio.run(_cmd_blacklist_remove(list(hotkeys)))
 
 
-@blacklist.command()
-def clear():
-    """Clear all hotkeys from blacklist."""
-    asyncio.run(cmd_blacklist_clear())
+@blacklist.command("clear")
+def blacklist_clear():
+    asyncio.run(_cmd_blacklist_clear())
 
 
 @db.command("set-burn")
 @click.argument("percentage", type=float)
 def set_burn(percentage):
     """Set validator burn percentage (0.0 to 1.0)."""
-    asyncio.run(cmd_set_burn_percentage(percentage))
+    asyncio.run(_cmd_set_burn(percentage))
 
 
 @db.command("get-burn")
 def get_burn():
-    """Get current validator burn percentage."""
-    asyncio.run(cmd_get_burn_percentage())
-
-
-@db.command("get-config")
-def get_config():
-    """Get and print current system configuration."""
-    asyncio.run(cmd_get_config())
-
-
-async def cmd_set_champion(hotkey: str, revision: str):
-    """Write or overwrite the champion record in system_config."""
-    from affine.database.dao.miner_stats import MinerStatsDAO
-    from affine.database.dao.miners import MinersDAO
-    from affine.utils.subtensor import get_subtensor
-
-    await init_client()
-    try:
-        miner_stats_dao = MinerStatsDAO()
-        miners_dao = MinersDAO()
-        config_dao = SystemConfigDAO()
-
-        # Look up UID from Miners table by hotkey
-        all_miners = await miners_dao.get_all_miners()
-        matched = [m for m in all_miners
-                   if m.get('hotkey') == hotkey and m.get('revision') == revision]
-        if matched:
-            uid = matched[0].get('uid')
-            model = matched[0].get('model', 'unknown')
-            print(f"Found miner:")
-            print(f"  Hotkey:   {hotkey}")
-            print(f"  Revision: {revision}")
-            print(f"  UID:      {uid}")
-            print(f"  Model:    {model}")
-        else:
-            # Fallback: look up by hotkey only
-            by_hk = [m for m in all_miners if m.get('hotkey') == hotkey]
-            if by_hk:
-                uid = by_hk[0].get('uid')
-                print(f"Warning: hotkey found but revision mismatch")
-                print(f"  Hotkey:       {hotkey}")
-                print(f"  DB revision:  {by_hk[0].get('revision', '?')}")
-                print(f"  Your revision: {revision}")
-                print(f"  UID:          {uid}")
-            else:
-                print(f"Error: hotkey {hotkey[:16]}... not found in Miners table")
-                return
-
-        # Show miner_stats if available
-        stats = await miner_stats_dao.get_miner_stats(hotkey, revision)
-        if stats:
-            elo = stats.get('elo_rating')
-            if elo:
-                print(f"  ELO:      {elo}")
-
-        # Show existing champion if any
-        existing = await config_dao.get_param_value('champion', default=None)
-        if existing:
-            print(f"\nCurrent champion in DB:")
-            print(f"  Hotkey:   {existing.get('hotkey', '?')}")
-            print(f"  Revision: {existing.get('revision', '?')}")
-            print(f"  UID:      {existing.get('uid', '?')}")
-            print(f"  Since:    block {existing.get('since_block', '?')}")
-        else:
-            print(f"\nNo existing champion in DB.")
-
-        # Fetch current block for since_block
-        print("\nFetching current block number...")
-        subtensor = await get_subtensor()
-        current_block = await subtensor.get_current_block()
-
-        print(f"\nWill set champion to:")
-        print(f"  Hotkey:      {hotkey}")
-        print(f"  Revision:    {revision}")
-        print(f"  UID:         {uid}")
-        print(f"  Since block: {current_block} (current)")
-
-        confirm = input("\nConfirm? [y/N] ").strip().lower()
-        if confirm != 'y':
-            print("Aborted.")
-            return
-
-        await config_dao.set_param(
-            param_name='champion',
-            param_value={
-                'hotkey': hotkey,
-                'revision': revision,
-                'uid': uid,
-                'since_block': current_block,
-            },
-            param_type='dict',
-            updated_by='cli:set-champion',
-        )
-        print(f"Champion set successfully (UID {uid}, since block {current_block}).")
-
-    finally:
-        await close_client()
-
-
-@db.command("set-champion")
-@click.option("--hotkey", required=True, help="Champion miner's hotkey")
-@click.option("--revision", required=True, help="Champion model revision hash")
-def set_champion(hotkey, revision):
-    """Set the initial champion before the first scorer run.
-
-    UID is automatically looked up from the Miners table by hotkey.
-    since_block is set to the current chain block.
-
-    Requires interactive confirmation.
-
-    Example:
-        af db set-champion --hotkey 5FnfLT3n... --revision 925409eacac8...
-    """
-    asyncio.run(cmd_set_champion(hotkey, revision))
+    asyncio.run(_cmd_get_burn())
 
 
 @db.command("delete-samples-by-range")
-@click.option("--hotkey", default=None, help="Miner's hotkey (optional, if not provided will delete for all miners)")
-@click.option("--revision", default=None, help="Model revision hash (optional, if not provided will delete for all revisions)")
-@click.option("--env", required=True, help="Environment name (e.g., agentgym:alfworld)")
-@click.option("--start-task-id", required=True, type=int, help="Start task_id (inclusive)")
-@click.option("--end-task-id", required=True, type=int, help="End task_id (exclusive)")
-def delete_samples_by_range(hotkey, revision, env, start_task_id, end_task_id):
-    """Delete samples within a task_id range for a specific miner and environment.
-    
-    If --hotkey and --revision are provided, deletes samples for that specific miner.
-    If they are omitted, deletes all samples in the environment and range across all miners.
-    
-    Examples:
-        # Delete for specific miner
-        af db delete-samples-by-range --hotkey 5C5... --revision abc123 --env agentgym:alfworld --start-task-id 0 --end-task-id 100
-        
-        # Delete for all miners in environment
-        af db delete-samples-by-range --env agentgym:alfworld --start-task-id 0 --end-task-id 100
-    """
-    # Validate that both hotkey and revision are provided together or both omitted
-    if (hotkey is None) != (revision is None):
-        print("Error: --hotkey and --revision must be provided together or both omitted")
-        sys.exit(1)
-    
-    asyncio.run(cmd_delete_samples_by_range(hotkey, revision, env, start_task_id, end_task_id))
-
-
-@db.command("delete-samples-empty-conversation")
-def delete_samples_empty_conversation():
-    """Delete all samples with empty conversation across the entire database.
-    
-    This command will scan the entire sample_results table and delete any samples
-    where the conversation field is empty or null. Progress will be logged during execution.
-    
-    Example:
-        af db delete-samples-empty-conversation
-    """
-    asyncio.run(cmd_delete_samples_empty_conversation())
-
-
-@db.command("cleanup-inactive-miners")
-@click.option('--days', default=30, help='Inactive days threshold')
-def cleanup_inactive_miners(days: int):
-    """Cleanup long-inactive miners from miner_stats table.
-    
-    Finds miners that haven't been updated for the specified number of days
-    and have never had any weight (best_weight == 0), then prompts for deletion.
-    
-    Examples:
-        af db cleanup-inactive-miners --days 30
-        af db cleanup-inactive-miners --days 90
-    """
-    asyncio.run(cmd_cleanup_inactive_miners(days))
-
-
-@db.command("update-miners")
-def update_miners():
-    """Initialize miner_stats table from existing sample_results data.
-    
-    Scans sample_results table and creates miner_stats records for all
-    unique (hotkey, revision) combinations found. Skips existing records.
-    
-    This is useful for:
-    - Initial setup after adding miner_stats table
-    - Backfilling historical miner metadata
-    
-    Example:
-        af db update-miners
-    """
-    asyncio.run(cmd_update_miners())
-
-
-async def cmd_get_stats():
-    """Get total sampling statistics for each environment.
-    
-    Aggregates sampling statistics across all miners for each environment.
-    """
-    print("Fetching environment sampling statistics...\n")
-    await init_client()
-    
-    try:
-        from affine.database.dao.miner_stats import MinerStatsDAO
-        
-        dao = MinerStatsDAO()
-        all_miners = await dao.get_all_historical_miners()
-        
-        # Aggregate stats by environment
-        env_aggregates = {}
-        
-        for miner in all_miners:
-            env_stats = miner.get('env_stats', {})
-            
-            for env, stats in env_stats.items():
-                if env not in env_aggregates:
-                    env_aggregates[env] = {
-                        'last_15min': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
-                        'last_1hour': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
-                        'last_6hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
-                        'last_24hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0}
-                    }
-                
-                for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
-                    if window in stats:
-                        wstats = stats[window]
-                        env_aggregates[env][window]['samples'] += wstats.get('samples', 0)
-                        env_aggregates[env][window]['success'] += wstats.get('success', 0)
-                        env_aggregates[env][window]['rate_limit_errors'] += wstats.get('rate_limit_errors', 0)
-                        env_aggregates[env][window]['timeout_errors'] += wstats.get('timeout_errors', 0)
-                        env_aggregates[env][window]['unavailable_errors'] += wstats.get('unavailable_errors', 0)
-                        env_aggregates[env][window]['other_errors'] += wstats.get('other_errors', 0)
-        
-        # Print results
-        if not env_aggregates:
-            print("No sampling statistics found.")
-            return
-        
-        # Calculate global totals
-        global_totals = {
-            'last_15min': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
-            'last_1hour': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
-            'last_6hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0},
-            'last_24hours': {'samples': 0, 'success': 0, 'rate_limit_errors': 0, 'timeout_errors': 0, 'unavailable_errors': 0, 'other_errors': 0}
-        }
-        
-        for env_stats in env_aggregates.values():
-            for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
-                global_totals[window]['samples'] += env_stats[window]['samples']
-                global_totals[window]['success'] += env_stats[window]['success']
-                global_totals[window]['rate_limit_errors'] += env_stats[window]['rate_limit_errors']
-                global_totals[window]['timeout_errors'] += env_stats[window]['timeout_errors']
-                global_totals[window]['unavailable_errors'] += env_stats[window]['unavailable_errors']
-                global_totals[window]['other_errors'] += env_stats[window]['other_errors']
-        
-        # Print global totals first
-        print("="*80)
-        print("GLOBAL SAMPLING STATISTICS (ALL ENVIRONMENTS)")
-        print("="*80)
-        
-        window_minutes = {
-            'last_15min': 15,
-            'last_1hour': 60,
-            'last_6hours': 360,
-            'last_24hours': 1440
-        }
-        
-        for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
-            wstats = global_totals[window]
-            samples = wstats['samples']
-            success = wstats['success']
-            success_rate = (success / samples * 100) if samples > 0 else 0
-            samples_per_min = samples / window_minutes[window] if samples > 0 else 0
-            
-            print(f"\n{window}:")
-            print(f"  Total samples: {samples}")
-            print(f"  Success: {success} ({success_rate:.1f}%)")
-            print(f"  Rate limit errors: {wstats['rate_limit_errors']}")
-            print(f"  Timeout errors: {wstats['timeout_errors']}")
-            print(f"  Unavailable errors: {wstats.get('unavailable_errors', 0)}")
-            print(f"  Other errors: {wstats['other_errors']}")
-            print(f"  Samples/min: {samples_per_min:.2f}")
-        
-        # Print per-environment statistics
-        print("\n" + "="*80)
-        print("PER-ENVIRONMENT SAMPLING STATISTICS")
-        print("="*80)
-        
-        for env in sorted(env_aggregates.keys()):
-            print(f"\n{env}:")
-            print("-"*80)
-            
-            for window in ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']:
-                wstats = env_aggregates[env][window]
-                samples = wstats['samples']
-                success = wstats['success']
-                success_rate = (success / samples * 100) if samples > 0 else 0
-                samples_per_min = samples / window_minutes[window] if samples > 0 else 0
-                
-                print(f"\n  {window}:")
-                print(f"    Total samples: {samples}")
-                print(f"    Success: {success} ({success_rate:.1f}%)")
-                print(f"    Rate limit errors: {wstats['rate_limit_errors']}")
-                print(f"    Timeout errors: {wstats['timeout_errors']}")
-                print(f"    Unavailable errors: {wstats.get('unavailable_errors', 0)}")
-                print(f"    Other errors: {wstats['other_errors']}")
-                print(f"    Samples/min: {samples_per_min:.2f}")
-        
-        print("\n" + "="*80)
-    
-    finally:
-        await close_client()
-
-
-@db.command("get-stats")
-def get_stats():
-    """Get total sampling statistics for each environment.
-    
-    Aggregates and displays sampling statistics across all miners,
-    grouped by environment. Shows statistics for different time windows
-    (15min, 1hour, 6hours, 24hours).
-    
-    Example:
-        af db get-stats
-    """
-    asyncio.run(cmd_get_stats())
-
-
-async def cmd_get_pool():
-    """Get task pool statistics: task count per miner per environment.
-    
-    Shows how many tasks each miner has in the sampling pool for each environment,
-    including pending and assigned tasks, plus sampling statistics and missing tasks.
-    Only displays environments where enabled_for_sampling=True.
-    """
-    print("Fetching task pool statistics...\n")
-    await init_client()
-    
-    try:
-        from affine.database.dao.miner_stats import MinerStatsDAO
-        from affine.database.dao.sample_results import SampleResultsDAO
-        
-        task_dao = TaskPoolDAO()
-        miners_dao = MinersDAO()
-        miner_stats_dao = MinerStatsDAO()
-        config_dao = SystemConfigDAO()
-        sample_dao = SampleResultsDAO()
-        
-        # Get only valid miners for hotkey lookup
-        all_miners = await miners_dao.get_valid_miners()
-        uid_by_hotkey = {m['hotkey']: m['uid'] for m in all_miners}
-        
-        # Get all miner stats for sampling statistics
-        all_miner_stats = await miner_stats_dao.get_all_historical_miners()
-        # For global view: use sampling_stats (global aggregated)
-        # For per-env view: use env_stats (per-environment breakdown)
-        # Filter out records missing required keys
-        valid_miner_stats = [m for m in all_miner_stats if 'hotkey' in m and 'revision' in m]
-        global_stats_by_miner = {
-            (m['hotkey'], m['revision']): m.get('sampling_stats', {})
-            for m in valid_miner_stats
-        }
-        env_stats_by_miner = {
-            (m['hotkey'], m['revision']): m.get('env_stats', {})
-            for m in valid_miner_stats
-        }
-        # Get slots for each miner. Leave missing as None so the display
-        # shows "-" rather than a fake number, making it obvious which
-        # miners have no stats record (likely chute hot per Chutes API
-        # but not actually serving).
-        slots_by_miner = {
-            (m['hotkey'], m['revision']): m.get('sampling_slots')
-            for m in valid_miner_stats
-        }
-        
-        # Get enabled environments from system config
-        environments = await config_dao.get_param_value('environments', default={})
-        active_envs = sorted([
-            env_name for env_name, env_config in environments.items()
-            if env_config.get('enabled_for_sampling', False)
-        ])
-        
-        if not active_envs:
-            print("No environments configured.")
-            return
-        
-        # Build miner list from valid miners only (no historical miners)
-        # Each valid miner has: uid, hotkey, revision from miners table
-        all_miners_keys = set()
-        for m in all_miners:
-            hotkey = m['hotkey']
-            revision = m['revision']
-            all_miners_keys.add((hotkey, revision))
-        
-        # Aggregate statistics across all environments
-        global_stats = {
-            'pending': {},  # {(hotkey, revision): count}
-            'assigned': {},
-            'missing': {}  # {(hotkey, revision): count}
-        }
-        
-        env_stats = {}  # {env: {status: {(hotkey, revision): count}}}
-        env_missing_stats = {}  # {env: {(hotkey, revision): count}}
-        
-        for env in active_envs:
-            env_stats[env] = {}
-            env_missing_stats[env] = {}
-            
-            # Get sampling_list for this environment
-            env_config = environments.get(env, {})
-            sampling_config = env_config.get('sampling_config', {})
-            sampling_list = set(sampling_config.get('sampling_list', []))
-            
-            for status in ['pending', 'assigned']:
-                counts = await task_dao.get_miner_task_counts(env, status)
-                env_stats[env][status] = counts
-                
-                # Aggregate to global
-                for miner_key, count in counts.items():
-                    parts = miner_key.split('#')
-                    if len(parts) >= 2:
-                        hotkey, revision = parts[0], parts[1]
-                        key = (hotkey, revision)
-                        global_stats[status][key] = global_stats[status].get(key, 0) + count
-            
-            # Calculate missing tasks for each miner in this environment
-            # Use all valid miners (not just those with tasks in pool)
-            all_miner_keys_in_env = set()
-            for hotkey, revision in all_miners_keys:
-                all_miner_keys_in_env.add(f"{hotkey}#{revision}")
-            
-            # Prepare concurrent tasks for all miners
-            async def process_miner_missing_tasks(miner_key: str):
-                """Process missing tasks calculation for a single miner."""
-                parts = miner_key.split('#')
-                if len(parts) < 2:
-                    return None
-                
-                hotkey, revision = parts[0], parts[1]
-                
-                # Get completed task IDs and pool task IDs concurrently
-                completed_taskids, pool_taskids = await asyncio.gather(
-                    sample_dao.get_completed_task_ids(hotkey, revision, env),
-                    task_dao.get_pending_task_ids_for_miner(hotkey, revision, env)
-                )
-                
-                # Calculate missing tasks
-                missing_taskids = sampling_list - completed_taskids - pool_taskids
-                missing_count = len(missing_taskids)
-                
-                return miner_key, hotkey, revision, missing_count
-            
-            # Execute all miner processing concurrently
-            results = await asyncio.gather(
-                *[process_miner_missing_tasks(miner_key) for miner_key in all_miner_keys_in_env]
-            )
-            
-            # Aggregate results
-            for result in results:
-                if result is not None:
-                    miner_key, hotkey, revision, missing_count = result
-                    
-                    # Store in env-specific stats
-                    env_missing_stats[env][miner_key] = missing_count
-                    
-                    # Aggregate to global
-                    key = (hotkey, revision)
-                    global_stats['missing'][key] = global_stats['missing'].get(key, 0) + missing_count
-        
-        # Print global summary with sampling stats
-        print("=" * 200)
-        print("GLOBAL TASK POOL SUMMARY")
-        print("=" * 200)
-        
-        if not all_miners_keys:
-            print("No miners found.")
-        else:
-            # Sort by total tasks descending
-            miner_totals = []
-            for hotkey, revision in all_miners_keys:
-                pending = global_stats['pending'].get((hotkey, revision), 0)
-                assigned = global_stats['assigned'].get((hotkey, revision), 0)
-                missing = global_stats['missing'].get((hotkey, revision), 0)
-                total = pending + assigned
-                uid = uid_by_hotkey.get(hotkey, '?')
-
-                # Get global sampling stats
-                sampling_stats = global_stats_by_miner.get((hotkey, revision), {})
-                stats_15m = sampling_stats.get('last_15min', {})
-                stats_1h = sampling_stats.get('last_1hour', {})
-                stats_6h = sampling_stats.get('last_6hours', {})
-                stats_24h = sampling_stats.get('last_24hours', {})
-
-                # Get slots
-                slots = slots_by_miner.get((hotkey, revision))
-
-                miner_totals.append((
-                    uid, hotkey, revision, pending, assigned, missing, total,
-                    stats_15m, stats_1h, stats_6h, stats_24h, slots
-                ))
-            
-            # Sort by (UID, hotkey, revision) to ensure unique ordering
-            # Use (hotkey, revision) as primary sort key since it's the unique identifier
-            miner_totals.sort(key=lambda x: (
-                int(x[0]) if str(x[0]).isdigit() else 99999,  # UID (numeric)
-                x[1],  # hotkey
-                x[2]   # revision
-            ))
-            
-            # Print header
-            print(
-                f"\n{'UID':<5} {'Hotkey':<19} {'Rev':<11} "
-                f"{'Pend':<6} {'Assg':<6} {'Miss':<6} "
-                f"{'Slots':<6} "
-                f"{'15m':<12} {'1h':<12} {'6h':<12} {'24h':<12}"
-            )
-            print("-" * 200)
-
-            total_pending = sum(global_stats['pending'].values())
-            total_assigned = sum(global_stats['assigned'].values())
-            total_missing = sum(global_stats['missing'].values())
-
-            for uid, hotkey, revision, pending, assigned, missing, total, s15m, s1h, s6h, s24h, slots in miner_totals:
-                # Format sampling stats as "samples/succ"
-                def format_stats(stats):
-                    if not stats or stats.get('samples', 0) == 0:
-                        return '-'
-                    samples = stats.get('samples', 0)
-                    success = stats.get('success', 0)
-                    return f"{samples}/{success}"
-
-                print(
-                    f"{str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
-                    f"{pending:<6} {assigned:<6} {missing:<6} "
-                    f"{(slots if slots is not None else '-'):<6} "
-                    f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
-                    f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
-                )
-
-            print("-" * 200)
-            print(
-                f"{'TOTAL':<5} {'':<18} {'':<10} "
-                f"{total_pending:<6} {total_assigned:<6} {total_missing:<6}"
-            )
-        
-        # Print per-environment breakdown
-        print("\n" + "=" * 200)
-        print("PER-ENVIRONMENT TASK POOL BREAKDOWN")
-        print("=" * 200)
-        
-        for env in active_envs:
-            print(f"\n{env}:")
-            print("-" * 200)
-            
-            # Use ALL valid miners for consistency (not just those with tasks in this env)
-            # Aggregate counts for this environment
-            env_totals = []
-            for hotkey, revision in all_miners_keys:
-                miner_key = f"{hotkey}#{revision}"
-                pending = env_stats[env]['pending'].get(miner_key, 0)
-                assigned = env_stats[env]['assigned'].get(miner_key, 0)
-                missing = env_missing_stats[env].get(miner_key, 0)
-                total = pending + assigned
-                uid = uid_by_hotkey.get(hotkey, '?')
-
-                # Get sampling stats for this specific environment
-                miner_env_stats = env_stats_by_miner.get((hotkey, revision), {})
-                env_specific_stats = miner_env_stats.get(env, {})
-                stats_15m = env_specific_stats.get('last_15min', {})
-                stats_1h = env_specific_stats.get('last_1hour', {})
-                stats_6h = env_specific_stats.get('last_6hours', {})
-                stats_24h = env_specific_stats.get('last_24hours', {})
-
-                # Get slots
-                slots = slots_by_miner.get((hotkey, revision))
-
-                env_totals.append((
-                    uid, hotkey, revision, pending, assigned, missing, total,
-                    stats_15m, stats_1h, stats_6h, stats_24h, slots
-                ))
-
-            # Sort by (UID, hotkey, revision) to ensure unique ordering
-            env_totals.sort(key=lambda x: (
-                int(x[0]) if str(x[0]).isdigit() else 99999,  # UID (numeric)
-                x[1],  # hotkey
-                x[2]   # revision
-            ))
-
-            print(
-                f"  {'UID':<5} {'Hotkey':<19} {'Rev':<11} "
-                f"{'Pend':<6} {'Assg':<6} {'Miss':<6} "
-                f"{'Slots':<6} "
-                f"{'15m':<12} {'1h':<12} {'6h':<12} {'24h':<12}"
-            )
-            print("  " + "-" * 196)
-
-            env_total_pending = sum(env_stats[env]['pending'].values())
-            env_total_assigned = sum(env_stats[env]['assigned'].values())
-            env_total_missing = sum(env_missing_stats[env].values())
-
-            for uid, hotkey, revision, pending, assigned, missing, total, s15m, s1h, s6h, s24h, slots in env_totals:
-                # Format sampling stats as "samples/succ"
-                def format_stats(stats):
-                    if not stats or stats.get('samples', 0) == 0:
-                        return '-'
-                    samples = stats.get('samples', 0)
-                    success = stats.get('success', 0)
-                    return f"{samples}/{success}"
-
-                print(
-                    f"  {str(uid):<5} {hotkey[:16]+'...':<18} {revision[:8]+'...':<10} "
-                    f"{pending:<6} {assigned:<6} {missing:<6} "
-                    f"{(slots if slots is not None else '-'):<6} "
-                    f"{format_stats(s15m):<12} {format_stats(s1h):<12} "
-                    f"{format_stats(s6h):<12} {format_stats(s24h):<12}"
-                )
-
-            print("  " + "-" * 196)
-            print(
-                f"  {'TOTAL':<5} {'':<18} {'':<10} "
-                f"{env_total_pending:<6} {env_total_assigned:<6} {env_total_missing:<6}"
-            )
-        
-        print("\n" + "=" * 206)
-    
-    finally:
-        await close_client()
-
-
-@db.command("get-pools")
-def get_pools():
-    """Get task pool statistics per miner per environment.
-
-    Shows the number of tasks each miner has in the sampling pool,
-    broken down by environment and status (pending/assigned).
-
-    Example:
-        af db get-pools
-    """
-    asyncio.run(cmd_get_pool())
-
-
-async def cmd_get_pool_by_uid(uid: int, env: Optional[str], full: bool):
-    """Get task pool status for a specific miner.
-
-    Shows sampled, pool, and missing task IDs for the miner.
-    If env is not specified, shows all environments.
-    """
-    print(f"Fetching task pool for UID={uid}...\n")
-    await init_client()
-
-    try:
-        from affine.core.sampling_list import get_task_id_set_from_config
-
-        miners_dao = MinersDAO()
-        task_pool_dao = TaskPoolDAO()
-        sample_dao = SampleResultsDAO()
-        config_dao = SystemConfigDAO()
-
-        # Get miner info by UID
-        miner = await miners_dao.get_miner_by_uid(uid)
-        if not miner:
-            print(f"Error: Miner not found for UID={uid}")
-            return
-
-        hotkey = miner['hotkey']
-        model_revision = miner['revision']
-        model = miner.get('model', 'N/A')
-
-        print(f"Miner: UID={uid}, Hotkey={hotkey[:16]}..., Revision={model_revision[:8]}...")
-        print(f"Model: {model}\n")
-
-        # Get environments
-        environments = await config_dao.get_param_value('environments', default={})
-
-        # Filter environments if specified
-        if env:
-            # Resolve shorthand
-            if env not in environments and ':' not in env:
-                matching_envs = [e for e in environments.keys() if e.endswith(f':{env}')]
-                if len(matching_envs) == 1:
-                    env = matching_envs[0]
-                elif len(matching_envs) > 1:
-                    print(f"Error: Ambiguous environment name: {env}. Matches: {', '.join(matching_envs)}")
-                    return
-                else:
-                    print(f"Error: Environment not found: {env}. Available: {', '.join(environments.keys())}")
-                    return
-            elif env not in environments:
-                print(f"Error: Environment not found: {env}. Available: {', '.join(environments.keys())}")
-                return
-            target_envs = {env: environments[env]}
-        else:
-            # Only show environments enabled for sampling
-            target_envs = {
-                e: c for e, c in environments.items()
-                if c.get('enabled_for_sampling', False)
-            }
-
-        if not target_envs:
-            print("No environments enabled for sampling.")
-            return
-
-        # Process each environment
-        for env_name, env_config in sorted(target_envs.items()):
-            print("=" * 80)
-            print(f"Environment: {env_name}")
-            print("=" * 80)
-
-            # Get all task IDs from sampling config
-            all_task_ids = get_task_id_set_from_config(env_config)
-
-            # Get sampling config info
-            sampling_config = env_config.get('sampling_config', {})
-            sampling_list = sampling_config.get('sampling_list', [])
-
-            # Get already sampled task_ids
-            sampled_task_ids = await sample_dao.get_completed_task_ids(
-                miner_hotkey=hotkey,
-                model_revision=model_revision,
-                env=env_name
-            )
-
-            # Get tasks in the task pool
-            tasks = await task_pool_dao.get_tasks_by_miner(
-                miner_hotkey=hotkey,
-                model_revision=model_revision,
-                env=env_name
-            )
-
-            # Separate by status
-            pending_task_ids = {t['task_id'] for t in tasks if t.get('status') == 'pending'}
-            assigned_task_ids = {t['task_id'] for t in tasks if t.get('status') == 'assigned'}
-            pool_task_ids = pending_task_ids | assigned_task_ids
-
-            # Calculate missing task_ids
-            missing_task_ids = all_task_ids - sampled_task_ids - pool_task_ids
-
-            # Print summary
-            print(f"\nSampling list size: {len(sampling_list)}")
-            print(f"Total tasks in range: {len(all_task_ids)}")
-            print(f"\nStatus:")
-            print(f"  Sampled:  {len(sampled_task_ids):>6}")
-            print(f"  Pending:  {len(pending_task_ids):>6}")
-            print(f"  Assigned: {len(assigned_task_ids):>6}")
-            print(f"  Missing:  {len(missing_task_ids):>6}")
-
-            # Print task IDs if --full or small count
-            def print_task_ids(label: str, task_ids: set, threshold: int = 20):
-                if not task_ids:
-                    return
-                sorted_ids = sorted(task_ids)
-                if full or len(sorted_ids) <= threshold:
-                    print(f"\n{label}: {sorted_ids}")
-                else:
-                    preview = sorted_ids[:10] + ['...'] + sorted_ids[-5:]
-                    print(f"\n{label}: {preview}")
-
-            print_task_ids("Sampled task_ids", sampled_task_ids)
-            print_task_ids("Pending task_ids", pending_task_ids)
-            print_task_ids("Assigned task_ids", assigned_task_ids)
-            print_task_ids("Missing task_ids", missing_task_ids)
-
-            print()
-
-    finally:
-        await close_client()
-
-
-@db.command("get-pool")
-@click.argument("uid", type=UID)
-@click.argument("env", type=str, required=False, default=None)
-@click.option("--full", is_flag=True, help="Print full task_ids lists without truncation")
-def get_pool_by_uid(uid: int, env: Optional[str], full: bool):
-    """Get task pool status for a specific miner by UID.
-
-    Shows sampled, pending, assigned, and missing task IDs
-    for the specified miner. If ENV is not specified, shows all
-    environments enabled for sampling.
-
-    System miners use UIDs > 1000 (e.g., 1001, 1002).
-
-    Examples:
-        af db get-pool 42
-        af db get-pool 1001
-        af db get-pool 1001 agentgym:webshop
-        af db get-pool 100 webshop --full
-    """
-    asyncio.run(cmd_get_pool_by_uid(uid, env, full))
-
-
-async def cmd_get_miner(hotkey: str, revision: Optional[str]):
-    """Get detailed performance data for a specific miner.
-    
-    Shows all performance metrics including:
-    - Basic info (model, timestamps, rank, weight)
-    - Sampling slots and adjustment history
-    - Global sampling statistics (aggregated across all envs)
-    - Per-environment sampling statistics
-    
-    Args:
-        hotkey: Miner's hotkey (full or prefix)
-        revision: Model revision (optional, if not provided shows all revisions)
-    """
-    import json
-    import time
-    from datetime import datetime
-    
-    print(f"Fetching miner stats for hotkey={hotkey}...\n")
-    await init_client()
-    
-    try:
-        from affine.database.dao.miner_stats import MinerStatsDAO
-        from affine.database.dao.miners import MinersDAO
-        
-        miner_stats_dao = MinerStatsDAO()
-        miners_dao = MinersDAO()
-        
-        # Get all miner stats
-        all_stats = await miner_stats_dao.get_all_historical_miners()
-        
-        # Filter by hotkey (support prefix matching)
-        matching_stats = [
-            s for s in all_stats
-            if s['hotkey'].startswith(hotkey) or hotkey in s['hotkey']
-        ]
-        
-        if not matching_stats:
-            print(f"No miner found with hotkey matching '{hotkey}'")
-            return
-        
-        # Further filter by revision if provided
-        if revision:
-            matching_stats = [
-                s for s in matching_stats
-                if s['revision'].startswith(revision) or revision in s['revision']
-            ]
-            
-            if not matching_stats:
-                print(f"No miner found with revision matching '{revision}'")
-                return
-        
-        # Pull every miner row, not just is_valid='true' — otherwise an
-        # invalidated miner (anticopy cheat, model_mismatch, etc.) shows
-        # up as 'offline' here even though it has a record we want to
-        # surface, with the invalid_reason that explains why sampling
-        # stopped.
-        all_miners = await miners_dao.get_all_miners()
-        miners_by_hotkey = {m['hotkey']: m for m in all_miners}
-
-        # Print each matching miner
-        for i, stats in enumerate(matching_stats, 1):
-            if i > 1:
-                print("\n" + "=" * 120 + "\n")
-
-            hotkey_val = stats['hotkey']
-            revision_val = stats['revision']
-
-            # Get miner info from miners table (has accurate model for system miners)
-            miner_record = miners_by_hotkey.get(hotkey_val, {})
-            uid = miner_record.get('uid', 'offline')
-            # Prefer model from miners table, fallback to miner_stats
-            model = miner_record.get('model') or stats.get('model', 'N/A')
-
-            print("=" * 120)
-            print(f"MINER #{i}: {hotkey_val}")
-            print("=" * 120)
-
-            # Effective status: is_valid (validator-side admissibility)
-            # gates *whether sampling is happening at all* via
-            # get_valid_miners(). challenge_status (sampling/terminated)
-            # only reflects challenge-game outcome. So a miner can read
-            # challenge_status='sampling' while is_valid='false' and
-            # actually have zero tasks generated — that's the case for
-            # anticopy cheat and other miners-monitor invalidations.
-            # Surface both, plus an EFFECTIVE label that makes the
-            # combined state obvious without having to cross-reference.
-            is_valid_str = miner_record.get('is_valid')
-            is_valid = str(is_valid_str or '').lower() == 'true'
-            invalid_reason = miner_record.get('invalid_reason') or ''
-            chal_status = stats.get('challenge_status', 'sampling')
-            term_reason = stats.get('termination_reason') or ''
-
-            if not miner_record:
-                effective = 'OFFLINE (not in miners table)'
-            elif not is_valid:
-                effective = f'TERMINATED (invalid: {invalid_reason or "no reason recorded"})'
-            elif chal_status == 'terminated':
-                effective = f'TERMINATED (challenge: {term_reason or "no reason recorded"})'
-            else:
-                effective = 'SAMPLING'
-
-            print("\n[STATUS]")
-            print(f"  Effective:        {effective}")
-            print(f"  Validator:        is_valid={is_valid_str if is_valid_str is not None else '-'}"
-                  + (f"  reason={invalid_reason}" if invalid_reason else ""))
-            print(f"  Challenge:        challenge_status={chal_status}"
-                  + (f"  reason={term_reason}" if term_reason else ""))
-            wins = stats.get('challenge_consecutive_wins', 0)
-            tot_wins = stats.get('challenge_total_wins', 0)
-            tot_losses = stats.get('challenge_total_losses', 0)
-            con_losses = stats.get('challenge_consecutive_losses', 0)
-            cp = stats.get('challenge_checkpoints_passed', 0)
-            print(f"                    consecutive_wins={wins}  total_wins={tot_wins}  "
-                  f"total_losses={tot_losses}  consecutive_losses={con_losses}  "
-                  f"checkpoints_passed={cp}")
-
-            # Basic Info
-            print("\n[BASIC INFO]")
-            print(f"  UID: {uid}")
-            print(f"  Hotkey: {hotkey_val}")
-            print(f"  Revision: {revision_val}")
-            print(f"  Model: {model}")
-            
-            first_seen = stats.get('first_seen_at', 0)
-            last_updated = stats.get('last_updated_at', 0)
-            if first_seen > 0:
-                first_seen_dt = datetime.fromtimestamp(first_seen)
-                print(f"  First seen: {first_seen_dt.strftime('%Y-%m-%d %H:%M:%S')} ({first_seen})")
-            else:
-                print(f"  First seen: N/A")
-            
-            if last_updated > 0:
-                last_updated_dt = datetime.fromtimestamp(last_updated)
-                elapsed = int(time.time()) - last_updated
-                print(f"  Last updated: {last_updated_dt.strftime('%Y-%m-%d %H:%M:%S')} ({elapsed}s ago)")
-            else:
-                print(f"  Last updated: N/A")
-            
-            print(f"  Best rank: {stats.get('best_rank', 'N/A')}")
-            print(f"  Best weight: {stats.get('best_weight', 0.0):.6f}")
-            print(f"  Currently online: {stats.get('is_currently_online', False)}")
-            
-            # Slots Info
-            print("\n[SAMPLING SLOTS]")
-            slots = stats.get('sampling_slots')
-            slots_last_adjusted = stats.get('slots_last_adjusted_at', 0)
-            print(f"  Current slots: {slots if slots is not None else '-'}")
-            
-            if slots_last_adjusted > 0:
-                adjusted_dt = datetime.fromtimestamp(slots_last_adjusted)
-                elapsed = int(time.time()) - slots_last_adjusted
-                print(f"  Last adjusted: {adjusted_dt.strftime('%Y-%m-%d %H:%M:%S')} ({elapsed}s ago)")
-            else:
-                print(f"  Last adjusted: Never")
-            
-            # Global Sampling Stats
-            print("\n[GLOBAL SAMPLING STATISTICS]")
-            sampling_stats = stats.get('sampling_stats', {})
-            
-            if not sampling_stats:
-                print("  No global statistics available")
-            else:
-                windows = ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']
-                window_labels = {
-                    'last_15min': '15min',
-                    'last_1hour': '1hour',
-                    'last_6hours': '6hours',
-                    'last_24hours': '24hours'
-                }
-                
-                print(f"\n  {'Window':<10} {'Samples':<10} {'Success':<10} {'Rate':<10} {'Slots':<8} {'RateLimit':<12} {'Timeout':<10} {'Other':<10} {'Samp/min':<10}")
-                print("  " + "-" * 118)
-                
-                for window in windows:
-                    wstats = sampling_stats.get(window, {})
-                    if not wstats:
-                        continue
-                    
-                    samples = wstats.get('samples', 0)
-                    success = wstats.get('success', 0)
-                    success_rate = wstats.get('success_rate', 0.0)
-                    rate_limit = wstats.get('rate_limit_errors', 0)
-                    timeout = wstats.get('timeout_errors', 0)
-                    other = wstats.get('other_errors', 0)
-                    samp_per_min = wstats.get('samples_per_min', 0.0)
-                    
-                    # Show slots in 6hours row (used by adjuster)
-                    slots_display = str(slots) if window == 'last_6hours' else '-'
-                    
-                    print(
-                        f"  {window_labels[window]:<10} {samples:<10} {success:<10} "
-                        f"{success_rate:<10.2%} {slots_display:<8} {rate_limit:<12} {timeout:<10} {other:<10} {samp_per_min:<10.2f}"
-                    )
-            
-            # Per-Environment Stats
-            print("\n[PER-ENVIRONMENT STATISTICS]")
-            env_stats = stats.get('env_stats', {})
-            
-            if not env_stats:
-                print("  No per-environment statistics available")
-            else:
-                for env_name in sorted(env_stats.keys()):
-                    env_data = env_stats[env_name]
-                    print(f"\n  Environment: {env_name}")
-                    print("  " + "-" * 110)
-                    
-                    windows = ['last_15min', 'last_1hour', 'last_6hours', 'last_24hours']
-                    window_labels = {
-                        'last_15min': '15min',
-                        'last_1hour': '1hour',
-                        'last_6hours': '6hours',
-                        'last_24hours': '24hours'
-                    }
-                    
-                    print(f"    {'Window':<10} {'Samples':<10} {'Success':<10} {'Rate':<10} {'Slots':<8} {'RateLimit':<12} {'Timeout':<10} {'Other':<10} {'Samp/min':<10}")
-                    print("    " + "-" * 116)
-                    
-                    for window in windows:
-                        wstats = env_data.get(window, {})
-                        if not wstats:
-                            continue
-                        
-                        samples = wstats.get('samples', 0)
-                        success = wstats.get('success', 0)
-                        success_rate = wstats.get('success_rate', 0.0)
-                        rate_limit = wstats.get('rate_limit_errors', 0)
-                        timeout = wstats.get('timeout_errors', 0)
-                        other = wstats.get('other_errors', 0)
-                        samp_per_min = wstats.get('samples_per_min', 0.0)
-                        
-                        # Show slots in 6hours row (used by adjuster)
-                        slots_display = str(slots) if window == 'last_6hours' else '-'
-                        
-                        print(
-                            f"    {window_labels[window]:<10} {samples:<10} {success:<10} "
-                            f"{success_rate:<10.2%} {slots_display:<8} {rate_limit:<12} {timeout:<10} {other:<10} {samp_per_min:<10.2f}"
-                        )
-            
-            print("\n" + "=" * 120)
-        
-        print(f"\n✓ Found {len(matching_stats)} matching miner(s)")
-    
-    finally:
-        await close_client()
+@click.option("--hotkey", default=None)
+@click.option("--revision", default=None)
+@click.option("--env", required=True)
+@click.option("--start-task-id", required=True, type=int)
+@click.option("--end-task-id", required=True, type=int)
+@click.option("--yes", "force", is_flag=True)
+def delete_samples_by_range(hotkey, revision, env, start_task_id, end_task_id, force):
+    """Delete sample_results rows by env + task_id range."""
+    asyncio.run(_cmd_delete_samples_by_range(
+        hotkey, revision, env, start_task_id, end_task_id, force))
 
 
 @db.command("get-miner")
-@click.option("--hotkey", required=True, help="Miner's hotkey (full or prefix)")
-@click.option("--revision", default=None, help="Model revision (optional)")
-def get_miner(hotkey: str, revision: Optional[str]):
-    """Get detailed performance data for a specific miner.
-
-    Shows comprehensive statistics including sampling performance, slots,
-    and adjustment history for the specified miner.
-
-    Examples:
-        # Get stats for all revisions of a hotkey
-        af db get-miner --hotkey 5DJHkQEio6qSayH3
-
-        # Get stats for specific revision
-        af db get-miner --hotkey 5DJHkQEio6qSayH3 --revision 7b4a3a20
-    """
-    asyncio.run(cmd_get_miner(hotkey, revision))
-
-
-# System Miners Commands
-
-async def cmd_set_miner(uid: int, model: str):
-    """Set a system miner configuration."""
-    if uid <= 0:
-        print(f"Error: System miner UID must be positive (got {uid})")
-        sys.exit(1)
-
-    # Normalize UID: small numbers (1-1000) are treated as system miner number
-    # e.g., 3 -> 1003, 1003 -> 1003
-    if uid <= 1000:
-        uid = uid + 1000
-
-    print(f"Setting system miner: uid={uid}, model={model}")
-    print(f"  Hotkey/Revision: SYSTEM-{uid - 1000}")
-    await init_client()
-
-    try:
-        config_dao = SystemConfigDAO()
-        result = await config_dao.set_system_miner(uid, model, updated_by='cli_set_miner')
-
-        print(f"✓ System miner set successfully")
-        print(f"  UID: {uid}")
-        print(f"  Model: {model}")
-
-    finally:
-        await close_client()
-
-
-async def cmd_list_system_miners():
-    """List all system miners."""
-    print("Fetching system miners...\n")
-    await init_client()
-
-    try:
-        config_dao = SystemConfigDAO()
-        system_miners = await config_dao.get_system_miners()
-
-        if not system_miners:
-            print("No system miners configured")
-        else:
-            print(f"System miners ({len(system_miners)} total):")
-            print("-" * 60)
-            print(f"{'UID':<8} {'Model':<50}")
-            print("-" * 60)
-
-            # Sort by UID ascending
-            for uid_str in sorted(system_miners.keys(), key=lambda x: int(x)):
-                config = system_miners[uid_str]
-                model = config.get('model', 'N/A')
-                print(f"{uid_str:<8} {model:<50}")
-
-            print("-" * 60)
-
-    finally:
-        await close_client()
-
-
-async def cmd_set_slots(uid: int, slots: int):
-    """Set sampling slots for a miner by UID."""
-    import time
-
-    if slots < 1:
-        print(f"Error: slots must be >= 1 (got {slots})")
-        sys.exit(1)
-
-    await init_client()
-
-    try:
-        from affine.database.dao.miner_stats import MinerStatsDAO
-
-        miners_dao = MinersDAO()
-        miner = await miners_dao.get_miner_by_uid(uid)
-        if not miner:
-            print(f"Error: Miner not found for UID={uid}")
-            sys.exit(1)
-
-        hotkey = miner['hotkey']
-        revision = miner['revision']
-
-        miner_stats_dao = MinerStatsDAO()
-        success = await miner_stats_dao.update_sampling_slots(
-            hotkey=hotkey,
-            revision=revision,
-            slots=slots,
-            adjusted_at=int(time.time())
-        )
-
-        if success:
-            print(f"✓ Set sampling_slots={slots} for UID={uid} (hotkey={hotkey[:16]}..., rev={revision[:8]}...)")
-        else:
-            print(f"✗ Failed to update slots (miner_stats record may not exist for this hotkey/revision)")
-            sys.exit(1)
-
-    finally:
-        await close_client()
-
-
-async def cmd_delete_miner(uid: int):
-    """Delete a system miner."""
-    # Normalize UID: small numbers (1-1000) -> 1000+N
-    if 0 < uid <= 1000:
-        uid = uid + 1000
-
-    print(f"Deleting system miner: uid={uid}")
-    await init_client()
-
-    try:
-        config_dao = SystemConfigDAO()
-
-        # Check if exists
-        current = await config_dao.get_system_miners()
-        if str(uid) not in current:
-            print(f"Error: System miner with uid={uid} not found")
-            sys.exit(1)
-
-        result = await config_dao.delete_system_miner(uid, updated_by='cli_delete_miner')
-
-        if result:
-            print(f"✓ System miner uid={uid} deleted successfully")
-        else:
-            print(f"Error: Failed to delete system miner")
-            sys.exit(1)
-
-    finally:
-        await close_client()
-
-
-@db.command("set-miner")
-@click.option("--uid", required=True, type=int, help="System miner UID (e.g., 1001 or 1; small numbers auto-convert to 1000+N)")
-@click.option("--model", required=True, help="Model identifier (e.g., 'zai-org/GLM-4.7')")
-def set_miner(uid: int, model: str):
-    """Set a system miner configuration.
-
-    System miners are benchmark models (like GPT-4o, Claude) that participate
-    in scoring but don't receive actual rewards. Their weights are allocated
-    to UID 0 (validator) when setting chain weights.
-
-    UIDs > 1000 are system miners. Small numbers (1-1000) are auto-converted
-    to 1000+N (e.g., 3 -> 1003). Hotkey/revision = SYSTEM-N.
-
-    Examples:
-        af db set-miner --uid 1001 --model "zai-org/GLM-4.7"
-        af db set-miner --uid 3 --model "deepseek-ai/DeepSeek-V3.2"
-    """
-    asyncio.run(cmd_set_miner(uid, model))
+@click.option("--hotkey", default=None)
+@click.option("--uid", type=UID, default=None)
+def get_miner(hotkey, uid):
+    """Look up a miner by hotkey or UID."""
+    asyncio.run(_cmd_get_miner(hotkey, uid))
 
 
 @db.command("list-system-miners")
 def list_system_miners():
-    """List all configured system miners.
-
-    Shows all system miners with their UIDs and model identifiers.
-
-    Example:
-        af db list-system-miners
-    """
-    asyncio.run(cmd_list_system_miners())
+    """List configured system (benchmark) miners."""
+    asyncio.run(_cmd_list_system_miners())
 
 
-@db.command("set-slots")
-@click.argument("uid", type=UID)
-@click.argument("slots", type=int)
-def set_slots(uid: int, slots: int):
-    """Set sampling slots for a miner by UID.
-
-    System miners use UIDs > 1000 (e.g., 1001, 1002).
-
-    Examples:
-        af db set-slots 42 8
-        af db set-slots 1001 10
-    """
-    asyncio.run(cmd_set_slots(uid, slots))
+@db.command("set-miner")
+@click.option("--uid", type=int, required=True)
+@click.option("--model", required=True)
+def set_miner(uid, model):
+    """Register or update a system miner."""
+    asyncio.run(_cmd_set_miner(uid, model))
 
 
 @db.command("delete-miner")
-@click.option("--uid", required=True, type=int, help="System miner UID to delete")
-def delete_miner(uid: int):
-    """Delete a system miner configuration.
-
-    Removes the specified system miner from the configuration.
-    Small UIDs (1-1000) are auto-converted to 1000+N.
-
-    Example:
-        af db delete-miner --uid 1001
-    """
-    asyncio.run(cmd_delete_miner(uid))
+@click.option("--uid", type=int, required=True)
+def delete_miner(uid):
+    """Delete a system miner registration."""
+    asyncio.run(_cmd_delete_miner(uid))
 
 
-async def cmd_pareto(uids: list):
-    """Compare miners using Pareto dominance on intersecting environments.
-
-    Fetches scoring data from the API, builds MinerData via Stage 1,
-    then applies Pareto comparison logic on common tasks per environment.
-    """
-    from affine.utils.api_client import cli_api_client
-    from affine.src.scorer.config import ScorerConfig
-    from affine.src.scorer.stage1_collector import Stage1Collector
-    from affine.src.scorer.utils import calculate_required_score
-
-    config = ScorerConfig()
-
-    async with cli_api_client() as api_client:
-        # Fetch scoring data and environment config
-        print("Fetching scoring data from API...")
-        scoring_data = await api_client.get("/samples/scoring?range_type=scoring")
-        if isinstance(scoring_data, dict) and scoring_data.get("success") is False:
-            print(f"API error: {scoring_data.get('error', 'unknown')}")
-            sys.exit(1)
-
-        env_response = await api_client.get("/config/environments")
-        env_value = env_response.get("param_value", {}) if isinstance(env_response, dict) else {}
-        environments = [
-            name for name, cfg in env_value.items()
-            if isinstance(cfg, dict) and cfg.get("enabled_for_scoring", False)
-        ]
-        env_configs = {
-            name: cfg for name, cfg in env_value.items()
-            if isinstance(cfg, dict) and cfg.get("enabled_for_scoring", False)
-        }
-
-        if not environments:
-            print("No scoring environments found.")
-            sys.exit(1)
-
-        # Stage 1: collect miner data
-        collector = Stage1Collector(config)
-        stage1 = collector.collect(scoring_data, environments, env_configs)
-
-        # Resolve UIDs
-        miners = {}
-        for uid in uids:
-            if uid not in stage1.miners:
-                print(f"Error: UID {uid} not found in scoring data")
-                sys.exit(1)
-            miners[uid] = stage1.miners[uid]
-
-        miner_list = list(miners.values())
-
-        # Find intersecting valid environments
-        valid_envs_per_miner = [
-            {env for env, s in m.env_scores.items() if s.is_valid}
-            for m in miner_list
-        ]
-        common_envs = sorted(valid_envs_per_miner[0].intersection(*valid_envs_per_miner[1:]))
-
-        if not common_envs:
-            print("No common valid environments between the specified miners.")
-            return
-
-        # Print miner info header
-        print()
-        for m in miner_list:
-            print(f"UID {m.uid}: {m.model_repo}  (first_block={m.first_block})")
-        print()
-
-        # Sort by first_block for A/B ordering
-        sorted_miners = sorted(miner_list, key=lambda m: (m.first_block, m.uid))
-
-        # Pairwise comparison for all UID pairs
-        for i in range(len(sorted_miners)):
-            for j in range(i + 1, len(sorted_miners)):
-                miner_a = sorted_miners[i]
-                miner_b = sorted_miners[j]
-
-                print("=" * 90)
-                print(f"  A = UID {miner_a.uid} (first_block={miner_a.first_block})")
-                print(f"  B = UID {miner_b.uid} (first_block={miner_b.first_block})")
-                print(f"  Threshold rule: B must beat  score_A + gap  (gap from SE-based confidence interval)")
-                print("=" * 90)
-
-                # Table header
-                header = f"{'Environment':<28} {'Tasks':>5} {'Score_A':>8} {'Score_B':>8} {'Threshold':>10} {'Gap':>7} {'Winner':>6}"
-                print(header)
-                print("-" * len(header))
-
-                a_wins = 0
-                b_wins = 0
-
-                for env in common_envs:
-                    env_score_a = miner_a.env_scores[env]
-                    env_score_b = miner_b.env_scores[env]
-
-                    # Align on common tasks
-                    common_tasks = set(env_score_a.all_task_scores) & set(env_score_b.all_task_scores)
-                    if common_tasks:
-                        score_a = sum(env_score_a.all_task_scores[t] for t in common_tasks) / len(common_tasks)
-                        score_b = sum(env_score_b.all_task_scores[t] for t in common_tasks) / len(common_tasks)
-                        env_threshold_config = config.ENV_THRESHOLD_CONFIGS.get(env, {})
-                        threshold = calculate_required_score(
-                            score_a,
-                            len(common_tasks),
-                            env_threshold_config.get('z_score', config.Z_SCORE),
-                            env_threshold_config.get('min_improvement', config.MIN_IMPROVEMENT),
-                            env_threshold_config.get('max_improvement', config.MAX_IMPROVEMENT),
-                        )
-                    else:
-                        score_a = env_score_a.avg_score
-                        score_b = env_score_b.avg_score
-                        threshold = env_score_a.threshold
-                        common_tasks = set()
-
-                    gap = threshold - score_a
-                    b_beats = score_b > (threshold + 1e-9)
-                    winner = "B" if b_beats else "A"
-
-                    if b_beats:
-                        b_wins += 1
-                    else:
-                        a_wins += 1
-
-                    # Color-code: mark B wins with *
-                    mark = "*" if b_beats else " "
-                    print(
-                        f"{env:<28} {len(common_tasks):>5} "
-                        f"{score_a:>8.4f} {score_b:>8.4f} {threshold:>10.4f} "
-                        f"{gap:>+7.4f} {winner:>5}{mark}"
-                    )
-
-                print("-" * len(header))
-
-                # Dominance summary
-                total = len(common_envs)
-                if a_wins == total:
-                    result = f"UID {miner_a.uid} DOMINATES UID {miner_b.uid} (A wins all {total} envs)"
-                elif b_wins == total:
-                    result = f"UID {miner_b.uid} DOMINATES UID {miner_a.uid} (B wins all {total} envs)"
-                else:
-                    result = f"No dominance (A wins {a_wins}/{total}, B wins {b_wins}/{total})"
-
-                print(f"\nResult: {result}")
-                print()
+# --------------------------------------------------------------------------- #
+# inference_endpoints
+# --------------------------------------------------------------------------- #
 
 
-@db.command("pareto")
-@click.argument("uids", nargs=-1, required=True, type=UID)
-def pareto(uids):
-    """Compare miners using Pareto dominance on intersecting environments.
+async def _cmd_list_endpoints() -> None:
+    await init_client()
+    try:
+        from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+        for ep in await InferenceEndpointsDAO().list_all():
+            flag = "" if ep.active else "  (inactive)"
+            print(f"{ep.name:<24} kind={ep.kind}{flag}")
+            if ep.ssh_url:
+                print(f"  ssh_url             : {ep.ssh_url}")
+            if ep.public_inference_url:
+                print(f"  public_inference_url: {ep.public_inference_url}")
+            if ep.kind == "ssh":
+                print(f"  sglang              : port={ep.sglang_port} dp={ep.sglang_dp} image={ep.sglang_image}")
+                print(f"  cache_dir           : {ep.sglang_cache_dir}")
+            if ep.notes:
+                print(f"  notes               : {ep.notes}")
+    finally:
+        await close_client()
 
-    Shows per-environment aligned scores, thresholds, and dominance results
-    between the specified miners, following Stage 2 Pareto logic.
 
-    Examples:
-        af db pareto 42 100
-        af db pareto 5 10 20
-    """
-    if len(uids) < 2:
-        print("Error: At least 2 UIDs are required.")
-        sys.exit(1)
-    asyncio.run(cmd_pareto(list(uids)))
+async def _cmd_set_endpoint(
+    name: str, kind: str, ssh_url: Optional[str], ssh_key_path: Optional[str],
+    public_inference_url: Optional[str], sglang_port: int, sglang_dp: int,
+    sglang_image: str, sglang_cache_dir: str, active: bool, notes: Optional[str],
+) -> None:
+    await init_client()
+    try:
+        from affine.database.dao.inference_endpoints import (
+            Endpoint, InferenceEndpointsDAO,
+        )
+        ep = Endpoint(
+            name=name, kind=kind, active=active,
+            ssh_url=ssh_url, ssh_key_path=ssh_key_path,
+            public_inference_url=public_inference_url,
+            sglang_port=sglang_port, sglang_dp=sglang_dp,
+            sglang_image=sglang_image, sglang_cache_dir=sglang_cache_dir,
+            notes=notes,
+        )
+        await InferenceEndpointsDAO().upsert(ep, updated_by="cli:set-endpoint")
+        print(f"✓ wrote endpoint {name!r}")
+    finally:
+        await close_client()
+
+
+async def _cmd_delete_endpoint(name: str) -> None:
+    await init_client()
+    try:
+        from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+        await InferenceEndpointsDAO().delete(name)
+        print(f"✓ deleted endpoint {name!r}")
+    finally:
+        await close_client()
+
+
+@db.command("list-endpoints")
+def list_endpoints():
+    """List registered inference endpoints."""
+    asyncio.run(_cmd_list_endpoints())
+
+
+@db.command("set-endpoint")
+@click.option("--name", required=True, help="Unique label, e.g. 'ssh_b300'")
+@click.option("--kind", required=True, type=click.Choice(["ssh", "targon"]))
+@click.option("--ssh-url", default=None, help="ssh://user@host[:port] — required for kind=ssh")
+@click.option("--ssh-key-path", default=None)
+@click.option("--public-inference-url", default=None,
+              help="What env containers actually connect to (e.g. http://val:30000/v1)")
+@click.option("--sglang-port", type=int, default=30000)
+@click.option("--sglang-dp", type=int, default=8)
+@click.option("--sglang-image", default="lmsysorg/sglang:latest")
+@click.option("--sglang-cache-dir", default="/data")
+@click.option("--active/--inactive", default=True)
+@click.option("--notes", default=None)
+def set_endpoint(
+    name, kind, ssh_url, ssh_key_path, public_inference_url,
+    sglang_port, sglang_dp, sglang_image, sglang_cache_dir, active, notes,
+):
+    """Register or update an inference endpoint."""
+    if kind == "ssh" and not ssh_url:
+        raise click.UsageError("--ssh-url is required when --kind=ssh")
+    asyncio.run(_cmd_set_endpoint(
+        name=name, kind=kind, ssh_url=ssh_url, ssh_key_path=ssh_key_path,
+        public_inference_url=public_inference_url,
+        sglang_port=sglang_port, sglang_dp=sglang_dp,
+        sglang_image=sglang_image, sglang_cache_dir=sglang_cache_dir,
+        active=active, notes=notes,
+    ))
+
+
+@db.command("delete-endpoint")
+@click.option("--name", required=True)
+def delete_endpoint(name):
+    """Delete an inference endpoint registration."""
+    asyncio.run(_cmd_delete_endpoint(name))
 
 
 def main():
-    """Main CLI entry point."""
     db()
 
 

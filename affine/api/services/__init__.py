@@ -1,11 +1,8 @@
 """
-API Services
+API services namespace.
 
-Business logic services for the API layer.
+Empty placeholder — the queue-window flow has no executor-auth round trip
+and no in-process services beyond the FastAPI routers.
 """
 
-from affine.api.services.auth import AuthService
-
-__all__ = [
-    "AuthService",
-]
+__all__: list[str] = []

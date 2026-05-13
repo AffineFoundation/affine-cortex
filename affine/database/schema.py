@@ -4,9 +4,6 @@ DynamoDB table schema definitions
 Defines table structures with partition keys, sort keys, and indexes.
 """
 
-from typing import Dict, Any, List
-
-
 def get_table_name(base_name: str) -> str:
     """Get full table name with prefix."""
     from affine.database.client import get_table_prefix
@@ -62,62 +59,6 @@ SAMPLE_RESULTS_SCHEMA = {
 SAMPLE_RESULTS_TTL = {
     "AttributeName": "ttl",
 }
-
-
-# Task Pool Table
-#
-# Design Philosophy:
-# - PK: MINER#{hotkey}#REV#{revision} - partition by miner for efficient cleanup
-# - SK: ENV#{env}#STATUS#{status}#TASK_ID#{task_id} - composite sort key with business semantics
-# - GSI1: env-status-index for weighted random task selection
-#
-# Query Patterns:
-# 1. Weighted random task selection (by TaskPoolManager):
-#    - Query GSI1 by ENV#{env}#STATUS#pending
-#    - SK sorted by MINER, enabling efficient grouping and counting
-#    - Weighted random select miner (probability ∝ task count)
-#    - Randomly select one task from chosen miner
-# 2. Miner task cleanup (by Scheduler):
-#    - Query main table by PK=MINER#{hotkey}#REV#{revision}
-#    - Batch delete all tasks for invalid miners (36x faster)
-# 3. Check miner pending tasks (by Scheduler):
-#    - Query main table by PK with env filter
-#    - Direct query, no GSI needed
-# 4. Pool statistics:
-#    - Query GSI1 by ENV#{env}#STATUS#{status} with Select=COUNT
-#
-# Design Rationale:
-# - No UUID: task_id has business semantics, easier to debug
-# - MINER partition: enables O(m) cleanup instead of O(n) individual deletes
-# - GSI1 SK by MINER: supports efficient weighted counting
-# - Fairness: new miners don't wait for old miners (weighted random, not FIFO)
-TASK_POOL_SCHEMA = {
-    "TableName": get_table_name("task_pool"),
-    "KeySchema": [
-        {"AttributeName": "pk", "KeyType": "HASH"},   # MINER#{hotkey}#REV#{revision}
-        {"AttributeName": "sk", "KeyType": "RANGE"},  # ENV#{env}#STATUS#{status}#TASK_ID#{task_id}
-    ],
-    "AttributeDefinitions": [
-        {"AttributeName": "pk", "AttributeType": "S"},
-        {"AttributeName": "sk", "AttributeType": "S"},
-        {"AttributeName": "gsi1_pk", "AttributeType": "S"},
-        {"AttributeName": "gsi1_sk", "AttributeType": "S"},
-    ],
-    "GlobalSecondaryIndexes": [
-        {
-            "IndexName": "env-status-index",
-            "KeySchema": [
-                {"AttributeName": "gsi1_pk", "KeyType": "HASH"},   # ENV#{env}#STATUS#{status}
-                {"AttributeName": "gsi1_sk", "KeyType": "RANGE"},  # MINER#{hotkey}#REV#{revision}#TASK_ID#{task_id}
-            ],
-            "Projection": {"ProjectionType": "ALL"},
-        },
-    ],
-    "BillingMode": "PAY_PER_REQUEST",
-}
-
-# Legacy name for compatibility during transition
-TASK_QUEUE_SCHEMA = TASK_POOL_SCHEMA
 
 
 # Execution Logs Table
@@ -278,107 +219,52 @@ SCORE_SNAPSHOTS_TTL = {
 # - Permanent storage of all miner metadata (not just current 256)
 # - Real-time sampling statistics via sliding windows
 # - No GSI needed (cleanup uses full scan, which is efficient for small tables)
-MINER_STATS_SCHEMA = {
-    "TableName": get_table_name("miner_stats"),
-    "KeySchema": [
-        {"AttributeName": "pk", "KeyType": "HASH"},   # HOTKEY#{hotkey}
-        {"AttributeName": "sk", "KeyType": "RANGE"},  # REV#{revision}
-    ],
-    "AttributeDefinitions": [
-        {"AttributeName": "pk", "AttributeType": "S"},
-        {"AttributeName": "sk", "AttributeType": "S"},
-    ],
-    "BillingMode": "PAY_PER_REQUEST",
-}
 
 
-# Anti-Copy Results Table
+
+
+
+
+
+# Inference Endpoints Table (Stage AI)
 #
-# Schema design:
-# - PK: MODEL#{hotkey}#{revision} - partition by model for even distribution
-# - SK: ROUND#{timestamp} - each detection round creates one record per model
+# Provider-agnostic registry for inference deployments. Replaces the older
+# Targon-specific ``targon_deployments`` table — operator can register
+# multiple endpoints (SSH/sglang on b300, Targon hosted, future B300) here
+# and providers read connection details from this table instead of env
+# vars.
 #
-# Each record stores whether this model is a copy, and if so, who it copied from
-# (determined by earliest commit block number).
+# Schema:
+#   PK: ENDPOINT#{name}   — unique label per endpoint (operator-chosen)
+#
+# Non-key attributes (sparse — fields are provider-specific):
+#   kind                   "ssh" | "targon"
+#   active                 bool — false rows are ignored at startup
+#   public_inference_url   the URL env containers actually connect to
+#   notes                  free-form
+#
+#   # ssh-kind extras
+#   ssh_url                "ssh://user@host[:port]"
+#   ssh_key_path           optional path to private key
+#   sglang_port            port sglang listens on inside the docker container
+#   sglang_dp              data-parallel size
+#   sglang_image           docker image (default lmsysorg/sglang:latest)
+#   sglang_cache_dir       host mount for HF cache
+#
+#   # targon-kind extras (most config is still env-based for back-compat)
+#   targon_api_url
 #
 # Query patterns:
-# 1. Check if a model is a copy: Query PK={model}#{revision} Limit=1 reverse=True
-# 2. Get full history for a model: Query PK={model}#{revision}
-ANTI_COPY_RESULTS_SCHEMA = {
-    "TableName": get_table_name("anti_copy_results"),
-    "KeySchema": [
-        {"AttributeName": "pk", "KeyType": "HASH"},   # {model}#{revision}
-        {"AttributeName": "sk", "KeyType": "RANGE"},   # ROUND#{timestamp}
-    ],
-    "AttributeDefinitions": [
-        {"AttributeName": "pk", "AttributeType": "S"},
-        {"AttributeName": "sk", "AttributeType": "S"},
-    ],
-    "BillingMode": "PAY_PER_REQUEST",
-}
-
-# TTL settings for anti_copy_results (30 days retention)
-ANTI_COPY_RESULTS_TTL = {
-    "AttributeName": "ttl",
-}
-
-
-
-# Targon Deployments Table
-# Tracks Targon GPU deployments managed by the validator for champion (and
-# future) models. Read by ProviderRouter on every fetch_task, written by the
-# targon_deployer reconciler.
-#
-# Schema design:
-# - PK: DEPLOYMENT#{deployment_id} - each Targon deployment is a single row
-# - SK: META
-# - GSI1: hotkey-revision-index for "does the current champion already have a
-#         live deployment?" lookups
-# - GSI2: status-index for "give me all active / rebuilding deployments" sweeps
-TARGON_DEPLOYMENTS_SCHEMA = {
-    "TableName": get_table_name("targon_deployments"),
+# 1. Get one endpoint by name → GetItem on pk
+# 2. List all active endpoints of a kind → full table scan + filter
+#    (table has at most a handful of rows, scan is fine)
+INFERENCE_ENDPOINTS_SCHEMA = {
+    "TableName": get_table_name("inference_endpoints"),
     "KeySchema": [
         {"AttributeName": "pk", "KeyType": "HASH"},
-        {"AttributeName": "sk", "KeyType": "RANGE"},
     ],
     "AttributeDefinitions": [
         {"AttributeName": "pk", "AttributeType": "S"},
-        {"AttributeName": "sk", "AttributeType": "S"},
-        {"AttributeName": "gsi1_pk", "AttributeType": "S"},
-        {"AttributeName": "gsi1_sk", "AttributeType": "S"},
-        {"AttributeName": "gsi2_pk", "AttributeType": "S"},
-    ],
-    "GlobalSecondaryIndexes": [
-        {
-            "IndexName": "hotkey-revision-index",
-            "KeySchema": [
-                {"AttributeName": "gsi1_pk", "KeyType": "HASH"},
-                {"AttributeName": "gsi1_sk", "KeyType": "RANGE"},
-            ],
-            "Projection": {"ProjectionType": "ALL"},
-        },
-        {
-            "IndexName": "status-index",
-            "KeySchema": [
-                {"AttributeName": "gsi2_pk", "KeyType": "HASH"},
-            ],
-            "Projection": {"ProjectionType": "ALL"},
-        },
     ],
     "BillingMode": "PAY_PER_REQUEST",
 }
-
-
-# All table schemas
-ALL_SCHEMAS = [
-    SAMPLE_RESULTS_SCHEMA,
-    TASK_POOL_SCHEMA,
-    EXECUTION_LOGS_SCHEMA,
-    SCORES_SCHEMA,
-    SYSTEM_CONFIG_SCHEMA,
-    MINERS_SCHEMA,
-    SCORE_SNAPSHOTS_SCHEMA,
-    MINER_STATS_SCHEMA,
-    ANTI_COPY_RESULTS_SCHEMA,
-    TARGON_DEPLOYMENTS_SCHEMA,
-]

@@ -1,996 +1,519 @@
 """
-Miners Monitor Service
+Miners monitor — queue-window refactor edition.
 
-Monitors and validates miners with anti-plagiarism detection.
-Persists validation state to Miners table.
+Replaces the chute-aware monitor with a slim metagraph/commit reader. For
+every miner on the subnet:
+
+  1. Read its on-chain commit ``{model, revision}`` (the legacy
+     ``chute_id`` field, if present, is ignored).
+  2. Validate model on HuggingFace: revision exists, weight hashes
+     computable, no duplicate-repo / suspicious commit history.
+  3. Optional: model size + chat-template safety checks.
+  4. Plagiarism detection by ``model_hash`` collision (earliest committer
+     wins; later miners with the same hash are marked invalid).
+  5. Persist to ``miners`` table.
+  6. Seed ``miners.challenge_status='pending'`` and ``enqueued_at`` when a
+     freshly-seen ``(hotkey, revision)`` lands — that's the only signal
+     the challenger queue needs to enter the rotation.
+
+Anti-copy / cold tracking / chute lifecycle are all out of scope now.
 """
 
-import os
-import json
-import time
+from __future__ import annotations
+
 import asyncio
-import aiohttp
-import logging
-from typing import Dict, Optional, Set
+import json
+import os
+import time
 from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
+
+from botocore.exceptions import ClientError
 from huggingface_hub import HfApi
 
-from affine.utils.subtensor import get_subtensor
-from affine.utils.api_client import get_chute_info
-from affine.utils.template_checker import check_template_safety
-from affine.utils.model_size_checker import check_model_size
-from affine.core.setup import NETUID
+from affine.core.setup import logger
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
-from affine.database.dao.anti_copy import AntiCopyDAO
-from affine.core.setup import logger
+from affine.utils.model_size_checker import check_model_size
+from affine.utils.subtensor import get_subtensor
+from affine.utils.template_checker import check_template_safety
+
+
+NETUID = int(os.getenv("AFFINE_NETUID", "120"))
+
+MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
+REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
 
 
 @dataclass
 class MinerInfo:
-    """Miner information data class"""
     uid: int
     hotkey: str
     model: str
     revision: str
-    chute_id: str
-    chute_slug: str = ""
     block: int = 0
     is_valid: bool = False
     invalid_reason: Optional[str] = None
-    # True iff invalid_reason is a durable termination (rule violation,
-    # confirmed plagiarism). False for transient blips (HTTP/lookup
-    # failures) that may recover next refresh. Set at the same site as
-    # invalid_reason via mark_invalid() so classification cannot drift
-    # away from the reasons it classifies.
     permanent_invalid: bool = False
-    model_hash: str = ""  # HuggingFace model hash (cached)
-    hf_revision: str = ""  # HuggingFace actual revision (cached)
-    chute_status: str = ""
-    template_check_result: Optional[str] = None  # "safe", "unsafe:reason", or None (unchecked)
+    model_hash: str = ""
+    hf_revision: str = ""
+    template_check_result: Optional[str] = None  # "safe" | "unsafe:<reason>" | None
 
     def key(self) -> str:
-        """Generate unique key: hotkey#revision"""
         return f"{self.hotkey}#{self.revision}"
 
     def mark_invalid(self, reason: str, *, permanent: bool) -> None:
-        """Set is_valid=False with reason and explicit permanence.
-
-        permanent=True  → durable failure (rule violation, plagiarism); will
-                          flow into challenge_status='terminated' and release
-                          the chute downstream.
-        permanent=False → transient blip (HTTP timeout, cold chute, etc);
-                          downstream leaves the deployment alone, lets the
-                          next refresh cycle decide.
-
-        The keyword-only argument is intentional: every new invalid_reason
-        added to the codebase MUST classify itself, so the system can't
-        silently leak chutes when someone adds a new failure mode."""
         self.is_valid = False
         self.invalid_reason = reason
         self.permanent_invalid = permanent
 
 
 class MinersMonitor:
-    """Miners monitor and validation service
-    
-    Responsibilities:
-    1. Discover miners from metagraph
-    2. Validate chute status, revision, and model weights
-    3. Detect plagiarism via model hash comparison
-    4. Persist validation results to database
-    """
-    
-    _instance: Optional['MinersMonitor'] = None
+    """Refreshes the ``miners`` table from chain + HF, seeds challenge state."""
+
+    _instance: Optional["MinersMonitor"] = None
     _lock = asyncio.Lock()
-    
+
     def __init__(self, refresh_interval_seconds: int = 300):
-        """Initialize monitor
-        
-        Args:
-            refresh_interval_seconds: Auto-refresh interval in seconds
-        """
         self.dao = MinersDAO()
         self.config_dao = SystemConfigDAO()
-        self.anticopy_dao = AntiCopyDAO()
         self.refresh_interval_seconds = refresh_interval_seconds
         self.last_update: int = 0
-        
-        # Caches: (type, model, revision) -> (result, timestamp)
-        # type: "model_info" | "duplicate"
-        self.weights_cache: Dict[tuple, tuple] = {}
-        self.weights_ttl = 1800  # 30 minutes
-        
-        # Background task management
-        self._running = False
-        self._refresh_task: Optional[asyncio.Task] = None
-        
-        logger.info("[MinersMonitor] Initialized")
-    
+        # (model, revision) -> (cached result or None, fetched_at)
+        self._weights_cache: Dict[Tuple[str, str], Tuple[Optional[Tuple[str, str, str]], float]] = {}
+        self._weights_ttl_sec = 1800
+        self._background_task: Optional[asyncio.Task] = None
+
+    # ---- lifecycle -------------------------------------------------------
+
     @classmethod
-    def get_instance(cls) -> 'MinersMonitor':
-        """Get global singleton instance"""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-    
-    @classmethod
-    async def initialize(cls, refresh_interval_seconds: int = 300) -> 'MinersMonitor':
-        """Initialize global singleton and start background tasks"""
+    async def initialize(cls, refresh_interval_seconds: int = 300) -> "MinersMonitor":
         async with cls._lock:
             if cls._instance is None:
                 cls._instance = cls(refresh_interval_seconds=refresh_interval_seconds)
-                await cls._instance.refresh_miners()
                 await cls._instance.start_background_tasks()
         return cls._instance
-    
-    async def _refresh_loop(self):
-        """Background refresh loop"""
-        while self._running:
-            try:
-                await self.refresh_miners()
-                await asyncio.sleep(self.refresh_interval_seconds)
-            except Exception as e:
-                logger.error(f"[MinersMonitor] Error in refresh loop: {e}", exc_info=True)
-    
-    async def start_background_tasks(self):
-        """Start background refresh tasks"""
-        if self._running:
-            logger.warning("[MinersMonitor] Background tasks already running")
+
+    @classmethod
+    def get_instance(cls) -> "MinersMonitor":
+        if cls._instance is None:
+            raise RuntimeError("MinersMonitor.initialize() must be called first")
+        return cls._instance
+
+    async def start_background_tasks(self) -> None:
+        if self._background_task and not self._background_task.done():
             return
-        
-        self._running = True
-        self._refresh_task = asyncio.create_task(self._refresh_loop())
-        logger.info(f"[MinersMonitor] Background refresh started (interval={self.refresh_interval_seconds}s)")
-    
-    async def stop_background_tasks(self):
-        """Stop background refresh tasks"""
-        self._running = False
-        if self._refresh_task:
-            self._refresh_task.cancel()
+        self._background_task = asyncio.create_task(self._refresh_loop())
+
+    async def stop_background_tasks(self) -> None:
+        if self._background_task and not self._background_task.done():
+            self._background_task.cancel()
             try:
-                await self._refresh_task
+                await self._background_task
             except asyncio.CancelledError:
                 pass
-        logger.info("[MinersMonitor] Background tasks stopped")
-    
-    async def _load_blacklist(self) -> set:
-        """Load blacklisted hotkeys from database and environment, then merge them.
-        
-        Returns:
-            Set of unique blacklisted hotkeys from both sources
-        """
-        # Load from environment variable
-        env_blacklist_str = os.getenv("AFFINE_MINER_BLACKLIST", "").strip()
-        env_blacklist = set()
-        if env_blacklist_str:
-            env_blacklist = {hk.strip() for hk in env_blacklist_str.split(",") if hk.strip()}
-        
-        # Load from database
-        db_blacklist = set(await self.config_dao.get_blacklist())
-        
-        # Merge and deduplicate
-        merged_blacklist = env_blacklist | db_blacklist
-        
-        if merged_blacklist:
-            logger.debug(
-                f"[MinersMonitor] Loaded blacklist: "
-                f"{len(env_blacklist)} from env, {len(db_blacklist)} from db, "
-                f"{len(merged_blacklist)} total after merge"
+        self._background_task = None
+
+    async def _refresh_loop(self) -> None:
+        while True:
+            try:
+                await self.refresh_miners()
+            except Exception as e:
+                logger.error(f"[MinersMonitor] refresh failed: {e}", exc_info=True)
+            await asyncio.sleep(self.refresh_interval_seconds)
+
+    # ---- main refresh ----------------------------------------------------
+
+    async def refresh_miners(self) -> Dict[str, MinerInfo]:
+        logger.info("[MinersMonitor] refreshing miners from metagraph...")
+        subtensor = await get_subtensor()
+        meta = await subtensor.metagraph(NETUID)
+        commits = await subtensor.get_all_revealed_commitments(NETUID)
+        current_block = int(await subtensor.get_current_block())
+        blacklist = await self._load_blacklist()
+
+        miners: list[MinerInfo] = []
+        for uid in range(len(meta.hotkeys)):
+            hotkey = meta.hotkeys[uid]
+
+            if hotkey in blacklist:
+                m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="")
+                m.mark_invalid("blacklisted", permanent=True)
+                miners.append(m)
+                continue
+
+            if hotkey not in commits:
+                m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="")
+                m.mark_invalid("no_commit", permanent=False)
+                miners.append(m)
+                continue
+
+            try:
+                block, commit_data = commits[hotkey][-1]
+                data = json.loads(commit_data)
+                model = data.get("model", "")
+                revision = data.get("revision", "")
+                if not model or not revision:
+                    m = MinerInfo(
+                        uid=uid, hotkey=hotkey, model=model, revision=revision,
+                        block=int(block) if uid != 0 else 0,
+                    )
+                    m.mark_invalid("incomplete_commit:missing_fields", permanent=False)
+                    miners.append(m)
+                    continue
+
+                miners.append(
+                    await self._validate_miner(
+                        uid=uid,
+                        hotkey=hotkey,
+                        model=model,
+                        revision=revision,
+                        block=int(block) if uid != 0 else 0,
+                        commit_count=len(commits[hotkey]),
+                    )
+                )
+            except json.JSONDecodeError:
+                m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="")
+                m.mark_invalid("invalid_json_commit", permanent=True)
+                miners.append(m)
+            except Exception as e:
+                logger.debug(f"[MinersMonitor] validate uid={uid} failed: {e}")
+                m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="")
+                m.mark_invalid(f"validation_error:{str(e)[:60]}", permanent=False)
+                miners.append(m)
+
+        miners = self._detect_plagiarism(miners)
+
+        # System miners — bench models (uid > 1000). They short-circuit
+        # every validation step and are simply persisted as valid.
+        system_miners = await self.config_dao.get_system_miners()
+        for uid_str, payload in system_miners.items():
+            uid = int(uid_str)
+            if uid <= 1000:
+                continue
+            miners.append(
+                MinerInfo(
+                    uid=uid,
+                    hotkey=f"SYSTEM-{uid - 1000}",
+                    model=payload.get("model", ""),
+                    revision=f"SYSTEM-{uid - 1000}",
+                    block=0,
+                    is_valid=True,
+                    invalid_reason=None,
+                    model_hash="",
+                    hf_revision=f"SYSTEM-{uid - 1000}",
+                    template_check_result="safe",
+                )
             )
-        
-        return merged_blacklist
-    
-    async def _get_model_info(self, model_id: str, revision: str) -> Optional[tuple[str, str, str]]:
-        """Get model hash, actual revision and duplicate source from HuggingFace
 
-        Args:
-            model_id: HuggingFace model repo
-            revision: Git commit hash
+        # Persist + seed challenge_status for newly-seen (hotkey, revision).
+        await self._persist_miners(miners, current_block=current_block)
 
-        Returns:
-            Tuple of (model_hash, actual_revision, duplicate_source) or None if failed
-            duplicate_source can be:
-            - "" (empty): no duplicate detected
-            - "blocked:too_many_commits": more than 100 commits in history
-            - "blocked:commit_msg_too_long": any commit message > 200 chars
-            - "<repo_name>": duplicated from this repo
+        self.last_update = int(time.time())
+        valid = {m.key(): m for m in miners if m.is_valid}
+        logger.info(
+            f"[MinersMonitor] refreshed {len(miners)} miners "
+            f"({len(valid)} valid, {len(miners) - len(valid)} invalid)"
+        )
+        return valid
+
+    # ---- validation -----------------------------------------------------
+
+    async def _validate_miner(
+        self,
+        *,
+        uid: int,
+        hotkey: str,
+        model: str,
+        revision: str,
+        block: int,
+        commit_count: int = 1,
+    ) -> MinerInfo:
+        info = MinerInfo(uid=uid, hotkey=hotkey, model=model, revision=revision, block=block)
+
+        # Inherit prior template_check_result so a one-cycle HF blip doesn't
+        # nuke the cached safety verdict.
+        try:
+            existing = await self.dao.get_miner_by_uid(uid)
+            if existing and existing.get("model") == model and existing.get("revision") == revision:
+                info.template_check_result = existing.get("template_check_result")
+        except Exception:
+            pass
+
+        # Multi-commit rule: a hotkey is only allowed one commit on this subnet.
+        if uid != 0 and commit_count > 1 and block >= MULTI_COMMIT_ENFORCE_BLOCK:
+            info.mark_invalid(f"multiple_commits:count={commit_count}", permanent=True)
+            return info
+
+        # "affine" must appear in the model name (system miners exempt).
+        if uid != 0 and "affine" not in model.lower():
+            info.mark_invalid("model_name_missing_affine", permanent=True)
+            return info
+
+        # Repo name must end with the hotkey from a certain block onward —
+        # makes plagiarism via repo rename impossible.
+        if uid != 0 and block >= REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK:
+            repo_name = model.split("/")[-1] if "/" in model else model
+            if not repo_name.lower().endswith(hotkey.lower()):
+                info.mark_invalid(
+                    f"repo_name_not_ending_with_hotkey:repo={repo_name}", permanent=True,
+                )
+                return info
+
+        # HuggingFace lookup → model_hash + sha + commit-history flags.
+        model_info = await self._get_model_info(model, revision)
+        if not model_info:
+            info.mark_invalid("hf_model_fetch_failed", permanent=False)
+            return info
+        model_hash, hf_revision, duplicate_source = model_info
+        info.model_hash = model_hash
+        info.hf_revision = hf_revision
+
+        if revision != hf_revision:
+            info.mark_invalid(f"revision_mismatch:hf={hf_revision}", permanent=True)
+            return info
+
+        if uid != 0 and uid <= 1000:
+            size_result = await check_model_size(model, revision)
+            if not size_result.get("pass"):
+                info.mark_invalid(f"model_check:{size_result.get('reason')}", permanent=True)
+                return info
+
+        if uid != 0 and duplicate_source:
+            info.mark_invalid(f"duplicate_repo:from={duplicate_source}", permanent=True)
+            return info
+
+        # Template safety. Cached "safe" skips the check; cached "unsafe" is
+        # honored (no second chances for malicious templates).
+        if uid != 0:
+            cached = info.template_check_result
+            if cached == "safe":
+                pass
+            elif cached and cached.startswith("unsafe:"):
+                info.mark_invalid(f"malicious_template:{cached[7:]}", permanent=True)
+                return info
+            else:
+                try:
+                    tr = await check_template_safety(model, revision)
+                    if not tr.get("safe"):
+                        reason = tr.get("reason", "unknown")
+                        transient = reason.startswith("template_fetch_failed:") or reason.startswith("check_error:")
+                        info.mark_invalid(f"malicious_template:{reason}", permanent=not transient)
+                        if not transient:
+                            info.template_check_result = f"unsafe:{reason}"
+                        return info
+                    if not tr.get("reason", "").startswith("llm_audit_skipped:"):
+                        info.template_check_result = "safe"
+                except Exception as e:
+                    logger.debug(f"[MinersMonitor] template check failed uid={uid}: {e}")
+
+        info.is_valid = True
+        if not info.template_check_result:
+            info.template_check_result = "safe"
+        return info
+
+    async def _get_model_info(
+        self, model_id: str, revision: str
+    ) -> Optional[Tuple[str, str, str]]:
+        """Return ``(model_hash, hf_revision, duplicate_source)`` or None.
+
+        - ``model_hash``: sha256 over the sorted sha256s of every weight
+          shard (.safetensors/.bin) listed by HF.
+        - ``hf_revision``: the actual git SHA HF resolves the revision to.
+        - ``duplicate_source``: empty string, ``blocked:too_many_commits``,
+          ``blocked:commit_msg_too_long``, or the repo a "Duplicate from
+          xxx" commit points at.
         """
         key = (model_id, revision)
         now = time.time()
-        cached = self.weights_cache.get(key)
-
-        if cached and now - cached[1] < self.weights_ttl:
+        cached = self._weights_cache.get(key)
+        if cached and now - cached[1] < self._weights_ttl_sec:
             return cached[0]
 
         try:
-            hf_api = HfApi(token=os.getenv("HF_TOKEN"))
-
-            def _repo_info():
-                return hf_api.repo_info(
-                    repo_id=model_id,
-                    repo_type="model",
-                    revision=revision,
-                    files_metadata=True,
+            api = HfApi(token=os.getenv("HF_TOKEN"))
+            info = await asyncio.to_thread(
+                lambda: api.repo_info(
+                    repo_id=model_id, repo_type="model", revision=revision, files_metadata=True,
                 )
-
-            def _list_commits():
-                return hf_api.list_repo_commits(
-                    repo_id=model_id,
-                    repo_type="model",
-                    revision=revision,
-                )
-
-            info = await asyncio.to_thread(_repo_info)
-
-            # Get actual revision (git SHA)
-            actual_revision = getattr(info, "sha", None)
-
-            # Get model weight hashes
+            )
+            hf_revision = getattr(info, "sha", None)
             siblings = getattr(info, "siblings", None) or []
-
-            def _name(s):
-                return getattr(s, "rfilename", None) or getattr(s, "path", "") or ""
-
             shas = {
                 str(getattr(s, "lfs", {})["sha256"])
                 for s in siblings
                 if (
                     isinstance(getattr(s, "lfs", None), dict)
-                    and _name(s) is not None
-                    and (_name(s).endswith(".safetensors") or _name(s).endswith(".bin"))
+                    and (getattr(s, "rfilename", "") or getattr(s, "path", "")).endswith(
+                        (".safetensors", ".bin")
+                    )
                     and "sha256" in getattr(s, "lfs", {})
                 )
             }
+            if not shas or not hf_revision:
+                self._weights_cache[key] = (None, now)
+                return None
+            import hashlib
+            model_hash = hashlib.sha256("".join(sorted(shas)).encode()).hexdigest()
 
-            # Compute total hash
-            model_hash = None
-            if shas:
-                import hashlib
-                model_hash = hashlib.sha256("".join(sorted(shas)).encode()).hexdigest()
-
-            # Check commit history for duplicate or suspicious patterns
             duplicate_source = ""
             try:
-                commits = list(await asyncio.to_thread(_list_commits))
-
-                # Block if too many commits
+                commits = list(
+                    await asyncio.to_thread(
+                        lambda: api.list_repo_commits(
+                            repo_id=model_id, repo_type="model", revision=revision,
+                        )
+                    )
+                )
                 if len(commits) > 100:
                     duplicate_source = "blocked:too_many_commits"
                 else:
-                    # Check all commits for duplicate or long messages
-                    for commit in commits:
-                        title = getattr(commit, "title", "") or ""
-
-                        # Block if commit message too long
+                    for c in commits:
+                        title = getattr(c, "title", "") or ""
                         if len(title) > 200:
                             duplicate_source = "blocked:commit_msg_too_long"
                             break
-
-                        # Check for duplicate
                         if title.lower().startswith("duplicate from"):
                             duplicate_source = title[len("Duplicate from"):].strip()
                             break
             except Exception as e:
-                logger.debug(f"Failed to get commits for {model_id}@{revision}: {e}")
+                logger.debug(f"[MinersMonitor] list_repo_commits failed {model_id}@{revision[:8]}: {e}")
 
-            result = (model_hash, actual_revision, duplicate_source) if model_hash and actual_revision else None
-            self.weights_cache[key] = (result, now)
+            result = (model_hash, hf_revision, duplicate_source)
+            self._weights_cache[key] = (result, now)
             return result
-
         except Exception as e:
             logger.warning(
-                f"Failed to fetch model info for {model_id}@{revision}: {type(e).__name__}: {e}",
-                exc_info=True
+                f"[MinersMonitor] HF fetch failed {model_id}@{revision[:8]}: "
+                f"{type(e).__name__}: {e}"
             )
-            self.weights_cache[key] = (None, now)
+            self._weights_cache[key] = (None, now)
             return None
 
-    async def _is_duplicate_commit(self, model_id: str, revision: str) -> Optional[str]:
-        """Check if repo has duplicate commit or suspicious patterns
-
-        Uses cached duplicate_source from _get_model_info().
-
-        Args:
-            model_id: HuggingFace model repo
-            revision: Git commit hash to check
-
-        Returns:
-            - None: no issues detected
-            - "blocked:too_many_commits": suspicious commit history
-            - "blocked:commit_msg_too_long": suspicious commit message
-            - "<repo_name>": duplicated from this repo
-        """
-        key = (model_id, revision)
-        cached = self.weights_cache.get(key)
-
-        if not cached or not cached[0]:
-            return None
-
-        duplicate_source = cached[0][2] or ""
-        return duplicate_source if duplicate_source else None
-    
-    async def _validate_miner(
-        self,
-        uid: int,
-        hotkey: str,
-        model: str,
-        revision: str,
-        chute_id: str,
-        block: int,
-        commit_count: int = 1,
-    ) -> MinerInfo:
-        """Validate a single miner
-
-        Validation steps:
-        1. Fetch chute info
-        2. Validate chute_slug is not empty
-        3. Check chute is hot
-        4. Verify model name matches chute
-        5. Verify model name contains "Affine" or "affine" (except uid 0)
-        6. Verify repo name ends with hotkey
-        7. Verify revision matches chute
-        8. Fetch HuggingFace model info and verify revision
-        9. Check model architecture (must be Qwen3-32B)
-        10. Check if commit is "Duplicate from xxx" (plagiarism check)
-        11. Check chat_template for malicious code
-        12. Check if hotkey has multiple commits
-
-        Args:
-            uid: Miner UID
-            hotkey: Miner hotkey
-            model: Model repo from commit
-            revision: Git commit hash from commit
-            chute_id: Chute deployment ID
-            block: Block when miner committed
-
-        Returns:
-            MinerInfo with validation result and cached model_hash/hf_revision
-        """
-        info = MinerInfo(
-            uid=uid,
-            hotkey=hotkey,
-            model=model,
-            revision=revision,
-            chute_id=chute_id,
-            block=block,
-        )
-
-        # Inherit template_check_result from database if model/revision unchanged
-        # This prevents losing the result when earlier steps fail
-        try:
-            existing = await self.dao.get_miner_by_uid(uid)
-            if (existing and
-                existing.get('model') == model and
-                existing.get('revision') == revision):
-                info.template_check_result = existing.get('template_check_result')
-        except Exception:
-            pass  # Ignore errors, will check template later if needed
-
-        # Disqualify if hotkey has more than one commit.
-        # Only enforced when the latest commit is at or after this block.
-        _MULTI_COMMIT_ENFORCE_BLOCK = 7710000
-        if uid != 0 and commit_count > 1 and block >= _MULTI_COMMIT_ENFORCE_BLOCK:
-            info.mark_invalid(f"multiple_commits:count={commit_count}", permanent=True)
-            return info
-
-        # Step 1: Fetch chute info
-        chute = await get_chute_info(chute_id)
-        if not chute:
-            info.mark_invalid("chute_fetch_failed", permanent=False)
-            return info
-
-        info.chute_slug = chute.get("slug", "")
-        info.chute_status = "hot" if chute.get("hot", False) else "cold"
-
-        # Step 2: Validate chute_slug is not empty
-        if not info.chute_slug:
-            info.mark_invalid("chute_slug_empty", permanent=False)
-            return info
-
-        # Step 3: Check chute is hot
-        if not chute.get("hot", False):
-            info.mark_invalid("chute_not_hot", permanent=False)
-            return info
-
-        # Step 4: Verify model name matches chute
-        chute_model = chute.get("name", "")
-        if model != chute_model:
-            # Skip validation for uid 0
-            if uid != 0:
-                info.mark_invalid(f"model_mismatch:chute={chute_model}", permanent=True)
-                return info
-
-        # Step 5: Verify model name contains "Affine" or "affine" (except uid 0)
-        if uid != 0:
-            if "affine" not in model.lower():
-                info.mark_invalid("model_name_missing_affine", permanent=True)
-                return info
-
-        # Step 6: Verify repo name ends with hotkey
-        if uid != 0 and block >= 7290000:
-            # Extract repo name from model (format: owner/repo_name)
-            repo_name = model.split('/')[-1] if '/' in model else model
-
-            # Check if repo name ends with hotkey (case-insensitive)
-            if not repo_name.lower().endswith(hotkey.lower()):
-                info.mark_invalid(f"repo_name_not_ending_with_hotkey:repo={repo_name}", permanent=True)
-                return info
-
-        # Step 7: Verify revision matches chute
-        chute_revision = chute.get("revision", "")
-        if chute_revision and revision != chute_revision:
-            info.mark_invalid(f"revision_mismatch:chute={chute_revision}", permanent=True)
-            return info
-
-        # Step 8: Fetch HuggingFace model info and verify revision
-        model_info = await self._get_model_info(model, revision)
-        if not model_info:
-            info.mark_invalid("hf_model_fetch_failed", permanent=False)
-            return info
-
-        model_hash, hf_revision, _ = model_info
-
-        # Cache model info in MinerInfo
-        info.model_hash = model_hash
-        info.hf_revision = hf_revision
-
-        # Verify revision matches
-        if revision != hf_revision:
-            info.mark_invalid(f"revision_mismatch:hf={hf_revision}", permanent=True)
-            return info
-
-        # Step 9: Check model architecture (must be Qwen3-32B)
-        # Skip for system miners (uid 0 or uid > 1000)
-        if uid != 0 and uid <= 1000:
-            size_result = await check_model_size(model, revision)
-            if not size_result["pass"]:
-                info.mark_invalid(f"model_check:{size_result['reason']}", permanent=True)
-                logger.info(
-                    f"[MinersMonitor] Model rejected for uid={uid}: "
-                    f"model={model} reason={size_result['reason']}"
-                )
-                return info
-
-        # Step 10: Check if commit is a "Duplicate from xxx" (except uid 0)
-        if uid != 0:
-            duplicate_source = await self._is_duplicate_commit(model, revision)
-            if duplicate_source:
-                info.mark_invalid(f"duplicate_repo:from={duplicate_source}", permanent=True)
-                logger.info(
-                    f"[MinersMonitor] Duplicate repo detected for uid={uid}: "
-                    f"model={model} is duplicated from {duplicate_source}"
-                )
-                return info
-
-        # Step 11: Check chat_template for malicious code (with database cache)
-        # Skip for uid 0 (test/admin miner)
-        if uid == 0:
-            info.template_check_result = "safe"
-            info.is_valid = True
-            return info
-
-        try:
-            # Use inherited template_check_result as cache (already loaded at start)
-            cached_result = info.template_check_result
-
-            if cached_result == "safe":
-                # Previously passed, skip check
-                logger.debug(f"[MinersMonitor] Skipping template check for uid={uid} (cached: safe)")
-            elif cached_result and cached_result.startswith("unsafe:"):
-                # Previously failed, use cached result directly
-                info.mark_invalid(f"malicious_template:{cached_result[7:]}", permanent=True)
-                logger.debug(f"[MinersMonitor] Using cached template result for uid={uid}: {cached_result}")
-                return info
-            else:
-                # No cache or model/revision changed, execute check
-                template_result = await check_template_safety(model, revision)
-                if not template_result["safe"]:
-                    reason = template_result['reason']
-                    # Only cache deterministic failures; transient errors
-                    # (network/HF outages) should be retried next refresh
-                    transient = reason.startswith("template_fetch_failed:") or reason.startswith("check_error:")
-                    info.mark_invalid(f"malicious_template:{reason}", permanent=not transient)
-                    if transient:
-                        # Leave template_check_result as None so next refresh retries
-                        logger.warning(
-                            f"[MinersMonitor] Template check transient failure for uid={uid}: {reason}"
-                        )
-                    else:
-                        info.template_check_result = f"unsafe:{reason}"
-                        logger.warning(
-                            f"[MinersMonitor] Malicious template detected for uid={uid}: {reason}"
-                        )
-                    return info
-
-                # Check if audit was skipped (no API key, error, etc.)
-                if template_result['reason'].startswith("llm_audit_skipped:"):
-                    # Leave template_check_result as None, will retry next time
-                    logger.debug(
-                        f"[MinersMonitor] Template check skipped for uid={uid}: "
-                        f"{template_result['reason']}"
-                    )
-                else:
-                    info.template_check_result = "safe"
-        except Exception as e:
-            logger.warning(f"[MinersMonitor] Template check failed for uid={uid}: {e}")
-            # Continue validation even if template check fails
-
-        # Step 12: Check anti-copy detection results (except uid 0)
-        if uid != 0:
-            try:
-                ac_result = await self.anticopy_dao.get_latest(model, revision)
-                ac_status = ""
-                if ac_result:
-                    ac_status = ac_result.get("status") or ("cheat" if ac_result.get("is_copy") else "clean")
-                if ac_result and ac_status in ("cheat", "suspicious"):
-                    copy_of = ac_result.get("copy_of", [])
-                    orig = copy_of[0] if copy_of else {}
-                    orig_model = orig.get("model", "unknown")
-                    lp_cos = orig.get("logprobs_cosine", "")
-                    hs_cos = orig.get("hs_cosine", "")
-                    sim_parts = []
-                    if lp_cos:
-                        sim_parts.append(f"lp={lp_cos:.4f}" if isinstance(lp_cos, (int, float)) else f"lp={lp_cos}")
-                    if hs_cos:
-                        sim_parts.append(f"hs={hs_cos:.4f}" if isinstance(hs_cos, (int, float)) else f"hs={hs_cos}")
-                    sim_str = ",".join(sim_parts)
-                    reason_prefix = "anticopy:high_similarity_with" if ac_status == "cheat" else "anticopy:suspicious_similarity_with"
-                    reason = f"{reason_prefix}={orig_model}"
-                    if sim_str:
-                        reason += f"({sim_str})"
-                    # Neither 'cheat' nor 'suspicious' triggers invalidation
-                    # anymore — both surface the same soft signal and let
-                    # stage2_pareto apply a tightened dominance margin
-                    # against the alleged source. Hard invalidation on
-                    # cheat caused false positives on legitimate fine-tunes
-                    # of an earlier base (e.g. uid 15 vs 213: 10pt SWE
-                    # improvement but logprobs still near-identical on
-                    # template tokens). is_valid stays True; do not call
-                    # mark_invalid.
-                    info.invalid_reason = reason
-                    logger.info(
-                        f"[MinersMonitor] Anti-copy {ac_status} uid={uid}: "
-                        f"model={model} similarity with {orig_model} [{sim_str}] "
-                        f"(downgraded to soft flag, not invalidated)"
-                    )
-            except Exception as e:
-                logger.debug(f"[MinersMonitor] Anti-copy check failed for uid={uid}: {e}")
-
-        # All checks passed
-        info.is_valid = True
-        return info
-    
-    async def _detect_plagiarism(self, miners: list[MinerInfo]) -> list[MinerInfo]:
-        """Detect plagiarism by checking duplicate model hashes
-        
-        Only valid miners are checked. For each unique model hash,
-        only the miner with the earliest block is kept as valid.
-        
-        Note: model_hash is already cached in MinerInfo from _validate_miner()
-        
-        Args:
-            miners: List of validated miners with cached model_hash
-            
-        Returns:
-            Updated miners list with plagiarism detection
-        """
-        # Group valid miners by model hash (already cached in MinerInfo)
-        hash_to_miners: Dict[str, list] = {}
-        for miner in miners:
-            if miner.is_valid and miner.model_hash:
-                if miner.model_hash not in hash_to_miners:
-                    hash_to_miners[miner.model_hash] = []
-                hash_to_miners[miner.model_hash].append((miner.block, miner.uid, miner))
-        
-        # Keep only earliest miner for each hash
-        for model_hash, group in hash_to_miners.items():
-            if len(group) <= 1:
+    def _detect_plagiarism(self, miners: list[MinerInfo]) -> list[MinerInfo]:
+        """Flag later committers as invalid when their model_hash collides
+        with an earlier committer's. Earliest wins."""
+        by_hash: Dict[str, list[MinerInfo]] = {}
+        for m in miners:
+            if not m.is_valid or not m.model_hash or m.uid == 0 or m.uid > 1000:
                 continue
-            
-            # Sort by block (earliest first), then by UID
-            group.sort(key=lambda x: (x[0], x[1]))
-            earliest_block, earliest_uid, _ = group[0]
-            
-            # Mark duplicates as invalid
-            for block, uid, miner in group[1:]:
-                if miner.is_valid:
-                    miner.mark_invalid(
-                        f"model_hash_duplicate:earliest_uid={earliest_uid}",
-                        permanent=True,
-                    )
-                    logger.info(
-                        f"[MinersMonitor] Plagiarism detected: uid={uid} copied from uid={earliest_uid} "
-                        f"(hash={model_hash[:16]}...)"
-                    )
-        
+            by_hash.setdefault(m.model_hash, []).append(m)
+        for h, group in by_hash.items():
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda x: x.block)
+            origin = group[0]
+            for later in group[1:]:
+                later.mark_invalid(
+                    f"plagiarism:duplicate_of_uid={origin.uid}", permanent=True,
+                )
+                logger.info(
+                    f"[MinersMonitor] plagiarism uid={later.uid} duplicates "
+                    f"uid={origin.uid} (hash={h[:12]}...)"
+                )
         return miners
-    
-    async def _terminate_permanently_invalid(self, miners: list):
-        """Promote durable is_valid=False reasons (anticopy etc.) to challenge_status='terminated' so the existing terminated-only chute release fires; transient reasons are skipped to avoid killing a healthy chute on a one-cycle blip."""
-        from affine.database.dao.miner_stats import MinerStatsDAO
-        miner_stats_dao = MinerStatsDAO()
+
+    # ---- persistence -----------------------------------------------------
+
+    async def _load_blacklist(self) -> set:
+        env_bl = {
+            hk.strip()
+            for hk in os.getenv("AFFINE_MINER_BLACKLIST", "").split(",")
+            if hk.strip()
+        }
+        db_bl = set(await self.config_dao.get_blacklist())
+        return env_bl | db_bl
+
+    async def _persist_miners(self, miners: list[MinerInfo], *, current_block: int) -> None:
+        """Save each miner row, and seed ``challenge_status='pending'``
+        when a freshly-seen ``(hotkey, revision)`` is observed (or when the
+        revision changes — each ``(hotkey, revision)`` gets exactly one
+        chance to challenge the champion, regardless of prior history)."""
+        from affine.database.client import get_client
+
+        client = get_client()
+        now = int(time.time())
 
         for miner in miners:
-            if miner.is_valid is not False:
-                continue
-            if miner.uid == 0 or miner.uid > 1000:
-                continue
-            if not miner.permanent_invalid:
-                continue
-            # Chain-side direct constructs (blacklisted / invalid_json_commit)
-            # carry revision="" because there's no usable commit to anchor a
-            # challenge_state row to. Writing a terminated row at (hotkey, "")
-            # would later poison get_challenge_state's hotkey-fallback for any
-            # future revision the same hotkey commits, locking an un-blacklisted
-            # miner out forever.
-            if not miner.revision:
-                continue
-
-            try:
-                state = await miner_stats_dao.get_challenge_state(
-                    miner.hotkey, miner.revision)
-                if state.get('challenge_status') == 'terminated':
-                    continue
-
-                await miner_stats_dao.update_challenge_state(
-                    hotkey=miner.hotkey,
-                    revision=miner.revision,
-                    consecutive_wins=int(state.get('challenge_consecutive_wins', 0) or 0),
-                    total_wins=int(state.get('challenge_total_wins', 0) or 0),
-                    total_losses=int(state.get('challenge_total_losses', 0) or 0),
-                    consecutive_losses=int(state.get('challenge_consecutive_losses', 0) or 0),
-                    checkpoints_passed=int(state.get('challenge_checkpoints_passed', 0) or 0),
-                    status='terminated',
-                    termination_reason=f"invalid:{miner.invalid_reason}",
-                )
-                logger.info(
-                    f"[MinersMonitor] Terminated permanently-invalid miner "
-                    f"uid={miner.uid} hk={miner.hotkey[:8]}.. "
-                    f"reason={miner.invalid_reason}")
-            except Exception as e:
-                logger.warning(
-                    f"[MinersMonitor] Failed to terminate uid={miner.uid}: {e}")
-
-    async def _release_terminated_chutes(self, miners: list):
-        """Release chute deployments for miners terminated by champion challenge."""
-        from affine.database.dao.miner_stats import MinerStatsDAO
-        from affine.utils.api_client import delete_chute
-
-        miner_stats_dao = MinerStatsDAO()
-
-        for miner in miners:
-            if not miner.chute_id or miner.chute_status != 'hot':
-                continue
-            if miner.uid == 0 or miner.uid > 1000:
-                continue
-
-            try:
-                state = await miner_stats_dao.get_challenge_state(
-                    miner.hotkey, miner.revision)
-                if state.get('challenge_status') != 'terminated':
-                    continue
-
-                logger.info(
-                    f"[MinersMonitor] Releasing chute for terminated miner "
-                    f"uid={miner.uid} chute_id={miner.chute_id}")
-                result = await delete_chute(miner.chute_id)
-                # Mark as cold so we don't retry next refresh
-                miner.chute_status = 'cold'
-                if result:
-                    logger.info(f"[MinersMonitor] Chute released for uid={miner.uid}")
-                else:
-                    logger.warning(f"[MinersMonitor] Chute release failed for uid={miner.uid}, marked cold to stop retrying")
-            except Exception as e:
-                miner.chute_status = 'cold'
-                logger.warning(
-                    f"[MinersMonitor] Failed to release chute for uid={miner.uid}: {e}, marked cold")
-
-    async def _update_cold_tracking(self, miners: list, current_block: int) -> None:
-        """Accumulate cold-time and auto-terminate stale miners.
-
-        Two termination triggers:
-          - cold_too_long: miner has produced samples in the past but
-            cumulative cold time has crossed the 36h threshold.
-          - never_sampled: miner has been on-chain for 48h+ without ever
-            producing a successful sample.
-
-        For miners that already exist when this is first deployed, the
-        cold clock is backfilled from the most recent sample timestamp.
-
-        Best-effort: any failure is logged but never propagates out of
-        the refresh loop, so cold tracking can never break miner
-        validation or scheduling.
-        """
-        try:
-            from affine.database.dao.miner_stats import MinerStatsDAO
-            from affine.database.dao.sample_results import SampleResultsDAO
-
-            miner_stats_dao = MinerStatsDAO()
-            sample_dao = SampleResultsDAO()
-
-            try:
-                envs = await self.config_dao.get_sampling_environments()
-            except Exception as e:
-                logger.warning(
-                    f"[MinersMonitor] failed to load sampling envs for "
-                    f"cold-tracking backfill: {e}"
-                )
-                envs = []
-
-            # Champion exemption. Match by hotkey (all revisions of
-            # current champion's hotkey are protected). On read failure
-            # skip the whole cycle — never risk terminating champion.
-            champion_hotkey = None
-            try:
-                champion = await self.config_dao.get_param_value('champion')
-                if isinstance(champion, dict):
-                    champion_hotkey = champion.get('hotkey') or None
-            except Exception as e:
-                logger.warning(
-                    f"[MinersMonitor] champion load failed: {e} — "
-                    f"skipping cold-tracking this cycle"
-                )
-                return
-
-            # Bittensor produces a block ≈ every 12 seconds. miner.block is
-            # the chain block at which the model commitment was first revealed.
-            SECONDS_PER_BLOCK = 12
-
-            for miner in miners:
-                if miner.uid == 0 or miner.uid > 1000:
-                    continue
-                if not miner.hotkey or not miner.revision:
-                    continue
-
-                if champion_hotkey and miner.hotkey == champion_hotkey:
-                    continue
-
-                is_cold = miner.chute_status != 'hot'
-
-                chain_age_seconds = None
-                if miner.block and current_block and current_block > miner.block:
-                    chain_age_seconds = (current_block - miner.block) * SECONDS_PER_BLOCK
-
+            await self.dao.save_miner(
+                uid=miner.uid,
+                hotkey=miner.hotkey,
+                model=miner.model,
+                revision=miner.revision,
+                model_hash=miner.model_hash,
+                is_valid=miner.is_valid,
+                invalid_reason=miner.invalid_reason,
+                block_number=current_block,
+                first_block=miner.block,
+            )
+            # template_check_result is a non-key attr we still want to keep
+            # cached on the row — write it separately so the DAO signature
+            # stays free of optional bric-à-brac.
+            if miner.template_check_result is not None:
                 try:
-                    existing = await miner_stats_dao.get_miner_stats(
-                        miner.hotkey, miner.revision)
-
-                    # Backfill only when:
-                    # - record exists (otherwise no fields to backfill)
-                    # - this is the first cold-tracking call for the row
-                    # - the miner is currently cold (a hot miner doesn't
-                    #   need a backfilled cold clock — its has_been_hot
-                    #   flips True this cycle and starts fresh)
-                    # - we have an env list to look up samples in
-                    backfill_ms = None
-                    if (existing
-                            and existing.get('last_status_check_at') is None
-                            and is_cold
-                            and envs):
-                        backfill_ms = await sample_dao.get_latest_sample_timestamp_ms(
-                            miner.hotkey, miner.revision, envs)
-
-                    result = await miner_stats_dao.update_cold_tracking(
-                        hotkey=miner.hotkey,
-                        revision=miner.revision,
-                        is_cold=is_cold,
-                        chain_age_seconds=chain_age_seconds,
-                        backfill_last_seen_ms=backfill_ms,
+                    await client.update_item(
+                        TableName=self.dao.table_name,
+                        Key={"pk": {"S": self.dao._make_pk(miner.uid)}},
+                        UpdateExpression="SET template_check_result = :v",
+                        ExpressionAttributeValues={
+                            ":v": {"S": miner.template_check_result},
+                        },
                     )
-
-                    if result and result.get('challenge_status') == 'terminated':
-                        reason = result.get('termination_reason', '')
-                        if reason in ('cold_too_long', 'never_sampled'):
-                            logger.info(
-                                f"[MinersMonitor] Miner uid={miner.uid} "
-                                f"hk={miner.hotkey[:8]}... terminated ({reason}) "
-                                f"cold_seconds_total={result.get('cold_seconds_total')} "
-                                f"chain_age_seconds={chain_age_seconds}"
-                            )
                 except Exception as e:
-                    logger.warning(
-                        f"[MinersMonitor] cold-tracking update failed for "
+                    logger.debug(
+                        f"[MinersMonitor] template_check_result write failed "
                         f"uid={miner.uid}: {e}"
                     )
-        except Exception as e:
-            logger.error(
-                f"[MinersMonitor] cold-tracking pass failed at top level: {e}",
-                exc_info=True,
-            )
 
-    async def refresh_miners(self) -> Dict[str, MinerInfo]:
-        """Refresh and validate all miners
-        
-        Returns:
-            Dict of valid miners {key: MinerInfo}
-        """
-        try:
-            logger.info("[MinersMonitor] Refreshing miners from metagraph...")
-            
-            # Get metagraph and commits
-            subtensor = await get_subtensor()
-            meta = await subtensor.metagraph(NETUID)
-            commits = await subtensor.get_all_revealed_commitments(NETUID)
-            
-            current_block = await subtensor.get_current_block()
-            
-            # Load blacklist
-            blacklist = await self._load_blacklist()
-            
-            # Discover and validate miners
-            miners = []
-            for uid in range(len(meta.hotkeys)):
-                hotkey = meta.hotkeys[uid]
-                
-                # Check blacklist
-                if hotkey in blacklist:
-                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
-                    m.mark_invalid("blacklisted", permanent=True)
-                    miners.append(m)
-                    continue
-
-                # Check for commit
-                if hotkey not in commits:
-                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
-                    m.mark_invalid("no_commit", permanent=False)
-                    miners.append(m)
-                    continue
-                
-                try:
-                    block, commit_data = commits[hotkey][-1]
-                    data = json.loads(commit_data)
-                    
-                    model = data.get("model", "")
-                    revision = data.get("revision", "")
-                    chute_id = data.get("chute_id", "")
-                    
-                    # Check if all required fields present
-                    if not model or not revision or not chute_id:
-                        m = MinerInfo(
-                            uid=uid,
-                            hotkey=hotkey,
-                            model=model,
-                            revision=revision,
-                            chute_id=chute_id,
-                            block=int(block) if uid != 0 else 0,
-                        )
-                        m.mark_invalid("incomplete_commit:missing_fields", permanent=False)
-                        miners.append(m)
-                        continue
-
-                    # Validate miner
-                    miner_info = await self._validate_miner(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model=model,
-                        revision=revision,
-                        chute_id=chute_id,
-                        block=int(block) if uid != 0 else 0,
-                        commit_count=len(commits[hotkey]),
+            # Seed challenge_status for new miners only. A miner can only
+            # commit once on this subnet (the multi-commit rule in
+            # _validate_miner rejects any second commit), so once the row
+            # carries a challenge_status — pending, in_progress, champion,
+            # or terminated_* — it stays. attribute_not_exists is enough.
+            if not miner.is_valid or miner.uid == 0 or miner.uid > 1000:
+                continue
+            try:
+                await client.update_item(
+                    TableName=self.dao.table_name,
+                    Key={"pk": {"S": self.dao._make_pk(miner.uid)}},
+                    UpdateExpression=(
+                        "SET challenge_status = :pending, enqueued_at = :now"
+                    ),
+                    ConditionExpression="attribute_not_exists(challenge_status)",
+                    ExpressionAttributeValues={
+                        ":pending": {"S": "pending"},
+                        ":now": {"N": str(now)},
+                    },
+                )
+            except ClientError as e:
+                if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                    logger.debug(
+                        f"[MinersMonitor] challenge_status seed failed "
+                        f"uid={miner.uid}: {e}"
                     )
-                    
-                    miners.append(miner_info)
-                    
-                except json.JSONDecodeError as e:
-                    logger.debug(f"Invalid JSON in commit for uid={uid}: {e}")
-                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
-                    m.mark_invalid("invalid_json_commit", permanent=True)
-                    miners.append(m)
-                except Exception as e:
-                    logger.debug(f"Failed to validate uid={uid}: {e}")
-                    m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="", chute_id="", block=0)
-                    m.mark_invalid(f"validation_error:{str(e)[:50]}", permanent=False)
-                    miners.append(m)
-            
-            # Detect plagiarism
-            miners = await self._detect_plagiarism(miners)
-
-            # Merge system miners (uid > 1000) from configuration
-            system_miners_config = await self.config_dao.get_system_miners()
-            for uid_str, config in system_miners_config.items():
-                uid = int(uid_str)
-                if uid <= 1000:
-                    continue
-
-                # Generate virtual hotkey and revision
-                # uid 1001 -> "SYSTEM-1", uid 1002 -> "SYSTEM-2", etc.
-                hotkey = f"SYSTEM-{uid - 1000}"
-                revision = f"SYSTEM-{uid - 1000}"
-                model = config.get("model", "")
-
-                # Create system miner's MinerInfo (always valid, skips all validation)
-                system_miner = MinerInfo(
-                    uid=uid,
-                    hotkey=hotkey,
-                    model=model,
-                    revision=revision,
-                    chute_id="",
-                    chute_slug="llm",
-                    block=0,
-                    is_valid=True,
-                    invalid_reason=None,
-                    model_hash="",
-                    hf_revision=revision,
-                    chute_status="hot",
-                    template_check_result="safe",
-                )
-                miners.append(system_miner)
-
-            # Must run before _release_terminated_chutes so durable
-            # invalidations land in challenge_status='terminated' and
-            # the release path below picks them up the same cycle.
-            await self._terminate_permanently_invalid(miners)
-
-            # Release chutes for terminated miners before persist,
-            # so the cold status is written to DB in the same round.
-            await self._release_terminated_chutes(miners)
-
-            # Persist to database (including system miners)
-            for miner in miners:
-                await self.dao.save_miner(
-                    uid=miner.uid,
-                    hotkey=miner.hotkey,
-                    model=miner.model,
-                    revision=miner.revision,
-                    chute_id=miner.chute_id,
-                    chute_slug=miner.chute_slug,
-                    model_hash=miner.model_hash,
-                    chute_status=miner.chute_status,
-                    is_valid=miner.is_valid,
-                    invalid_reason=miner.invalid_reason,
-                    block_number=current_block,
-                    first_block=miner.block,
-                    template_check_result=miner.template_check_result,
+            except Exception as e:
+                logger.debug(
+                    f"[MinersMonitor] challenge_status seed unexpected error "
+                    f"uid={miner.uid}: {type(e).__name__}: {e}"
                 )
 
-            await self._update_cold_tracking(miners, current_block=current_block)
+    # ---- public read ----------------------------------------------------
 
-            valid_miners = {m.key(): m for m in miners if m.is_valid}
-
-            # Count system miners separately for logging
-            system_miner_count = len([m for m in miners if m.uid == 0 or m.uid > 1000])
-            regular_miner_count = len(miners) - system_miner_count
-
-            self.last_update = int(time.time())
-
-            logger.info(
-                f"[MinersMonitor] Refreshed {regular_miner_count} regular miners + "
-                f"{system_miner_count} system miners "
-                f"({len(valid_miners)} valid, {len(miners) - len(valid_miners)} invalid)"
-            )
-
-            return valid_miners
-            
-        except Exception as e:
-            logger.error(f"[MinersMonitor] Failed to refresh miners: {e}", exc_info=True)
-            return {}
-    
     async def get_valid_miners(self, force_refresh: bool = False) -> Dict[str, MinerInfo]:
-        """Get current valid miner list
-        
-        Args:
-            force_refresh: Whether to force refresh
-            
-        Returns:
-            Miners dictionary {key: MinerInfo}
-        """
-        # Query from database
-        miners_data = await self.dao.get_valid_miners()
-        
-        # Convert to MinerInfo
-        result = {}
-        for data in miners_data:
+        if force_refresh:
+            return await self.refresh_miners()
+        rows = await self.dao.get_valid_miners()
+        out: Dict[str, MinerInfo] = {}
+        for r in rows:
             info = MinerInfo(
-                uid=data['uid'],
-                hotkey=data['hotkey'],
-                model=data['model'],
-                revision=data['revision'],
-                chute_id=data['chute_id'],
-                chute_slug=data.get('chute_slug', ''),
-                block=data.get('first_block', 0),
+                uid=int(r["uid"]),
+                hotkey=r["hotkey"],
+                model=r.get("model", ""),
+                revision=r.get("revision", ""),
+                block=int(r.get("first_block", 0) or 0),
                 is_valid=True,
+                model_hash=r.get("model_hash", ""),
+                template_check_result=r.get("template_check_result"),
             )
-            result[info.key()] = info
-        
-        return result
+            out[info.key()] = info
+        return out

@@ -1,5 +1,4 @@
-# This file is an override for local development; do not run alone.
-# Use together with docker-compose.backend.yml:
+# Override for local development; use alongside docker-compose.backend.yml:
 #   docker compose -f docker-compose.backend.yml -f docker-compose.backend.local.yml up --build
 
 x-affine-image: &affine_image
@@ -12,19 +11,16 @@ services:
   api:
     <<: *affine_image
 
-  scheduler:
-    <<: *affine_image
-  
-  executor:
-    <<: *affine_image
-  
-  teacher:
-    <<: *affine_image
-
   monitor:
     <<: *affine_image
-  
-  scorer:
+
+  scheduler:
+    <<: *affine_image
+
+  executor:
+    <<: *affine_image
+
+  teacher:
     <<: *affine_image
 
   watchtower:

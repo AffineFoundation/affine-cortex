@@ -288,73 +288,6 @@ class APIClient:
 
         except aiohttp.ClientError as e:
             raise NetworkError(f"Network error during PUT {url}: {e}", url, e)
-        
-
-    async def get_chute_info(self, chute_id: str) -> Optional[Dict]:
-        """Get chute info from Chutes API.
-        
-        Args:
-            chute_id: Chute deployment ID
-            
-        Returns:
-            Chute info dict or None if failed
-        """
-        url = f"https://api.chutes.ai/chutes/{chute_id}"
-        token = os.getenv("CHUTES_API_KEY", "")
-        
-        if not token:
-            logger.warning("CHUTES_API_KEY not configured")
-            return None
-        
-        headers = {"Authorization": token}
-        
-        try:
-            async with self._session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status != 200:
-                    return None
-                
-                info = await resp.json()
-                # Remove unnecessary fields but keep instance count for provider routing
-                instances = info.pop("instances", None)
-                info["instance_count"] = len(instances) if isinstance(instances, list) else 0
-                for k in ("readme", "cords", "tagline"):
-                    info.pop(k, None)
-                info.get("image", {}).pop("readme", None)
-
-                return info
-        except Exception as e:
-            logger.debug(f"Failed to fetch chute {chute_id}: {e}")
-            return None
-
-    async def delete_chute(self, chute_id: str) -> bool:
-        """Delete a chute deployment via Chutes API.
-
-        Args:
-            chute_id: Chute deployment ID
-
-        Returns:
-            True if deleted successfully, False otherwise
-        """
-        url = f"https://api.chutes.ai/chutes/{chute_id}"
-        token = os.getenv("CHUTES_API_KEY", "")
-
-        if not token:
-            logger.warning("CHUTES_API_KEY not configured, cannot delete chute")
-            return False
-
-        headers = {"Authorization": token}
-
-        try:
-            async with self._session.delete(url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    logger.info(f"Deleted chute {chute_id}")
-                    return True
-                body = await resp.text()
-                logger.warning(f"Failed to delete chute {chute_id}: HTTP {resp.status} {body[:200]}")
-                return False
-        except Exception as e:
-            logger.error(f"Error deleting chute {chute_id}: {e}")
-            return False
 
 
 def cli_api_client(base_url: Optional[str] = None) -> CLIAPIClient:
@@ -372,21 +305,6 @@ def cli_api_client(base_url: Optional[str] = None) -> CLIAPIClient:
             print(json.dumps(data, indent=2))
     """
     return CLIAPIClient(base_url)
-
-
-async def get_chute_info(chute_id: str) -> Optional[Dict]:
-    """Legacy function for backward compatibility.
-    
-    Creates a temporary APIClient to fetch chute info.
-    """
-    async with cli_api_client() as client:
-        return await client.get_chute_info(chute_id)
-
-
-async def delete_chute(chute_id: str) -> bool:
-    """Delete a chute deployment via Chutes API."""
-    async with cli_api_client() as client:
-        return await client.delete_chute(chute_id)
 
 
 async def create_api_client(base_url: Optional[str] = None) -> APIClient:

@@ -43,28 +43,13 @@ class ScoresDAO(BaseDAO):
         average_score: float,
         scores_by_env: Dict[str, Any],
         total_samples: int,
-        challenge_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Save a score snapshot for a miner at a specific block.
+        """Save a per-miner row for a given block's score snapshot.
 
-        Args:
-            block_number: Current block number
-            miner_hotkey: Miner's hotkey
-            uid: Miner UID
-            model_revision: Model revision
-            model: Model repository identifier
-            first_block: Block number when miner first registered
-            overall_score: Overall score (normalized weight, 1.0 for champion, 0.0 for others)
-            average_score: Average score across environments
-            scores_by_env: Detailed scores by environment (with score, sample_count, completeness)
-            total_samples: Total number of samples
-            challenge_info: Champion challenge state (optional)
-
-        Returns:
-            Saved score item
+        ``overall_score`` is the on-chain-bound weight: 1.0 for the
+        champion this window, 0.0 for everyone else. ``scores_by_env``
+        is the per-env mean/n breakdown the rank UI surfaces.
         """
-        calculated_at = int(time.time())
-
         item = {
             'pk': self._make_pk(block_number),
             'sk': self._make_sk(miner_hotkey),
@@ -74,21 +59,17 @@ class ScoresDAO(BaseDAO):
             'model_revision': model_revision,
             'model': model,
             'first_block': first_block,
-            'calculated_at': calculated_at,
+            'calculated_at': int(time.time()),
             'overall_score': overall_score,
             'average_score': average_score,
             'scores_by_env': scores_by_env,
             'total_samples': total_samples,
-            'latest_marker': 'LATEST',  # For GSI
+            'latest_marker': 'LATEST',
         }
-
-        if challenge_info is not None:
-            item['challenge_info'] = challenge_info
-
-        # Conditional TTL: only set TTL for miners with zero weight
+        # Zero-weight rows auto-expire after a week so the scores table
+        # doesn't grow unbounded across windows.
         if overall_score == 0:
             item['ttl'] = self.get_ttl(7)
-
         return await self.put(item)
     
     async def get_scores_at_block(

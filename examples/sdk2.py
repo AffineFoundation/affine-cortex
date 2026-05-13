@@ -1,39 +1,37 @@
-import asyncio
-import affine as af
-from dotenv import load_dotenv
-import os
-import sys
-import json
-af.trace()
+"""Affine SDK example — evaluate any model identifier directly.
 
+Skips the on-chain miner lookup from ``sdk.py`` — useful when you want
+to benchmark an arbitrary HuggingFace model against an Affine
+environment without committing it on chain first.
+"""
+
+import asyncio
+import json
+
+from dotenv import load_dotenv
+
+import affine as af
+
+
+af.trace()
 load_dotenv()
 
 
-async def main():
-    api_key = os.getenv("CHUTES_API_KEY")
-    if not api_key:
-        print("\n   ❌ CHUTES_API_KEY environment variable not set")
-        print("   Please set: export CHUTES_API_KEY='your-key'")
-        print("   Or create .env file with: CHUTES_API_KEY=your-key")
-        sys.exit(1)
+# OpenAI-compatible inference endpoint for the model below. Bring up
+# vLLM / sglang / ollama / a managed gateway — anything that speaks
+# /v1/chat/completions.
+BASE_URL = "http://localhost:8000/v1"
+MODEL = "deepseek-ai/DeepSeek-V3"
 
-    ded_env = af.DED()
-    evaluation = await ded_env.evaluate(
-        model="deepseek-ai/DeepSeek-V3",
-        base_url="https://llm.chutes.ai/v1",
-        task_id=20100
-    )
-    print(f"\nDED Evaluation Result:")
-    print(json.dumps(evaluation.dict(), indent=2, ensure_ascii=False))
 
-    abd_env = af.ABD()
-    evaluation_abd = await abd_env.evaluate(
-        model="deepseek-ai/DeepSeek-V3",
-        base_url="https://llm.chutes.ai/v1",
-        task_id=20200,
-    )
-    print(f"\nABD Evaluation Result:")
-    print(json.dumps(evaluation_abd.dict(), indent=2, ensure_ascii=False))
+async def main() -> None:
+    ded = af.DED()
+    result = await ded.evaluate(model=MODEL, base_url=BASE_URL, task_id=20100)
+    print("DED:", json.dumps(result.dict(), indent=2, ensure_ascii=False))
+
+    abd = af.ABD()
+    result = await abd.evaluate(model=MODEL, base_url=BASE_URL, task_id=20200)
+    print("ABD:", json.dumps(result.dict(), indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

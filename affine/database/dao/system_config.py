@@ -4,7 +4,7 @@ System Config DAO
 Manages dynamic configuration parameters.
 """
 
-from typing import Dict, Any, List, Optional, Set
+from typing import Dict, Any, List, Optional
 from affine.database.base_dao import BaseDAO
 from affine.database.schema import get_table_name
 
@@ -133,93 +133,12 @@ class SystemConfigDAO(BaseDAO):
         return await self.query(pk=pk)
     
     # Environment Configuration Management
-    
-    async def get_sampling_environments(self) -> List[str]:
-        """Get list of environments for task generation (sampling).
-        
-        Returns:
-            List of environment names where enabled_for_sampling=true
-        """
-        environments = await self.get_param_value('environments', default={})
-        return [
-            env_name
-            for env_name, env_config in environments.items()
-            if env_config.get('enabled_for_sampling', False)
-        ]
-    
-    async def set_sampling_environments(
-        self, envs: List[str], updated_by: str = "system"
-    ) -> Dict[str, Any]:
-        """Set sampling environments list.
-        
-        This method updates the enabled_for_sampling flag for environments.
-        
-        Args:
-            envs: List of environment names to enable for sampling
-            updated_by: Who updated the parameter
-            
-        Returns:
-            Saved config item
-        """
-        environments = await self.get_param_value('environments', default={})
-        
-        # Update enabled_for_sampling for all environments
-        for env_name in environments:
-            environments[env_name]['enabled_for_sampling'] = env_name in envs
-        
-        return await self.set_param(
-            param_name='environments',
-            param_value=environments,
-            param_type='dict',
-            description='Environment configurations (sampling, scoring, ranges)',
-            updated_by=updated_by
-        )
-    
-    async def get_active_environments(self) -> List[str]:
-        """Get list of environments for score calculation (active).
-        
-        Allows transition period when adding new environments:
-        - New env added to sampling list first (enabled_for_sampling=true)
-        - After sufficient sampling, added to active list (enabled_for_scoring=true)
-        
-        Returns:
-            List of environment names where enabled_for_scoring=true
-        """
-        environments = await self.get_param_value('environments', default={})
-        return [
-            env_name
-            for env_name, env_config in environments.items()
-            if env_config.get('enabled_for_scoring', False)
-        ]
-    
-    async def set_active_environments(
-        self, envs: List[str], updated_by: str = "system"
-    ) -> Dict[str, Any]:
-        """Set active environments list for scoring.
-        
-        This method updates the enabled_for_scoring flag for environments.
-        
-        Args:
-            envs: List of environment names to enable for scoring
-            updated_by: Who updated the parameter
-            
-        Returns:
-            Saved config item
-        """
-        environments = await self.get_param_value('environments', default={})
-        
-        # Update enabled_for_scoring for all environments
-        for env_name in environments:
-            environments[env_name]['enabled_for_scoring'] = env_name in envs
-        
-        return await self.set_param(
-            param_name='environments',
-            param_value=environments,
-            param_type='dict',
-            description='Environment configurations (sampling, scoring, ranges)',
-            updated_by=updated_by
-        )
-    
+    #
+    # The queue-window flow has a single ``enabled`` flag per env; the old
+    # split between ``enabled_for_sampling`` and ``enabled_for_scoring`` is
+    # gone. ``WindowStateStore.get_environments()`` is the only consumer
+    # and filters by ``enabled`` directly, so no helper here.
+
     # Blacklist Configuration Management
     
     async def get_blacklist(self) -> List[str]:

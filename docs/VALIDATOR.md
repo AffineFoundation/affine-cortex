@@ -245,11 +245,11 @@ af get-weights
 # View top 10 miners
 af get-scores --top 10
 
-# View full ranking table
+# One-stop: window state + queue head + weights table
 af get-rank
 
-# View specific miner info
-af get-miner <UID>
+# Inspect one miner from the validator side (admin command)
+AFFINE_SHOW_ADMIN_COMMANDS=true af db get-miner --uid <UID>
 ```
 
 ## Monitoring & Maintenance
