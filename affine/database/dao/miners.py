@@ -41,8 +41,7 @@ class MinersDAO(BaseDAO):
         """Save or update miner validation state.
 
         Directly updates the record for this UID (no history tracking).
-        Chute fields are dropped — inference is provider-routed by the
-        scheduler service per window.
+        Inference is provider-routed by the scheduler service per window.
 
         Args:
             uid: Miner UID (0-255 regular, > 1000 system).

@@ -267,8 +267,8 @@ def get_rank(ctx):
 def miner_deploy(ctx):
     """One-command miner deployment: HF upload → on-chain commit.
 
-    Chutes is no longer in the loop — the scheduler service hosts inference
-    per window, so there's nothing for the miner to deploy externally.
+    The scheduler service hosts inference per window, so miners only upload
+    weights and commit the model snapshot.
 
     Examples:
         af miner-deploy -r myuser/model -p ./my_model

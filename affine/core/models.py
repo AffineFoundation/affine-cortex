@@ -18,7 +18,7 @@ class Miner(BaseModel):
 
     The queue-window scorer hosts inference itself, so a miner row is
     just ``(uid, hotkey, model, revision)`` plus the on-chain block when
-    the commit landed. There is no chute / slug / weights_shas anymore.
+    the commit landed.
     """
 
     uid: int

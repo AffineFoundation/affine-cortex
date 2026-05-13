@@ -4,9 +4,7 @@ How to participate in Affine as a miner.
 
 > The validator now hosts inference for you. You commit a HuggingFace
 > `(model, revision)` pair on chain and the validator-side scheduler
-> pulls your weights into Targon when your queue slot comes up. There
-> is no Chutes deployment, no GPU rental, no inference server to keep
-> warm.
+> deploys your weights when your queue slot comes up.
 
 ## Table of Contents
 
@@ -23,7 +21,7 @@ How to participate in Affine as a miner.
 2. **HuggingFace account** with a personal access token that has *Write*
    scope (you'll upload model weights through it).
 
-That's all. No Chutes account, no GPU funding.
+That's all you need to submit a model.
 
 ## Environment Setup
 

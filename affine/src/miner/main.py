@@ -46,8 +46,8 @@ def pull(uid, model_path, hf_token):
 @click.option("--coldkey", help="Wallet coldkey name (default: $BT_WALLET_COLD)")
 @click.option("--hotkey", help="Wallet hotkey name (default: $BT_WALLET_HOT)")
 def commit(repo, revision, coldkey, hotkey):
-    """Commit {model, revision} to the chain. No chute_id — the validator
-    hosts inference itself per window."""
+    """Commit {model, revision} to the chain. The validator hosts inference
+    per window."""
     asyncio.run(commit_command(repo=repo, revision=revision, coldkey=coldkey, hotkey=hotkey))
 
 

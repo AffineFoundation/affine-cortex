@@ -8,19 +8,19 @@ Affine is a Bittensor subnet designed to incentivize the creation of advanced re
 
 **Q2: How does mining work on this subnet?**
 
-The flow is much simpler than it used to be — the validator hosts the inference itself, so miners don't run any infrastructure:
+The validator hosts inference, so miners submit model weights rather than running serving infrastructure:
 
 1. **Train a model.** Improve a Qwen3-based model on the subnet's evaluation environments.
 2. **Upload to HuggingFace.** Push the weights to a public HuggingFace repo whose name ends with your hotkey.
 3. **Commit on chain.** Run `af commit --repo user/repo-hotkey --revision <SHA>` once. Each hotkey can commit exactly one revision — any second commit permanently invalidates the miner.
 
-You don't deploy to Chutes or anywhere else. The validator pulls your weights from HuggingFace, runs them through a hosted inference provider (Targon by default, optionally an operator-managed B300 fleet), and evaluates them against the current champion when your slot comes up in the daily queue.
+The validator pulls your weights from HuggingFace, runs them through its configured inference provider, and evaluates them against the current champion when your slot comes up in the daily queue.
 
 **Q3: What are the requirements to start mining?**
 
 * A HuggingFace account to host your model weights.
 * A registered Bittensor coldkey + hotkey.
-* That's it. No Chutes account, no GPU rental — the validator pays for inference compute.
+* The validator handles inference compute for scheduled evaluations.
 
 **Q4: Where can I find the code and leaderboard?**
 

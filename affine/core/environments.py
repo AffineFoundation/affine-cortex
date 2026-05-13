@@ -500,11 +500,10 @@ class SDKEnvironment:
     
     def _get_env_vars(self) -> Dict[str, str]:
         """Get environment variables for this environment"""
-        api_key = os.getenv("CHUTES_API_KEY")
-        if not api_key:
-            raise ValueError("CHUTES_API_KEY environment variable is required")
-        
-        env_vars = {"CHUTES_API_KEY": api_key, "API_KEY": api_key}
+        env_vars: Dict[str, str] = {}
+        inference_api_key = os.getenv("INFERENCE_API_KEY") or os.getenv("API_KEY")
+        if inference_api_key:
+            env_vars["API_KEY"] = inference_api_key
 
         # Forward any required host env vars into the container for this environment
         for key in self.config.required_env_vars:
@@ -712,10 +711,8 @@ class SDKEnvironment:
         start = time.monotonic()
         kwargs = self._prepare_eval_kwargs(**kwargs)
 
-        # Build payload with miner info. The queue-window scorer routes
-        # inference exclusively through a provider-supplied base_url —
-        # the legacy Chutes-slug fallback is gone (no more chute_slug in
-        # any miner record).
+        # Build payload with miner info. The scheduler routes inference
+        # exclusively through a provider-supplied base_url.
         payload = kwargs.copy()
         if miner:
             base_url = getattr(miner, "base_url", None)
@@ -787,12 +784,10 @@ class SDKEnvironment:
     
     @staticmethod
     def _validate_miner(miner: Any) -> bool:
-        """Validate miner object. Either a slug (legacy Chutes) or base_url is enough."""
+        """Validate miner object."""
         if not hasattr(miner, "model") or not miner.model:
             return False
-        has_slug = getattr(miner, "slug", None)
-        has_base_url = getattr(miner, "base_url", None)
-        return bool(has_slug or has_base_url)
+        return bool(getattr(miner, "base_url", None))
 
 
 # ========================= Factory Functions =========================

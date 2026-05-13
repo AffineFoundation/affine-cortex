@@ -3,7 +3,7 @@ Miner-side CLI command implementations.
 
 After the queue-window refactor, the miner-side surface is purely:
   - pull              : fetch the on-chain model snapshot for a UID
-  - commit            : write {model, revision} on chain (no chute_id)
+  - commit            : write {model, revision} on chain
   - miner-deploy      : convenience wrapper (HF upload → commit)
   - get-weights       : pretty-print the latest weight snapshot
   - get-scores / get-score : score table / single-miner score

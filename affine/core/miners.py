@@ -2,7 +2,7 @@
 
 Public face of the SDK — ``affine.miners(uid)`` returns the model + revision
 a miner committed, nothing else. The queue-window scorer hosts inference
-itself, so there is no chute / slug lookup here.
+itself.
 """
 
 from __future__ import annotations
@@ -27,8 +27,7 @@ async def miners(
     """Return ``{uid: Miner}`` for every UID with a valid on-chain commit.
 
     A commit is valid when its JSON has both ``model`` and ``revision``.
-    Unknown extra fields (e.g. legacy ``chute_id``) are tolerated and
-    ignored.
+    Unknown extra fields are tolerated and ignored.
 
     Args:
         uids: A single UID, a list, or ``None`` for every UID on the

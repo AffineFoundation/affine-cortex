@@ -329,8 +329,10 @@ class ExecutorWorker:
 class _Miner:
     """Duck-typed miner shim SDKEnvironment.evaluate expects."""
 
-    __slots__ = ("hotkey", "model", "revision", "base_url",
-                 "inference_model", "slug", "public_base_url")
+    __slots__ = (
+        "hotkey", "model", "revision", "base_url",
+        "inference_model", "public_base_url",
+    )
 
     def __init__(self, *, hotkey: str, model: str, revision: str, base_url: str):
         self.hotkey = hotkey
@@ -338,7 +340,6 @@ class _Miner:
         self.revision = revision
         self.base_url = base_url
         self.inference_model = None
-        self.slug = None
         self.public_base_url = None
 
 

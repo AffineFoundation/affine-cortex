@@ -7,8 +7,7 @@ sanity-check a fine-tune locally before committing on chain, or to spot-
 test a model someone is hosting.
 
 The scheduler service handles all production sampling — the queue-window
-flow doesn't go through this CLI. There is no UID / chute mode anymore;
-just ``--base-url`` + ``--model``.
+flow doesn't go through this CLI. Use ``--base-url`` + ``--model``.
 """
 
 from __future__ import annotations

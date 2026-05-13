@@ -1,11 +1,9 @@
 """
-Miners monitor — queue-window refactor edition.
+Miners monitor.
 
-Replaces the chute-aware monitor with a slim metagraph/commit reader. For
-every miner on the subnet:
+Reads metagraph commits and miner metadata. For every miner on the subnet:
 
-  1. Read its on-chain commit ``{model, revision}`` (the legacy
-     ``chute_id`` field, if present, is ignored).
+  1. Read its on-chain commit ``{model, revision}``.
   2. Validate model on HuggingFace: revision exists, weight hashes
      computable, no duplicate-repo / suspicious commit history.
   3. Optional: model size + chat-template safety checks.
@@ -16,7 +14,7 @@ every miner on the subnet:
      freshly-seen ``(hotkey, revision)`` lands — that's the only signal
      the challenger queue needs to enter the rotation.
 
-Anti-copy / cold tracking / chute lifecycle are all out of scope now.
+Anti-copy checks run here; inference lifecycle is handled by the scheduler.
 """
 
 from __future__ import annotations

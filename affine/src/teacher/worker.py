@@ -225,9 +225,8 @@ class TeacherWorker:
             # Collect env vars; override UVICORN_WORKERS=1 for teacher
             env_vars = dict(config.env_vars)
             env_vars["UVICORN_WORKERS"] = "1"
-            api_key = os.getenv("CHUTES_API_KEY", "")
-            if api_key:
-                env_vars.update({"CHUTES_API_KEY": api_key, "API_KEY": api_key})
+            if self.api_key:
+                env_vars["API_KEY"] = self.api_key
             if "task_type" in config.eval_params:
                 env_vars["ENV_NAME"] = config.eval_params["task_type"]
             for key in config.required_env_vars:
