@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 from contextlib import redirect_stdout
 
@@ -14,6 +15,30 @@ def _render_rank(window, queue, scores):
     with redirect_stdout(buf):
         _print_rank_table(window, queue, scores)
     return buf.getvalue()
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self.responses = responses
+        self.calls = []
+
+    async def get(self, path):
+        self.calls.append(path)
+        response = self.responses[path]
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class _FakeClientContext:
+    def __init__(self, client):
+        self.client = client
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
@@ -277,3 +302,38 @@ def test_rank_table_respects_no_color(monkeypatch):
         )
 
     assert "\033[" not in buf.getvalue()
+
+
+def test_get_rank_falls_back_to_scores_when_aggregate_endpoint_is_missing(monkeypatch):
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 1,
+                "miner_hotkey": "champ_hotkey",
+                "model": "org/champion",
+                "overall_score": 1.0,
+                "is_valid": True,
+                "scores_by_env": {},
+            },
+        ],
+    }
+    client = _FakeClient({
+        "/rank/current?top=256&queue_limit=10": RuntimeError("HTTP 404"),
+        "/scores/latest?top=256": scores,
+    })
+    monkeypatch.setattr(rank, "cli_api_client", lambda: _FakeClientContext(client))
+
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        asyncio.run(rank.get_rank_command())
+
+    assert client.calls == [
+        "/rank/current?top=256&queue_limit=10",
+        "/scores/latest?top=256",
+    ]
+    out = buf.getvalue()
+    assert "No scores found" not in out
+    assert "CHAMPION CHALLENGE RANKING - Block 100" in out
+    assert "CHAMPION" in out

@@ -42,6 +42,25 @@ async def _safe_get(client, path: str) -> Optional[Any]:
         return None
 
 
+async def _fetch_rank_payload(client) -> Dict[str, Any]:
+    payload = await _safe_get(
+        client,
+        f"/rank/current?top={_RANK_FETCH_LIMIT}&queue_limit={_QUEUE_PREVIEW}",
+    )
+    if isinstance(payload, dict) and isinstance(payload.get("scores"), dict):
+        return payload
+
+    # Some deployed API servers may not have the aggregate rank endpoint yet.
+    # Fall back to the stable score snapshot so the CLI still renders a rank
+    # table instead of reporting "No scores found" for a 404 on /rank/current.
+    scores = await _safe_get(client, f"/scores/latest?top={_RANK_FETCH_LIMIT}")
+    if isinstance(scores, dict):
+        out = payload if isinstance(payload, dict) else {}
+        out["scores"] = scores
+        return out
+    return payload if isinstance(payload, dict) else {}
+
+
 def _short(value: Any, n: int) -> str:
     text = "" if value is None else str(value)
     return text[:n]
@@ -326,11 +345,7 @@ def _print_rank_table(
 
 async def get_rank_command() -> None:
     async with cli_api_client() as client:
-        payload = await _safe_get(
-            client,
-            f"/rank/current?top={_RANK_FETCH_LIMIT}&queue_limit={_QUEUE_PREVIEW}",
-        )
-    payload = payload if isinstance(payload, dict) else {}
+        payload = await _fetch_rank_payload(client)
 
     _print_rank_table(
         payload.get("window") if isinstance(payload.get("window"), dict) else None,
