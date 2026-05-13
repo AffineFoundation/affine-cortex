@@ -232,16 +232,32 @@ class FlowScheduler:
         ``SAMPLE_BUFFER_RATIO`` so the contest can decide as soon as
         the (champion ∩ challenger) overlap reaches the base
         ``sampling_count``. Slow-tail / errored task_ids in the buffer
-        portion are simply abandoned."""
-        env_configs = {
-            env: EnvSamplingConfig(
+        portion are simply abandoned.
+
+        Envs with a ``dataset_range_source`` (SWE-INFINITE, DISTILL —
+        datasets that grow over time) get their ``dataset_range``
+        resolved against the remote metadata before sampling. Falls
+        back to the static config range on any resolver failure.
+        """
+        from affine.src.scorer.dataset_range_resolver import resolve_dataset_range
+
+        env_configs: Dict[str, EnvSamplingConfig] = {}
+        for env, cfg in envs.items():
+            resolved_range = cfg.dataset_range
+            if cfg.dataset_range_source:
+                fresh = await resolve_dataset_range(cfg.dataset_range_source)
+                if fresh is not None and fresh != cfg.dataset_range:
+                    logger.info(
+                        f"FlowScheduler: dataset_range for {env} refreshed via "
+                        f"source: {cfg.dataset_range} → {fresh}"
+                    )
+                    resolved_range = fresh
+            env_configs[env] = EnvSamplingConfig(
                 env=env,
                 sampling_count=math.ceil(cfg.sampling_count * (1 + SAMPLE_BUFFER_RATIO)),
-                dataset_range=cfg.dataset_range,
+                dataset_range=resolved_range,
                 mode=cfg.sampling_mode,
             )
-            for env, cfg in envs.items()
-        }
         task_ids = self.sampler.generate(
             window_id=current_block // self.cfg.window_blocks,
             block_start=current_block,

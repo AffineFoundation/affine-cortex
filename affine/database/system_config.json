@@ -7,7 +7,12 @@
       "sampling": {
         "sampling_count": 300,
         "dataset_range": [[0, 5000]],
-        "sampling_mode": "latest"
+        "sampling_mode": "latest",
+        "dataset_range_source": {
+          "url": "https://pub-7882418a56434a479bf9a7febd660b36.r2.dev/bugs/metadata.json",
+          "field": "tasks.completed_up_to",
+          "range_type": "zero_to_value"
+        }
       }
     },
     "DISTILL": {
@@ -16,7 +21,12 @@
       "sampling": {
         "sampling_count": 300,
         "dataset_range": [[0, 1000]],
-        "sampling_mode": "latest"
+        "sampling_mode": "latest",
+        "dataset_range_source": {
+          "url": "https://pub-4546777cb27840ec91b892f19eb5742b.r2.dev/metadata.json",
+          "field": "completed_up_to",
+          "range_type": "zero_to_value"
+        }
       }
     },
     "LIVEWEB": {

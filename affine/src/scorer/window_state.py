@@ -90,6 +90,12 @@ class EnvConfig:
     sampling_count: int
     dataset_range: List[List[int]]
     sampling_mode: str = "random"  # 'random' | 'latest'
+    # Optional remote source for the dataset's current top index. When
+    # set, the scheduler resolves ``dataset_range`` from this URL at
+    # each window refresh so envs whose dataset accumulates new
+    # task_ids (SWE-INFINITE, DISTILL) always sample the freshest tail.
+    # Shape: ``{"url": str, "field": str, "range_type": "zero_to_value"}``.
+    dataset_range_source: Optional[Dict[str, Any]] = None
 
 
 # ---- store protocol -------------------------------------------------------
@@ -333,10 +339,12 @@ def _env_from_payload(payload: Any) -> EnvConfig:
             sampling_count=0, dataset_range=[], sampling_mode="random",
         )
     sampling = payload.get("sampling") or payload.get("window_config") or {}
+    src = sampling.get("dataset_range_source")
     return EnvConfig(
         display_name=str(payload.get("display_name", "")),
         enabled=bool(payload.get("enabled", True)),
         sampling_count=int(sampling.get("sampling_count", 0)),
         dataset_range=list(sampling.get("dataset_range", []) or []),
         sampling_mode=str(sampling.get("sampling_mode", "random")),
+        dataset_range_source=src if isinstance(src, dict) else None,
     )

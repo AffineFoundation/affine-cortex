@@ -23,13 +23,17 @@ router = APIRouter(prefix="/scores", tags=["Scores"])
 
 
 async def _build_validity_map() -> dict:
-    """Map hotkey -> (is_valid_bool, invalid_reason_str|None) from miners table.
+    """Map hotkey -> (is_valid, invalid_reason, challenge_status,
+    termination_reason) from the miners table.
 
-    Surfaces validator-side invalidation in the rank UI: scoring
-    snapshots only carry challenge_status, but a miner can be
-    challenge_status='sampling' while is_valid=False (e.g. anticopy
-    cheat, model_mismatch). Without this lookup the CLI shows them
-    as still competing when in reality sampling has stopped.
+    Surfaces validator-side state in the rank UI:
+      - ``is_valid`` flags monitor-side rejections (model_mismatch,
+        anticopy, multiple_commits, …)
+      - ``challenge_status`` flags terminated_won / terminated_lost
+        (set by the flow scheduler at DECIDE, and by the one-shot
+        ``af db bootstrap-legacy-terminated`` for pre-refactor
+        terminate carry-over). Without this lookup the CLI shows
+        legacy-terminated miners as VALID even though they're out.
 
     One full scan (256-row cap → cheap). Empty map on any DAO error
     so a miners-table blip just hides reasons rather than 500ing.
@@ -46,7 +50,12 @@ async def _build_validity_map() -> dict:
             continue
         # is_valid stored as 'true'/'false' string in the GSI partition key.
         is_valid = str(m.get("is_valid") or "").lower() == "true"
-        out[hk] = (is_valid, m.get("invalid_reason") or None)
+        out[hk] = (
+            is_valid,
+            m.get("invalid_reason") or None,
+            m.get("challenge_status") or None,
+            m.get("termination_reason") or None,
+        )
     return out
 
 
@@ -87,7 +96,8 @@ async def get_latest_scores(
         miner_scores = []
         for s in scores_list:
             hk = s.get("miner_hotkey")
-            is_valid, invalid_reason = validity.get(hk, (None, None))
+            is_valid, invalid_reason, challenge_status, termination_reason = \
+                validity.get(hk, (None, None, None, None))
             miner_scores.append(MinerScore(
                 miner_hotkey=hk,
                 uid=s.get("uid"),
@@ -100,6 +110,8 @@ async def get_latest_scores(
                 total_samples=s.get("total_samples"),
                 is_valid=is_valid,
                 invalid_reason=invalid_reason,
+                challenge_status=challenge_status,
+                termination_reason=termination_reason,
             ))
 
         return ScoresResponse(

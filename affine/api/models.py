@@ -29,6 +29,10 @@ class MinerScore(BaseModel):
     total_samples: int
     is_valid: Optional[bool] = None
     invalid_reason: Optional[str] = None
+    # Surfaced so ``af get-rank`` can display TERMINATED for legacy- and
+    # battle-loser miners (``challenge_status`` starting with ``terminated_``).
+    challenge_status: Optional[str] = None
+    termination_reason: Optional[str] = None
 
 
 class ScoresResponse(BaseModel):
