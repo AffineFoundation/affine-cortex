@@ -11,8 +11,8 @@ path. Two pieces:
   - :class:`TeacherMover` (``mover.py``) periodically promotes a random
     subset of pending rollouts to the **public** R2 bucket so the
     DISTILL environment container can read them during scoring. Stays
-    paused while ``system_config.environments.DISTILL.enabled`` is
-    false.
+    paused while ``system_config.environments.DISTILL.enabled_for_sampling``
+    is false.
 
 Both run together inside ``af servers teacher``; the public DISTILL
 scoring loop is independent and unchanged.

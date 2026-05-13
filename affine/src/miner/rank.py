@@ -139,19 +139,27 @@ def _status_for(
     uid = row.get("uid")
     if uid == champion_uid:
         return "CHAMPION"
-    if row.get("is_valid") is False:
-        reason = str(row.get("invalid_reason") or "invalid")
-        return reason.split(":", 1)[0][:11]
     # Terminated lifecycle state lives in miner_stats, not the current
     # miners snapshot.
     chal_status = str(row.get("challenge_status") or "")
     if chal_status == "terminated":
         return "TERMINATED"
+    if row.get("is_valid") is False:
+        reason = str(row.get("invalid_reason") or "invalid")
+        return reason.split(":", 1)[0][:11]
     if uid == battle_uid:
         return "BATTLING"
     if uid in queue_positions:
         return f"QUEUE #{queue_positions[uid]}"
     return "VALID"
+
+
+def _reason_for(row: Dict[str, Any], status: str) -> str:
+    if status == "TERMINATED":
+        return _short(row.get("termination_reason"), 18)
+    if row.get("is_valid") is False:
+        return _short(row.get("invalid_reason"), 18)
+    return ""
 
 
 def _colored_status(status: str, *, is_invalid: bool) -> str:
@@ -174,7 +182,7 @@ def _colored_status(status: str, *, is_invalid: bool) -> str:
 def _sampling_mark(uid: Any, champion_uid: Optional[int], battle_uid: Optional[int]) -> str:
     if uid == champion_uid or uid == battle_uid:
         return _ansi("⚡", "1;92")
-    return " "
+    return "  "
 
 
 def _sort_scores(
@@ -186,20 +194,22 @@ def _sort_scores(
 ) -> List[Dict[str, Any]]:
     def key(row: Dict[str, Any]) -> tuple:
         uid = row.get("uid")
+        chal_status = str(row.get("challenge_status") or "")
         if uid == champion_uid:
             bucket = 0
         elif uid == battle_uid:
             bucket = 1
         elif uid in queue_positions:
             bucket = 2
-        elif row.get("is_valid") is False:
+        elif chal_status == "terminated":
             bucket = 4
+        elif row.get("is_valid") is False:
+            bucket = 5
         else:
             bucket = 3
         return (
             bucket,
             queue_positions.get(uid, 9999),
-            -_as_float(row.get("overall_score")),
             int(uid if isinstance(uid, int) else 9999),
         )
 
@@ -210,6 +220,8 @@ def _print_rank_table(
     window: Optional[Dict[str, Any]],
     queue: Optional[List[Dict[str, Any]]],
     scores_resp: Optional[Dict[str, Any]],
+    *,
+    show_reason: bool = False,
 ) -> None:
     if not scores_resp or not scores_resp.get("scores"):
         print("No scores found")
@@ -245,7 +257,10 @@ def _print_rank_table(
 
     header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
     header_parts.extend(f"{env[:24]:>24}" for env in envs)
-    header_parts.extend(["  Status   ", " Weight "])
+    header_parts.append("  Status   ")
+    if show_reason:
+        header_parts.append(" Reason           ")
+    header_parts.append(" Weight ")
     header_line = " | ".join(header_parts)
     width = max(88, len(header_line))
 
@@ -306,10 +321,12 @@ def _print_rank_table(
         for env in envs:
             live_count = row_live_counts.get(env)
             row_parts.append(f"{_env_cell(scores_by_env.get(env), live_count):>24}")
-        row_parts.extend([
-            _colored_status(status, is_invalid=(row.get("is_valid") is False)),
-            f"{_as_float(row.get('overall_score')):>7.4f}",
-        ])
+        row_parts.append(
+            _colored_status(status, is_invalid=(row.get("is_valid") is False))
+        )
+        if show_reason:
+            row_parts.append(f"{_reason_for(row, status):18s}")
+        row_parts.append(f"{_as_float(row.get('overall_score')):>7.4f}")
         print(" | ".join(row_parts))
 
     print(_ansi("=" * width, "2"))
@@ -323,15 +340,9 @@ def _print_rank_table(
         f"  |  Queue head: {queue_count}  |  Valid: {valid}  |  Invalid: {invalid}"
     )
     print(f"Sampling: {_ansi('⚡', '1;92')} marks miners in the current live sampling set")
-    if queue:
-        head = ", ".join(
-            f"#{row.get('position')} UID {row.get('uid')}"
-            for row in queue[:_QUEUE_PREVIEW]
-        )
-        print(f"Queue: {head}")
     print(_ansi("=" * width, "2"))
 
-async def get_rank_command() -> None:
+async def get_rank_command(*, show_reason: bool = False) -> None:
     try:
         async with cli_api_client() as client:
             payload = await _fetch_rank_payload(client)
@@ -343,4 +354,5 @@ async def get_rank_command() -> None:
         payload.get("window") if isinstance(payload.get("window"), dict) else None,
         payload.get("queue") if isinstance(payload.get("queue"), list) else None,
         payload.get("scores") if isinstance(payload.get("scores"), dict) else None,
+        show_reason=show_reason,
     )

@@ -3,7 +3,7 @@ Teacher Mover - Promotes teacher rollouts from the private to public bucket.
 
 Runs alongside teacher_worker. Each tick:
   1. Reads the DISTILL env config from SystemConfig (DynamoDB) to pick up
-     the current rotation_interval/rotation_count and enabled flag.
+     the sampling gate.
   2. Lists pending/{env}/* in the private bucket.
   3. Builds a candidate pool from all pending envs (with optional
      low-priority deprioritization via ``LOW_PRIORITY_ENVS``).
@@ -108,14 +108,14 @@ class TeacherMover:
     # ---------------- SystemConfig lookup ----------------
 
     async def _read_distill_config(self) -> Optional[Tuple[int, int, bool]]:
-        """Return ``(interval_sec, count, enabled)``.
+        """Return ``(interval_sec, count, sampling_enabled)``.
 
         The queue-window refactor removed per-env ``rotation_interval`` /
         ``rotation_count`` from SystemConfig; the mover now drives its
         own cadence via ``MOVER_PROMOTE_INTERVAL_SEC`` /
-        ``MOVER_PROMOTE_COUNT`` module constants. The only field we
-        still consult on the DISTILL env is its ``enabled`` flag, which
-        we honor so the mover pauses when DISTILL is paused.
+        ``MOVER_PROMOTE_COUNT`` module constants. The only environment
+        gate it honors is ``enabled_for_sampling``: if DISTILL is not
+        sampling, the public bucket should not keep rotating fresh tasks.
         """
         try:
             environments = await self._config_dao.get_param_value(
@@ -128,14 +128,10 @@ class TeacherMover:
         distill = environments.get(DISTILL_ENV_KEY)
         if not distill:
             return None
-        # Pause the mover when the env's sampling pipeline is off — the
-        # bucket would just accumulate stale rollouts. Accepts the new
-        # ``enabled_for_sampling`` name plus the legacy ``enabled``
-        # alias so an unmigrated DB still drains correctly.
-        enabled = bool(distill.get(
-            "enabled_for_sampling", distill.get("enabled", False),
-        ))
-        return MOVER_PROMOTE_INTERVAL_SEC, MOVER_PROMOTE_COUNT, enabled
+        # Pause the mover when the env's sampling pipeline is off; the bucket
+        # would just accumulate stale rollouts.
+        sampling_enabled = bool(distill.get("enabled_for_sampling", False))
+        return MOVER_PROMOTE_INTERVAL_SEC, MOVER_PROMOTE_COUNT, sampling_enabled
 
     # ---------------- Listing & metadata ----------------
 
@@ -312,7 +308,7 @@ class TeacherMover:
             f"public={self.public_bucket} "
             f"(interval={MOVER_PROMOTE_INTERVAL_SEC}s, "
             f"count={MOVER_PROMOTE_COUNT}, gated by "
-            f"SystemConfig.environments.{DISTILL_ENV_KEY}.enabled)"
+            f"SystemConfig.environments.{DISTILL_ENV_KEY}.enabled_for_sampling)"
         )
         self.running = True
         while self.running:
@@ -325,10 +321,10 @@ class TeacherMover:
                 await self._sleep_interruptible(CONFIG_RETRY_SLEEP_SEC)
                 continue
 
-            interval_sec, target_count, enabled = cfg
-            if not enabled:
+            interval_sec, target_count, sampling_enabled = cfg
+            if not sampling_enabled:
                 logger.info(
-                    f"[MOVER] {DISTILL_ENV_KEY}.enabled is false, "
+                    f"[MOVER] {DISTILL_ENV_KEY}.enabled_for_sampling is false, "
                     f"pausing for {interval_sec}s"
                 )
                 await self._sleep_interruptible(interval_sec)

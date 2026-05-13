@@ -157,3 +157,146 @@ def test_global_slot_helpers_noop_when_unwired():
         worker._release_global_slot()  # no-op
 
     _asyncio.run(_drive())
+
+
+def test_env_concurrency_cap_none_means_no_env_semaphore():
+    from affine.src.executor.worker import ExecutorWorker
+
+    worker = ExecutorWorker(worker_id=0, env="MEMORY")
+    assert worker._env_sem is None
+
+
+def test_env_concurrency_cap_creates_asyncio_semaphore():
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+
+    worker = ExecutorWorker(
+        worker_id=0, env="LIVEWEB", env_concurrency_cap=100,
+    )
+    assert isinstance(worker._env_sem, _asyncio.Semaphore)
+    # Acquire 100 times; the 101st should not be immediately available.
+    async def _drive():
+        for _ in range(100):
+            await worker._env_sem.acquire()
+        assert worker._env_sem.locked()
+
+    _asyncio.run(_drive())
+
+
+def test_env_sem_caps_in_flight_evaluate_and_persist():
+    """Per-env cap must serialise concurrent evaluate calls inside one
+    worker. Without it, a flaky env's infra-retry storm can occupy the
+    entire global dispatch budget — exactly the LIVEWEB Stooq-lock
+    incident this knob exists to prevent."""
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import MinerSnapshot
+
+    worker = ExecutorWorker(
+        worker_id=0, env="LIVEWEB", env_concurrency_cap=2,
+    )
+
+    observed_peak = {"value": 0}
+    in_flight = {"value": 0}
+
+    async def _fake_gated(**_kwargs):
+        in_flight["value"] += 1
+        observed_peak["value"] = max(observed_peak["value"], in_flight["value"])
+        try:
+            await _asyncio.sleep(0.05)
+        finally:
+            in_flight["value"] -= 1
+
+    worker._evaluate_and_persist_gated = _fake_gated
+
+    miner = MinerSnapshot(uid=1, hotkey="hk", model="m", revision="r")
+
+    async def _drive():
+        # Five concurrent calls; cap=2 should keep peak at 2.
+        await _asyncio.gather(*[
+            worker._evaluate_and_persist(
+                miner=miner, task_id=i, base_url="http://x",
+                refresh_block=0,
+            )
+            for i in range(5)
+        ])
+        assert observed_peak["value"] == 2
+
+    _asyncio.run(_drive())
+
+
+def test_env_sem_unset_does_not_serialise_calls():
+    """Without a cap, the outer wrapper must be a no-op — concurrent
+    evaluate calls all proceed in parallel up to the global semaphore."""
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import MinerSnapshot
+
+    worker = ExecutorWorker(worker_id=0, env="MEMORY")  # no cap
+    observed_peak = {"value": 0}
+    in_flight = {"value": 0}
+
+    async def _fake_gated(**_kwargs):
+        in_flight["value"] += 1
+        observed_peak["value"] = max(observed_peak["value"], in_flight["value"])
+        try:
+            await _asyncio.sleep(0.05)
+        finally:
+            in_flight["value"] -= 1
+
+    worker._evaluate_and_persist_gated = _fake_gated
+
+    miner = MinerSnapshot(uid=1, hotkey="hk", model="m", revision="r")
+
+    async def _drive():
+        await _asyncio.gather(*[
+            worker._evaluate_and_persist(
+                miner=miner, task_id=i, base_url="http://x",
+                refresh_block=0,
+            )
+            for i in range(5)
+        ])
+        assert observed_peak["value"] == 5
+
+    _asyncio.run(_drive())
+
+
+def test_env_from_payload_parses_max_concurrent():
+    from affine.src.scorer.window_state import _env_from_payload
+
+    cfg = _env_from_payload({
+        "display_name": "LIVEWEB",
+        "enabled_for_sampling": True,
+        "sampling": {
+            "sampling_count": 400,
+            "dataset_range": [[0, 100]],
+            "sampling_mode": "random",
+            "max_concurrent": 100,
+        },
+    })
+    assert cfg.max_concurrent == 100
+
+
+def test_env_from_payload_max_concurrent_defaults_to_none():
+    from affine.src.scorer.window_state import _env_from_payload
+
+    cfg = _env_from_payload({
+        "display_name": "MEMORY",
+        "enabled_for_sampling": True,
+        "sampling": {"sampling_count": 200, "dataset_range": [[0, 10]]},
+    })
+    assert cfg.max_concurrent is None
+
+
+def test_env_from_payload_rejects_nonpositive_max_concurrent():
+    from affine.src.scorer.window_state import _env_from_payload
+
+    # Negative / zero / non-numeric all fall back to None to avoid
+    # silently uncapping or deadlocking an env with cap=0.
+    for bad in (-1, 0, "abc", None, "0"):
+        cfg = _env_from_payload({
+            "display_name": "x",
+            "enabled_for_sampling": True,
+            "sampling": {"max_concurrent": bad},
+        })
+        assert cfg.max_concurrent is None, f"bad input {bad!r} leaked through"

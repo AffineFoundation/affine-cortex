@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 from affine.core.setup import logger
@@ -46,6 +47,7 @@ class ExecutorWorker:
         warmup_sec: float = 240.0,
         global_sem: Any = None,
         in_flight_value: Any = None,
+        env_concurrency_cap: Optional[int] = None,
     ):
         self.worker_id = worker_id
         self.env = env
@@ -56,6 +58,17 @@ class ExecutorWorker:
         # is sized at ``max_concurrent`` and only exists as a defensive
         # floor against scheduling tens of thousands of coroutines.
         self._global_sem = global_sem
+        # Optional in-process asyncio semaphore that caps concurrent
+        # evaluate() calls for THIS env's worker. Set from
+        # ``EnvConfig.max_concurrent`` so a flaky env can't burn the
+        # whole global dispatch budget retrying — see LIVEWEB
+        # Stooq-lock incident, PR #459. None = no per-env cap.
+        self.env_concurrency_cap = env_concurrency_cap
+        self._env_sem: Optional[asyncio.Semaphore] = (
+            asyncio.Semaphore(env_concurrency_cap)
+            if env_concurrency_cap is not None and env_concurrency_cap > 0
+            else None
+        )
         # Per-env ``mp.Value(c_int, lock=False)`` for the manager's
         # ``[STATUS]`` printer to read live in-flight without IPC ping.
         # Single writer (this worker), single reader (manager); aligned
@@ -430,6 +443,21 @@ class ExecutorWorker:
             hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
             base_url=base_url,
         )
+        # Per-env cap (if configured) is acquired BEFORE the global slot
+        # so a flaky env can't transiently hold global capacity while
+        # waiting on its own sem. ``nullcontext`` makes this a no-op for
+        # envs without a cap.
+        env_gate = self._env_sem if self._env_sem is not None else nullcontext()
+        async with env_gate:
+            await self._evaluate_and_persist_gated(
+                miner=miner, task_id=task_id, base_url=base_url,
+                refresh_block=refresh_block, miner_obj=miner_obj,
+            )
+
+    async def _evaluate_and_persist_gated(
+        self, *, miner: MinerSnapshot, task_id: int, base_url: str,
+        refresh_block: int, miner_obj: "_Miner",
+    ) -> None:
         # Wait until the cross-process global semaphore yields a slot.
         # Envs with bigger pending lists submit more concurrent acquire
         # attempts and so win a proportional share of the b300 budget —

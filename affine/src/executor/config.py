@@ -17,10 +17,15 @@ to gate anything, just so a runaway pending list can't schedule tens of
 thousands of coroutines into asyncio at once.
 """
 
-# Saturation point on the inference backend (b300: 8 × 60 per-card).
-# The shared global semaphore is sized to this so the inference cluster
-# is the bottleneck, not the executor.
-GLOBAL_DISPATCH_BUDGET = 480
+# Total executor in-flight budget. The b300 inference cluster saturates
+# around 480 (8 × 60 per-card), and that's still the bottleneck for envs
+# that hit it (SWE-INFINITE, MEMORY, NAVWORLD, TERMINAL). 600 adds
+# headroom for envs that don't go through b300 — LIVEWEB runs against
+# its own SSH hosts for web scraping, so its in-flight share doesn't
+# consume GPU capacity. Pair with per-env ``max_concurrent`` caps
+# (EnvConfig.max_concurrent) to keep any single env from monopolising
+# the shared pool.
+GLOBAL_DISPATCH_BUDGET = 600
 
 # Per-worker asyncio-side safety floor. Never the real gate — the
 # global sem above is. Set high so dispatch never blocks on local

@@ -160,13 +160,13 @@ def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
     kv = InMemoryConfigStore()
     kv.data["environments"] = {
         "ENV_A": {
-            "display_name": "A", "enabled": True,
+            "display_name": "A", "enabled_for_sampling": True,
             "sampling": {"sampling_count": sampling_count,
                          "dataset_range": [[0, 1000]],
                          "sampling_mode": "random"},
         },
         "ENV_B": {
-            "display_name": "B", "enabled": True,
+            "display_name": "B", "enabled_for_sampling": True,
             "sampling": {"sampling_count": sampling_count,
                          "dataset_range": [[0, 1000]],
                          "sampling_mode": "random"},

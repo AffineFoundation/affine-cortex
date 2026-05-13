@@ -248,21 +248,23 @@ def get_miner(uid_arg, uid, hotkey):
     asyncio.run(get_miner_command(uid=uid if uid is not None else uid_arg, hotkey=hotkey))
 
 
-@cli.command("get-rank", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
-@click.pass_context
-def get_rank(ctx):
+@cli.command("get-rank")
+@click.option("--reason", "show_reason", is_flag=True,
+              help="Show brief invalid or termination reason column")
+def get_rank(show_reason):
     """Query and display miner ranking table.
 
     Shows the live window state (champion/challenger/phase/progress),
     the public rank/status snapshot.
 
+    \b
     Example:
         af get-rank
+        af get-rank --reason
     """
-    from affine.src.miner.main import get_rank as miner_get_rank
+    from affine.src.miner.rank import get_rank_command
 
-    sys.argv = ["get-rank"] + ctx.args
-    miner_get_rank.main(standalone_mode=False)
+    asyncio.run(get_rank_command(show_reason=show_reason))
 
 
 @cli.command("miner-deploy", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})

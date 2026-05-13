@@ -2,7 +2,7 @@
 ``af servers executor`` — manager that spawns one subprocess per env.
 
 The manager process does very little hot-path work: it spawns N
-``WorkerProcess`` instances (one per enabled env), restarts them if
+``WorkerProcess`` instances (one per sampling-enabled env), restarts them if
 they die, prints a periodic ``[STATUS]`` line for operators, and owns
 the cross-process IPC primitives (``BoundedSemaphore`` for global
 dispatch budget; one ``Value(c_int)`` per env for live in-flight
@@ -18,7 +18,7 @@ from __future__ import annotations
 import asyncio
 import multiprocessing
 import signal
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import click
 
@@ -32,13 +32,23 @@ from affine.src.scorer.dao_adapters import SampleResultsAdapter
 
 
 HEALTH_CHECK_INTERVAL_SEC = 10
-STATUS_PRINT_INTERVAL_SEC = 30
+STATUS_PRINT_INTERVAL_SEC = 60
 
 
 class ExecutorManager:
-    def __init__(self, envs: List[str], *, verbosity: int = 1):
+    def __init__(
+        self,
+        envs: List[str],
+        *,
+        verbosity: int = 1,
+        env_concurrency_caps: Optional[Dict[str, int]] = None,
+    ):
         self.envs = envs
         self.verbosity = verbosity
+        # Optional per-env evaluate-concurrency caps. Sourced from
+        # ``EnvConfig.max_concurrent`` (system_config). Envs absent
+        # from this dict only contend on the global semaphore.
+        self.env_concurrency_caps = env_concurrency_caps or {}
         self.mp_ctx = multiprocessing.get_context("spawn")
         # Single cross-process bounded semaphore = the real concurrency
         # gate. Sized to the b300 saturation point so the inference
@@ -75,6 +85,7 @@ class ExecutorManager:
                 in_flight_value=self.in_flight_values[env],
                 max_concurrent=get_max_concurrent(env),
                 verbosity=self.verbosity,
+                env_concurrency_cap=self.env_concurrency_caps.get(env),
             )
             wp.start()
             self.workers.append(wp)
@@ -111,7 +122,7 @@ class ExecutorManager:
         separately) and per-env in-flight from the shared
         ``in_flight_values`` Values. Format:
 
-            [STATUS] running=N/480 | env@done/target +delta in Xs rate:Y/h
+            [STATUS] running=N/GLOBAL_DISPATCH_BUDGET | env@done/target +delta in Xs rate:Y/h
                 run:R | env2@... | total +D in Xs rate:Y/h
 
         First print after start is the baseline (delta+rate omitted).
@@ -197,8 +208,7 @@ class ExecutorManager:
 async def _enabled_envs() -> List[str]:
     """Read system_config.environments and return sampling-enabled env keys.
 
-    Accepts both the new ``enabled_for_sampling`` key and the legacy
-    ``enabled`` alias so an unmigrated DB doesn't go silent.
+    Only ``enabled_for_sampling`` starts executor workers.
     """
     config_dao = SystemConfigDAO()
     envs_raw = await config_dao.get_param_value("environments", default={}) or {}
@@ -206,9 +216,26 @@ async def _enabled_envs() -> List[str]:
     for name, cfg in envs_raw.items():
         if not isinstance(cfg, dict):
             continue
-        sampling_flag = cfg.get("enabled_for_sampling", cfg.get("enabled", True))
+        sampling_flag = cfg.get("enabled_for_sampling", False)
         if sampling_flag:
             out.append(name)
+    return out
+
+
+async def _env_concurrency_caps(envs: List[str]) -> Dict[str, int]:
+    """Read ``EnvConfig.max_concurrent`` for the named envs via the
+    shared ``_env_from_payload`` parser. Returns a dict of only the
+    envs that have a positive cap configured — sharing the parser
+    keeps the int/bool/str validation in one place."""
+    from affine.src.scorer.window_state import _env_from_payload
+
+    config_dao = SystemConfigDAO()
+    envs_raw = await config_dao.get_param_value("environments", default={}) or {}
+    out: Dict[str, int] = {}
+    for name in envs:
+        cfg = _env_from_payload(envs_raw.get(name))
+        if cfg.max_concurrent:
+            out[name] = cfg.max_concurrent
     return out
 
 
@@ -216,10 +243,18 @@ async def _run() -> None:
     await init_client()
     envs = await _enabled_envs()
     if not envs:
-        logger.error("executor: no enabled envs in system_config.environments")
+        logger.error(
+            "executor: no sampling-enabled envs in system_config.environments"
+        )
         return
 
-    manager = ExecutorManager(envs=envs, verbosity=1)
+    caps = await _env_concurrency_caps(envs)
+    if caps:
+        logger.info(f"executor: per-env concurrency caps = {caps}")
+
+    manager = ExecutorManager(
+        envs=envs, verbosity=1, env_concurrency_caps=caps,
+    )
     await manager.start()
 
     stop_event = asyncio.Event()

@@ -78,9 +78,9 @@ async def test_task_state_roundtrip():
 async def test_environments_filter_disabled():
     kv = InMemoryConfigStore()
     kv.data["environments"] = {
-        "A": {"display_name": "A", "enabled": True,
+        "A": {"display_name": "A", "enabled_for_sampling": True,
               "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]], "sampling_mode": "random"}},
-        "B": {"display_name": "B", "enabled": False,
+        "B": {"display_name": "B", "enabled_for_sampling": False,
               "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]], "sampling_mode": "random"}},
     }
     store = StateStore(kv)
@@ -123,21 +123,24 @@ async def test_get_scoring_environments_filters_independently_from_sampling():
 
 
 @pytest.mark.asyncio
-async def test_legacy_enabled_key_maps_to_enabled_for_sampling():
-    """Older system_config rows used a single ``enabled`` flag. The
-    parser should accept it and treat it as ``enabled_for_sampling``
-    so we don't drop active envs during the schema transition."""
+async def test_missing_sampling_gate_is_disabled():
+    """Environment rows must explicitly opt into sampling."""
     kv = InMemoryConfigStore()
     kv.data["environments"] = {
-        "LEGACY": {"display_name": "Legacy", "enabled": True,
-                   "sampling": {"sampling_count": 5, "dataset_range": [[0, 50]], "sampling_mode": "random"}},
+        "MISSING_GATE": {
+            "display_name": "Missing",
+            "sampling": {
+                "sampling_count": 5,
+                "dataset_range": [[0, 50]],
+                "sampling_mode": "random",
+            },
+        },
     }
     store = StateStore(kv)
     envs = await store.get_environments()
-    assert "LEGACY" in envs
-    # Default scoring flag is True so legacy envs behave as before.
+    assert "MISSING_GATE" not in envs
     scoring = await store.get_scoring_environments()
-    assert "LEGACY" in scoring
+    assert "MISSING_GATE" not in scoring
 
 
 @pytest.mark.asyncio
@@ -146,7 +149,7 @@ async def test_environments_accepts_legacy_window_config_shape():
     ``.sampling``. Coercion should accept both."""
     kv = InMemoryConfigStore()
     kv.data["environments"] = {
-        "OLD": {"display_name": "Old", "enabled": True,
+        "OLD": {"display_name": "Old", "enabled_for_sampling": True,
                 "window_config": {"sampling_count": 50, "dataset_range": [[0, 1000]], "sampling_mode": "latest"}},
     }
     store = StateStore(kv)
