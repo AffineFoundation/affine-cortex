@@ -257,18 +257,23 @@ class ExecutorWorker:
         tagged with the task-id pool's ``refresh_block`` so the scheduler
         only counts current-refresh samples.
 
-        Failure handling distinguishes two cases:
+        Failure handling distinguishes three cases (pre-refactor parity,
+        see PR #439):
 
-          - ``evaluate`` raises an exception (network glitch, Targon 5xx,
-            container restart mid-call): infrastructure-level failure.
+          - **Miner-capability error** — the exception chain matches
+            ``_ZERO_SCORE_ERROR_PATTERNS`` (context-length overflow).
+            That's a property of the model and won't change on retry,
+            so persist score=0.
+          - **All other exceptions** (transport, parse, HTTP status,
+            env crash mid-flight, env returning ``status=failed`` for
+            non-capability reasons): never the miner's fault to know.
             **Don't persist** — let the next ``_tick`` re-attempt this
             task_id. The shuffle keeps us from always blocking on the
-            same flaky task. Permanent failures (>10% of pool) eventually
-            exceed the refresh's buffer and operator intervention is
-            required.
-          - ``evaluate`` returns ``success=False``: semantic failure (the
-            env's verdict that the miner's response was wrong). Persist
-            with score=0 — that's the env's judgment, not a retry signal.
+            same flaky task. The 10% buffer absorbs permanent infra-only
+            failures; beyond that operators step in.
+          - ``Result.success=False`` from a non-raising evaluate: the
+            env returned a structured failure verdict alongside a score.
+            Persist whatever score the env supplied (handled below).
         """
         miner_obj = _Miner(
             hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
@@ -288,10 +293,27 @@ class ExecutorWorker:
                 latency_s = time.monotonic() - started
                 latency_ms = int(latency_s * 1000)
                 error_brief = str(e).replace("\n", " ").replace("\r", " ")[:200]
+                zero_score = _is_zero_score_error(e)
+                tag = "ZERO" if zero_score else "FAILED"
                 logger.info(
-                    f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
+                    f"[{tag}] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
                     f"task_id={task_id:<8} │ {latency_s:6.3f}s │ {type(e).__name__}: {error_brief}"
                 )
+                if zero_score:
+                    # Miner-capability limit (context overflow). Persist as
+                    # score=0 — retrying would yield the same error.
+                    await self._samples.persist(
+                        miner_hotkey=miner.hotkey,
+                        model_revision=miner.revision,
+                        model=miner.model,
+                        env=self.env,
+                        task_id=task_id,
+                        score=0.0,
+                        latency_ms=latency_ms,
+                        extra={"error": error_brief, "zero_score_reason": "context_overflow"},
+                        block_number=0,
+                        refresh_block=refresh_block,
+                    )
                 self.metrics.record_completion(success=False, latency_ms=latency_ms)
                 return
         finally:
@@ -355,3 +377,37 @@ def _pick_url(urls: List[str], task_id: int, index: int) -> str:
     if len(urls) == 1:
         return urls[0]
     return urls[(int(task_id) + index) % len(urls)]
+
+
+# Pre-refactor parity (see PR #439): only errors that point at a miner
+# capability limit get persisted as a real zero-score sample. Everything
+# else is transport / env-side flake and gets retried on the next tick.
+#
+# This is conservative on purpose. Random ``status=failed`` from the env,
+# Targon 5xx, dropped connections — none of those are the miner's fault,
+# and persisting them as 0 would let one flaky env round permanently
+# disqualify a miner. The only sanctioned zero-score-on-error class is
+# "the miner's response/prompt blew past the model context window",
+# which is a model property and won't change on retry.
+_ZERO_SCORE_ERROR_PATTERNS = (
+    "is longer than the model",
+    "exceeds the maximum allowed length",
+    "exceeds the maximum context length",
+)
+
+
+def _is_zero_score_error(exc: BaseException) -> bool:
+    """Walk the cause chain and check each layer's message for a known
+    miner-capability-limit pattern. We walk the chain because affinetes
+    wraps the original error several times (ExecutionError → BackendError
+    → EnvironmentError) and the substring of interest can live on any
+    layer."""
+    seen: List[BaseException] = []
+    cur: Optional[BaseException] = exc
+    while cur is not None and cur not in seen:
+        msg = str(cur).lower()
+        if any(p in msg for p in _ZERO_SCORE_ERROR_PATTERNS):
+            return True
+        seen.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    return False
