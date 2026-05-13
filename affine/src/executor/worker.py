@@ -113,7 +113,13 @@ class ExecutorWorker:
             await asyncio.sleep(self.poll_interval_sec if worked else self.idle_sleep_sec)
 
     async def _tick(self) -> bool:
-        """One poll cycle. Returns True if any sampling work was attempted."""
+        """One poll cycle. Returns True if any sampling work was attempted.
+
+        Stops dispatching for a (subject, env) pair once the subject has
+        ``sampling_count`` rows in the current refresh — the 10% pool
+        oversampling is buffer for slow/erroring task_ids, not an
+        instruction to fully drain the pool. Once base count is met the
+        scheduler's overlap check will release ``_decide``."""
         task_state = await self._state.get_task_state()
         if task_state is None:
             return False
@@ -122,36 +128,59 @@ class ExecutorWorker:
             return False
         refresh_block = task_state.refreshed_at_block
 
+        envs = await self._state.get_environments()
+        env_cfg = envs.get(self.env)
+        if env_cfg is None:
+            return False  # env disabled / removed from config
+        sampling_count = env_cfg.sampling_count
+
         champion = await self._state.get_champion()
         champion_urls = _base_urls(champion.deployments if champion else [], champion.base_url if champion else None)
         if champion is None or not champion_urls:
             return False
 
         pending: List[tuple] = []  # (miner_snapshot, task_id, base_url)
-        # Champion's missing samples for current pool (current refresh).
-        for idx, tid in enumerate(task_ids):
-            if not await self._samples.has_sample(
-                champion.hotkey, champion.revision, self.env, tid,
-                refresh_block=refresh_block,
-            ):
-                pending.append((
-                    MinerSnapshot(
-                        uid=champion.uid, hotkey=champion.hotkey,
-                        revision=champion.revision, model=champion.model,
-                    ),
-                    tid, _pick_url(champion_urls, tid, idx),
-                ))
 
-        # Battle in flight → also fill challenger's missing samples.
+        # Champion: only build pending if we're still below the base count.
+        champ_have = await self._samples.count_samples_for_tasks(
+            champion.hotkey, champion.revision, self.env, task_ids,
+            refresh_block=refresh_block,
+        )
+        if champ_have < sampling_count:
+            remaining = sampling_count - champ_have
+            champ_snap = MinerSnapshot(
+                uid=champion.uid, hotkey=champion.hotkey,
+                revision=champion.revision, model=champion.model,
+            )
+            for idx, tid in enumerate(task_ids):
+                if remaining <= 0:
+                    break
+                if not await self._samples.has_sample(
+                    champion.hotkey, champion.revision, self.env, tid,
+                    refresh_block=refresh_block,
+                ):
+                    pending.append((champ_snap, tid, _pick_url(champion_urls, tid, idx)))
+                    remaining -= 1
+
+        # Battle in flight → same cap for the challenger.
         battle = await self._state.get_battle()
         battle_urls = _base_urls(battle.deployments if battle else [], battle.base_url if battle else None)
         if battle is not None and battle_urls:
-            for idx, tid in enumerate(task_ids):
-                if not await self._samples.has_sample(
-                    battle.challenger.hotkey, battle.challenger.revision,
-                    self.env, tid, refresh_block=refresh_block,
-                ):
-                    pending.append((battle.challenger, tid, _pick_url(battle_urls, tid, idx)))
+            chal_have = await self._samples.count_samples_for_tasks(
+                battle.challenger.hotkey, battle.challenger.revision, self.env,
+                task_ids, refresh_block=refresh_block,
+            )
+            if chal_have < sampling_count:
+                remaining = sampling_count - chal_have
+                for idx, tid in enumerate(task_ids):
+                    if remaining <= 0:
+                        break
+                    if not await self._samples.has_sample(
+                        battle.challenger.hotkey, battle.challenger.revision,
+                        self.env, tid, refresh_block=refresh_block,
+                    ):
+                        pending.append((battle.challenger, tid, _pick_url(battle_urls, tid, idx)))
+                        remaining -= 1
 
         if not pending:
             return False
