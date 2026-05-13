@@ -43,7 +43,6 @@ async def _build_current(store: StateStore):
     task_state = await store.get_task_state()
     return {
         "champion": _miner_summary(champion) if champion else None,
-        "champion_base_url": champion.base_url if champion else None,
         "battle": {
             "challenger": _miner_summary(battle.challenger),
             "started_at_block": battle.started_at_block,
@@ -63,7 +62,6 @@ async def test_current_endpoint_on_empty_state():
     resp = await _build_current(store)
     assert resp == {
         "champion": None,
-        "champion_base_url": None,
         "battle": None,
         "task_refresh_block": None,
         "sample_counts": {},
@@ -81,7 +79,7 @@ async def test_current_endpoint_with_champion_only():
     ))
     resp = await _build_current(store)
     assert resp["champion"]["uid"] == 12
-    assert resp["champion_base_url"] == "https://t/w1"
+    assert "champion_base_url" not in resp
     assert resp["battle"] is None
     assert resp["task_refresh_block"] is None
 

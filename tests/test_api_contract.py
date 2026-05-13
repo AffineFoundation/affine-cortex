@@ -7,6 +7,7 @@ import pytest
 import affine.api.routers.config as config_router
 from affine.api.routers.miners import get_miner_by_hotkey, get_miner_by_uid
 from affine.api.routers.logs import get_miner_logs
+from affine.api.routers.scores import get_latest_weights
 
 
 class _FakeMinersDAO:
@@ -28,6 +29,14 @@ class _FakeExecutionLogsDAO:
     async def get_recent_logs(self, miner_hotkey, limit=1000, status=None):
         self.calls.append((miner_hotkey, limit, status))
         return self.logs
+
+
+class _FakeScoreSnapshotsDAO:
+    def __init__(self, snapshot):
+        self.snapshot = snapshot
+
+    async def get_latest_snapshot(self):
+        return self.snapshot
 
 
 class _FakeSystemConfigDAO:
@@ -134,6 +143,35 @@ async def test_config_router_blocks_internal_config_keys(monkeypatch):
         await config_router.get_config("current_task_ids")
 
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_does_not_expose_snapshot_config():
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO({
+            "block_number": 123,
+            "config": {
+                "window_id": 17,
+                "environments": ["SWE", "DISTILL"],
+                "current_task_ids": {"SWE": [1, 2, 3]},
+                "inference_endpoints": [{"name": "ssh-a"}],
+            },
+            "statistics": {
+                "final_weights": {
+                    "7": "1.0",
+                    "8": "0.0",
+                }
+            },
+        })
+    )
+
+    assert response == {
+        "block_number": 123,
+        "weights": {
+            "7": {"weight": 1.0},
+            "8": {"weight": 0.0},
+        },
+    }
 
 
 @pytest.mark.asyncio

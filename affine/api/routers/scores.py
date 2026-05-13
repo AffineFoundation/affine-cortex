@@ -225,6 +225,5 @@ async def get_latest_weights(
 
     return {
         "block_number": snapshot.get("block_number"),
-        "config": snapshot.get("config", {}),
         "weights": weights_response,
     }

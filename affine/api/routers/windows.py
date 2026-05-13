@@ -108,8 +108,9 @@ async def _sample_counts(
 
 @router.get("/current")
 async def get_current_state() -> Dict[str, Any]:
-    """Live snapshot: champion, in-flight battle (if any), task-id refresh
-    block. No sample-level data."""
+    """Live public snapshot: champion, in-flight battle (if any), task-id
+    refresh block, and aggregate sample counts. Deployment URLs and task IDs
+    stay internal."""
     store = _state_store()
     champion = await store.get_champion()
     if champion is None:
@@ -118,7 +119,6 @@ async def get_current_state() -> Dict[str, Any]:
     task_state = await store.get_task_state()
     return {
         "champion": _miner_summary(champion) if champion else None,
-        "champion_base_url": champion.base_url if champion else None,
         "battle": {
             "challenger": _miner_summary(battle.challenger),
             "started_at_block": battle.started_at_block,
