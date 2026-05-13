@@ -34,7 +34,10 @@ async def _build_validity_map() -> dict:
         terminated miners remain terminated even if they leave/rejoin the
         active 256-UID snapshot.
 
-    One full scan (256-row cap → cheap).
+    This map is also the current-online filter for rank output: score rows
+    whose hotkey is absent from the current ``miners`` snapshot are historical
+    rows and are not shown by ``af get-rank``. One full scan (256-row cap →
+    cheap).
     """
     miners = await MinersDAO().get_all_miners()
     states = await MinerStatsDAO().build_challenge_state_map(miners)
@@ -82,11 +85,15 @@ async def get_latest_scores(
         calculated_at = scores_data.get("calculated_at")
         scores_list = scores_data.get("scores", [])
         
-        # Sort by overall_score descending and take top N
+        validity = await _build_validity_map()
+        scores_list = [
+            s for s in scores_list
+            if s.get("miner_hotkey") in validity
+        ]
+
+        # Sort current-online rows by overall_score descending and take top N.
         scores_list.sort(key=lambda x: x.get("overall_score", 0.0), reverse=True)
         scores_list = scores_list[:top]
-
-        validity = await _build_validity_map()
 
         # Convert to response models with safe field access
         miner_scores = []
