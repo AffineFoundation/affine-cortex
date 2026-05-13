@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
-from typing import Iterable, Optional
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional
 
 import aiohttp
 
@@ -47,12 +47,30 @@ class DeployTarget:
 
 
 @dataclass
+class MachineDeployment:
+    endpoint_name: str
+    deployment_id: str
+    base_url: str
+
+
+@dataclass
 class DeployResult:
     """What ``deploy`` returns. Stored in ``ChampionRecord.deployment_id``
     or ``BattleRecord.deployment_id`` so a recovery run can re-adopt
     without restarting the workload."""
     deployment_id: str
     base_url: str
+    deployments: List[MachineDeployment] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.deployments and self.deployment_id and self.base_url:
+            self.deployments = [
+                MachineDeployment(
+                    endpoint_name="",
+                    deployment_id=self.deployment_id,
+                    base_url=self.base_url,
+                )
+            ]
 
 
 async def find_existing_workload(

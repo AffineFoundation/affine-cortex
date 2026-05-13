@@ -111,3 +111,47 @@ async def test_no_state_returns_none():
     assert await store.get_champion() is None
     assert await store.get_battle() is None
     assert await store.get_task_state() is None
+
+
+@pytest.mark.asyncio
+async def test_kv_adapter_signature_matches_dao():
+    """Regression guard: ``SystemConfigKVAdapter`` must call the production
+    ``SystemConfigDAO`` with the exact kwargs the DAO accepts. Tests using
+    ``InMemoryConfigStore`` cannot catch a mismatch here. Build a stub DAO
+    that records the call shape and assert it matches the real DAO's
+    ``set_param`` / ``get_param_value`` / ``delete_param`` signatures."""
+    import inspect
+
+    from affine.database.dao.system_config import SystemConfigDAO
+    from affine.src.scorer.window_state import SystemConfigKVAdapter
+
+    real_set_sig = inspect.signature(SystemConfigDAO.set_param)
+    real_get_sig = inspect.signature(SystemConfigDAO.get_param_value)
+    real_del_sig = inspect.signature(SystemConfigDAO.delete_param)
+
+    captured = {}
+
+    class StubDAO:
+        async def set_param(self, **kwargs):
+            # bind against the REAL signature — raises TypeError on any mismatch
+            real_set_sig.bind(self, **kwargs)
+            captured["set"] = kwargs
+
+        async def get_param_value(self, *args, **kwargs):
+            real_get_sig.bind(self, *args, **kwargs)
+            captured["get"] = (args, kwargs)
+            return None
+
+        async def delete_param(self, *args, **kwargs):
+            real_del_sig.bind(self, *args, **kwargs)
+            captured["del"] = (args, kwargs)
+            return True
+
+    adapter = SystemConfigKVAdapter(StubDAO(), updated_by="t")
+    await adapter.set("champion", {"uid": 1})
+    await adapter.get("champion")
+    await adapter.delete("champion")
+    assert captured["set"]["param_name"] == "champion"
+    assert captured["set"]["param_value"] == {"uid": 1}
+    assert captured["set"]["param_type"] == "dict"
+    assert captured["set"]["updated_by"] == "t"

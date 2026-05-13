@@ -42,6 +42,14 @@ class MinerSnapshot:
 
 
 @dataclass
+class DeploymentRecord:
+    """One inference machine serving a miner."""
+    endpoint_name: str
+    deployment_id: str
+    base_url: str
+
+
+@dataclass
 class ChampionRecord:
     """The current champion. Targon workload is owned for the champion's
     full reign — only torn down when a challenger wins."""
@@ -51,6 +59,7 @@ class ChampionRecord:
     model: str
     deployment_id: Optional[str] = None
     base_url: Optional[str] = None
+    deployments: List[DeploymentRecord] = field(default_factory=list)
     since_block: int = 0
 
 
@@ -62,6 +71,7 @@ class BattleRecord:
     deployment_id: str
     base_url: str
     started_at_block: int
+    deployments: List[DeploymentRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -113,7 +123,7 @@ class StateStore:
         raw = await self._kv.get(self.KEY_CHAMPION)
         if not raw:
             return None
-        return _from_dict(ChampionRecord, raw)
+        return _champion_from_dict(raw)
 
     async def set_champion(self, champ: ChampionRecord) -> None:
         await self._kv.set(self.KEY_CHAMPION, asdict(champ))
@@ -194,8 +204,26 @@ class SystemConfigKVAdapter:
         return await self._dao.get_param_value(key, default=default)
 
     async def set(self, key: str, value: Any) -> None:
+        # Infer ``param_type`` from the value so callers don't have to.
+        # SystemConfigDAO uses this column as metadata only (no validation),
+        # but it's still required positional.
+        if isinstance(value, bool):
+            ptype = "bool"
+        elif isinstance(value, int):
+            ptype = "int"
+        elif isinstance(value, float):
+            ptype = "float"
+        elif isinstance(value, str):
+            ptype = "str"
+        elif isinstance(value, list):
+            ptype = "list"
+        else:
+            ptype = "dict"
         await self._dao.set_param(
-            key=key, value=value, updated_by=self._updated_by,
+            param_name=key,
+            param_value=value,
+            param_type=ptype,
+            updated_by=self._updated_by,
         )
 
     async def delete(self, key: str) -> bool:
@@ -210,25 +238,91 @@ def _from_dict(cls, raw: Dict[str, Any]):
     return cls(**{k: v for k, v in raw.items() if k in fields})
 
 
+def _deployment_list(raw: Dict[str, Any]) -> List[DeploymentRecord]:
+    deployments = []
+    for item in raw.get("deployments") or []:
+        if not isinstance(item, dict):
+            continue
+        deployment_id = str(item.get("deployment_id") or "")
+        base_url = str(item.get("base_url") or "")
+        if not deployment_id or not base_url:
+            continue
+        deployments.append(
+            DeploymentRecord(
+                endpoint_name=str(item.get("endpoint_name") or ""),
+                deployment_id=deployment_id,
+                base_url=base_url,
+            )
+        )
+    if (
+        "deployments" not in raw
+        and not deployments
+        and raw.get("deployment_id")
+        and raw.get("base_url")
+    ):
+        deployments.append(
+            DeploymentRecord(
+                endpoint_name=str(raw.get("endpoint_name") or ""),
+                deployment_id=str(raw.get("deployment_id")),
+                base_url=str(raw.get("base_url")),
+            )
+        )
+    return deployments
+
+
+def _primary_deployment(deployments: List[DeploymentRecord]) -> tuple[Optional[str], Optional[str]]:
+    if not deployments:
+        return None, None
+    first = deployments[0]
+    return first.deployment_id, first.base_url
+
+
+def _champion_from_dict(raw: Dict[str, Any]) -> ChampionRecord:
+    deployments = _deployment_list(raw)
+    deployment_id = raw.get("deployment_id")
+    base_url = raw.get("base_url")
+    if deployments and (not deployment_id or not base_url):
+        deployment_id, base_url = _primary_deployment(deployments)
+    return ChampionRecord(
+        uid=int(raw["uid"]),
+        hotkey=str(raw["hotkey"]),
+        revision=str(raw["revision"]),
+        model=str(raw["model"]),
+        deployment_id=str(deployment_id) if deployment_id else None,
+        base_url=str(base_url) if base_url else None,
+        deployments=deployments,
+        since_block=int(raw.get("since_block", 0)),
+    )
+
+
 def _battle_to_dict(b: BattleRecord) -> Dict[str, Any]:
     return {
         "challenger": asdict(b.challenger),
         "deployment_id": b.deployment_id,
         "base_url": b.base_url,
         "started_at_block": b.started_at_block,
+        "deployments": [asdict(d) for d in b.deployments],
     }
 
 
 def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
     chal_raw = raw.get("challenger") or {}
+    deployments = _deployment_list(raw)
+    deployment_id = str(raw.get("deployment_id") or "")
+    base_url = str(raw.get("base_url") or "")
+    if deployments and (not deployment_id or not base_url):
+        primary_id, primary_url = _primary_deployment(deployments)
+        deployment_id = primary_id or ""
+        base_url = primary_url or ""
     return BattleRecord(
         challenger=MinerSnapshot(**{
             k: chal_raw[k] for k in ("uid", "hotkey", "revision", "model")
             if k in chal_raw
         }),
-        deployment_id=str(raw.get("deployment_id") or ""),
-        base_url=str(raw.get("base_url") or ""),
+        deployment_id=deployment_id,
+        base_url=base_url,
         started_at_block=int(raw.get("started_at_block", 0)),
+        deployments=deployments,
     )
 
 

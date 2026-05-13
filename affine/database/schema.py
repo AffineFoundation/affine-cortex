@@ -242,6 +242,14 @@ SCORE_SNAPSHOTS_TTL = {
 #   active                 bool — false rows are ignored at startup
 #   public_inference_url   the URL env containers actually connect to
 #   notes                  free-form
+#   assigned_uid           miner currently assigned to this endpoint
+#   assigned_hotkey
+#   assigned_model
+#   assigned_revision
+#   deployment_id          provider-specific live deployment id
+#   base_url               URL executor should use for this assignment
+#   assignment_role        "champion" | "challenger" | "active"
+#   assigned_at            assignment timestamp
 #
 #   # ssh-kind extras
 #   ssh_url                "ssh://user@host[:port]"
@@ -250,6 +258,12 @@ SCORE_SNAPSHOTS_TTL = {
 #   sglang_dp              data-parallel size
 #   sglang_image           docker image (default lmsysorg/sglang:latest)
 #   sglang_cache_dir       host mount for HF cache
+#   sglang_context_len     context length passed to sglang
+#   sglang_mem_fraction    GPU memory fraction passed to sglang
+#   sglang_chunked_prefill chunked-prefill size passed to sglang
+#   sglang_tool_call_parser tool-call parser name, "none" to omit
+#   ready_timeout_sec      readiness probe timeout
+#   poll_interval_sec      readiness probe interval
 #
 #   # targon-kind extras (most config is still env-based for back-compat)
 #   targon_api_url

@@ -20,12 +20,12 @@ import os
 import signal
 from typing import Dict, List, Optional
 
-import bittensor as bt
 import click
 
 from affine.core.providers.targon_client import get_targon_client
 from affine.core.setup import logger, setup_logging
 from affine.database import close_client, init_client
+from affine.utils.subtensor import get_subtensor
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.scores import ScoresDAO
@@ -62,6 +62,49 @@ TICK_INTERVAL_SEC = float(os.getenv("SCHEDULER_TICK_INTERVAL_SEC", "12"))
 ORPHAN_SWEEP_INTERVAL_SEC = int(
     os.getenv("SCHEDULER_ORPHAN_SWEEP_INTERVAL_SEC", "600")
 )
+
+
+def _endpoint_matches_target(endpoint, target) -> bool:
+    return (
+        endpoint.assigned_uid == target.uid
+        and endpoint.assigned_hotkey == target.hotkey
+        and endpoint.assigned_model == target.model
+        and endpoint.assigned_revision == target.revision
+    )
+
+
+def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List[object]:
+    """Pick SSH machines for one miner.
+
+    Policy is intentionally simple:
+    - reuse endpoints already assigned to the same miner (restart/adopt);
+    - champion gets up to N-1 free endpoints, leaving capacity for a challenger;
+    - challenger gets all remaining free endpoints;
+    - with one machine, challenger may reuse it sequentially.
+    """
+    if not endpoints:
+        raise RuntimeError("no active ssh endpoints")
+    matching = [ep for ep in endpoints if _endpoint_matches_target(ep, target)]
+    if matching:
+        return matching
+
+    free = [ep for ep in endpoints if ep.assigned_uid is None]
+    if role == "champion":
+        if len(endpoints) == 1:
+            return [endpoints[0]]
+        desired = max(1, len(endpoints) - 1)
+        selected = free[:desired]
+    elif role == "challenger":
+        selected = free or ([endpoints[0]] if len(endpoints) == 1 else [])
+    else:
+        selected = free or endpoints
+
+    if not selected:
+        raise RuntimeError(
+            f"no ssh endpoints available for role={role} "
+            f"target_uid={target.uid}"
+        )
+    return selected
 
 
 async def _run() -> None:
@@ -110,38 +153,94 @@ async def _run() -> None:
     # at the right moments (refresh + post-loss teardown) so step 5 fresh-
     # deploys when needed.
     if PROVIDER_KIND == "ssh":
-        # Prefer the inference_endpoints table (operator manages SSH targets
-        # in DynamoDB). Fall back to env vars when no active ssh row is
-        # registered (first-boot / dev).
+        # SSH endpoints are configured in DynamoDB. There is intentionally
+        # no env-var fallback for the host URL/key/public URL; otherwise a
+        # stale container env could silently override the operator-managed
+        # endpoint registry.
         from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
         endpoints_dao = InferenceEndpointsDAO()
         active = await endpoints_dao.list_active(kind="ssh")
-        if active:
-            ssh_config = ssh_lifecycle.SSHConfig.from_endpoint(active[0])
-            logger.info(
-                f"scheduler: provider=ssh endpoint={active[0].name!r} "
-                f"(from inference_endpoints table)"
+        if not active:
+            raise RuntimeError(
+                "scheduler: provider=ssh but no active ssh endpoint is "
+                "registered; configure one with `af db set-endpoint "
+                "--kind ssh --ssh-url ssh://user@host[:port] ...`"
             )
-        else:
-            ssh_config = ssh_lifecycle.SSHConfig.from_env()
-            logger.info(
-                "scheduler: provider=ssh (from env vars — no active "
-                "row in inference_endpoints table)"
-            )
+        active = sorted(active, key=lambda ep: ep.name)
+        ssh_configs = {
+            ep.name: ssh_lifecycle.SSHConfig.from_endpoint(ep)
+            for ep in active
+        }
+        logger.info(
+            f"scheduler: provider=ssh endpoints={[ep.name for ep in active]!r} "
+            f"(from inference_endpoints table)"
+        )
 
-        async def deploy_fn(target):
-            return await ssh_lifecycle.deploy(ssh_config, target)
+        async def deploy_fn(target, role: str = "active"):
+            endpoints = sorted(
+                await endpoints_dao.list_active(kind="ssh"),
+                key=lambda ep: ep.name,
+            )
+            selected = _select_ssh_endpoints(endpoints, target, role=role)
+            deployments = []
+            for ep in selected:
+                cfg = ssh_configs.get(ep.name) or ssh_lifecycle.SSHConfig.from_endpoint(ep)
+                result = await ssh_lifecycle.deploy(cfg, target)
+                await endpoints_dao.set_assignment(
+                    ep.name,
+                    uid=target.uid,
+                    hotkey=target.hotkey,
+                    model=target.model,
+                    revision=target.revision,
+                    deployment_id=result.deployment_id,
+                    base_url=result.base_url,
+                    role=role,
+                )
+                deployments.append(
+                    targon_lifecycle.MachineDeployment(
+                        endpoint_name=ep.name,
+                        deployment_id=result.deployment_id,
+                        base_url=result.base_url,
+                    )
+                )
+            primary = deployments[0]
+            return targon_lifecycle.DeployResult(
+                deployment_id=primary.deployment_id,
+                base_url=primary.base_url,
+                deployments=deployments,
+            )
 
         async def teardown_fn(deployment_id):
-            await ssh_lifecycle.teardown(ssh_config, deployment_id)
+            if not deployment_id:
+                return
+            for name, cfg in ssh_configs.items():
+                if deployment_id == cfg.deployment_id():
+                    await ssh_lifecycle.teardown(cfg, deployment_id)
+                    await endpoints_dao.clear_assignment(name)
+                    return
+            logger.warning(
+                f"scheduler: no ssh endpoint owns deployment_id={deployment_id!r}"
+            )
 
-        flow_config = FlowConfig(single_instance_provider=True)
+        flow_config = FlowConfig(single_instance_provider=(len(active) == 1))
         targon_client = None
-        logger.info(f"scheduler: ssh control plane → {ssh_config.host}:{ssh_config.port}")
+        logger.info(
+            "scheduler: ssh control plane → "
+            + ", ".join(f"{cfg.host}:{cfg.port}" for cfg in ssh_configs.values())
+        )
     else:
         targon_client = get_targon_client()
+        targon_endpoint_count = int(
+            await config_dao.get_param_value("targon_endpoint_count", default=0) or 0
+        )
+        if targon_endpoint_count > 0:
+            logger.warning(
+                "scheduler: targon_endpoint_count>0 requested, but automatic "
+                "Targon endpoint provisioning is not implemented in this flow; "
+                "falling back to direct Targon workload lifecycle."
+            )
 
-        async def deploy_fn(target):
+        async def deploy_fn(target, role: str = "active"):
             return await targon_lifecycle.deploy(targon_client, target)
 
         async def teardown_fn(deployment_id):
@@ -172,7 +271,10 @@ async def _run() -> None:
         except (NotImplementedError, RuntimeError):
             pass
 
-    subtensor = bt.subtensor(network=SUBTENSOR_NETWORK)
+    # Use the project's async-safe SubtensorWrapper (re-connects on failure).
+    # Hard-coding ``bittensor.subtensor`` (sync) doesn't exist on the version
+    # of bittensor shipped in the deploy image.
+    subtensor = await get_subtensor()
     logger.info(f"scheduler started: netuid={NETUID}")
 
     last_block: Optional[int] = None
@@ -180,7 +282,7 @@ async def _run() -> None:
     try:
         while not stop_event.is_set():
             try:
-                block = subtensor.get_current_block()
+                block = await subtensor.get_current_block()
             except Exception as e:
                 logger.warning(f"scheduler: get_current_block raised: {e}")
                 await asyncio.sleep(TICK_INTERVAL_SEC)

@@ -25,6 +25,7 @@ from affine.src.executor.logging_utils import safe_log
 from affine.src.executor.metrics import WorkerMetrics
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
 from affine.src.scorer.window_state import (
+    DeploymentRecord,
     MinerSnapshot,
     StateStore,
     SystemConfigKVAdapter,
@@ -116,12 +117,13 @@ class ExecutorWorker:
         refresh_block = task_state.refreshed_at_block
 
         champion = await self._state.get_champion()
-        if champion is None or not champion.base_url:
+        champion_urls = _base_urls(champion.deployments if champion else [], champion.base_url if champion else None)
+        if champion is None or not champion_urls:
             return False
 
         pending: List[tuple] = []  # (miner_snapshot, task_id, base_url)
         # Champion's missing samples for current pool (current refresh).
-        for tid in task_ids:
+        for idx, tid in enumerate(task_ids):
             if not await self._samples.has_sample(
                 champion.hotkey, champion.revision, self.env, tid,
                 refresh_block=refresh_block,
@@ -131,18 +133,19 @@ class ExecutorWorker:
                         uid=champion.uid, hotkey=champion.hotkey,
                         revision=champion.revision, model=champion.model,
                     ),
-                    tid, champion.base_url,
+                    tid, _pick_url(champion_urls, tid, idx),
                 ))
 
         # Battle in flight → also fill challenger's missing samples.
         battle = await self._state.get_battle()
-        if battle is not None and battle.base_url:
-            for tid in task_ids:
+        battle_urls = _base_urls(battle.deployments if battle else [], battle.base_url if battle else None)
+        if battle is not None and battle_urls:
+            for idx, tid in enumerate(task_ids):
                 if not await self._samples.has_sample(
                     battle.challenger.hotkey, battle.challenger.revision,
                     self.env, tid, refresh_block=refresh_block,
                 ):
-                    pending.append((battle.challenger, tid, battle.base_url))
+                    pending.append((battle.challenger, tid, _pick_url(battle_urls, tid, idx)))
 
         if not pending:
             return False
@@ -244,3 +247,17 @@ class _Miner:
         self.inference_model = None
         self.slug = None
         self.public_base_url = None
+
+
+def _base_urls(deployments: List[DeploymentRecord], fallback: Optional[str]) -> List[str]:
+    urls = [d.base_url for d in deployments if d.base_url]
+    if not urls and fallback:
+        urls = [fallback]
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(urls))
+
+
+def _pick_url(urls: List[str], task_id: int, index: int) -> str:
+    if len(urls) == 1:
+        return urls[0]
+    return urls[(int(task_id) + index) % len(urls)]

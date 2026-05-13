@@ -16,7 +16,7 @@ dataclass below for the typed view.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 from affine.database.base_dao import BaseDAO
@@ -32,6 +32,18 @@ class Endpoint:
     public_inference_url: Optional[str] = None
     notes: Optional[str] = None
 
+    # Runtime assignment. Provider-agnostic: one endpoint/machine may be
+    # serving one miner model at a time. Scheduler writes these fields after
+    # deploy/adopt and clears them on teardown.
+    assigned_uid: Optional[int] = None
+    assigned_hotkey: Optional[str] = None
+    assigned_model: Optional[str] = None
+    assigned_revision: Optional[str] = None
+    deployment_id: Optional[str] = None
+    base_url: Optional[str] = None
+    assignment_role: Optional[str] = None
+    assigned_at: int = 0
+
     # ssh-kind extras
     ssh_url: Optional[str] = None
     ssh_key_path: Optional[str] = None
@@ -39,6 +51,12 @@ class Endpoint:
     sglang_dp: int = 8
     sglang_image: str = "lmsysorg/sglang:latest"
     sglang_cache_dir: str = "/data"
+    sglang_context_len: int = 65536
+    sglang_mem_fraction: float = 0.8
+    sglang_chunked_prefill: int = 4096
+    sglang_tool_call_parser: str = "qwen"
+    ready_timeout_sec: int = 1800
+    poll_interval_sec: float = 15.0
 
     # targon-kind extras
     targon_api_url: Optional[str] = None
@@ -77,7 +95,6 @@ class InferenceEndpointsDAO(BaseDAO):
         return await self.put(payload)
 
     async def get(self, name: str) -> Optional[Endpoint]:
-        from affine.database.base_dao import BaseDAO as _Base  # noqa
         row = await super().get(self._make_pk(name))
         if row is None:
             return None
@@ -108,3 +125,65 @@ class InferenceEndpointsDAO(BaseDAO):
                 continue
             out.append(ep)
         return out
+
+    async def set_assignment(
+        self,
+        name: str,
+        *,
+        uid: int,
+        hotkey: str,
+        model: str,
+        revision: str,
+        deployment_id: str,
+        base_url: str,
+        role: str,
+        updated_by: str = "scheduler",
+    ) -> None:
+        from affine.database.client import get_client
+        client = get_client()
+        await client.update_item(
+            TableName=self.table_name,
+            Key={"pk": {"S": self._make_pk(name)}},
+            UpdateExpression=(
+                "SET assigned_uid = :uid, assigned_hotkey = :hotkey, "
+                "assigned_model = :model, assigned_revision = :revision, "
+                "deployment_id = :deployment_id, base_url = :base_url, "
+                "assignment_role = :role, assigned_at = :now, "
+                "updated_at = :now, updated_by = :updated_by"
+            ),
+            ExpressionAttributeValues={
+                ":uid": {"N": str(uid)},
+                ":hotkey": {"S": hotkey},
+                ":model": {"S": model},
+                ":revision": {"S": revision},
+                ":deployment_id": {"S": deployment_id},
+                ":base_url": {"S": base_url},
+                ":role": {"S": role},
+                ":now": {"N": str(int(time.time()))},
+                ":updated_by": {"S": updated_by},
+            },
+        )
+
+    async def clear_assignment(
+        self,
+        name: str,
+        *,
+        updated_by: str = "scheduler",
+    ) -> None:
+        from affine.database.client import get_client
+        client = get_client()
+        now = int(time.time())
+        await client.update_item(
+            TableName=self.table_name,
+            Key={"pk": {"S": self._make_pk(name)}},
+            UpdateExpression=(
+                "SET updated_at = :now, updated_by = :updated_by "
+                "REMOVE assigned_uid, assigned_hotkey, assigned_model, "
+                "assigned_revision, deployment_id, base_url, "
+                "assignment_role, assigned_at"
+            ),
+            ExpressionAttributeValues={
+                ":now": {"N": str(now)},
+                ":updated_by": {"S": updated_by},
+            },
+        )

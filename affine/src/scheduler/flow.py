@@ -42,6 +42,7 @@ from affine.src.scorer.weight_writer import WeightSubject, WeightWriter
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
+    DeploymentRecord,
     EnvConfig,
     MinerSnapshot,
     StateStore,
@@ -93,7 +94,7 @@ matches in the current refresh."""
 ListValidMinersFn = Callable[[], Awaitable[List[Dict[str, Any]]]]
 """Return every is_valid=true row in the miners table."""
 
-DeployFn = Callable[[targon_lifecycle.DeployTarget],
+DeployFn = Callable[[targon_lifecycle.DeployTarget, str],
                     Awaitable[targon_lifecycle.DeployResult]]
 TeardownFn = Callable[[Optional[str]], Awaitable[None]]
 
@@ -171,8 +172,10 @@ class FlowScheduler:
             await self._cold_start(current_block)
             return
 
-        # 5. Champion needs Targon.
-        if not champion.deployment_id or not champion.base_url:
+        # 5. Champion needs inference. During a single-instance battle the
+        # champion may intentionally have no live deployment because its
+        # samples were completed before the challenger reused the machine.
+        if battle is None and (not champion.deployment_id or not champion.base_url):
             await self._deploy_champion(champion)
             return
 
@@ -217,7 +220,7 @@ class FlowScheduler:
                 f"FlowScheduler: champion uid={champ.uid} no longer valid; "
                 f"dropping. Tearing down any live workload."
             )
-            await self._teardown(champ.deployment_id)
+            await self._teardown_record(champ)
             await self.state.clear_champion()
             return None
         return champ
@@ -259,6 +262,7 @@ class FlowScheduler:
             if champ is not None and champ.deployment_id is not None:
                 champ.deployment_id = None
                 champ.base_url = None
+                champ.deployments = []
                 await self.state.set_champion(champ)
                 logger.info(
                     "FlowScheduler: cleared champion.deployment_id at refresh "
@@ -307,13 +311,15 @@ class FlowScheduler:
             model=champion.model, revision=champion.revision,
         )
         try:
-            result = await self._deploy(target)
+            result = await self._deploy(target, "champion")
         except Exception as e:
             logger.error(
                 f"FlowScheduler: champion deploy failed for uid={champion.uid}: "
                 f"{type(e).__name__}: {e}"
             )
             return
+        deployments = _deployments_from_result(result)
+        champion.deployments = deployments
         champion.deployment_id = result.deployment_id
         champion.base_url = result.base_url
         await self.state.set_champion(champion)
@@ -388,7 +394,7 @@ class FlowScheduler:
             model=candidate.model, revision=candidate.revision,
         )
         try:
-            result = await self._deploy(target)
+            result = await self._deploy(target, "challenger")
         except Exception as e:
             logger.error(
                 f"FlowScheduler: challenger deploy failed uid={candidate.uid}: "
@@ -399,6 +405,11 @@ class FlowScheduler:
             from affine.src.scorer.challenger_queue import OUTCOME_FAILED
             await self.queue.mark_terminated(candidate.uid, OUTCOME_FAILED)
             return
+        if self.cfg.single_instance_provider:
+            champion.deployment_id = None
+            champion.base_url = None
+            champion.deployments = []
+            await self.state.set_champion(champion)
         battle = BattleRecord(
             challenger=MinerSnapshot(
                 uid=candidate.uid, hotkey=candidate.hotkey,
@@ -407,6 +418,7 @@ class FlowScheduler:
             deployment_id=result.deployment_id,
             base_url=result.base_url,
             started_at_block=current_block,
+            deployments=_deployments_from_result(result),
         )
         await self.state.set_battle(battle)
         logger.info(
@@ -466,7 +478,7 @@ class FlowScheduler:
                 f"FlowScheduler: challenger uid={battle.challenger.uid} "
                 f"invalidated mid-battle; forcing LOST regardless of scores"
             )
-            await self._teardown(battle.deployment_id)
+            await self._teardown_record(battle)
             await self.queue.mark_terminated(battle.challenger.uid, OUTCOME_LOST)
             await self.state.clear_battle()
             return
@@ -508,7 +520,7 @@ class FlowScheduler:
         )
 
         if result.winner == "challenger":
-            await self._teardown(champion.deployment_id)
+            await self._teardown_record(champion)
             new_champion = ChampionRecord(
                 uid=battle.challenger.uid,
                 hotkey=battle.challenger.hotkey,
@@ -516,6 +528,7 @@ class FlowScheduler:
                 model=battle.challenger.model,
                 deployment_id=battle.deployment_id,
                 base_url=battle.base_url,
+                deployments=list(battle.deployments),
                 since_block=current_block,
             )
             # Order: write the canonical champion record FIRST so any
@@ -530,7 +543,7 @@ class FlowScheduler:
                 f"uid {battle.challenger.uid}"
             )
         else:
-            await self._teardown(battle.deployment_id)
+            await self._teardown_record(battle)
             await self.queue.mark_terminated(battle.challenger.uid, OUTCOME_LOST)
             # Single-instance provider: the teardown just emptied the
             # inference host (champion's container went away with the
@@ -541,6 +554,7 @@ class FlowScheduler:
             if self.cfg.single_instance_provider:
                 champion.deployment_id = None
                 champion.base_url = None
+                champion.deployments = []
                 await self.state.set_champion(champion)
             logger.info(
                 f"FlowScheduler: champion uid {champion.uid} held against "
@@ -548,6 +562,14 @@ class FlowScheduler:
             )
 
         await self.state.clear_battle()
+
+    async def _teardown_record(self, record: Any) -> None:
+        deployments = list(getattr(record, "deployments", []) or [])
+        if deployments:
+            for dep in deployments:
+                await self._teardown(dep.deployment_id)
+            return
+        await self._teardown(getattr(record, "deployment_id", None))
 
     async def _write_weights(
         self, champion: ChampionRecord, block_number: int, result: Any,
@@ -595,3 +617,24 @@ class FlowScheduler:
                 "reason": getattr(result, "reason", ""),
             },
         )
+
+
+def _deployments_from_result(result: targon_lifecycle.DeployResult) -> List[DeploymentRecord]:
+    out: List[DeploymentRecord] = []
+    for dep in getattr(result, "deployments", []) or []:
+        out.append(
+            DeploymentRecord(
+                endpoint_name=getattr(dep, "endpoint_name", ""),
+                deployment_id=dep.deployment_id,
+                base_url=dep.base_url,
+            )
+        )
+    if not out and result.deployment_id and result.base_url:
+        out.append(
+            DeploymentRecord(
+                endpoint_name="",
+                deployment_id=result.deployment_id,
+                base_url=result.base_url,
+            )
+        )
+    return out

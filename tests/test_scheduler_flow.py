@@ -69,7 +69,7 @@ class _DeployTracker:
     fail_on_deploy: bool = False
     next_deployment_id: int = 0
 
-    async def deploy(self, target: DeployTarget) -> DeployResult:
+    async def deploy(self, target: DeployTarget, role: str = "active") -> DeployResult:
         self.deploys.append(target)
         if self.fail_on_deploy:
             raise RuntimeError("simulated targon deploy failure")
