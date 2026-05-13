@@ -139,7 +139,7 @@ class ValidatorService:
             try:
                 response = await self.api_client.get("/config")
                 
-                if not isinstance(response, dict) or not response.get("configs"):
+                if not isinstance(response, dict) or "configs" not in response:
                     logger.warning(f"Invalid or empty config from API (attempt {attempt}/{max_retries})")
                     if attempt < max_retries:
                         logger.info(f"Retrying in {retry_interval}s...")
