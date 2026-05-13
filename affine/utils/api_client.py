@@ -85,7 +85,7 @@ class CLIAPIClient:
     
     Usage:
         async with cli_api_client() as client:
-            data = await client.get("/miners/uid/42")
+            data = await client.get("/scores/uid/42")
     """
     
     def __init__(self, base_url: Optional[str] = None):
@@ -155,7 +155,7 @@ class APIClient:
         """Make GET request to API endpoint.
         
         Args:
-            endpoint: API endpoint path (e.g., "/miners/uid/123")
+            endpoint: API endpoint path (e.g., "/scores/uid/123")
             params: Optional query parameters
             headers: Optional request headers
         
@@ -301,7 +301,7 @@ def cli_api_client(base_url: Optional[str] = None) -> CLIAPIClient:
         
     Example:
         async with cli_api_client() as client:
-            data = await client.get("/miners/uid/42")
+            data = await client.get("/scores/uid/42")
             print(json.dumps(data, indent=2))
     """
     return CLIAPIClient(base_url)

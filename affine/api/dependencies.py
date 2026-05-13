@@ -6,7 +6,7 @@ does all sampling/scoring in-process via DAOs, so there's no executor
 auth, no task pool manager, no signature verification on this surface.
 
 The dependencies that remain:
-  - DAO singletons used by /miners, /scores, /logs, /config, /windows.
+  - DAO singletons used by /scores, /logs, /config, /windows.
   - A simple per-IP rate limiter for read endpoints.
 """
 

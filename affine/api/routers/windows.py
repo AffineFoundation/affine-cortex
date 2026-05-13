@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from affine.api.dependencies import rate_limit_read
 
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
@@ -21,7 +23,11 @@ from affine.src.scorer.window_state import (
 )
 
 
-router = APIRouter(prefix="/windows", tags=["windows"])
+router = APIRouter(
+    prefix="/windows",
+    tags=["windows"],
+    dependencies=[Depends(rate_limit_read)],
+)
 
 
 def _state_store() -> StateStore:

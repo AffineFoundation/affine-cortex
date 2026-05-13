@@ -13,7 +13,6 @@ from affine.api.config import config
 from affine.api.middleware import setup_middleware
 from affine.api.routers import (
     config_router,
-    logs_router,
     scores_router,
     windows_router,
 )
@@ -61,7 +60,21 @@ setup_middleware(app)
 app.include_router(windows_router, prefix="/api/v1")
 app.include_router(scores_router, prefix="/api/v1")
 app.include_router(config_router, prefix="/api/v1")
-app.include_router(logs_router, prefix="/api/v1")
+if config.INTERNAL_ENDPOINTS_ENABLED:
+    from affine.api.routers import logs_router
+
+    app.include_router(logs_router, prefix="/api/v1")
+    logger.info("Internal API endpoints enabled")
+
+
+@app.get("/", tags=["health"])
+async def health():
+    return {"status": "ok", "service": "affine-api"}
+
+
+@app.get("/api/v1/health", tags=["health"])
+async def api_health():
+    return await health()
 
 
 @app.exception_handler(Exception)

@@ -36,10 +36,9 @@ async def get_miner_logs(
     Note: model_revision filtering not supported by DAO
     """
     try:
-        # Determine status filter based on success parameter
         status_filter = None
         if success is not None:
-            status_filter = 'success' if success else 'failed'
+            status_filter = "completed" if success else "failed"
         
         # DAO only accepts miner_hotkey, limit, and status
         logs = await dao.get_recent_logs(
@@ -52,12 +51,12 @@ async def get_miner_logs(
             ExecutionLog(
                 log_id=log["log_id"],
                 timestamp=log["timestamp"],
-                task_id=log["task_id"],
+                task_id=str(log.get("dataset_task_id", log.get("task_id", ""))),
                 env=log["env"],
-                success=(log["status"] == "success"),
+                status=log.get("status", "unknown"),
                 error_type=log.get("error_type"),
                 error_message=log.get("error_message"),
-                latency_ms=log.get("execution_time_ms", 0),
+                latency_ms=int(log.get("latency_ms") or log.get("execution_time_ms") or 0),
             )
             for log in logs
         ]

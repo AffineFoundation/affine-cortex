@@ -1,5 +1,5 @@
 services:
-  # API Server — read-only public endpoints (/windows/*, /miners/*, /scores/*).
+  # API Server — read-only public endpoints (/windows/*, /scores/*, /config).
   api:
     image: affinefoundation/affine:latest
     container_name: affine-api
