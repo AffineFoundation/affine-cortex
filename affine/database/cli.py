@@ -714,7 +714,7 @@ def _parse_duration(spec: str) -> int:
 
 
 async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
-    """Per-env progress + rate + ETA for the current refresh."""
+    """Per-env progress + rate + ETA + live worker concurrency."""
     import time
     from datetime import datetime
     from affine.database.client import get_client
@@ -746,24 +746,35 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
             click.echo("No subjects to report (no champion / battle, or filter excluded all).")
             return
 
+        # Pull each env's live worker status (in_flight / cumulative counters).
+        now = time.time()
+        worker_status: dict = {}
+        for env_name in envs:
+            if envs[env_name].get("enabled"):
+                worker_status[env_name] = await sc.get_param_value(f"worker_status_{env_name}")
+
         win_label = window_spec if win_secs > 0 else "all-time"
         click.echo(f"refresh_block={rb}  window={win_label}")
+
         for role, uid, hk, rev in subjects:
             click.echo("")
             click.echo(f"=== {role}  uid={uid}  ({hk[:14]}...@{rev[:8]}) ===")
-            click.echo(f"{'env':<16}{'target':>8}{'done':>7}{'%':>5}  {'pool':>5}  {'rate/min':>10}  {'eta':>8}  {'last_write':>11}")
+            click.echo(
+                f"{'env':<14}{'tgt':>5}{'done':>6}{'%':>5}  {'rate/m':>8}{'eta':>8}"
+                f"  {'in_fly':>7}{'ok':>7}{'fail':>6}{'avg_lat':>9}  {'last':>10}{'age':>5}"
+            )
 
-            now_ms = int(time.time() * 1000)
+            now_ms = int(now * 1000)
             cutoff_ms = now_ms - win_secs * 1000 if win_secs > 0 else 0
 
             for env_name in sorted(envs.keys()):
                 cfg = envs[env_name]
                 if not cfg.get("enabled"):
-                    click.echo(f"{env_name:<16}{'-':>8}{'-':>7}{'-':>5}  {'-':>5}  {'(disabled)':>10}")
+                    click.echo(f"{env_name:<14}  (disabled)")
                     continue
+
+                # --- progress columns ---
                 target = (cfg.get("sampling") or {}).get("sampling_count", 0)
-                pool = tids.get("task_ids", {}).get(env_name) or []
-                pool_size = len(pool)
 
                 pk = dao._make_pk(hk, rev, env_name)
                 rows = []
@@ -811,9 +822,25 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
                     eta_min = remaining / rate_per_min
                     eta = f"{eta_min:.0f}m" if eta_min < 60 else f"{eta_min/60:.1f}h"
 
+                # --- worker_status columns (live concurrency) — only meaningful
+                # for the champion row; challenger sample writes share the env
+                # workers so the columns are repeated but the numbers are env-wide.
+                ws = worker_status.get(env_name) or {}
+                in_flight = ws.get("tasks_in_flight", "—")
+                succ = ws.get("tasks_succeeded", "—")
+                fail = ws.get("tasks_failed", "—")
+                total_ms = ws.get("total_execution_ms", 0)
+                count = (ws.get("tasks_succeeded", 0) + ws.get("tasks_failed", 0)) if ws else 0
+                avg_lat = f"{(total_ms / count) / 1000:.1f}s" if count else "—"
+                reported_at = ws.get("reported_at", 0) if ws else 0
+                age = int(now - reported_at) if reported_at else None
+                age_str = f"{age}s" if age is not None else "—"
+
                 click.echo(
-                    f"{env_name:<16}{target:>8}{done:>7}{pct:>4}%  {pool_size:>5}  "
-                    f"{rate_per_min:>8.1f}/m  {eta:>8}  {last_str:>11}"
+                    f"{env_name:<14}{target:>5}{done:>6}{pct:>4}%  "
+                    f"{rate_per_min:>6.1f}/m{eta:>8}  "
+                    f"{in_flight:>7}{succ:>7}{fail:>6}{avg_lat:>9}  "
+                    f"{last_str:>10}{age_str:>5}"
                 )
     finally:
         await close_client()
@@ -826,60 +853,17 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
               type=click.Choice(["champion", "challenger", "both"]),
               help="Which miner to report (default: champion)")
 def sample_progress(window, miner):
-    """Show per-env sample progress, write rate, and ETA for the current refresh.
+    """Per-env sample progress + rate + ETA + live executor concurrency.
 
-    Useful for spotting bottleneck envs — compare rate across envs and
-    see which ones won't finish their sampling_count before the next
-    7200-block refresh.
+    Combined view of:
+      - ``done / target`` and ``%`` against ``sampling_count``
+      - ``rate/m`` and ``eta`` over the requested rolling window
+      - ``in_fly`` live in-flight evaluate() calls (from the
+        ``worker_status_*`` rows each worker publishes every ~10s)
+      - cumulative ``ok / fail`` and average per-task latency
+      - timestamp of last write + freshness ``age`` of the worker status
     """
     asyncio.run(_cmd_sample_progress(window, miner))
-
-
-async def _cmd_worker_status() -> None:
-    """Show live per-env executor concurrency + cumulative counters."""
-    import time
-    from datetime import datetime
-    sc = SystemConfigDAO()
-    await init_client()
-    try:
-        envs = await sc.get_param_value("environments") or {}
-        click.echo(f"{'env':<16}{'in_flight':>11}{'succeeded':>11}{'failed':>9}"
-                   f"{'avg_lat':>10}{'last_task':>11}{'age':>7}")
-        now = time.time()
-        for env_name in sorted(envs.keys()):
-            cfg = envs[env_name]
-            if not cfg.get("enabled"):
-                click.echo(f"{env_name:<16}  (disabled)")
-                continue
-            status = await sc.get_param_value(f"worker_status_{env_name}")
-            if not status:
-                click.echo(f"{env_name:<16}  (no status — worker not running or pre-warmup)")
-                continue
-            in_flight = status.get("tasks_in_flight", 0)
-            succ = status.get("tasks_succeeded", 0)
-            fail = status.get("tasks_failed", 0)
-            total_ms = status.get("total_execution_ms", 0)
-            avg_ms = total_ms / (succ + fail) if (succ + fail) else 0
-            last_at = status.get("last_task_at")
-            last_str = datetime.fromtimestamp(last_at).strftime("%H:%M:%S") if last_at else "—"
-            reported_at = status.get("reported_at", 0)
-            age = int(now - reported_at) if reported_at else -1
-            age_str = f"{age}s" if age >= 0 else "?"
-            click.echo(f"{env_name:<16}{in_flight:>11}{succ:>11}{fail:>9}"
-                       f"{avg_ms/1000:>9.1f}s{last_str:>11}{age_str:>7}")
-    finally:
-        await close_client()
-
-
-@db.command("worker-status")
-def worker_status():
-    """Live per-env executor concurrency + cumulative counters.
-
-    Each executor worker publishes its metrics to ``system_config`` every
-    ~10s; this command reads them back. ``age`` shows how stale the snapshot
-    is (high ``age`` ⇒ worker stuck or just exited).
-    """
-    asyncio.run(_cmd_worker_status())
 
 
 def main():
