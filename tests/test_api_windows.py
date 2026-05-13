@@ -21,6 +21,7 @@ from affine.src.scorer.window_state import (
     StateStore,
     TaskIdState,
 )
+from affine.api.routers.windows import _infer_champion_from_scores
 
 
 # Pull the same response-shape construction the router uses. Re-implementing
@@ -48,6 +49,7 @@ async def _build_current(store: StateStore):
             "started_at_block": battle.started_at_block,
         } if battle else None,
         "task_refresh_block": task_state.refreshed_at_block if task_state else None,
+        "sample_counts": {},
     }
 
 
@@ -64,6 +66,7 @@ async def test_current_endpoint_on_empty_state():
         "champion_base_url": None,
         "battle": None,
         "task_refresh_block": None,
+        "sample_counts": {},
     }
 
 
@@ -133,3 +136,44 @@ async def test_champion_endpoint_with_real_record():
     }
     assert result["uid"] == 7
     assert result["since_block"] == 100
+
+
+class _FakeScoresDAO:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def get_latest_scores(self, limit=None):
+        return self.payload
+
+
+@pytest.mark.asyncio
+async def test_infer_champion_from_latest_weight_snapshot(monkeypatch):
+    monkeypatch.setattr(
+        "affine.api.routers.windows.ScoresDAO",
+        lambda: _FakeScoresDAO({
+            "block_number": 123,
+            "scores": [
+                {
+                    "uid": 7,
+                    "miner_hotkey": "hk",
+                    "model_revision": "rev",
+                    "model": "org/model",
+                    "overall_score": 1.0,
+                },
+                {
+                    "uid": 8,
+                    "miner_hotkey": "hk2",
+                    "model_revision": "rev2",
+                    "model": "org/model2",
+                    "overall_score": 0.0,
+                },
+            ],
+        }),
+    )
+
+    champ = await _infer_champion_from_scores()
+
+    assert champ.uid == 7
+    assert champ.hotkey == "hk"
+    assert champ.revision == "rev"
+    assert champ.since_block == 123

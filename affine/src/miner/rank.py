@@ -7,6 +7,8 @@ champion-challenge table backed by the read-only API.
 
 from __future__ import annotations
 
+import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -17,6 +19,19 @@ from affine.utils.api_client import cli_api_client
 
 _RANK_FETCH_LIMIT = 256
 _QUEUE_PREVIEW = 10
+
+
+def _is_color_tty() -> bool:
+    try:
+        return sys.stdout.isatty() and os.getenv("NO_COLOR") is None
+    except Exception:
+        return False
+
+
+def _ansi(text: str, code: str) -> str:
+    if not _is_color_tty():
+        return text
+    return f"\033[{code}m{text}\033[0m"
 
 
 async def _safe_get(client, path: str) -> Optional[Any]:
@@ -78,7 +93,7 @@ def _env_names(scores: List[Dict[str, Any]]) -> List[str]:
     return sorted(envs)
 
 
-def _env_cell(payload: Any) -> str:
+def _env_cell(payload: Any, live_count: Optional[int] = None) -> str:
     if not isinstance(payload, dict):
         return "-"
     score_on_common = _number(payload.get("score_on_common"))
@@ -104,9 +119,9 @@ def _env_cell(payload: Any) -> str:
             break
     if score is None:
         return "-"
-    samples = None
+    samples = live_count
     for key in ("sample_count", "historical_count", "common_tasks", "count"):
-        if isinstance(payload.get(key), int):
+        if samples is None and isinstance(payload.get(key), int):
             samples = int(payload[key])
             break
     if samples is None:
@@ -120,6 +135,15 @@ def _valid_mark(value: Any) -> str:
     if value is False:
         return "no"
     return "-"
+
+
+def _colored_valid_mark(value: Any) -> str:
+    text = f"{_valid_mark(value):>6}"
+    if value is True:
+        return _ansi(text, "32")
+    if value is False:
+        return _ansi(text, "31")
+    return _ansi(text, "2")
 
 
 def _status_for(
@@ -142,9 +166,24 @@ def _status_for(
     return "VALID"
 
 
+def _colored_status(status: str, *, is_invalid: bool) -> str:
+    text = f"{status:>11}"
+    if status == "CHAMPION":
+        return _ansi(text, "1;93")
+    if status == "BATTLING":
+        return _ansi(text, "1;96")
+    if status.startswith("QUEUE #"):
+        return _ansi(text, "1;94")
+    if is_invalid:
+        return _ansi(text, "1;91")
+    if status == "VALID":
+        return _ansi(text, "32")
+    return text
+
+
 def _sampling_mark(uid: Any, champion_uid: Optional[int], battle_uid: Optional[int]) -> str:
     if uid == champion_uid or uid == battle_uid:
-        return "⚡"
+        return _ansi("⚡", "1;92")
     return " "
 
 
@@ -201,6 +240,7 @@ def _print_rank_table(
         if len(weight_champions) == 1:
             inferred = weight_champions[0]
             champion_uid = inferred.get("uid")
+            live_champion_uid = champion_uid
             champion = {
                 "uid": inferred.get("uid"),
                 "hotkey": inferred.get("miner_hotkey"),
@@ -211,6 +251,7 @@ def _print_rank_table(
         for idx, row in enumerate(queue or [])
         if row.get("uid") is not None
     }
+    live_sample_counts = (window or {}).get("sample_counts") or {}
 
     header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
     header_parts.extend(f"{env[:24]:>24}" for env in envs)
@@ -221,8 +262,8 @@ def _print_rank_table(
     block_number = scores_resp.get("block_number")
     calculated_at = scores_resp.get("calculated_at")
 
-    print("=" * width)
-    print(f"CHAMPION CHALLENGE RANKING - Block {block_number}")
+    print(_ansi("=" * width, "2"))
+    print(_ansi(f"CHAMPION CHALLENGE RANKING - Block {block_number}", "1;96"))
     print(
         f"Calculated: {_format_relative_time(calculated_at)} "
         f"({_format_iso(calculated_at)})"
@@ -247,9 +288,9 @@ def _print_rank_table(
     refresh = (window or {}).get("task_refresh_block")
     if refresh is not None:
         print(f"Task pool:  refreshed @ block {refresh}")
-    print("=" * width)
-    print(header_line)
-    print("-" * width)
+    print(_ansi("=" * width, "2"))
+    print(_ansi(header_line, "1"))
+    print(_ansi("-" * width, "2"))
 
     for row in _sort_scores(
         scores,
@@ -270,16 +311,19 @@ def _print_rank_table(
             f"{_short(row.get('model'), 25):25s}",
         ]
         scores_by_env = row.get("scores_by_env") or {}
+        uid_key = str(row.get("uid"))
+        row_live_counts = live_sample_counts.get(uid_key) or {}
         for env in envs:
-            row_parts.append(f"{_env_cell(scores_by_env.get(env)):>24}")
+            live_count = row_live_counts.get(env)
+            row_parts.append(f"{_env_cell(scores_by_env.get(env), live_count):>24}")
         row_parts.extend([
-            f"{status:>11}",
+            _colored_status(status, is_invalid=(row.get("is_valid") is False)),
             f"{_as_float(row.get('overall_score')):>7.4f}",
-            f"{_valid_mark(row.get('is_valid')):>6}",
+            _colored_valid_mark(row.get("is_valid")),
         ])
         print(" | ".join(row_parts))
 
-    print("=" * width)
+    print(_ansi("=" * width, "2"))
     total = len(scores)
     valid = sum(1 for row in scores if row.get("is_valid") is True)
     invalid = sum(1 for row in scores if row.get("is_valid") is False)
@@ -289,14 +333,14 @@ def _print_rank_table(
         f"  |  Battle: {battle_uid if battle_uid is not None else '-'}"
         f"  |  Queue head: {queue_count}  |  Valid: {valid}  |  Invalid: {invalid}"
     )
-    print("Sampling: ⚡ marks miners in the current live sampling set")
+    print(f"Sampling: {_ansi('⚡', '1;92')} marks miners in the current live sampling set")
     if queue:
         head = ", ".join(
             f"#{row.get('position')} UID {row.get('uid')}"
             for row in queue[:_QUEUE_PREVIEW]
         )
         print(f"Queue: {head}")
-    print("=" * width)
+    print(_ansi("=" * width, "2"))
 
 
 # Compatibility helpers used by unit tests and older callers.
