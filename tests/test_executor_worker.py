@@ -300,3 +300,42 @@ def test_env_from_payload_rejects_nonpositive_max_concurrent():
             "sampling": {"max_concurrent": bad},
         })
         assert cfg.max_concurrent is None, f"bad input {bad!r} leaked through"
+
+
+def test_compute_env_caps_defaults_to_fair_share():
+    from affine.src.executor.main import _compute_env_caps
+
+    caps = _compute_env_caps(
+        ["LIVEWEB", "MEMORY", "NAVWORLD", "SWE-INFINITE", "TERMINAL"],
+        {},
+        global_budget=600,
+    )
+
+    assert caps == {
+        "LIVEWEB": 120,
+        "MEMORY": 120,
+        "NAVWORLD": 120,
+        "SWE-INFINITE": 120,
+        "TERMINAL": 120,
+    }
+
+
+def test_compute_env_caps_allows_explicit_override():
+    from affine.src.executor.main import _compute_env_caps
+
+    caps = _compute_env_caps(
+        ["LIVEWEB", "MEMORY", "NAVWORLD"],
+        {
+            "LIVEWEB": {
+                "enabled_for_sampling": True,
+                "sampling": {"max_concurrent": 80},
+            },
+        },
+        global_budget=300,
+    )
+
+    assert caps == {
+        "LIVEWEB": 80,
+        "MEMORY": 110,
+        "NAVWORLD": 110,
+    }

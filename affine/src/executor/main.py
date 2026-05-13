@@ -16,6 +16,7 @@ connection pools don't have to be shared.
 from __future__ import annotations
 
 import asyncio
+import math
 import multiprocessing
 import signal
 from typing import Any, Dict, List, Optional
@@ -45,18 +46,16 @@ class ExecutorManager:
     ):
         self.envs = envs
         self.verbosity = verbosity
-        # Optional per-env evaluate-concurrency caps. Sourced from
-        # ``EnvConfig.max_concurrent`` (system_config). Envs absent
-        # from this dict only contend on the global semaphore.
+        # Per-env evaluate-concurrency caps. Sourced from a fair-share
+        # default plus optional ``EnvConfig.max_concurrent`` overrides.
         self.env_concurrency_caps = env_concurrency_caps or {}
         self.mp_ctx = multiprocessing.get_context("spawn")
         # Single cross-process bounded semaphore = the real concurrency
         # gate. Sized to the b300 saturation point so the inference
-        # backend is the bottleneck (where we want it). Workers
-        # contend on this sem before every evaluate(); envs with more
-        # remaining work submit more concurrent acquire() attempts and
-        # naturally win a proportional share of slots — that's the
-        # cross-env priority, no explicit queue needed.
+        # backend is the bottleneck (where we want it). Workers first pass
+        # their per-env cap, then contend on this shared sem before every
+        # evaluate. The per-env caps prevent fast-cycling envs from starving
+        # slower env workers.
         self.global_sem = self.mp_ctx.BoundedSemaphore(GLOBAL_DISPATCH_BUDGET)
         # Per-env in-flight counter; worker writes (single writer), manager
         # reads. ``lock=False`` is safe: only one process writes each
@@ -222,21 +221,52 @@ async def _enabled_envs() -> List[str]:
     return out
 
 
-async def _env_concurrency_caps(envs: List[str]) -> Dict[str, int]:
-    """Read ``EnvConfig.max_concurrent`` for the named envs via the
-    shared ``_env_from_payload`` parser. Returns a dict of only the
-    envs that have a positive cap configured — sharing the parser
-    keeps the int/bool/str validation in one place."""
+def _compute_env_caps(
+    envs: List[str],
+    raw_envs: Dict[str, Any],
+    *,
+    global_budget: int,
+) -> Dict[str, int]:
+    """Return one evaluate-in-flight cap per sampling env.
+
+    A single global semaphore alone is not fair: workers with many fast
+    retries or short tasks win more acquire races and can crowd out slow
+    envs. Envs without an explicit cap split the remaining global budget
+    evenly, so every env has a bounded share. An explicit
+    ``system_config.environments.<env>.sampling.max_concurrent`` overrides
+    the default for that env.
+    """
     from affine.src.scorer.window_state import _env_from_payload
 
-    config_dao = SystemConfigDAO()
-    envs_raw = await config_dao.get_param_value("environments", default={}) or {}
+    if not envs:
+        return {}
+    parsed = {name: _env_from_payload(raw_envs.get(name)) for name in envs}
+    explicit = {
+        name: cfg.max_concurrent
+        for name, cfg in parsed.items()
+        if cfg.max_concurrent
+    }
+    uncapped = [name for name in envs if name not in explicit]
+    explicit_total = sum(explicit.values())
+    default_cap = 1
+    if uncapped:
+        remaining = max(1, global_budget - explicit_total)
+        default_cap = max(1, math.ceil(remaining / len(uncapped)))
     out: Dict[str, int] = {}
     for name in envs:
-        cfg = _env_from_payload(envs_raw.get(name))
-        if cfg.max_concurrent:
-            out[name] = cfg.max_concurrent
+        out[name] = explicit.get(name) or default_cap
     return out
+
+
+async def _env_concurrency_caps(envs: List[str]) -> Dict[str, int]:
+    """Compute per-env caps from live ``system_config.environments``."""
+    config_dao = SystemConfigDAO()
+    envs_raw = await config_dao.get_param_value("environments", default={}) or {}
+    return _compute_env_caps(
+        envs,
+        envs_raw if isinstance(envs_raw, dict) else {},
+        global_budget=GLOBAL_DISPATCH_BUDGET,
+    )
 
 
 async def _run() -> None:

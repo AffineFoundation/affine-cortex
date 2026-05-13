@@ -155,9 +155,8 @@ class ExecutorWorker:
 
         Net effect: a tick that contains 200 SWE-INFINITE tasks no
         longer waits for the slowest task to finish before dispatching
-        peer task_ids. The global ``BoundedSemaphore(480)`` remains the
-        only concurrency gate; per-env env-container capacity is the
-        downstream physical bottleneck (operator dial).
+        peer task_ids. The per-env cap is applied before the shared
+        global semaphore so fast-cycling envs cannot monopolize it.
         """
         assert self._state and self._samples, "call initialize() first"
         status_task = asyncio.create_task(self._publish_status_loop())
@@ -296,11 +295,10 @@ class ExecutorWorker:
             that, overlap is sufficient and continuing adds no
             comparator signal.
 
-        Concurrency: the cross-process ``self._global_sem`` (480 by
-        default = b300 saturation) is the only gate. No per-env local
-        semaphore — env-container capacity is the physical bottleneck
-        downstream, and we want every un-sampled task_id contending for
-        a global slot so slow peers can't hide free capacity.
+        Concurrency: candidates pass the optional per-env semaphore first,
+        then the shared cross-process global semaphore. This keeps all
+        envs streaming while bounding how much of the global budget one
+        env can occupy.
         """
         task_state = await self._state.get_task_state()
         if task_state is None:
@@ -459,9 +457,8 @@ class ExecutorWorker:
         refresh_block: int, miner_obj: "_Miner",
     ) -> None:
         # Wait until the cross-process global semaphore yields a slot.
-        # Envs with bigger pending lists submit more concurrent acquire
-        # attempts and so win a proportional share of the b300 budget —
-        # that's the cross-env priority, no explicit queue needed.
+        # The per-env semaphore has already bounded this worker's share,
+        # so fast retry loops cannot crowd out slower envs here.
         await self._acquire_global_slot()
         started = time.monotonic()
         # Track real in-flight concurrency. Two counters intentionally:

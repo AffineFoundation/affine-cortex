@@ -38,7 +38,8 @@
       "sampling": {
         "sampling_count": 400,
         "dataset_range": [[0, 78060000]],
-        "sampling_mode": "random"
+        "sampling_mode": "random",
+        "max_concurrent": 100
       }
     },
     "LOGPROBS": {
