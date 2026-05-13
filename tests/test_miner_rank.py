@@ -93,6 +93,7 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     assert "Battle:     UID 2" in out
     assert "Hotkey" in out
     assert "⚡| Model" in out
+    assert " Valid " not in out
     assert "CHAMPION" in out
     assert "BATTLING" in out
     assert "QUEUE #1" in out
@@ -158,7 +159,6 @@ def test_rank_table_does_not_show_unknown_status_for_missing_validity():
 
     assert "UNKNOWN" not in out
     assert "VALID" in out
-    assert "     -" in out
 
 
 def test_rank_table_infers_active_champion_from_weight_when_window_is_empty():

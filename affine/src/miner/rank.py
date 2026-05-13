@@ -129,23 +129,6 @@ def _env_cell(payload: Any, live_count: Optional[int] = None) -> str:
     return f"{score * 100:.2f}/{samples}"
 
 
-def _valid_mark(value: Any) -> str:
-    if value is True:
-        return "yes"
-    if value is False:
-        return "no"
-    return "-"
-
-
-def _colored_valid_mark(value: Any) -> str:
-    text = f"{_valid_mark(value):>6}"
-    if value is True:
-        return _ansi(text, "32")
-    if value is False:
-        return _ansi(text, "31")
-    return _ansi(text, "2")
-
-
 def _status_for(
     row: Dict[str, Any],
     *,
@@ -255,7 +238,7 @@ def _print_rank_table(
 
     header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
     header_parts.extend(f"{env[:24]:>24}" for env in envs)
-    header_parts.extend(["  Status   ", " Weight ", " Valid "])
+    header_parts.extend(["  Status   ", " Weight "])
     header_line = " | ".join(header_parts)
     width = max(88, len(header_line))
 
@@ -319,7 +302,6 @@ def _print_rank_table(
         row_parts.extend([
             _colored_status(status, is_invalid=(row.get("is_valid") is False)),
             f"{_as_float(row.get('overall_score')):>7.4f}",
-            _colored_valid_mark(row.get("is_valid")),
         ])
         print(" | ".join(row_parts))
 
