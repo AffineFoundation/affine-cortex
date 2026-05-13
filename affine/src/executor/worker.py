@@ -180,13 +180,26 @@ class ExecutorWorker:
         asyncio loop directly — never multiprocessing.Queue (that path
         historically segfaulted under paramiko + nest_asyncio).
 
-        First failure is logged at WARNING so a misconfigured DAO surfaces
-        quickly; subsequent failures (likely the same cause) drop to DEBUG.
+        Errors are caught and logged at WARNING (first occurrence) /
+        DEBUG (subsequent) so a broken publish path surfaces in the
+        executor's normal log without spamming it.
         """
-        import time as _t
-        from affine.src.scorer.window_state import SystemConfigKVAdapter
-        from affine.database.dao.system_config import SystemConfigDAO
-        kv = SystemConfigKVAdapter(SystemConfigDAO(), updated_by=f"executor-{self.env}")
+        try:
+            import time as _t
+            from affine.src.scorer.window_state import SystemConfigKVAdapter
+            from affine.database.dao.system_config import SystemConfigDAO
+            kv = SystemConfigKVAdapter(SystemConfigDAO(), updated_by=f"executor-{self.env}")
+        except Exception as e:
+            logger.warning(
+                f"[{self.env}] status publish setup failed; loop disabled: "
+                f"{type(e).__name__}: {e}"
+            )
+            return
+
+        # Confirm the loop actually entered iteration — this single line
+        # is the diagnostic for "did the task get scheduled at all?".
+        logger.info(f"[{self.env}] status publish loop entered (interval={interval_sec}s)")
+
         ever_failed = False
         while self.running:
             try:
@@ -197,7 +210,8 @@ class ExecutorWorker:
                 if not ever_failed:
                     logger.warning(
                         f"[{self.env}] status publish failed (first occurrence): "
-                        f"{type(e).__name__}: {e}"
+                        f"{type(e).__name__}: {e}",
+                        exc_info=True,
                     )
                     ever_failed = True
                 else:
