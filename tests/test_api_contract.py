@@ -96,6 +96,29 @@ async def test_miners_router_returns_basic_public_metadata_by_uid():
 
 
 @pytest.mark.asyncio
+async def test_miners_router_returns_termination_reason_when_set():
+    """When a miner has been terminated (DECIDE or legacy bootstrap),
+    ``af get-miner`` should be able to read both the status and the
+    human-readable reason via the same endpoint."""
+    dao = _FakeMinersDAO({
+        ("uid", 9): {
+            "uid": 9,
+            "hotkey": "hk-lost",
+            "model": "org/m",
+            "revision": "r",
+            "is_valid": "true",
+            "challenge_status": "terminated_lost",
+            "termination_reason": "lost_to_champion:5GepM|DISTILL:0.75vs0.76",
+        }
+    })
+
+    response = await get_miner_by_uid(9, dao=dao)
+
+    assert response.challenge_status == "terminated_lost"
+    assert response.termination_reason.startswith("lost_to_champion:")
+
+
+@pytest.mark.asyncio
 async def test_miners_router_returns_basic_public_metadata_by_hotkey():
     dao = _FakeMinersDAO({
         ("hotkey", "hk"): {

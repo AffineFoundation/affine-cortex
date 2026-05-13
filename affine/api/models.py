@@ -56,6 +56,10 @@ class MinerInfo(BaseModel):
     revision: Optional[str] = None
     is_valid: Optional[bool] = None
     challenge_status: Optional[str] = None
+    # Why the miner was terminated. Set alongside
+    # ``challenge_status='terminated_*'`` by DECIDE (current run) or by
+    # ``af db bootstrap-legacy-terminated`` (pre-refactor carry-over).
+    termination_reason: Optional[str] = None
     first_block: Optional[int] = None
     block_number: Optional[int] = None
     invalid_reason: Optional[str] = None
