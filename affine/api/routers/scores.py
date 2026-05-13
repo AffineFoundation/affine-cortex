@@ -17,6 +17,7 @@ from affine.api.dependencies import (
 )
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
+from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 
 router = APIRouter(prefix="/scores", tags=["Scores"])
@@ -24,25 +25,19 @@ router = APIRouter(prefix="/scores", tags=["Scores"])
 
 async def _build_validity_map() -> dict:
     """Map hotkey -> (is_valid, invalid_reason, challenge_status,
-    termination_reason) from the miners table.
+    termination_reason) from current miners plus historical miner_stats.
 
     Surfaces validator-side state in the rank UI:
       - ``is_valid`` flags monitor-side rejections (model_mismatch,
         anticopy, multiple_commits, …)
-      - ``challenge_status`` flags terminated_won / terminated_lost
-        (set by the flow scheduler at DECIDE, and by the one-shot
-        ``af db bootstrap-legacy-terminated`` for pre-refactor
-        terminate carry-over). Without this lookup the CLI shows
-        legacy-terminated miners as VALID even though they're out.
+      - ``challenge_status`` comes from ``miner_stats`` so pre-refactor
+        terminated miners remain terminated even if they leave/rejoin the
+        active 256-UID snapshot.
 
-    One full scan (256-row cap → cheap). Empty map on any DAO error
-    so a miners-table blip just hides reasons rather than 500ing.
+    One full scan (256-row cap → cheap).
     """
-    try:
-        dao = MinersDAO()
-        miners = await dao.get_all_miners()
-    except Exception:
-        return {}
+    miners = await MinersDAO().get_all_miners()
+    states = await MinerStatsDAO().build_challenge_state_map(miners)
     out: dict = {}
     for m in miners:
         hk = m.get("hotkey")
@@ -50,11 +45,12 @@ async def _build_validity_map() -> dict:
             continue
         # is_valid stored as 'true'/'false' string in the GSI partition key.
         is_valid = str(m.get("is_valid") or "").lower() == "true"
+        state = states.get((m.get("hotkey"), m.get("revision"))) or {}
         out[hk] = (
             is_valid,
             m.get("invalid_reason") or None,
-            m.get("challenge_status") or None,
-            m.get("termination_reason") or None,
+            state.get("challenge_status") or None,
+            state.get("termination_reason") or None,
         )
     return out
 
@@ -176,7 +172,9 @@ async def get_score_by_uid(
             )
         
         hk = miner_score.get("miner_hotkey")
-        is_valid, invalid_reason = (await _build_validity_map()).get(hk, (None, None))
+        is_valid, invalid_reason, challenge_status, termination_reason = (
+            await _build_validity_map()
+        ).get(hk, (None, None, None, None))
         return MinerScore(
             miner_hotkey=hk,
             uid=miner_score.get("uid"),
@@ -189,6 +187,8 @@ async def get_score_by_uid(
             total_samples=miner_score.get("total_samples"),
             is_valid=is_valid,
             invalid_reason=invalid_reason,
+            challenge_status=challenge_status,
+            termination_reason=termination_reason,
         )
 
     except HTTPException:

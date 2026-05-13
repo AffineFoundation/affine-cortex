@@ -2,11 +2,11 @@
 Challenger queue.
 
 Each window picks at most one challenger to face the current champion. The
-queue is materialized on demand from the ``miners`` table — there is no
-separate queue table.
+queue is materialized from current online miners joined with historical
+``miner_stats`` challenge state — there is no separate queue table.
 
 Selection rules:
-  - challenge_status == "pending"
+  - miner_stats.challenge_status is missing/"sampling"
   - is_valid == true
   - uid != champion_uid (the current champion is never its own challenger)
   - order by (first_block ASC, uid ASC)
@@ -16,25 +16,17 @@ from dataclasses import dataclass
 from typing import Optional, Protocol
 
 
-# Status values written into miners.challenge_status.
+# Status values read/written in miner_stats.challenge_status.
 #
 # Lifecycle:
-#   pending  ─[claim_pending]→  in_progress
-#   in_progress  ─[mark_terminated(WON)]→     champion
-#                 ─[mark_terminated(LOST)]→    terminated_lost
-#                 ─[mark_terminated(FAILED)]→  terminated_failed
-#   champion  ─[mark_terminated(LOST)]→  terminated_lost   (dethroned)
-#
-# At any time the subnet has at most one row in ``champion`` state —
-# kept in sync with ``system_config['champion'].uid``. The state's
-# meaning differs from ``terminated_won`` (which doesn't exist in this
-# state machine): the winner becomes the *active* champion, not a
-# terminated bookmark.
-STATUS_PENDING = "pending"
+#   sampling ─[claim_pending]→ in_progress
+#   in_progress ─[mark_terminated(WON)]→  champion
+#               ─[mark_terminated(LOST/FAILED)]→ terminated
+#   champion ─[mark_terminated(LOST)]→ terminated
+STATUS_PENDING = "sampling"
 STATUS_IN_PROGRESS = "in_progress"
 STATUS_CHAMPION = "champion"
-STATUS_TERMINATED_LOST = "terminated_lost"
-STATUS_TERMINATED_FAILED = "terminated_failed"
+STATUS_TERMINATED = "terminated"
 
 # What mark_terminated callers pass in.
 OUTCOME_WON = "won"
@@ -43,8 +35,8 @@ OUTCOME_FAILED = "failed"
 
 _OUTCOME_TO_STATUS = {
     OUTCOME_WON: STATUS_CHAMPION,
-    OUTCOME_LOST: STATUS_TERMINATED_LOST,
-    OUTCOME_FAILED: STATUS_TERMINATED_FAILED,
+    OUTCOME_LOST: STATUS_TERMINATED,
+    OUTCOME_FAILED: STATUS_TERMINATED,
 }
 
 
@@ -75,13 +67,17 @@ class MinerQueueStore(Protocol):
         """
         ...
 
-    async def set_terminal(self, uid: int, new_status: str) -> None:
-        """Set ``uid``'s ``challenge_status`` to a terminal value.
-
-        Revision is effectively immutable per hotkey — the miners monitor
-        rejects any second commit via the multi-commit rule — so we don't
-        need a revision guard here.
-        """
+    async def set_terminal(
+        self,
+        uid: int,
+        new_status: str,
+        *,
+        reason: str = "",
+        hotkey: Optional[str] = None,
+        revision: Optional[str] = None,
+        model: str = "",
+    ) -> None:
+        """Set ``uid``'s historical ``challenge_status``."""
         ...
 
 
@@ -94,11 +90,8 @@ class ChallengerQueue:
     ) -> Optional[MinerCandidate]:
         """Return the earliest eligible challenger and mark it in_progress.
 
-        A row is eligible if ``is_valid='true'`` and ``challenge_status`` is
-        either ``'pending'`` or missing (the monitor seeds it on first
-        refresh after a fresh on-chain commit; until then we still want
-        the queue to claim — the conditional ``UpdateItem`` in the
-        adapter tolerates the absent attribute too).
+        A row is eligible if ``is_valid='true'`` and historical
+        ``challenge_status`` is missing or ``'sampling'``.
 
         Returns ``None`` if no eligible miner exists. On a lost race for
         the same candidate, the conditional write returns False and we
@@ -129,13 +122,34 @@ class ChallengerQueue:
                 )
         return None
 
-    async def mark_terminated(self, uid: int, outcome: str) -> None:
+    async def mark_terminated(
+        self,
+        uid: int,
+        outcome: str,
+        *,
+        reason: Optional[str] = None,
+        hotkey: Optional[str] = None,
+        revision: Optional[str] = None,
+        model: str = "",
+    ) -> None:
         """Transition ``uid`` to a terminal challenge state."""
         try:
             new_status = _OUTCOME_TO_STATUS[outcome]
         except KeyError:
             raise ValueError(f"unknown outcome {outcome!r}") from None
-        await self._store.set_terminal(uid, new_status)
+        final_reason = reason or ""
+        if outcome == OUTCOME_FAILED:
+            final_reason = final_reason or "deployment_failed"
+        elif outcome == OUTCOME_LOST:
+            final_reason = final_reason or "lost"
+        await self._store.set_terminal(
+            uid,
+            new_status,
+            reason=final_reason,
+            hotkey=hotkey,
+            revision=revision,
+            model=model,
+        )
 
 
 def _is_truthy(value) -> bool:

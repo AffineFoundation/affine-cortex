@@ -12,8 +12,7 @@ from affine.src.scorer.challenger_queue import (
     STATUS_CHAMPION,
     STATUS_IN_PROGRESS,
     STATUS_PENDING,
-    STATUS_TERMINATED_FAILED,
-    STATUS_TERMINATED_LOST,
+    STATUS_TERMINATED,
 )
 
 
@@ -52,10 +51,26 @@ class InMemoryStore:
         row["last_window_id"] = window_id
         return True
 
-    async def set_terminal(self, uid: int, new_status: str) -> None:
-        self.terminal_calls.append((uid, new_status))
+    async def set_terminal(
+        self,
+        uid: int,
+        new_status: str,
+        *,
+        reason: str = "",
+        hotkey: str | None = None,
+        revision: str | None = None,
+        model: str = "",
+    ) -> None:
+        self.terminal_calls.append((uid, new_status, reason, hotkey, revision, model))
         row = self.rows.setdefault(uid, {"uid": uid})
         row["challenge_status"] = new_status
+        row["termination_reason"] = reason
+        if hotkey is not None:
+            row["hotkey"] = hotkey
+        if revision is not None:
+            row["revision"] = revision
+        if model:
+            row["model"] = model
 
 
 def _truthy(value) -> bool:
@@ -126,7 +141,7 @@ async def test_skips_champion_uid():
 async def test_skips_non_pending_status():
     store = InMemoryStore(
         [
-            _miner(1, "A", first_block=100, status=STATUS_TERMINATED_LOST),
+            _miner(1, "A", first_block=100, status=STATUS_TERMINATED),
             _miner(2, "B", first_block=200, status=STATUS_CHAMPION),
             _miner(3, "C", first_block=300, status=STATUS_PENDING),
         ]
@@ -161,7 +176,7 @@ async def test_empty_queue_returns_none():
 async def test_all_terminated_returns_none():
     store = InMemoryStore(
         [
-            _miner(1, "A", first_block=100, status=STATUS_TERMINATED_LOST),
+            _miner(1, "A", first_block=100, status=STATUS_TERMINATED),
             _miner(2, "B", first_block=200, status=STATUS_CHAMPION),
         ]
     )
@@ -197,11 +212,11 @@ async def test_mark_terminated_won():
     q = ChallengerQueue(store)
     await q.mark_terminated(1, OUTCOME_WON)
     assert store.rows[1]["challenge_status"] == STATUS_CHAMPION
-    assert store.terminal_calls == [(1, STATUS_CHAMPION)]
+    assert store.terminal_calls == [(1, STATUS_CHAMPION, "", None, None, "")]
 
 
 @pytest.mark.asyncio
-async def test_mark_terminated_lost_and_failed():
+async def test_lost_and_failed_outcomes_share_terminated_status():
     store = InMemoryStore(
         [
             _miner(1, "A", 100, status=STATUS_IN_PROGRESS),
@@ -211,8 +226,10 @@ async def test_mark_terminated_lost_and_failed():
     q = ChallengerQueue(store)
     await q.mark_terminated(1, OUTCOME_LOST)
     await q.mark_terminated(2, OUTCOME_FAILED)
-    assert store.rows[1]["challenge_status"] == STATUS_TERMINATED_LOST
-    assert store.rows[2]["challenge_status"] == STATUS_TERMINATED_FAILED
+    assert store.rows[1]["challenge_status"] == STATUS_TERMINATED
+    assert store.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert store.rows[1]["termination_reason"] == "lost"
+    assert store.rows[2]["termination_reason"] == "deployment_failed"
 
 
 @pytest.mark.asyncio

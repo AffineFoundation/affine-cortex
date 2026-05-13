@@ -96,6 +96,53 @@ class _FakeScoresDAO:
         return self.payload
 
 
+class _FakeMinersDAO:
+    async def get_valid_miners(self):
+        return [
+            {
+                "uid": 1,
+                "hotkey": "lost",
+                "revision": "r1",
+                "model": "org/lost",
+                "first_block": 10,
+                "is_valid": "true",
+            },
+            {
+                "uid": 2,
+                "hotkey": "ready",
+                "revision": "r2",
+                "model": "org/ready",
+                "first_block": 20,
+                "is_valid": "true",
+            },
+        ]
+
+
+class _FakeMinerStatsDAO:
+    async def build_challenge_state_map(self, miners):
+        return {
+            ("lost", "r1"): {
+                "challenge_status": "terminated",
+                "termination_reason": "lost_to_champion",
+            },
+            ("ready", "r2"): {
+                "challenge_status": "sampling",
+                "termination_reason": "",
+            },
+        }
+
+
+@pytest.mark.asyncio
+async def test_queue_excludes_historical_terminated_miners(monkeypatch):
+    monkeypatch.setattr("affine.api.rank_state.MinersDAO", _FakeMinersDAO)
+    monkeypatch.setattr("affine.api.rank_state.MinerStatsDAO", _FakeMinerStatsDAO)
+
+    queue = await rank_state.get_queue(limit=10)
+
+    assert [row["uid"] for row in queue] == [2]
+    assert queue[0]["challenge_status"] == "sampling"
+
+
 @pytest.mark.asyncio
 async def test_infer_champion_from_latest_weight_snapshot(monkeypatch):
     monkeypatch.setattr(

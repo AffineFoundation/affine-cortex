@@ -9,10 +9,8 @@ Reads metagraph commits and miner metadata. For every miner on the subnet:
   3. Optional: model size + chat-template safety checks.
   4. Plagiarism detection by ``model_hash`` collision (earliest committer
      wins; later miners with the same hash are marked invalid).
-  5. Persist to ``miners`` table.
-  6. Seed ``miners.challenge_status='pending'`` and ``enqueued_at`` when a
-     freshly-seen ``(hotkey, revision)`` lands — that's the only signal
-     the challenger queue needs to enter the rotation.
+  5. Persist to ``miners`` table. Challenge lifecycle is historical state
+     owned by ``miner_stats`` and is not stored on the current snapshot.
 
 Anti-copy checks run here; inference lifecycle is handled by the scheduler.
 """
@@ -26,7 +24,6 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from botocore.exceptions import ClientError
 from huggingface_hub import HfApi
 
 from affine.core.setup import logger
@@ -204,7 +201,8 @@ class MinersMonitor:
                 )
             )
 
-        # Persist + seed challenge_status for newly-seen (hotkey, revision).
+        # Persist current online snapshot. Historical challenge state lives
+        # in miner_stats, keyed by (hotkey, revision).
         await self._persist_miners(miners, current_block=current_block)
 
         self.last_update = int(time.time())
@@ -423,14 +421,15 @@ class MinersMonitor:
         return env_bl | db_bl
 
     async def _persist_miners(self, miners: list[MinerInfo], *, current_block: int) -> None:
-        """Save each miner row, and seed ``challenge_status='pending'``
-        when a freshly-seen ``(hotkey, revision)`` is observed (or when the
-        revision changes — each ``(hotkey, revision)`` gets exactly one
-        chance to challenge the champion, regardless of prior history)."""
+        """Save the current online miner snapshot.
+
+        Do not write challenge lifecycle fields here. ``miners`` is rebuilt
+        from the current metagraph and can drop rows when miners leave; the
+        durable lifecycle source is ``miner_stats``.
+        """
         from affine.database.client import get_client
 
         client = get_client()
-        now = int(time.time())
 
         for miner in miners:
             await self.dao.save_miner(
@@ -462,38 +461,6 @@ class MinersMonitor:
                         f"[MinersMonitor] template_check_result write failed "
                         f"uid={miner.uid}: {e}"
                     )
-
-            # Seed challenge_status for new miners only. A miner can only
-            # commit once on this subnet (the multi-commit rule in
-            # _validate_miner rejects any second commit), so once the row
-            # carries a challenge_status — pending, in_progress, champion,
-            # or terminated_* — it stays. attribute_not_exists is enough.
-            if not miner.is_valid or miner.uid == 0 or miner.uid > 1000:
-                continue
-            try:
-                await client.update_item(
-                    TableName=self.dao.table_name,
-                    Key={"pk": {"S": self.dao._make_pk(miner.uid)}},
-                    UpdateExpression=(
-                        "SET challenge_status = :pending, enqueued_at = :now"
-                    ),
-                    ConditionExpression="attribute_not_exists(challenge_status)",
-                    ExpressionAttributeValues={
-                        ":pending": {"S": "pending"},
-                        ":now": {"N": str(now)},
-                    },
-                )
-            except ClientError as e:
-                if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
-                    logger.debug(
-                        f"[MinersMonitor] challenge_status seed failed "
-                        f"uid={miner.uid}: {e}"
-                    )
-            except Exception as e:
-                logger.debug(
-                    f"[MinersMonitor] challenge_status seed unexpected error "
-                    f"uid={miner.uid}: {type(e).__name__}: {e}"
-                )
 
     # ---- public read ----------------------------------------------------
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.system_config import SystemConfigDAO
@@ -112,7 +113,16 @@ async def get_queue(limit: int = 20) -> List[Dict[str, Any]]:
     if limit <= 0 or limit > 100:
         limit = 20
     miners = await MinersDAO().get_valid_miners()
-    pending = [m for m in miners if m.get("challenge_status") == "pending"]
+    state_map = await MinerStatsDAO().build_challenge_state_map(miners)
+    pending = []
+    for miner in miners:
+        state = state_map.get((miner.get("hotkey"), miner.get("revision"))) or {}
+        status = str(state.get("challenge_status") or "sampling")
+        if status == "sampling":
+            row = dict(miner)
+            row["challenge_status"] = status
+            row["termination_reason"] = state.get("termination_reason") or None
+            pending.append(row)
     pending.sort(key=lambda m: (m.get("first_block", float("inf")), m.get("uid", 0)))
     out: List[Dict[str, Any]] = []
     for i, m in enumerate(pending[:limit]):
@@ -125,6 +135,8 @@ async def get_queue(limit: int = 20) -> List[Dict[str, Any]]:
                 "model": m.get("model", ""),
                 "first_block": m.get("first_block"),
                 "enqueued_at": m.get("enqueued_at"),
+                "challenge_status": m.get("challenge_status"),
+                "termination_reason": m.get("termination_reason"),
             }
         )
     return out

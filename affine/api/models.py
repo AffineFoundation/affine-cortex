@@ -29,8 +29,8 @@ class MinerScore(BaseModel):
     total_samples: int
     is_valid: Optional[bool] = None
     invalid_reason: Optional[str] = None
-    # Surfaced so ``af get-rank`` can display TERMINATED for legacy- and
-    # battle-loser miners (``challenge_status`` starting with ``terminated_``).
+    # Surfaced from miner_stats so ``af get-rank`` can display TERMINATED
+    # for historical lifecycle state.
     challenge_status: Optional[str] = None
     termination_reason: Optional[str] = None
 
@@ -56,9 +56,8 @@ class MinerInfo(BaseModel):
     revision: Optional[str] = None
     is_valid: Optional[bool] = None
     challenge_status: Optional[str] = None
-    # Why the miner was terminated. Set alongside
-    # ``challenge_status='terminated_*'`` by DECIDE (current run) or by
-    # ``af db bootstrap-legacy-terminated`` (pre-refactor carry-over).
+    # Why the miner was terminated. Stored in miner_stats alongside
+    # ``challenge_status='terminated'``.
     termination_reason: Optional[str] = None
     first_block: Optional[int] = None
     block_number: Optional[int] = None
