@@ -157,6 +157,55 @@ def test_rank_table_groups_invalid_miners_below_valid_rows():
     assert "model_misma" in out
 
 
+def test_rank_table_sorts_miners_by_status_then_uid_not_score():
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 9,
+                "miner_hotkey": "uid9",
+                "model": "org/uid9",
+                "overall_score": 0.99,
+                "is_valid": True,
+                "scores_by_env": {},
+            },
+            {
+                "uid": 3,
+                "miner_hotkey": "uid3",
+                "model": "org/uid3",
+                "overall_score": 0.01,
+                "is_valid": True,
+                "scores_by_env": {},
+            },
+            {
+                "uid": 4,
+                "miner_hotkey": "terminated",
+                "model": "org/terminated",
+                "overall_score": 1.0,
+                "is_valid": True,
+                "challenge_status": "terminated",
+                "scores_by_env": {},
+            },
+            {
+                "uid": 2,
+                "miner_hotkey": "invalid",
+                "model": "org/invalid",
+                "overall_score": 1.0,
+                "is_valid": False,
+                "invalid_reason": "model_check:bad",
+                "scores_by_env": {},
+            },
+        ],
+    }
+
+    out = _render_rank(None, None, scores)
+
+    assert out.index("uid3") < out.index("uid9")
+    assert out.index("uid9") < out.index("invalid")
+    assert out.index("uid9") < out.index("terminated")
+
+
 def test_rank_table_shows_terminated_for_terminated_status():
     """miner_stats challenge_status='terminated' renders TERMINATED."""
     scores = {

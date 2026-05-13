@@ -186,20 +186,20 @@ def _sort_scores(
 ) -> List[Dict[str, Any]]:
     def key(row: Dict[str, Any]) -> tuple:
         uid = row.get("uid")
+        chal_status = str(row.get("challenge_status") or "")
         if uid == champion_uid:
             bucket = 0
         elif uid == battle_uid:
             bucket = 1
         elif uid in queue_positions:
             bucket = 2
-        elif row.get("is_valid") is False:
+        elif row.get("is_valid") is False or chal_status == "terminated":
             bucket = 4
         else:
             bucket = 3
         return (
             bucket,
             queue_positions.get(uid, 9999),
-            -_as_float(row.get("overall_score")),
             int(uid if isinstance(uid, int) else 9999),
         )
 
