@@ -111,22 +111,47 @@ class ExecutorWorker:
 
     async def run(self) -> None:
         assert self._state and self._samples, "call initialize() first"
-        if self.warmup_sec > 0:
-            logger.info(
-                f"[{self.env}] warmup: sleeping {self.warmup_sec:.0f}s before "
-                f"first tick (let env containers finish app-level boot)"
-            )
-            await asyncio.sleep(self.warmup_sec)
+        # Publish status to DB in the background so ``af db worker-status``
+        # can read live in-flight / succeeded / failed counters.
+        status_task = asyncio.create_task(self._publish_status_loop())
+        try:
+            if self.warmup_sec > 0:
+                logger.info(
+                    f"[{self.env}] warmup: sleeping {self.warmup_sec:.0f}s before "
+                    f"first tick (let env containers finish app-level boot)"
+                )
+                await asyncio.sleep(self.warmup_sec)
+            while self.running:
+                try:
+                    worked = await self._tick()
+                except Exception as e:
+                    logger.error(
+                        f"[{self.env}] tick raised: {type(e).__name__}: {e}",
+                        exc_info=True,
+                    )
+                    worked = False
+                await asyncio.sleep(self.poll_interval_sec if worked else self.idle_sleep_sec)
+        finally:
+            status_task.cancel()
+
+    async def _publish_status_loop(self, interval_sec: float = 10.0) -> None:
+        """Periodically write this worker's metrics to ``system_config`` under
+        ``worker_status_<env>``. ``af db worker-status`` reads these rows so
+        operators can see live in-flight concurrency without docker-exec
+        spelunking. Uses the asyncio loop directly — never multiprocessing.Queue
+        (that path historically segfaulted under paramiko + nest_asyncio)."""
+        import time as _t
+        from affine.src.scorer.window_state import SystemConfigKVAdapter
+        from affine.database.dao.system_config import SystemConfigDAO
+        kv = SystemConfigKVAdapter(SystemConfigDAO(), updated_by=f"executor-{self.env}")
         while self.running:
             try:
-                worked = await self._tick()
+                payload = self.metrics.to_dict()
+                payload["reported_at"] = _t.time()
+                await kv.set(f"worker_status_{self.env}", payload)
             except Exception as e:
-                logger.error(
-                    f"[{self.env}] tick raised: {type(e).__name__}: {e}",
-                    exc_info=True,
-                )
-                worked = False
-            await asyncio.sleep(self.poll_interval_sec if worked else self.idle_sleep_sec)
+                logger.debug(f"[{self.env}] status publish failed: {e}")
+            await asyncio.sleep(interval_sec)
 
     async def _tick(self) -> bool:
         """One poll cycle. Returns True if any sampling work was attempted.
@@ -250,20 +275,27 @@ class ExecutorWorker:
             base_url=base_url,
         )
         started = time.monotonic()
+        # Track real in-flight concurrency so ``af db worker-status`` can
+        # report it. Increment before the blocking evaluate() call, decrement
+        # in the finally below.
+        self.metrics.tasks_in_flight += 1
         try:
-            result = await self._env_executor.evaluate(
-                miner=miner_obj, task_id=task_id,
-            )
-        except Exception as e:
-            latency_s = time.monotonic() - started
-            latency_ms = int(latency_s * 1000)
-            error_brief = str(e).replace("\n", " ").replace("\r", " ")[:200]
-            logger.info(
-                f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
-                f"task_id={task_id:<8} │ {latency_s:6.3f}s │ {type(e).__name__}: {error_brief}"
-            )
-            self.metrics.record_completion(success=False, latency_ms=latency_ms)
-            return
+            try:
+                result = await self._env_executor.evaluate(
+                    miner=miner_obj, task_id=task_id,
+                )
+            except Exception as e:
+                latency_s = time.monotonic() - started
+                latency_ms = int(latency_s * 1000)
+                error_brief = str(e).replace("\n", " ").replace("\r", " ")[:200]
+                logger.info(
+                    f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
+                    f"task_id={task_id:<8} │ {latency_s:6.3f}s │ {type(e).__name__}: {error_brief}"
+                )
+                self.metrics.record_completion(success=False, latency_ms=latency_ms)
+                return
+        finally:
+            self.metrics.tasks_in_flight -= 1
 
         score = float(getattr(result, "score", 0.0))
         success = bool(getattr(result, "success", True))

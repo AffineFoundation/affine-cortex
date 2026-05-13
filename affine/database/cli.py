@@ -835,6 +835,53 @@ def sample_progress(window, miner):
     asyncio.run(_cmd_sample_progress(window, miner))
 
 
+async def _cmd_worker_status() -> None:
+    """Show live per-env executor concurrency + cumulative counters."""
+    import time
+    from datetime import datetime
+    sc = SystemConfigDAO()
+    await init_client()
+    try:
+        envs = await sc.get_param_value("environments") or {}
+        click.echo(f"{'env':<16}{'in_flight':>11}{'succeeded':>11}{'failed':>9}"
+                   f"{'avg_lat':>10}{'last_task':>11}{'age':>7}")
+        now = time.time()
+        for env_name in sorted(envs.keys()):
+            cfg = envs[env_name]
+            if not cfg.get("enabled"):
+                click.echo(f"{env_name:<16}  (disabled)")
+                continue
+            status = await sc.get_param_value(f"worker_status_{env_name}")
+            if not status:
+                click.echo(f"{env_name:<16}  (no status — worker not running or pre-warmup)")
+                continue
+            in_flight = status.get("tasks_in_flight", 0)
+            succ = status.get("tasks_succeeded", 0)
+            fail = status.get("tasks_failed", 0)
+            total_ms = status.get("total_execution_ms", 0)
+            avg_ms = total_ms / (succ + fail) if (succ + fail) else 0
+            last_at = status.get("last_task_at")
+            last_str = datetime.fromtimestamp(last_at).strftime("%H:%M:%S") if last_at else "—"
+            reported_at = status.get("reported_at", 0)
+            age = int(now - reported_at) if reported_at else -1
+            age_str = f"{age}s" if age >= 0 else "?"
+            click.echo(f"{env_name:<16}{in_flight:>11}{succ:>11}{fail:>9}"
+                       f"{avg_ms/1000:>9.1f}s{last_str:>11}{age_str:>7}")
+    finally:
+        await close_client()
+
+
+@db.command("worker-status")
+def worker_status():
+    """Live per-env executor concurrency + cumulative counters.
+
+    Each executor worker publishes its metrics to ``system_config`` every
+    ~10s; this command reads them back. ``age`` shows how stale the snapshot
+    is (high ``age`` ⇒ worker stuck or just exited).
+    """
+    asyncio.run(_cmd_worker_status())
+
+
 def main():
     db()
 

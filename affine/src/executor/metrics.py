@@ -18,6 +18,7 @@ class WorkerMetrics:
     running: bool = True
     tasks_succeeded: int = 0
     tasks_failed: int = 0
+    tasks_in_flight: int = 0
     total_execution_ms: int = 0
     last_task_at: Optional[float] = None
 
