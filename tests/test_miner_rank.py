@@ -1,24 +1,17 @@
-"""``af get-rank`` renderer — partial / empty / full state.
-
-The renderer is a pure function over dicts (no HTTP, no DB). We feed
-it the same shapes the API would, capture stdout, and verify the
-output makes sense and doesn't crash.
-"""
+"""``af get-rank`` renderer."""
 
 from __future__ import annotations
 
 import io
 from contextlib import redirect_stdout
 
-import pytest
-
-from affine.src.miner.rank import _print_queue, _print_window
+from affine.src.miner.rank import _print_queue, _print_rank_table
 
 
-def _render_window(state):
+def _render_rank(window, queue, scores):
     buf = io.StringIO()
     with redirect_stdout(buf):
-        _print_window(state)
+        _print_rank_table(window, queue, scores)
     return buf.getvalue()
 
 
@@ -29,81 +22,113 @@ def _render_queue(queue):
     return buf.getvalue()
 
 
-# ---- _print_window --------------------------------------------------------
-
-
-def test_window_renders_none_safely():
-    out = _render_window(None)
-    assert "no state" in out
-
-
-def test_window_renders_empty_dict_safely():
-    """An ``{}`` reply (which the API never actually produces — it always
-    returns a dict with explicit None keys) collapses to the same
-    'no state' branch as a None reply, because Python ``not {}`` is
-    truthy. Documenting that behavior so a future API change doesn't
-    silently break the renderer."""
-    out = _render_window({})
-    assert "no state" in out
-
-
-def test_window_renders_champion_only():
-    state = {
+def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
+    window = {
         "champion": {
-            "uid": 5, "hotkey": "a" * 40, "revision": "r" * 40,
-            "model": "org/m5",
+            "uid": 1,
+            "hotkey": "champ_hotkey",
+            "revision": "rc",
+            "model": "org/champion",
         },
-        "champion_base_url": "https://t/w1",
-        "battle": None,
-        "task_refresh_block": 7200,
-    }
-    out = _render_window(state)
-    assert "uid=5" in out
-    assert "org/m5" in out
-    assert "https://t/w1" in out
-    assert "(idle)" in out
-
-
-def test_window_renders_battle_in_flight():
-    state = {
-        "champion": {"uid": 1, "hotkey": "champ", "revision": "rc", "model": "o/c"},
-        "champion_base_url": "https://t/c",
         "battle": {
-            "challenger": {"uid": 2, "hotkey": "chal", "revision": "rh", "model": "o/h"},
+            "challenger": {
+                "uid": 2,
+                "hotkey": "challenger_hotkey",
+                "revision": "rh",
+                "model": "org/challenger",
+            },
             "started_at_block": 42,
         },
         "task_refresh_block": 40,
     }
-    out = _render_window(state)
-    assert "uid=1" in out
-    assert "uid=2" in out
-    assert "started @ block 42" in out
-
-
-def test_window_renders_when_champion_field_present_but_null():
-    """API returns ``champion: None`` for empty-state currently — the
-    renderer should treat that the same as missing."""
-    state = {
-        "champion": None,
-        "champion_base_url": None,
-        "battle": None,
-        "task_refresh_block": None,
+    queue = [
+        {"position": 1, "uid": 3, "hotkey": "queued", "revision": "rq", "model": "org/q"},
+    ]
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 1,
+                "miner_hotkey": "champ_hotkey",
+                "model": "org/champion",
+                "overall_score": 1.0,
+                "is_valid": True,
+                "scores_by_env": {"SWE": {"score": 0.8, "sample_count": 10}},
+            },
+            {
+                "uid": 2,
+                "miner_hotkey": "challenger_hotkey",
+                "model": "org/challenger",
+                "overall_score": 0.0,
+                "is_valid": True,
+                "scores_by_env": {"SWE": {"score": 0.7, "sample_count": 9}},
+            },
+            {
+                "uid": 3,
+                "miner_hotkey": "queued",
+                "model": "org/q",
+                "overall_score": 0.0,
+                "is_valid": True,
+                "scores_by_env": {"SWE": {"score": 0.6, "sample_count": 8}},
+            },
+        ],
     }
-    out = _render_window(state)
-    assert "champion      : -" in out
-    assert "battle        : - (idle)" in out
+
+    out = _render_rank(window, queue, scores)
+
+    assert "CHAMPION CHALLENGE RANKING - Block 100" in out
+    assert "Champion:   UID 1" in out
+    assert "Battle:     UID 2" in out
+    assert "Hotkey" in out
+    assert "⚡| Model" in out
+    assert "CHAMPION" in out
+    assert "BATTLING" in out
+    assert "QUEUE #1" in out
+    assert "80.00/10" in out
+    assert "70.00/9" in out
+    assert out.count("⚡| org/") == 2
+    assert "Sampling: ⚡ marks miners in the current live sampling set" in out
 
 
-# ---- _print_queue ---------------------------------------------------------
+def test_rank_table_renders_empty_scores_safely():
+    out = _render_rank(None, None, None)
+    assert "No scores found" in out
+
+
+def test_rank_table_groups_invalid_miners_below_valid_rows():
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 4,
+                "miner_hotkey": "bad",
+                "model": "org/bad",
+                "overall_score": 0.0,
+                "is_valid": False,
+                "invalid_reason": "model_mismatch:detail",
+                "scores_by_env": {},
+            },
+            {
+                "uid": 5,
+                "miner_hotkey": "good",
+                "model": "org/good",
+                "overall_score": 0.0,
+                "is_valid": True,
+                "scores_by_env": {},
+            },
+        ],
+    }
+
+    out = _render_rank(None, None, scores)
+
+    assert out.index("good") < out.index("bad")
+    assert "model_misma" in out
 
 
 def test_queue_renders_none_safely():
     out = _render_queue(None)
-    assert "queue empty" in out
-
-
-def test_queue_renders_empty_list_safely():
-    out = _render_queue([])
     assert "queue empty" in out
 
 
@@ -115,8 +140,7 @@ def test_queue_renders_pending_entries():
          "first_block": 200, "enqueued_at": 1100},
     ]
     out = _render_queue(queue)
-    # Both rows make it onto the output.
-    assert " 3 " in out  # uid 3
-    assert " 7 " in out  # uid 7
+    assert " 3 " in out
+    assert " 7 " in out
     assert "100" in out
     assert "200" in out

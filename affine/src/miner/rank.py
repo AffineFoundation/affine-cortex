@@ -1,19 +1,14 @@
 """
 Rank display.
 
-``af get-rank`` prints three blocks in order:
-
-  1. CURRENT WINDOW     — block range, phase, champion, challenger, progress
-  2. CHALLENGER QUEUE   — next N miners ordered by (first_block, uid)
-  3. WEIGHT SNAPSHOT    — current scores table (one row per miner; the
-                          champion sits at overall_score=1.0, everyone
-                          else at 0.0)
-
-Read-only; talks to the API only.
+``af get-rank`` renders the public ranking surface as a single
+champion-challenge table backed by the read-only API.
 """
 
 from __future__ import annotations
 
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from affine.core.setup import logger
@@ -32,76 +27,292 @@ async def _safe_get(client, path: str) -> Optional[Any]:
         return None
 
 
-def _print_window(state: Optional[Dict[str, Any]]) -> None:
-    """Render ``GET /windows/current`` — champion + in-flight battle."""
-    print("=" * 80)
-    print("CURRENT STATE")
-    print("=" * 80)
-    if not state:
-        print("  (no state)")
+def _short(value: Any, n: int) -> str:
+    text = "" if value is None else str(value)
+    return text[:n]
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_relative_time(epoch_seconds: Optional[int]) -> str:
+    if not epoch_seconds:
+        return "unknown"
+    delta = int(time.time()) - int(epoch_seconds)
+    if delta < 0:
+        return "just now"
+    if delta < 60:
+        return f"{delta}s ago"
+    if delta < 3600:
+        return f"{delta // 60}m ago"
+    if delta < 86400:
+        hours, rem = divmod(delta, 3600)
+        return f"{hours}h {rem // 60}m ago"
+    return f"{delta // 86400}d ago"
+
+
+def _format_iso(epoch_seconds: Optional[int]) -> str:
+    if not epoch_seconds:
+        return "unknown"
+    return datetime.fromtimestamp(
+        int(epoch_seconds), tz=timezone.utc,
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _env_names(scores: List[Dict[str, Any]]) -> List[str]:
+    envs: set[str] = set()
+    for row in scores:
+        scores_by_env = row.get("scores_by_env") or {}
+        if isinstance(scores_by_env, dict):
+            envs.update(str(k) for k in scores_by_env.keys())
+    return sorted(envs)
+
+
+def _env_cell(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "-"
+    score = None
+    for key in ("score", "mean", "average_score", "score_on_common"):
+        if isinstance(payload.get(key), (int, float)):
+            score = float(payload[key])
+            break
+    if score is None:
+        return "-"
+    samples = None
+    for key in ("sample_count", "historical_count", "common_tasks", "count"):
+        if isinstance(payload.get(key), int):
+            samples = int(payload[key])
+            break
+    if samples is None:
+        return f"{score * 100:.2f}"
+    return f"{score * 100:.2f}/{samples}"
+
+
+def _valid_mark(value: Any) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "?"
+
+
+def _status_for(
+    row: Dict[str, Any],
+    *,
+    champion_uid: Optional[int],
+    battle_uid: Optional[int],
+    queue_positions: Dict[int, int],
+) -> str:
+    uid = row.get("uid")
+    if uid == champion_uid:
+        return "CHAMPION"
+    if row.get("is_valid") is False:
+        reason = str(row.get("invalid_reason") or "invalid")
+        return reason.split(":", 1)[0][:11]
+    if uid == battle_uid:
+        return "BATTLING"
+    if uid in queue_positions:
+        return f"QUEUE #{queue_positions[uid]}"
+    return "VALID" if row.get("is_valid") is True else "UNKNOWN"
+
+
+def _sampling_mark(uid: Any, champion_uid: Optional[int], battle_uid: Optional[int]) -> str:
+    if uid == champion_uid or uid == battle_uid:
+        return "⚡"
+    return " "
+
+
+def _sort_scores(
+    rows: List[Dict[str, Any]],
+    *,
+    champion_uid: Optional[int],
+    battle_uid: Optional[int],
+    queue_positions: Dict[int, int],
+) -> List[Dict[str, Any]]:
+    def key(row: Dict[str, Any]) -> tuple:
+        uid = row.get("uid")
+        if uid == champion_uid:
+            bucket = 0
+        elif uid == battle_uid:
+            bucket = 1
+        elif uid in queue_positions:
+            bucket = 2
+        elif row.get("is_valid") is False:
+            bucket = 4
+        else:
+            bucket = 3
+        return (
+            bucket,
+            queue_positions.get(uid, 9999),
+            -_as_float(row.get("overall_score")),
+            int(uid if isinstance(uid, int) else 9999),
+        )
+
+    return sorted(rows, key=key)
+
+
+def _print_rank_table(
+    window: Optional[Dict[str, Any]],
+    queue: Optional[List[Dict[str, Any]]],
+    scores_resp: Optional[Dict[str, Any]],
+) -> None:
+    if not scores_resp or not scores_resp.get("scores"):
+        print("No scores found")
         return
-    refresh = state.get("task_refresh_block")
-    if refresh is not None:
-        print(f"  task_refresh  : block {refresh}")
-    champ = state.get("champion")
-    if champ:
-        base_url = state.get("champion_base_url") or "-"
-        print(f"  champion      : uid={champ.get('uid')}  hk={(champ.get('hotkey') or '')[:14]}...  "
-              f"{champ.get('model')}@{(champ.get('revision') or '')[:8]}...")
-        print(f"  champion_url  : {base_url}")
+
+    scores = list(scores_resp.get("scores") or [])
+    envs = _env_names(scores)
+    champion = (window or {}).get("champion") or {}
+    battle = ((window or {}).get("battle") or {}).get("challenger") or {}
+    champion_uid = champion.get("uid")
+    battle_uid = battle.get("uid")
+    queue_positions = {
+        int(row["uid"]): int(row.get("position") or idx + 1)
+        for idx, row in enumerate(queue or [])
+        if row.get("uid") is not None
+    }
+
+    header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
+    header_parts.extend(f"{env[:24]:>24}" for env in envs)
+    header_parts.extend(["  Status   ", " Weight ", " Valid "])
+    header_line = " | ".join(header_parts)
+    width = max(88, len(header_line))
+
+    block_number = scores_resp.get("block_number")
+    calculated_at = scores_resp.get("calculated_at")
+
+    print("=" * width)
+    print(f"CHAMPION CHALLENGE RANKING - Block {block_number}")
+    print(
+        f"Calculated: {_format_relative_time(calculated_at)} "
+        f"({_format_iso(calculated_at)})"
+    )
+    if champion:
+        champ_hk = _short(champion.get("hotkey"), 8)
+        print(
+            f"Champion:   UID {champion.get('uid')}  {champ_hk}...  "
+            f"{champion.get('model', '-')}"
+        )
     else:
-        print("  champion      : -")
-    battle = state.get("battle")
+        print("Champion:   (none)")
     if battle:
-        chal = battle.get("challenger") or {}
-        print(f"  battle        : uid={chal.get('uid')}  hk={(chal.get('hotkey') or '')[:14]}...  "
-              f"{chal.get('model')}@{(chal.get('revision') or '')[:8]}...  "
-              f"(started @ block {battle.get('started_at_block')})")
+        battle_hk = _short(battle.get("hotkey"), 8)
+        started = ((window or {}).get("battle") or {}).get("started_at_block")
+        print(
+            f"Battle:     UID {battle.get('uid')}  {battle_hk}...  "
+            f"{battle.get('model', '-')}  started @ block {started}"
+        )
     else:
-        print("  battle        : - (idle)")
+        print("Battle:     idle")
+    refresh = (window or {}).get("task_refresh_block")
+    if refresh is not None:
+        print(f"Task pool:  refreshed @ block {refresh}")
+    print("=" * width)
+    print(header_line)
+    print("-" * width)
+
+    for row in _sort_scores(
+        scores,
+        champion_uid=champion_uid,
+        battle_uid=battle_uid,
+        queue_positions=queue_positions,
+    ):
+        status = _status_for(
+            row,
+            champion_uid=champion_uid,
+            battle_uid=battle_uid,
+            queue_positions=queue_positions,
+        )
+        row_parts = [
+            f"{_short(row.get('miner_hotkey'), 8):8s}",
+            f"{int(row.get('uid') or -1):4d}",
+            f"{_sampling_mark(row.get('uid'), champion_uid, battle_uid)}| "
+            f"{_short(row.get('model'), 25):25s}",
+        ]
+        scores_by_env = row.get("scores_by_env") or {}
+        for env in envs:
+            row_parts.append(f"{_env_cell(scores_by_env.get(env)):>24}")
+        row_parts.extend([
+            f"{status:>11}",
+            f"{_as_float(row.get('overall_score')):>7.4f}",
+            f"{_valid_mark(row.get('is_valid')):>6}",
+        ])
+        print(" | ".join(row_parts))
+
+    print("=" * width)
+    total = len(scores)
+    valid = sum(1 for row in scores if row.get("is_valid") is True)
+    invalid = sum(1 for row in scores if row.get("is_valid") is False)
+    queue_count = len(queue or [])
+    print(
+        f"Total: {total}  |  Champion: {champion_uid if champion_uid is not None else '-'}"
+        f"  |  Battle: {battle_uid if battle_uid is not None else '-'}"
+        f"  |  Queue head: {queue_count}  |  Valid: {valid}  |  Invalid: {invalid}"
+    )
+    print("Sampling: ⚡ marks miners in the current live sampling set")
+    if queue:
+        head = ", ".join(
+            f"#{row.get('position')} UID {row.get('uid')}"
+            for row in queue[:_QUEUE_PREVIEW]
+        )
+        print(f"Queue: {head}")
+    print("=" * width)
+
+
+# Compatibility helpers used by unit tests and older callers.
+def _print_window(state: Optional[Dict[str, Any]]) -> None:
+    scores = {
+        "block_number": "-",
+        "calculated_at": None,
+        "scores": [],
+    }
+    champion = (state or {}).get("champion")
+    battle = ((state or {}).get("battle") or {}).get("challenger")
+    if champion:
+        scores["scores"].append({
+            "uid": champion.get("uid"),
+            "miner_hotkey": champion.get("hotkey"),
+            "model": champion.get("model"),
+            "overall_score": 1.0,
+            "is_valid": True,
+            "scores_by_env": {},
+        })
+    if battle:
+        scores["scores"].append({
+            "uid": battle.get("uid"),
+            "miner_hotkey": battle.get("hotkey"),
+            "model": battle.get("model"),
+            "overall_score": 0.0,
+            "is_valid": True,
+            "scores_by_env": {},
+        })
+    _print_rank_table(state, [], scores if scores["scores"] else None)
 
 
 def _print_queue(queue: Optional[List[Dict[str, Any]]]) -> None:
-    print()
-    print("=" * 80)
+    print("=" * 88)
     print(f"CHALLENGER QUEUE (head {_QUEUE_PREVIEW})")
-    print("=" * 80)
+    print("=" * 88)
     if not queue:
         print("  (queue empty)")
         return
     print(f"  {'pos':<5}{'uid':<6}{'first_block':<14}{'hotkey':<20}{'revision':<12}{'model'}")
     for row in queue[:_QUEUE_PREVIEW]:
-        hk = (row.get("hotkey") or "")[:18]
-        rev = (row.get("revision") or "")[:10]
-        model = (row.get("model") or "")[:40]
         print(
             f"  {row.get('position'):<5}{row.get('uid'):<6}"
-            f"{row.get('first_block', ''):<14}{hk:<20}{rev:<12}{model}"
+            f"{str(row.get('first_block', '')):<14}"
+            f"{_short(row.get('hotkey'), 18):<20}"
+            f"{_short(row.get('revision'), 10):<12}"
+            f"{_short(row.get('model'), 40)}"
         )
 
 
 def _print_scores(scores_resp: Optional[Dict[str, Any]]) -> None:
-    print()
-    print("=" * 80)
-    print("WEIGHT SNAPSHOT")
-    print("=" * 80)
-    if not scores_resp or not scores_resp.get("scores"):
-        print("  (no scores yet)")
-        return
-    print(f"  block_number  : {scores_resp.get('block_number')}")
-    print(f"  calculated_at : {scores_resp.get('calculated_at')}")
-    print()
-    print(f"  {'uid':<6}{'weight':<10}{'valid':<8}{'hotkey':<18}{'revision':<12}{'model'}")
-    scores = scores_resp["scores"]
-    scores.sort(key=lambda s: -float(s.get("overall_score") or 0.0))
-    for s in scores:
-        weight = float(s.get("overall_score") or 0.0)
-        is_valid = s.get("is_valid")
-        valid_mark = "yes" if is_valid is True else ("no" if is_valid is False else "?")
-        hk = (s.get("miner_hotkey") or "")[:16]
-        rev = (s.get("model_revision") or "")[:10]
-        model = (s.get("model") or "")[:35]
-        print(f"  {s.get('uid'):<6}{weight:<10.4f}{valid_mark:<8}{hk:<18}{rev:<12}{model}")
+    _print_rank_table(None, [], scores_resp)
 
 
 async def get_rank_command() -> None:
@@ -110,6 +321,8 @@ async def get_rank_command() -> None:
         queue = await _safe_get(client, f"/windows/queue?limit={_QUEUE_PREVIEW}")
         scores = await _safe_get(client, f"/scores/latest?top={_RANK_FETCH_LIMIT}")
 
-    _print_window(window if isinstance(window, dict) else None)
-    _print_queue(queue if isinstance(queue, list) else None)
-    _print_scores(scores if isinstance(scores, dict) else None)
+    _print_rank_table(
+        window if isinstance(window, dict) else None,
+        queue if isinstance(queue, list) else None,
+        scores if isinstance(scores, dict) else None,
+    )
