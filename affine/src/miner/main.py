@@ -73,11 +73,12 @@ def get_score(uid):
 
 
 @click.command("get-miner")
+@click.argument("uid_arg", required=False, type=UID)
 @click.option("--uid", type=UID, help="Miner UID")
 @click.option("--hotkey", help="Miner hotkey")
-def get_miner(uid, hotkey):
+def get_miner(uid_arg, uid, hotkey):
     """Show one miner's public metadata."""
-    asyncio.run(get_miner_command(uid=uid, hotkey=hotkey))
+    asyncio.run(get_miner_command(uid=uid if uid is not None else uid_arg, hotkey=hotkey))
 
 
 @click.command("get-rank")

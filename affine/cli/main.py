@@ -35,6 +35,7 @@ import os
 import subprocess
 import asyncio
 import click
+from affine.cli.types import UID
 from affine.core.setup import setup_logging, logger
 
 # Check if admin commands should be visible
@@ -231,18 +232,20 @@ def get_score(ctx):
 
 
 @cli.command("get-miner")
-@click.option("--uid", type=int, help="Miner UID")
+@click.argument("uid_arg", required=False, type=UID)
+@click.option("--uid", type=UID, help="Miner UID")
 @click.option("--hotkey", help="Miner hotkey")
-def get_miner(uid, hotkey):
+def get_miner(uid_arg, uid, hotkey):
     """Query public miner metadata by UID or hotkey.
 
     Example:
+        af get-miner 42
         af get-miner --uid 42
         af get-miner --hotkey 5F...
     """
     from affine.src.miner.commands import get_miner_command
 
-    asyncio.run(get_miner_command(uid=uid, hotkey=hotkey))
+    asyncio.run(get_miner_command(uid=uid if uid is not None else uid_arg, hotkey=hotkey))
 
 
 @cli.command("get-rank", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})

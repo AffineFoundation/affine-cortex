@@ -243,7 +243,13 @@ async def get_miner_command(uid: Optional[int], hotkey: Optional[str]) -> None:
     if uid is None and not hotkey:
         print(json.dumps({
             "success": False,
-            "error": "--uid or --hotkey required",
+            "error": "uid argument, --uid, or --hotkey required",
+        }))
+        sys.exit(1)
+    if uid is not None and hotkey:
+        print(json.dumps({
+            "success": False,
+            "error": "provide either uid or --hotkey, not both",
         }))
         sys.exit(1)
     endpoint = f"/miners/uid/{uid}" if uid is not None else f"/miners/hotkey/{hotkey}"
