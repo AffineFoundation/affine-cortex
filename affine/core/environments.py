@@ -203,7 +203,7 @@ _ENV_CONFIGS_CANONICAL = {
         name="swe-infinite",
         docker_image="affinefoundation/swebench:infinite",
         env_type="swebench",
-        env_vars={"UVICORN_WORKERS": "100"},
+        env_vars={"UVICORN_WORKERS": "50"},
         required_env_vars=["DOCKER_HUB_USERNAME", "DOCKER_HUB_TOKEN"],
         optional_env_vars=[
             "R2_STAGING_ENDPOINT",
