@@ -82,9 +82,11 @@ def get_miner(uid_arg, uid, hotkey):
 
 
 @click.command("get-rank")
-def get_rank():
+@click.option("--reason", "show_reason", is_flag=True,
+              help="Show brief invalid or termination reason column")
+def get_rank(show_reason):
     """Show the current ranking table + live window state."""
-    asyncio.run(get_rank_command())
+    asyncio.run(get_rank_command(show_reason=show_reason))
 
 
 @click.command("miner-deploy")

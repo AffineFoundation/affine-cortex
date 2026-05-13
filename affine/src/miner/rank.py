@@ -220,6 +220,8 @@ def _print_rank_table(
     window: Optional[Dict[str, Any]],
     queue: Optional[List[Dict[str, Any]]],
     scores_resp: Optional[Dict[str, Any]],
+    *,
+    show_reason: bool = False,
 ) -> None:
     if not scores_resp or not scores_resp.get("scores"):
         print("No scores found")
@@ -255,7 +257,10 @@ def _print_rank_table(
 
     header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
     header_parts.extend(f"{env[:24]:>24}" for env in envs)
-    header_parts.extend(["  Status   ", " Reason           ", " Weight "])
+    header_parts.append("  Status   ")
+    if show_reason:
+        header_parts.append(" Reason           ")
+    header_parts.append(" Weight ")
     header_line = " | ".join(header_parts)
     width = max(88, len(header_line))
 
@@ -316,11 +321,12 @@ def _print_rank_table(
         for env in envs:
             live_count = row_live_counts.get(env)
             row_parts.append(f"{_env_cell(scores_by_env.get(env), live_count):>24}")
-        row_parts.extend([
-            _colored_status(status, is_invalid=(row.get("is_valid") is False)),
-            f"{_reason_for(row, status):18s}",
-            f"{_as_float(row.get('overall_score')):>7.4f}",
-        ])
+        row_parts.append(
+            _colored_status(status, is_invalid=(row.get("is_valid") is False))
+        )
+        if show_reason:
+            row_parts.append(f"{_reason_for(row, status):18s}")
+        row_parts.append(f"{_as_float(row.get('overall_score')):>7.4f}")
         print(" | ".join(row_parts))
 
     print(_ansi("=" * width, "2"))
@@ -336,7 +342,7 @@ def _print_rank_table(
     print(f"Sampling: {_ansi('⚡', '1;92')} marks miners in the current live sampling set")
     print(_ansi("=" * width, "2"))
 
-async def get_rank_command() -> None:
+async def get_rank_command(*, show_reason: bool = False) -> None:
     try:
         async with cli_api_client() as client:
             payload = await _fetch_rank_payload(client)
@@ -348,4 +354,5 @@ async def get_rank_command() -> None:
         payload.get("window") if isinstance(payload.get("window"), dict) else None,
         payload.get("queue") if isinstance(payload.get("queue"), list) else None,
         payload.get("scores") if isinstance(payload.get("scores"), dict) else None,
+        show_reason=show_reason,
     )

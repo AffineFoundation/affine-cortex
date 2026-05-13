@@ -10,10 +10,10 @@ import affine.src.miner.rank as rank
 from affine.src.miner.rank import _print_rank_table
 
 
-def _render_rank(window, queue, scores):
+def _render_rank(window, queue, scores, *, show_reason=False):
     buf = io.StringIO()
     with redirect_stdout(buf):
-        _print_rank_table(window, queue, scores)
+        _print_rank_table(window, queue, scores, show_reason=show_reason)
     return buf.getvalue()
 
 
@@ -111,7 +111,7 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     assert "Battle:     UID 2" in out
     assert "Hotkey" in out
     assert "⚡| Model" in out
-    assert "Reason" in out
+    assert "Reason" not in out
     assert " Valid " not in out
     assert "CHAMPION" in out
     assert "BATTLING" in out
@@ -158,7 +158,7 @@ def test_rank_table_groups_invalid_miners_below_valid_rows():
 
     assert out.index("good") < out.index("bad")
     assert "model_misma" in out
-    assert "model_mismatch:de" in out
+    assert "model_mismatch:de" not in out
 
 
 def test_rank_table_sorts_miners_by_status_then_uid_not_score():
@@ -212,7 +212,42 @@ def test_rank_table_sorts_miners_by_status_then_uid_not_score():
     assert out.index("uid9") < out.index("terminated")
     assert out.index("terminated") < out.index("invalid")
     assert "TERMINATED" in out
+    assert "lost_to_champion:" not in out
+
+
+def test_rank_table_can_show_reason_column_when_requested():
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 4,
+                "miner_hotkey": "terminated",
+                "model": "org/terminated",
+                "overall_score": 1.0,
+                "is_valid": False,
+                "invalid_reason": "hf_model_fetch_failed",
+                "challenge_status": "terminated",
+                "termination_reason": "lost_to_champion:abc",
+                "scores_by_env": {},
+            },
+            {
+                "uid": 2,
+                "miner_hotkey": "invalid",
+                "model": "org/invalid",
+                "overall_score": 1.0,
+                "is_valid": False,
+                "invalid_reason": "model_mismatch:detail",
+                "scores_by_env": {},
+            },
+        ],
+    }
+
+    out = _render_rank(None, None, scores, show_reason=True)
+
+    assert "Reason" in out
     assert "lost_to_champion:" in out
+    assert "model_mismatch:de" in out
 
 
 def test_rank_table_shows_terminated_for_terminated_status():
