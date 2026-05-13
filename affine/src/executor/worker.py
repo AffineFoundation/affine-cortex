@@ -123,29 +123,75 @@ class ExecutorWorker:
     # ---- main loop ---------------------------------------------------------
 
     async def run(self) -> None:
+        """Streaming dispatch loop.
+
+        Unlike the older per-tick model (which gathered the entire pending
+        list and blocked until every task finished before computing the
+        next tick), this loop:
+
+          - Computes new dispatchable (subject, task_id) keys on every
+            poll.
+          - Fires each new dispatch as a free-standing ``asyncio.Task``
+            and immediately returns to the loop.
+          - Tracks in-flight by key (subject_hotkey, subject_revision,
+            task_id) so a slow task doesn't block its peers and the
+            next poll can pull more work into the global semaphore the
+            moment a peer completes.
+
+        Net effect: a tick that contains 200 SWE-INFINITE tasks no
+        longer waits for the slowest task to finish before dispatching
+        peer task_ids. The global ``BoundedSemaphore(480)`` remains the
+        only concurrency gate; per-env env-container capacity is the
+        downstream physical bottleneck (operator dial).
+        """
         assert self._state and self._samples, "call initialize() first"
-        # Publish status to DB in the background so ``af db worker-status``
-        # can read live in-flight / succeeded / failed counters.
         status_task = asyncio.create_task(self._publish_status_loop())
+        # Tracks which (subject_hotkey, subject_revision, task_id) keys
+        # are currently in flight so we don't dispatch the same key
+        # twice while the first attempt is still running. Reset whenever
+        # the task-id pool refreshes (new window).
+        in_flight_keys: set = set()
+        # Active asyncio.Task objects; kept so we can reap completed
+        # ones and cancel everything on stop.
+        in_flight_tasks: set = set()
         try:
             if self.warmup_sec > 0:
                 logger.info(
                     f"[{self.env}] warmup: sleeping {self.warmup_sec:.0f}s before "
-                    f"first tick (let env containers finish app-level boot)"
+                    f"first dispatch (let env containers finish app-level boot)"
                 )
                 await asyncio.sleep(self.warmup_sec)
             while self.running:
                 try:
-                    worked = await self._tick()
+                    # Reap completed dispatch tasks before launching new ones.
+                    completed = {t for t in in_flight_tasks if t.done()}
+                    in_flight_tasks -= completed
+                    for t in completed:
+                        # Surface any unexpected exception so silent crashes
+                        # don't hide. ``_evaluate_and_persist`` catches its
+                        # own exceptions; anything raised past it is a bug.
+                        exc = t.exception()
+                        if exc is not None:
+                            logger.error(
+                                f"[{self.env}] dispatch task error: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                    new = await self._dispatch_new(in_flight_keys, in_flight_tasks)
                 except Exception as e:
                     logger.error(
-                        f"[{self.env}] tick raised: {type(e).__name__}: {e}",
+                        f"[{self.env}] dispatch loop raised: {type(e).__name__}: {e}",
                         exc_info=True,
                     )
-                    worked = False
-                await asyncio.sleep(self.poll_interval_sec if worked else self.idle_sleep_sec)
+                    new = 0
+                # Short poll when we just launched fresh work, longer when
+                # idle so we're not hammering DB checks needlessly.
+                await asyncio.sleep(self.poll_interval_sec if new else self.idle_sleep_sec)
         finally:
             status_task.cancel()
+            for t in in_flight_tasks:
+                t.cancel()
+            if in_flight_tasks:
+                await asyncio.gather(*in_flight_tasks, return_exceptions=True)
 
     async def _acquire_global_slot(self) -> None:
         """Block until the cross-process global dispatch semaphore yields
@@ -218,110 +264,139 @@ class ExecutorWorker:
                     logger.debug(f"[{self.env}] status publish failed: {e}")
             await asyncio.sleep(interval_sec)
 
-    async def _tick(self) -> bool:
-        """One poll cycle. Returns True if any sampling work was attempted.
+    async def _dispatch_new(
+        self, in_flight_keys: set, in_flight_tasks: set,
+    ) -> int:
+        """Launch every (subject, task_id) that's still un-sampled and not
+        already in flight. Each launched task is fire-and-forget — the
+        run loop reaps completions on its next iteration.
 
-        Sampling policy is asymmetric between subjects:
-          - **Champion** keeps draining the full pool (sampling_count *
-            1.1 from Stage AF). The extra 10% gives later contests more
-            comparison data and a buffer against task-ids that the env
-            can't process (~5% expected); a champion sticks around for
-            many battles, so investing in deeper samples pays off.
-          - **Challenger** stops at the base ``sampling_count``. Once
-            the overlap with champion can possibly clear the comparator
-            threshold there's no value in continuing — the challenger
-            either wins and the rotation moves on, or loses and gets
-            torn down.
+        Returns the number of new dispatches so the loop knows whether
+        to short-poll (more work to do) or idle-sleep.
 
-        The dispatch semaphore (``self.max_concurrent``) is a defensive
-        hygiene cap, not a throughput knob — real backpressure comes
-        from the env containers downstream. See ``executor/config.py``.
+        Sampling policy is unchanged:
+          - **Champion** drains the full pool (sampling_count × 1.1
+            buffer from Stage AF).
+          - **Challenger** caps at the base ``sampling_count`` — past
+            that, overlap is sufficient and continuing adds no
+            comparator signal.
+
+        Concurrency: the cross-process ``self._global_sem`` (480 by
+        default = b300 saturation) is the only gate. No per-env local
+        semaphore — env-container capacity is the physical bottleneck
+        downstream, and we want every un-sampled task_id contending for
+        a global slot so slow peers can't hide free capacity.
         """
         task_state = await self._state.get_task_state()
         if task_state is None:
-            return False
+            return 0
         task_ids = task_state.task_ids.get(self.env) or []
         if not task_ids:
-            return False
+            return 0
         refresh_block = task_state.refreshed_at_block
+
+        # Pool refresh = new window. Clear in-flight tracking so the next
+        # round of task_ids gets dispatched cleanly. Any tasks still in
+        # the old refresh keep running; their result rows will be tagged
+        # with the prior ``refresh_block`` and ignored by the comparator.
+        if getattr(self, "_dispatch_refresh_block", 0) != refresh_block:
+            in_flight_keys.clear()
+            self._dispatch_refresh_block = refresh_block
 
         envs = await self._state.get_environments()
         env_cfg = envs.get(self.env)
         if env_cfg is None:
-            return False  # env disabled / removed from config
+            return 0
         sampling_count = env_cfg.sampling_count
 
         champion = await self._state.get_champion()
-        champion_urls = _base_urls(champion.deployments if champion else [], champion.base_url if champion else None)
+        champion_urls = _base_urls(
+            champion.deployments if champion else [],
+            champion.base_url if champion else None,
+        )
         if champion is None or not champion_urls:
-            return False
+            return 0
 
-        pending: List[tuple] = []  # (miner_snapshot, task_id, base_url)
+        battle = await self._state.get_battle()
+        battle_urls = _base_urls(
+            battle.deployments if battle else [],
+            battle.base_url if battle else None,
+        )
 
-        # Champion: drain the full pool (no cap). A persistently-failing
-        # task_id keeps reappearing in ``pending`` each tick — that's
-        # acceptable because env-level failures eat constant low-grade
-        # capacity and the 10% buffer + 5% miss tolerance absorbs them.
+        # Build the candidate pool: champion drains everything; challenger
+        # is capped by ``sampling_count``. We shuffle so persistently slow
+        # task_ids don't always end up at the tail across worker restarts.
+        candidates: List[tuple] = []
         champ_snap = MinerSnapshot(
             uid=champion.uid, hotkey=champion.hotkey,
             revision=champion.revision, model=champion.model,
         )
         for idx, tid in enumerate(task_ids):
-            if not await self._samples.has_sample(
+            key = (champion.hotkey, champion.revision, int(tid))
+            if key in in_flight_keys:
+                continue
+            if await self._samples.has_sample(
                 champion.hotkey, champion.revision, self.env, tid,
                 refresh_block=refresh_block,
             ):
-                pending.append((champ_snap, tid, _pick_url(champion_urls, tid, idx)))
+                continue
+            candidates.append((key, champ_snap, tid, _pick_url(champion_urls, tid, idx)))
 
-        # Battle in flight → cap challenger at ``sampling_count``.
-        battle = await self._state.get_battle()
-        battle_urls = _base_urls(battle.deployments if battle else [], battle.base_url if battle else None)
         if battle is not None and battle_urls:
             chal_have = await self._samples.count_samples_for_tasks(
                 battle.challenger.hotkey, battle.challenger.revision, self.env,
                 task_ids, refresh_block=refresh_block,
             )
-            if chal_have < sampling_count:
-                remaining = sampling_count - chal_have
+            remaining = sampling_count - chal_have
+            if remaining > 0:
                 for idx, tid in enumerate(task_ids):
                     if remaining <= 0:
                         break
-                    if not await self._samples.has_sample(
+                    key = (battle.challenger.hotkey, battle.challenger.revision, int(tid))
+                    if key in in_flight_keys:
+                        remaining -= 1
+                        continue
+                    if await self._samples.has_sample(
                         battle.challenger.hotkey, battle.challenger.revision,
                         self.env, tid, refresh_block=refresh_block,
                     ):
-                        pending.append((battle.challenger, tid, _pick_url(battle_urls, tid, idx)))
-                        remaining -= 1
+                        continue
+                    candidates.append(
+                        (key, battle.challenger, tid, _pick_url(battle_urls, tid, idx))
+                    )
+                    remaining -= 1
 
-        if not pending:
-            return False
+        if not candidates:
+            return 0
 
-        # Shuffle so the same slow-tail task_ids don't always end up last
-        # across ticks / executor restarts. The task pool's deterministic
-        # order would otherwise pin which task is the slowest to finish.
-        # The contest's 10% buffer + overlap-readiness can then release
-        # ``decide`` sooner once enough overlap appears anywhere in the pool.
-        random.shuffle(pending)
+        random.shuffle(candidates)
 
-        # Local asyncio semaphore is just a defensive floor — the real
-        # gate is the cross-process ``self._global_sem`` acquired inside
-        # ``_evaluate_and_persist``. Local cap >= pending size in normal
-        # operation, so this is effectively a no-op except as protection
-        # against runaway pending lists.
-        local_sem = asyncio.Semaphore(self.max_concurrent)
-
-        async def _run_one(miner: MinerSnapshot, task_id: int, base_url: str) -> None:
-            async with local_sem:
-                await self._evaluate_and_persist(
+        # Launch each candidate as a free-standing task. The wrapper
+        # removes the key from ``in_flight_keys`` on completion so a
+        # failed-but-not-persisted task can be retried next poll.
+        for key, miner, task_id, base_url in candidates:
+            in_flight_keys.add(key)
+            t = asyncio.create_task(
+                self._dispatch_one(
                     miner=miner, task_id=task_id, base_url=base_url,
-                    refresh_block=refresh_block,
+                    refresh_block=refresh_block, key=key,
+                    in_flight_keys=in_flight_keys,
                 )
+            )
+            in_flight_tasks.add(t)
+        return len(candidates)
 
-        await asyncio.gather(
-            *(_run_one(m, tid, url) for m, tid, url in pending),
-            return_exceptions=True,
-        )
-        return True
+    async def _dispatch_one(
+        self, *, miner: MinerSnapshot, task_id: int, base_url: str,
+        refresh_block: int, key: tuple, in_flight_keys: set,
+    ) -> None:
+        try:
+            await self._evaluate_and_persist(
+                miner=miner, task_id=task_id, base_url=base_url,
+                refresh_block=refresh_block,
+            )
+        finally:
+            in_flight_keys.discard(key)
 
     async def _evaluate_and_persist(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
