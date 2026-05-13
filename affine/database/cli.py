@@ -149,8 +149,6 @@ def _print_env_summary(environments: dict) -> None:
         scoring_on = cfg.get("enabled_for_scoring", True)
         count = sampling.get("sampling_count", "?")
         mode = sampling.get("sampling_mode", "?")
-        cap = sampling.get("max_concurrent")
-        cap_str = str(cap) if cap else "—"
         rng = sampling.get("dataset_range")
         if sampling.get("dataset_range_source"):
             rng_str = "resolved-at-refresh"
@@ -168,7 +166,6 @@ def _print_env_summary(environments: dict) -> None:
             f"scoring={'Y' if scoring_on else 'N'} "
             f"count={count:<5} "
             f"mode={mode:<7} "
-            f"cap={cap_str:<5} "
             f"range={rng_str}"
         )
 

@@ -6,11 +6,10 @@ It's sized to the inference backend's saturation point (b300: 8 GPUs ×
 60 in-flight per card) — the goal is to keep that semaphore exhausted
 so the inference cluster stays fully utilized while we sample.
 
-Cross-env priority emerges naturally from the shared sem: a worker with
-more remaining task_ids spawns more coroutines, makes more acquire
-attempts per unit time, and so wins a proportionally larger share of
-slots than envs with little remaining work. No explicit priority queue
-is needed.
+Cross-env priority is adjusted by the manager from live progress:
+backlogged envs that are using their share receive more slots, while
+envs that cannot consume their current cap release capacity but keep a
+small probe floor so they cannot starve.
 
 Per-worker ``max_concurrent`` is a defensive floor — large enough not
 to gate anything, just so a runaway pending list can't schedule tens of
@@ -22,9 +21,8 @@ thousands of coroutines into asyncio at once.
 # that hit it (SWE-INFINITE, MEMORY, NAVWORLD, TERMINAL). 600 adds
 # headroom for envs that don't go through b300 — LIVEWEB runs against
 # its own SSH hosts for web scraping, so its in-flight share doesn't
-# consume GPU capacity. Pair with per-env ``max_concurrent`` caps
-# (EnvConfig.max_concurrent) to keep any single env from monopolising
-# the shared pool.
+# consume GPU capacity. The executor manager dynamically assigns per-env
+# caps inside this global budget from observed throughput and backlog.
 GLOBAL_DISPATCH_BUDGET = 600
 
 # Per-worker asyncio-side safety floor. Never the real gate — the

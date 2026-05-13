@@ -109,13 +109,6 @@ class EnvConfig:
     # task_ids (SWE-INFINITE, DISTILL) always sample the freshest tail.
     # Shape: ``{"url": str, "field": str, "range_type": "zero_to_value"}``.
     dataset_range_source: Optional[Dict[str, Any]] = None
-    # Optional per-env in-flight evaluate cap. When ``None`` the env
-    # only contends on the shared global semaphore. When set, an
-    # additional asyncio semaphore in the env's worker subprocess caps
-    # concurrent evaluate() calls to this many — used to isolate flaky
-    # envs (LIVEWEB infra-retry storm in PR #459) so their failure loops
-    # cannot starve other envs out of the global dispatch budget.
-    max_concurrent: Optional[int] = None
 
 
 # ---- store protocol -------------------------------------------------------
@@ -377,16 +370,6 @@ def _env_from_payload(payload: Any) -> EnvConfig:
         )
     sampling = payload.get("sampling") or payload.get("window_config") or {}
     src = sampling.get("dataset_range_source")
-    raw_cap = sampling.get("max_concurrent")
-    cap: Optional[int] = None
-    if isinstance(raw_cap, bool):
-        # bool is an int subclass; ignore stray True/False so we don't
-        # silently end up with cap=1 from ``max_concurrent: True``.
-        cap = None
-    elif isinstance(raw_cap, int) and raw_cap > 0:
-        cap = raw_cap
-    elif isinstance(raw_cap, str) and raw_cap.isdigit() and int(raw_cap) > 0:
-        cap = int(raw_cap)
     return EnvConfig(
         display_name=str(payload.get("display_name", "")),
         enabled_for_sampling=bool(payload.get("enabled_for_sampling", False)),
@@ -398,5 +381,4 @@ def _env_from_payload(payload: Any) -> EnvConfig:
         dataset_range=list(sampling.get("dataset_range", []) or []),
         sampling_mode=str(sampling.get("sampling_mode", "random")),
         dataset_range_source=src if isinstance(src, dict) else None,
-        max_concurrent=cap,
     )

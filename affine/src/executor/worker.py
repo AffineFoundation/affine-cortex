@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import random
 import time
-from contextlib import nullcontext
 from typing import Any, Dict, List, Optional
 
 from affine.core.setup import logger
@@ -47,28 +46,21 @@ class ExecutorWorker:
         warmup_sec: float = 240.0,
         global_sem: Any = None,
         in_flight_value: Any = None,
-        env_concurrency_cap: Optional[int] = None,
+        env_cap_value: Any = None,
     ):
         self.worker_id = worker_id
         self.env = env
         self.max_concurrent = max_concurrent
         # Cross-process ``BoundedSemaphore`` (or ``None`` in unit tests /
         # standalone runs). Real backpressure runs through this — see
-        # ``_acquire_global_slot`` below. The per-tick local semaphore
-        # is sized at ``max_concurrent`` and only exists as a defensive
-        # floor against scheduling tens of thousands of coroutines.
+        # ``_acquire_global_slot`` below. ``max_concurrent`` remains as a
+        # standalone fallback for tests/local runs; production workers read
+        # their live cap from ``_env_cap_value``.
         self._global_sem = global_sem
-        # Optional in-process asyncio semaphore that caps concurrent
-        # evaluate() calls for THIS env's worker. Set from
-        # ``EnvConfig.max_concurrent`` so a flaky env can't burn the
-        # whole global dispatch budget retrying — see LIVEWEB
-        # Stooq-lock incident, PR #459. None = no per-env cap.
-        self.env_concurrency_cap = env_concurrency_cap
-        self._env_sem: Optional[asyncio.Semaphore] = (
-            asyncio.Semaphore(env_concurrency_cap)
-            if env_concurrency_cap is not None and env_concurrency_cap > 0
-            else None
-        )
+        # Manager-updated dynamic cap for this env. The worker reads this
+        # before acquiring the global semaphore, so cap changes take effect
+        # without restarting the subprocess.
+        self._env_cap_value = env_cap_value
         # Per-env ``mp.Value(c_int, lock=False)`` for the manager's
         # ``[STATUS]`` printer to read live in-flight without IPC ping.
         # Single writer (this worker), single reader (manager); aligned
@@ -441,25 +433,41 @@ class ExecutorWorker:
             hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
             base_url=base_url,
         )
-        # Per-env cap (if configured) is acquired BEFORE the global slot
-        # so a flaky env can't transiently hold global capacity while
-        # waiting on its own sem. ``nullcontext`` makes this a no-op for
-        # envs without a cap.
-        env_gate = self._env_sem if self._env_sem is not None else nullcontext()
-        async with env_gate:
-            await self._evaluate_and_persist_gated(
-                miner=miner, task_id=task_id, base_url=base_url,
-                refresh_block=refresh_block, miner_obj=miner_obj,
-            )
+        await self._evaluate_and_persist_gated(
+            miner=miner, task_id=task_id, base_url=base_url,
+            refresh_block=refresh_block, miner_obj=miner_obj,
+        )
+
+    def _current_env_cap(self) -> int:
+        if self._env_cap_value is None:
+            return max(1, int(self.max_concurrent))
+        return max(1, int(self._env_cap_value.value))
+
+    def _current_env_in_flight(self) -> int:
+        if self._in_flight_value is not None:
+            return max(0, int(self._in_flight_value.value))
+        return max(0, int(self.metrics.tasks_in_flight))
+
+    async def _acquire_dispatch_slot(self) -> None:
+        """Acquire this env's dynamic share, then one global slot.
+
+        The cap is rechecked after acquiring the global slot because the
+        manager can lower it while this coroutine is waiting.
+        """
+        while True:
+            while self._current_env_in_flight() >= self._current_env_cap():
+                await asyncio.sleep(0.05)
+            await self._acquire_global_slot()
+            if self._current_env_in_flight() < self._current_env_cap():
+                return
+            self._release_global_slot()
+            await asyncio.sleep(0.05)
 
     async def _evaluate_and_persist_gated(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, miner_obj: "_Miner",
     ) -> None:
-        # Wait until the cross-process global semaphore yields a slot.
-        # The per-env semaphore has already bounded this worker's share,
-        # so fast retry loops cannot crowd out slower envs here.
-        await self._acquire_global_slot()
+        await self._acquire_dispatch_slot()
         started = time.monotonic()
         # Track real in-flight concurrency. Two counters intentionally:
         # ``metrics.tasks_in_flight`` is in-process for ``af db worker-status``
