@@ -321,7 +321,7 @@ _ENV_CONFIGS_CANONICAL = {
     "memory": EnvConfig(
         name="memory",
         docker_image="affinefoundation/memorygym:latest",
-        env_vars={"UVICORN_WORKERS": "8"},
+        env_vars={"UVICORN_WORKERS": "16"},
         mem_limit="12g",
         eval_params={
             "tier": "standard",
@@ -359,7 +359,10 @@ _ENV_CONFIGS_CANONICAL = {
         docker_image="affinefoundation/navworld:latest",
         env_type="navworld",
         mem_limit="5g",
-        env_vars={"QQR_CACHE_DIR": "/var/lib/navworld/cache"},
+        env_vars={
+            "QQR_CACHE_DIR": "/var/lib/navworld/cache",
+            "UVICORN_WORKERS": "4",
+        },
         required_env_vars=["AMAP_MAPS_API_KEY"],
         optional_env_vars=["DASHSCOPE_API_KEY"],
         volumes={
