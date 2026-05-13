@@ -22,7 +22,6 @@ from typing import Dict, List, Optional
 
 import click
 
-from affine.core.providers.targon_client import get_targon_client
 from affine.core.setup import logger, setup_logging
 from affine.database import close_client, init_client
 from affine.utils.subtensor import get_subtensor
@@ -50,12 +49,6 @@ from . import targon as targon_lifecycle
 from .flow import FlowConfig, FlowScheduler
 
 
-PROVIDER_KIND = os.getenv("AFFINE_PROVIDER_KIND", "targon").lower()
-"""Which inference provider to use. ``targon`` (default) routes through
-the hosted Targon API; multi-instance, deployments are independent.
-``ssh`` SSHs into an operator-managed host and runs sglang via docker —
-single-instance, model swap on each contest."""
-
 NETUID = int(os.getenv("NETUID", "120"))
 SUBTENSOR_NETWORK = os.getenv("SUBTENSOR_NETWORK", "finney")
 TICK_INTERVAL_SEC = float(os.getenv("SCHEDULER_TICK_INTERVAL_SEC", "12"))
@@ -71,6 +64,37 @@ def _endpoint_matches_target(endpoint, target) -> bool:
         and endpoint.assigned_model == target.model
         and endpoint.assigned_revision == target.revision
     )
+
+
+def _resolve_provider_kind(active: List[object]) -> tuple:
+    """Decide provider lifecycle from the active ``inference_endpoints``.
+
+    Returns ``(kind, ssh_active, targon_active)`` where ``kind`` is
+    ``"ssh"`` or ``"targon"``. Raises ``RuntimeError`` on:
+      - empty active list (no endpoints registered)
+      - mixed ssh+targon kinds (not yet supported)
+      - rows present but none of a known kind
+    """
+    if not active:
+        raise RuntimeError(
+            "no active inference endpoints registered; configure one with "
+            "`af db set-endpoint --kind ssh --ssh-url ssh://user@host[:port] ...` "
+            "or `--kind targon --targon-api-url https://...`"
+        )
+    ssh_active = [ep for ep in active if ep.kind == "ssh"]
+    targon_active = [ep for ep in active if ep.kind == "targon"]
+    if ssh_active and targon_active:
+        raise RuntimeError(
+            f"mixed-kind provider dispatch not yet supported "
+            f"(ssh={len(ssh_active)}, targon={len(targon_active)}); "
+            f"deactivate one kind in inference_endpoints"
+        )
+    if not (ssh_active or targon_active):
+        raise RuntimeError(
+            "inference_endpoints has rows but none are kind=ssh|targon; "
+            f"found kinds: {sorted({ep.kind for ep in active})}"
+        )
+    return ("ssh" if ssh_active else "targon", ssh_active, targon_active)
 
 
 def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List[object]:
@@ -146,34 +170,27 @@ async def _run() -> None:
     async def list_valid_miners_fn():
         return await miners_dao.get_valid_miners()
 
-    # Dispatch provider per AFFINE_PROVIDER_KIND. ``targon`` (default) is
-    # multi-instance — independent deployments per role. ``ssh`` is
-    # single-instance — one model on the operator's GPU host at a time;
-    # the FlowConfig flag tells the flow to invalidate champion.deployment_id
-    # at the right moments (refresh + post-loss teardown) so step 5 fresh-
-    # deploys when needed.
-    if PROVIDER_KIND == "ssh":
-        # SSH endpoints are configured in DynamoDB. There is intentionally
-        # no env-var fallback for the host URL/key/public URL; otherwise a
-        # stale container env could silently override the operator-managed
-        # endpoint registry.
-        from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
-        endpoints_dao = InferenceEndpointsDAO()
-        active = await endpoints_dao.list_active(kind="ssh")
-        if not active:
-            raise RuntimeError(
-                "scheduler: provider=ssh but no active ssh endpoint is "
-                "registered; configure one with `af db set-endpoint "
-                "--kind ssh --ssh-url ssh://user@host[:port] ...`"
-            )
-        active = sorted(active, key=lambda ep: ep.name)
+    # Provider dispatch is DB-driven: ``inference_endpoints`` rows determine
+    # which lifecycle (ssh/sglang via docker, or Targon API) the scheduler
+    # uses. ``ssh`` is single-instance — one model on the GPU host at a
+    # time; ``targon`` is multi-instance (independent deployments). The
+    # FlowConfig flag tells the flow to invalidate champion.deployment_id
+    # at the right moments for single-instance providers.
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+    endpoints_dao = InferenceEndpointsDAO()
+    active = await endpoints_dao.list_active()
+    provider_kind, ssh_active, targon_active = _resolve_provider_kind(active)
+
+    if provider_kind == "ssh":
+        active = sorted(ssh_active, key=lambda ep: ep.name)
         ssh_configs = {
             ep.name: ssh_lifecycle.SSHConfig.from_endpoint(ep)
             for ep in active
         }
         logger.info(
-            f"scheduler: provider=ssh endpoints={[ep.name for ep in active]!r} "
-            f"(from inference_endpoints table)"
+            "scheduler: provider=ssh "
+            f"endpoints={[ep.name for ep in active]!r} "
+            "(from inference_endpoints table)"
         )
 
         async def deploy_fn(target, role: str = "active"):
@@ -229,15 +246,20 @@ async def _run() -> None:
             + ", ".join(f"{cfg.host}:{cfg.port}" for cfg in ssh_configs.values())
         )
     else:
-        targon_client = get_targon_client()
-        targon_endpoint_count = int(
-            await config_dao.get_param_value("targon_endpoint_count", default=0) or 0
-        )
-        if targon_endpoint_count > 0:
+        # Targon endpoints in inference_endpoints provide the API URL;
+        # API_KEY stays in env (secret material doesn't belong in DB).
+        # Multiple active Targon endpoints aren't currently shareded across
+        # — flow uses the first one for the workload create/delete API.
+        from affine.core.providers.targon_client import TargonClient
+        targon_active = sorted(targon_active, key=lambda ep: ep.name)
+        primary = targon_active[0]
+        targon_client = TargonClient(api_url=primary.targon_api_url)
+        if len(targon_active) > 1:
+            extra = [ep.name for ep in targon_active[1:]]
             logger.warning(
-                "scheduler: targon_endpoint_count>0 requested, but automatic "
-                "Targon endpoint provisioning is not implemented in this flow; "
-                "falling back to direct Targon workload lifecycle."
+                f"scheduler: provider=targon using endpoint={primary.name!r} "
+                f"({primary.targon_api_url}); additional endpoints "
+                f"{extra} are not yet sharded into deployment dispatch."
             )
 
         async def deploy_fn(target, role: str = "active"):
@@ -247,7 +269,10 @@ async def _run() -> None:
             await targon_lifecycle.teardown(targon_client, deployment_id)
 
         flow_config = FlowConfig()
-        logger.info("scheduler: provider=targon")
+        logger.info(
+            f"scheduler: provider=targon endpoint={primary.name!r} "
+            f"api_url={primary.targon_api_url!r}"
+        )
 
     scheduler = FlowScheduler(
         config=flow_config,
