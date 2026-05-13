@@ -109,17 +109,35 @@ class ExecutorManager:
                 if not wp.is_alive():
                     logger.warning(f"[{wp.env}] subprocess died; restarting")
                     try:
+                        self._recover_dead_worker_slots(wp.env)
                         wp.start()
                     except Exception as e:
                         logger.error(f"[{wp.env}] restart raised: {e}")
 
+    def _recover_dead_worker_slots(self, env: str) -> None:
+        """Clear dispatch accounting left behind by a dead worker process."""
+        value = self.in_flight_values.get(env)
+        if value is None:
+            return
+        stale = max(0, int(value.value))
+        if stale:
+            logger.warning(
+                f"[{env}] recovering {stale} stale dispatch slot(s) "
+                "after subprocess death"
+            )
+        for _ in range(stale):
+            try:
+                self.global_sem.release()
+            except ValueError:
+                break
+        value.value = 0
+
     async def _status_printer(self) -> None:
         """Periodic ``[STATUS]`` line in the legacy executor's format.
 
-        Reads done counts from ``sample_results`` (champion-only — the
-        challenger row count rides on the same window so isn't reported
-        separately) and per-env in-flight from the shared
-        ``in_flight_values`` Values. Format:
+        Reads done counts from ``sample_results`` for the champion and,
+        during battles, the challenger. Per-env in-flight comes from the
+        shared ``in_flight_values`` Values. Format:
 
             [STATUS] running=N/GLOBAL_DISPATCH_BUDGET | env@done/target +delta in Xs rate:Y/h
                 run:R | env2@... | total +D in Xs rate:Y/h
@@ -148,18 +166,19 @@ class ExecutorManager:
         tids = await sc.get_param_value("current_task_ids") or {}
         champion = await sc.get_param_value("champion") or {}
         battle = await sc.get_param_value("current_battle") or {}
+        envs_raw = await sc.get_param_value("environments", default={}) or {}
         task_ids_by_env: Dict[str, List[int]] = tids.get("task_ids", {}) or {}
         refresh_block = int(tids.get("refreshed_at_block", 0) or 0)
-        subjects: List[tuple[str, str]] = []
+        subjects: List[tuple[str, str, str]] = []
         if champion.get("hotkey") and champion.get("revision"):
-            subjects.append((str(champion["hotkey"]), str(champion["revision"])))
+            subjects.append(("champion", str(champion["hotkey"]), str(champion["revision"])))
         challenger = battle.get("challenger") if isinstance(battle, dict) else None
         if (
             isinstance(challenger, dict)
             and challenger.get("hotkey")
             and challenger.get("revision")
         ):
-            pair = (str(challenger["hotkey"]), str(challenger["revision"]))
+            pair = ("challenger", str(challenger["hotkey"]), str(challenger["revision"]))
             if pair not in subjects:
                 subjects.append(pair)
 
@@ -174,14 +193,20 @@ class ExecutorManager:
 
         for env in sorted(self.envs):
             ids = task_ids_by_env.get(env, []) or []
-            target = len(ids) * max(1, len(subjects))
+            sampling_count = _sampling_count_for_env(envs_raw, env, len(ids))
+            subject_targets = {
+                "champion": len(ids),
+                "challenger": min(len(ids), sampling_count),
+            }
+            target = sum(subject_targets[kind] for kind, _, _ in subjects)
             done = 0
             if ids and subjects and refresh_block:
-                for hk, rev in subjects:
+                for kind, hk, rev in subjects:
                     try:
-                        done += await samples.count_samples_for_tasks(
+                        count = await samples.count_samples_for_tasks(
                             hk, rev, env, ids, refresh_block=refresh_block,
                         )
+                        done += min(count, subject_targets[kind])
                     except Exception as e:
                         logger.debug(f"status count failed for {env}: {e}")
             running = int(self.in_flight_values[env].value)
@@ -299,7 +324,13 @@ def _compute_adaptive_env_caps(
         return {env: initial for env in envs}
     fair = _initial_env_cap(active, global_budget)
     floor = max(1, fair // 8)
-    caps: Dict[str, int] = {env: floor for env in envs}
+    # Envs with no current work keep their previous cap so a new battle
+    # can ramp immediately between status ticks. They do not enter the
+    # active budget math below because they are not consuming slots.
+    caps: Dict[str, int] = {
+        env: max(floor, int(previous_caps.get(env, fair) or fair))
+        for env in envs
+    }
     weights: Dict[str, float] = {}
     for env in active:
         row = stats.get(env, {})
@@ -311,19 +342,19 @@ def _compute_adaptive_env_caps(
         prev = max(1, int(previous_caps.get(env, fair) or fair))
         if remaining <= 0:
             # Let existing calls drain; do not launch a new wave for an
-            # env whose current subject set is complete. Keep the probe
-            # floor so a newly started battle is not stuck at one-at-a-time
+            # env whose current subject set is complete. Keep fair share
+            # ready so a newly started battle is not stuck at one-at-a-time
             # until the next status interval.
-            caps[env] = max(floor, min(prev, running or floor))
+            caps[env] = max(fair, min(prev, running or fair))
             continue
 
         saturated = running >= max(floor, int(prev * 0.75))
         if saturated:
             if delta <= 0:
                 # Saturated but no recent completions: preserve a bounded
-                # share so long-running calls can finish, but do not add
-                # more pressure to a possibly stuck env.
-                caps[env] = max(floor, min(prev, running or floor))
+                # fair-share launch cap so long-running calls can finish,
+                # but do not keep a previously inflated cap forever.
+                caps[env] = max(floor, min(prev, fair))
                 continue
             # Saturated envs compete for the shared budget by pressure.
             # Keep only the probe floor before allocation so a nearly done
@@ -341,9 +372,16 @@ def _compute_adaptive_env_caps(
             # this local-demand cap and do not receive extra budget.
             caps[env] = max(floor, min(prev, running + floor))
 
-    total = sum(caps.values())
+    total = sum(caps[env] for env in active)
     if total > global_budget:
-        return _trim_caps(caps, global_budget=global_budget, floor=1)
+        caps.update(
+            _trim_caps(
+                {env: caps[env] for env in active},
+                global_budget=global_budget,
+                floor=1,
+            )
+        )
+        return caps
 
     extra = global_budget - total
     if extra <= 0 or not weights:
@@ -366,7 +404,33 @@ def _compute_adaptive_env_caps(
         used += 1
     for env, add in allocations.items():
         caps[env] += add
-    return _trim_caps(caps, global_budget=global_budget, floor=1)
+    caps.update(
+        _trim_caps(
+            {env: caps[env] for env in active},
+            global_budget=global_budget,
+            floor=1,
+        )
+    )
+    return caps
+
+
+def _sampling_count_for_env(envs_raw: Any, env: str, default: int) -> int:
+    if not isinstance(envs_raw, dict):
+        return default
+    cfg = envs_raw.get(env) or {}
+    if not isinstance(cfg, dict):
+        return default
+    sampling = cfg.get("sampling") or cfg.get("window_config") or {}
+    if not isinstance(sampling, dict):
+        return default
+    raw = sampling.get("sampling_count", default)
+    if raw is None:
+        return default
+    try:
+        count = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(0, count)
 
 
 def _trim_caps(caps: Dict[str, int], *, global_budget: int, floor: int) -> Dict[str, int]:

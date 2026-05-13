@@ -29,6 +29,26 @@ def test_executor_manager_ipc_handles_survive_spawn():
     manager.global_sem.release()
 
 
+def test_executor_manager_recovers_stale_slots_after_worker_death():
+    from affine.src.executor.config import GLOBAL_DISPATCH_BUDGET
+
+    manager = ExecutorManager(["ENV_A"])
+    # Simulate a worker dying while holding two dispatch slots.
+    assert manager.global_sem.acquire(block=False)
+    assert manager.global_sem.acquire(block=False)
+    manager.in_flight_values["ENV_A"].value = 2
+
+    manager._recover_dead_worker_slots("ENV_A")
+
+    assert manager.in_flight_values["ENV_A"].value == 0
+    acquired = 0
+    while manager.global_sem.acquire(block=False):
+        acquired += 1
+    assert acquired == GLOBAL_DISPATCH_BUDGET
+    for _ in range(acquired):
+        manager.global_sem.release()
+
+
 def test_base_urls_prefers_deployments_and_dedupes():
     deployments = [
         DeploymentRecord(endpoint_name="a", deployment_id="da", base_url="http://a/v1"),
@@ -325,6 +345,23 @@ def test_adaptive_caps_do_not_expand_zero_progress_saturated_env():
     assert caps["TERMINAL"] > caps["LIVEWEB"]
 
 
+def test_adaptive_caps_decay_inflated_zero_progress_saturated_env_to_fair_share():
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    caps = _compute_adaptive_env_caps(
+        ["LIVEWEB", "TERMINAL"],
+        {
+            "LIVEWEB": {"target": 500, "done": 50, "running": 240, "delta": 0},
+            "TERMINAL": {"target": 500, "done": 250, "running": 120, "delta": 5},
+        },
+        {"LIVEWEB": 240, "TERMINAL": 120},
+        global_budget=300,
+    )
+
+    assert caps["LIVEWEB"] == 150
+    assert caps["TERMINAL"] >= caps["LIVEWEB"]
+
+
 def test_adaptive_caps_release_completed_env_capacity():
     from affine.src.executor.main import _compute_adaptive_env_caps
 
@@ -340,6 +377,65 @@ def test_adaptive_caps_release_completed_env_capacity():
 
     assert 1 < caps["MEMORY"] < caps["TERMINAL"]
     assert caps["TERMINAL"] > 150
+
+
+def test_sampling_count_for_env_reads_current_config():
+    from affine.src.executor.main import _sampling_count_for_env
+
+    envs = {
+        "ENV_A": {
+            "sampling": {
+                "sampling_count": 400,
+            },
+        },
+    }
+
+    assert _sampling_count_for_env(envs, "ENV_A", 441) == 400
+    assert _sampling_count_for_env(envs, "MISSING", 441) == 441
+    envs["ENV_A"]["sampling"]["sampling_count"] = 0
+    assert _sampling_count_for_env(envs, "ENV_A", 441) == 0
+
+
+def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
+    import asyncio as _asyncio
+
+    manager = ExecutorManager(["ENV_A"])
+    ids = list(range(441))
+
+    class _SC:
+        async def get_param_value(self, name, default=None):
+            values = {
+                "current_task_ids": {
+                    "task_ids": {"ENV_A": ids},
+                    "refreshed_at_block": 123,
+                },
+                "champion": {"hotkey": "champ_hk", "revision": "champ_rev"},
+                "current_battle": {
+                    "challenger": {
+                        "hotkey": "chal_hk",
+                        "revision": "chal_rev",
+                    },
+                },
+                "environments": {
+                    "ENV_A": {"sampling": {"sampling_count": 400}},
+                },
+            }
+            return values.get(name, default)
+
+    class _Samples:
+        async def count_samples_for_tasks(
+            self, hotkey, revision, env, task_ids, *, refresh_block
+        ):
+            if hotkey == "champ_hk":
+                return 441
+            if hotkey == "chal_hk":
+                return 400
+            return 0
+
+    _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
+
+    assert manager._last_done["ENV_A"] == 841
+    assert manager.env_cap_values["ENV_A"].value == 600
 
 
 def test_dispatch_proceeds_when_only_battle_has_url():
