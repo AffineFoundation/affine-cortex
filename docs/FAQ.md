@@ -46,11 +46,11 @@ You're out for good with that hotkey. The "multi-commit rule" prevents re-trying
 
 The environments are configured in `system_config.environments` and currently include SWE-INFINITE, LIVEWEB, NAVWORLD, MEMORY, DISTILL, TERMINAL (LOGPROBS is disabled by default). Each environment evaluates several hundred tasks per window (e.g. SWE evaluates 300 of its latest task IDs; LIVEWEB samples 400 deterministically-random task IDs).
 
-**Q8: Is there still a "model copying" problem?**
+**Q8: How does the subnet handle model copying?**
 
-Much less of one. Three changes neutered it:
+The design limits copying through three current controls:
 
-- Live sampling data is no longer exposed via API — there is no `/samples/*` endpoint and no `af get-pool`/`af get-sample` command. Copiers can't see which tasks are being evaluated in the current window.
+- Public status commands show ranking, queue, weights, and miner metadata. Current-window task details stay internal to the validator.
 - The challenge is sequential and bounded: each hotkey gets exactly one shot at the throne, ever. There's no leaderboard climbing by repeatedly submitting variants.
 - Plagiarism detection compares `model_hash` (sha256 of weight shards): the earliest committer wins; any later miner with an identical hash is marked `invalid` by the monitor.
 

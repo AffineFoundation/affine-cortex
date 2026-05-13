@@ -10,9 +10,8 @@ After the queue-window refactor, the miner-side surface is purely:
   - get-miner         : basic public miner metadata
   - get-rank          : one-stop status — window state + queue head + weight table
 
-All Chutes / Targon / private-repo workflows that lived here previously
-are gone — the validator now hosts inference per window via the scorer
-service, miners only have to upload to HuggingFace and commit.
+The validator hosts inference per window via the scorer service; miners
+upload to HuggingFace and commit their model snapshot.
 """
 
 from __future__ import annotations
@@ -160,8 +159,8 @@ async def deploy_command(
 ) -> None:
     """One-shot: upload to HF (optional) → commit ``{model, revision}``.
 
-    Chutes is no longer in the loop — inference is hosted by the scorer
-    service per window, so there's nothing to deploy externally.
+    Inference is hosted by the scorer service per window, so the miner-side
+    action is HuggingFace upload plus on-chain commit.
     """
     hf_token = hf_token or _conf("HF_TOKEN")
 
@@ -252,4 +251,3 @@ async def get_miner_command(uid: Optional[int], hotkey: Optional[str]) -> None:
         data = await client.get(endpoint)
         if data:
             print(json.dumps(data, indent=2, ensure_ascii=False))
-

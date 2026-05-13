@@ -42,9 +42,8 @@ class ScoresResponse(BaseModel):
 class MinerInfo(BaseModel):
     """Public miner metadata.
 
-    This is the same basic record operators historically inspected via
-    ``get-miner``. It intentionally excludes sample rows and sampling-rate
-    counters; those no longer belong to the public API surface.
+    Basic identity, model, validity, queue status, and commit block fields
+    for a miner.
     """
 
     uid: int

@@ -33,8 +33,7 @@ class APIConfig:
     # Logging
     LOG_LEVEL: str = os.getenv("API_LOG_LEVEL", "INFO")
 
-    # Optional operator-only diagnostics. The API process no longer owns
-    # scheduler/executor services; this only mounts non-public read endpoints.
+    # Optional operator-only diagnostics. This mounts non-public read endpoints.
     INTERNAL_ENDPOINTS_ENABLED: bool = (
         os.getenv("API_INTERNAL_ENDPOINTS_ENABLED", "false").lower() == "true"
     )

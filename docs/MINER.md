@@ -118,10 +118,8 @@ second commit invalidates the miner permanently (see [Multi-commit Rule](#multi-
 | `af get-scores --top N` | Top N miners from the latest snapshot |
 | `af get-score <UID>` | One miner's score |
 
-`af get-rank` is the only status command you usually need; the others
-are narrow query helpers. `af get-miner` exposes only basic miner metadata;
-there is intentionally no `af get-pool` or `af get-sample`, and no public
-sampling-rate statistics or sample rows.
+`af get-rank` is the main status command; the others are focused query
+helpers. `af get-miner` exposes public miner metadata.
 
 ### Local evaluation
 
