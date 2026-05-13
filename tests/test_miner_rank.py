@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 import affine.src.miner.rank as rank
 from affine.src.miner.rank import _print_rank_table
@@ -304,36 +304,20 @@ def test_rank_table_respects_no_color(monkeypatch):
     assert "\033[" not in buf.getvalue()
 
 
-def test_get_rank_falls_back_to_scores_when_aggregate_endpoint_is_missing(monkeypatch):
-    scores = {
-        "block_number": 100,
-        "calculated_at": 0,
-        "scores": [
-            {
-                "uid": 1,
-                "miner_hotkey": "champ_hotkey",
-                "model": "org/champion",
-                "overall_score": 1.0,
-                "is_valid": True,
-                "scores_by_env": {},
-            },
-        ],
-    }
+def test_get_rank_reports_aggregate_endpoint_errors_without_fallback(monkeypatch):
     client = _FakeClient({
         "/rank/current?top=256&queue_limit=10": RuntimeError("HTTP 404"),
-        "/scores/latest?top=256": scores,
     })
     monkeypatch.setattr(rank, "cli_api_client", lambda: _FakeClientContext(client))
 
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        asyncio.run(rank.get_rank_command())
+    err = io.StringIO()
+    with redirect_stderr(err):
+        try:
+            asyncio.run(rank.get_rank_command())
+        except SystemExit as exc:
+            assert exc.code == 1
+        else:
+            raise AssertionError("expected get_rank_command to exit")
 
-    assert client.calls == [
-        "/rank/current?top=256&queue_limit=10",
-        "/scores/latest?top=256",
-    ]
-    out = buf.getvalue()
-    assert "No scores found" not in out
-    assert "CHAMPION CHALLENGE RANKING - Block 100" in out
-    assert "CHAMPION" in out
+    assert client.calls == ["/rank/current?top=256&queue_limit=10"]
+    assert "failed to fetch /rank/current" in err.getvalue()

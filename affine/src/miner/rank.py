@@ -13,7 +13,6 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from affine.core.setup import logger
 from affine.utils.api_client import cli_api_client
 
 
@@ -34,30 +33,12 @@ def _ansi(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m"
 
 
-async def _safe_get(client, path: str) -> Optional[Any]:
-    try:
-        return await client.get(path)
-    except Exception as e:
-        logger.warning(f"rank: GET {path} failed: {type(e).__name__}: {e}")
-        return None
-
-
 async def _fetch_rank_payload(client) -> Dict[str, Any]:
-    payload = await _safe_get(
-        client,
+    payload = await client.get(
         f"/rank/current?top={_RANK_FETCH_LIMIT}&queue_limit={_QUEUE_PREVIEW}",
     )
     if isinstance(payload, dict) and isinstance(payload.get("scores"), dict):
         return payload
-
-    # Some deployed API servers may not have the aggregate rank endpoint yet.
-    # Fall back to the stable score snapshot so the CLI still renders a rank
-    # table instead of reporting "No scores found" for a 404 on /rank/current.
-    scores = await _safe_get(client, f"/scores/latest?top={_RANK_FETCH_LIMIT}")
-    if isinstance(scores, dict):
-        out = payload if isinstance(payload, dict) else {}
-        out["scores"] = scores
-        return out
     return payload if isinstance(payload, dict) else {}
 
 
@@ -344,8 +325,12 @@ def _print_rank_table(
     print(_ansi("=" * width, "2"))
 
 async def get_rank_command() -> None:
-    async with cli_api_client() as client:
-        payload = await _fetch_rank_payload(client)
+    try:
+        async with cli_api_client() as client:
+            payload = await _fetch_rank_payload(client)
+    except Exception as e:
+        print(f"Error: failed to fetch /rank/current: {e}", file=sys.stderr)
+        sys.exit(1)
 
     _print_rank_table(
         payload.get("window") if isinstance(payload.get("window"), dict) else None,
