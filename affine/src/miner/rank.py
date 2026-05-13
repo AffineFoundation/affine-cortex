@@ -182,7 +182,7 @@ def _colored_status(status: str, *, is_invalid: bool) -> str:
 def _sampling_mark(uid: Any, champion_uid: Optional[int], battle_uid: Optional[int]) -> str:
     if uid == champion_uid or uid == battle_uid:
         return _ansi("⚡", "1;92")
-    return " "
+    return "  "
 
 
 def _sort_scores(
