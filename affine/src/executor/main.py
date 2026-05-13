@@ -37,7 +37,8 @@ class ExecutorManager:
     def __init__(self, envs: List[str], *, verbosity: int = 1):
         self.envs = envs
         self.verbosity = verbosity
-        self.stats_queue: multiprocessing.Queue = multiprocessing.Queue()
+        self.mp_ctx = multiprocessing.get_context("spawn")
+        self.stats_queue: multiprocessing.Queue = self.mp_ctx.Queue()
         self.workers: List[WorkerProcess] = []
         self.aggregated: Dict[str, Dict[str, Any]] = {}
         self.running = False

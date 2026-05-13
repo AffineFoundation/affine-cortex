@@ -1,5 +1,21 @@
 from affine.src.executor.worker import _base_urls, _pick_url
+from affine.src.executor.main import ExecutorManager
 from affine.src.scorer.window_state import DeploymentRecord
+
+
+def _queue_probe(q):
+    q.put("ok")
+
+
+def test_executor_manager_stats_queue_can_be_passed_to_spawn_process():
+    manager = ExecutorManager(["affine:ded-v2"])
+    proc = manager.mp_ctx.Process(target=_queue_probe, args=(manager.stats_queue,))
+
+    proc.start()
+    proc.join(timeout=10)
+
+    assert proc.exitcode == 0
+    assert manager.stats_queue.get(timeout=1) == "ok"
 
 
 def test_base_urls_prefers_deployments_and_dedupes():

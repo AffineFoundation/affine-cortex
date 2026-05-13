@@ -10,27 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
-import queue
-import time
 from typing import Optional
 
 from affine.core.setup import logger, setup_logging
-
-
-async def stats_reporter(worker, stats_queue: multiprocessing.Queue, env: str, interval: int = 5):
-    """Periodically push worker metrics to the manager process."""
-    while worker.running:
-        try:
-            payload = worker.get_metrics()
-            payload["reported_at"] = time.time()
-            try:
-                stats_queue.put_nowait(payload)
-            except queue.Full:
-                pass
-            await asyncio.sleep(interval)
-        except Exception as e:
-            logger.error(f"[{env}] stats reporter error: {e}")
-            await asyncio.sleep(1)
 
 
 def run_worker_subprocess(
@@ -55,7 +37,6 @@ def run_worker_subprocess(
         )
         loop.run_until_complete(worker.initialize())
         worker.start()
-        loop.create_task(stats_reporter(worker, stats_queue, env))
         loop.run_until_complete(worker.run())
     except KeyboardInterrupt:
         logger.info(f"[{env}] subprocess received SIGINT")

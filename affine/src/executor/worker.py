@@ -237,6 +237,13 @@ class ExecutorWorker:
             refresh_block=refresh_block,
         )
         self.metrics.record_completion(success=success, latency_ms=latency_ms)
+        # Observable success signal — without this, docker logs only shows
+        # failures, giving the false impression that nothing is being
+        # written even when sample_results is filling up.
+        logger.info(
+            f"[{self.env}] task_id={task_id} miner=uid{miner.uid} "
+            f"persisted score={score:.4f} success={success} latency={latency_ms}ms"
+        )
 
 
 class _Miner:
