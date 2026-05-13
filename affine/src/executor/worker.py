@@ -174,21 +174,34 @@ class ExecutorWorker:
 
     async def _publish_status_loop(self, interval_sec: float = 10.0) -> None:
         """Periodically write this worker's metrics to ``system_config`` under
-        ``worker_status_<env>``. ``af db worker-status`` reads these rows so
-        operators can see live in-flight concurrency without docker-exec
-        spelunking. Uses the asyncio loop directly — never multiprocessing.Queue
-        (that path historically segfaulted under paramiko + nest_asyncio)."""
+        ``worker_status_<env>``. ``af db worker-status`` and
+        ``af db sample-progress`` read these rows so operators can see live
+        in-flight concurrency without docker-exec spelunking. Uses the
+        asyncio loop directly — never multiprocessing.Queue (that path
+        historically segfaulted under paramiko + nest_asyncio).
+
+        First failure is logged at WARNING so a misconfigured DAO surfaces
+        quickly; subsequent failures (likely the same cause) drop to DEBUG.
+        """
         import time as _t
         from affine.src.scorer.window_state import SystemConfigKVAdapter
         from affine.database.dao.system_config import SystemConfigDAO
         kv = SystemConfigKVAdapter(SystemConfigDAO(), updated_by=f"executor-{self.env}")
+        ever_failed = False
         while self.running:
             try:
                 payload = self.metrics.to_dict()
                 payload["reported_at"] = _t.time()
                 await kv.set(f"worker_status_{self.env}", payload)
             except Exception as e:
-                logger.debug(f"[{self.env}] status publish failed: {e}")
+                if not ever_failed:
+                    logger.warning(
+                        f"[{self.env}] status publish failed (first occurrence): "
+                        f"{type(e).__name__}: {e}"
+                    )
+                    ever_failed = True
+                else:
+                    logger.debug(f"[{self.env}] status publish failed: {e}")
             await asyncio.sleep(interval_sec)
 
     async def _tick(self) -> bool:
