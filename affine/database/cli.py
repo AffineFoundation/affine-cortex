@@ -794,9 +794,7 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
         now = time.time()
         worker_status: dict = {}
         for env_name in envs:
-            if envs[env_name].get(
-                "enabled_for_sampling", envs[env_name].get("enabled", True),
-            ):
+            if envs[env_name].get("enabled_for_sampling", False):
                 worker_status[env_name] = await sc.get_param_value(f"worker_status_{env_name}")
 
         win_label = window_spec if win_secs > 0 else "all-time"
@@ -815,9 +813,7 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
 
             for env_name in sorted(envs.keys()):
                 cfg = envs[env_name]
-                if not cfg.get(
-                    "enabled_for_sampling", cfg.get("enabled", True),
-                ):
+                if not cfg.get("enabled_for_sampling", False):
                     click.echo(f"{env_name:<14}  (disabled)")
                     continue
 

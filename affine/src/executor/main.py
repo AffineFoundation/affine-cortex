@@ -2,7 +2,7 @@
 ``af servers executor`` — manager that spawns one subprocess per env.
 
 The manager process does very little hot-path work: it spawns N
-``WorkerProcess`` instances (one per enabled env), restarts them if
+``WorkerProcess`` instances (one per sampling-enabled env), restarts them if
 they die, prints a periodic ``[STATUS]`` line for operators, and owns
 the cross-process IPC primitives (``BoundedSemaphore`` for global
 dispatch budget; one ``Value(c_int)`` per env for live in-flight
@@ -197,8 +197,7 @@ class ExecutorManager:
 async def _enabled_envs() -> List[str]:
     """Read system_config.environments and return sampling-enabled env keys.
 
-    Accepts both the new ``enabled_for_sampling`` key and the legacy
-    ``enabled`` alias so an unmigrated DB doesn't go silent.
+    Only ``enabled_for_sampling`` starts executor workers.
     """
     config_dao = SystemConfigDAO()
     envs_raw = await config_dao.get_param_value("environments", default={}) or {}
@@ -206,7 +205,7 @@ async def _enabled_envs() -> List[str]:
     for name, cfg in envs_raw.items():
         if not isinstance(cfg, dict):
             continue
-        sampling_flag = cfg.get("enabled_for_sampling", cfg.get("enabled", True))
+        sampling_flag = cfg.get("enabled_for_sampling", False)
         if sampling_flag:
             out.append(name)
     return out

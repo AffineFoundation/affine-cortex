@@ -137,7 +137,6 @@ class SystemConfigDAO(BaseDAO):
     # Environment rows use two independent gates:
     #   enabled_for_sampling controls task-id materialization/executor work.
     #   enabled_for_scoring controls DECIDE/rank score columns.
-    # The legacy ``enabled`` key is accepted by StateStore as a sampling alias.
 
     # Blacklist Configuration Management
     

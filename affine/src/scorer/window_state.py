@@ -370,16 +370,9 @@ def _env_from_payload(payload: Any) -> EnvConfig:
         )
     sampling = payload.get("sampling") or payload.get("window_config") or {}
     src = sampling.get("dataset_range_source")
-    # ``enabled_for_sampling`` is the explicit name; fall back to the
-    # legacy ``enabled`` key so an unmigrated row keeps working until
-    # ``af db load-config`` rewrites it under the new shape.
-    sampling_flag = payload.get(
-        "enabled_for_sampling",
-        payload.get("enabled", True),
-    )
     return EnvConfig(
         display_name=str(payload.get("display_name", "")),
-        enabled_for_sampling=bool(sampling_flag),
+        enabled_for_sampling=bool(payload.get("enabled_for_sampling", False)),
         # Default True so existing envs keep their pre-flag behavior
         # (sampling and scoring both on). New envs opt out of scoring
         # explicitly by setting ``enabled_for_scoring: false``.

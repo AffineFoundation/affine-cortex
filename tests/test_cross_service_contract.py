@@ -94,11 +94,11 @@ async def test_environments_filter_disabled_envs():
     doesn't fork a worker for a disabled env."""
     kv = InMemoryConfigStore()
     kv.data["environments"] = {
-        "ENABLED": {"display_name": "On", "enabled": True,
+        "ENABLED": {"display_name": "On", "enabled_for_sampling": True,
                     "sampling": {"sampling_count": 100,
                                  "dataset_range": [[0, 1000]],
                                  "sampling_mode": "random"}},
-        "DISABLED": {"display_name": "Off", "enabled": False,
+        "DISABLED": {"display_name": "Off", "enabled_for_sampling": False,
                      "sampling": {"sampling_count": 100,
                                   "dataset_range": [[0, 1000]],
                                   "sampling_mode": "random"}},
@@ -153,13 +153,13 @@ async def test_legacy_env_payload_shape_still_works():
     accepts both so a partial migration doesn't break the scheduler."""
     kv = InMemoryConfigStore()
     kv.data["environments"] = {
-        "OLD": {"display_name": "X", "enabled": True,
+        "OLD": {"display_name": "X", "enabled_for_sampling": True,
                 "window_config": {  # legacy key
                     "sampling_count": 50,
                     "dataset_range": [[0, 999]],
                     "sampling_mode": "latest",
                 }},
-        "NEW": {"display_name": "Y", "enabled": True,
+        "NEW": {"display_name": "Y", "enabled_for_sampling": True,
                 "sampling": {  # current key
                     "sampling_count": 100,
                     "dataset_range": [[0, 999]],

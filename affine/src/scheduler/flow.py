@@ -361,7 +361,7 @@ class FlowScheduler:
         envs: Mapping[str, EnvConfig], task_state: TaskIdState,
     ) -> bool:
         """True iff ``miner`` has ≥ ``sampling_count`` current-refresh
-        samples in every enabled env. The pool is oversampled to
+        samples in every sampling-enabled env. The pool is oversampled to
         ``ceil(sampling_count * 1.1)`` to absorb the slow-tail; we only
         require the base count to be ready, so a single slow / errored
         task at the end doesn't block decide."""
