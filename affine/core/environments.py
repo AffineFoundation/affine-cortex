@@ -501,9 +501,9 @@ class SDKEnvironment:
     def _get_env_vars(self) -> Dict[str, str]:
         """Get environment variables for this environment"""
         env_vars: Dict[str, str] = {}
-        inference_api_key = os.getenv("INFERENCE_API_KEY") or os.getenv("API_KEY")
-        if inference_api_key:
-            env_vars["API_KEY"] = inference_api_key
+        api_key = os.getenv("API_KEY")
+        if api_key:
+            env_vars["API_KEY"] = api_key
 
         # Forward any required host env vars into the container for this environment
         for key in self.config.required_env_vars:
