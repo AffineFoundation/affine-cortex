@@ -184,7 +184,8 @@ def test_rank_table_sorts_miners_by_status_then_uid_not_score():
                 "miner_hotkey": "terminated",
                 "model": "org/terminated",
                 "overall_score": 1.0,
-                "is_valid": True,
+                "is_valid": False,
+                "invalid_reason": "hf_model_fetch_failed",
                 "challenge_status": "terminated",
                 "scores_by_env": {},
             },
@@ -206,6 +207,8 @@ def test_rank_table_sorts_miners_by_status_then_uid_not_score():
     assert out.index("uid9") < out.index("invalid")
     assert out.index("uid9") < out.index("terminated")
     assert out.index("terminated") < out.index("invalid")
+    assert "TERMINATED" in out
+    assert "hf_model_fe" not in out
 
 
 def test_rank_table_shows_terminated_for_terminated_status():

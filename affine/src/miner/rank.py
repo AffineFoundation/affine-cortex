@@ -139,14 +139,14 @@ def _status_for(
     uid = row.get("uid")
     if uid == champion_uid:
         return "CHAMPION"
-    if row.get("is_valid") is False:
-        reason = str(row.get("invalid_reason") or "invalid")
-        return reason.split(":", 1)[0][:11]
     # Terminated lifecycle state lives in miner_stats, not the current
     # miners snapshot.
     chal_status = str(row.get("challenge_status") or "")
     if chal_status == "terminated":
         return "TERMINATED"
+    if row.get("is_valid") is False:
+        reason = str(row.get("invalid_reason") or "invalid")
+        return reason.split(":", 1)[0][:11]
     if uid == battle_uid:
         return "BATTLING"
     if uid in queue_positions:
