@@ -192,13 +192,26 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=7300,
     ),
-    # SWE-bench Infinite environment (requires R2 credentials for dataset/artifact access)
+    # SWE-bench Infinite environment.
+    # Task JSON is read from the public R2 bucket via anonymous HTTP, so no
+    # R2 credentials are required for basic operation. The staging
+    # credentials below are forwarded only when the host has them set;
+    # they let the validator read tasks during the 24h maturation window
+    # (before they appear in the public bucket), so scoring is ready by
+    # the time miners can pull them.
     "swe-infinite": EnvConfig(
         name="swe-infinite",
         docker_image="affinefoundation/swebench:infinite",
         env_type="swebench",
         env_vars={"UVICORN_WORKERS": "15"},
-        required_env_vars=["DOCKER_HUB_USERNAME", "DOCKER_HUB_TOKEN", "HF_TOKEN"],
+        required_env_vars=["DOCKER_HUB_USERNAME", "DOCKER_HUB_TOKEN"],
+        optional_env_vars=[
+            "R2_STAGING_ENDPOINT",
+            "R2_STAGING_ACCESS_KEY",
+            "R2_STAGING_SECRET_KEY",
+            "R2_STAGING_BUCKET",
+            "R2_STAGING_PREFIX",
+        ],
         mem_limit="10g",
         volumes={
             "/var/run/docker.sock": {
