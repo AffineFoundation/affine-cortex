@@ -537,7 +537,10 @@ class FlowScheduler:
             await self.state.set_champion(new_champion)
             await self.queue.mark_terminated(battle.challenger.uid, OUTCOME_WON)
             await self.queue.mark_terminated(champion.uid, OUTCOME_LOST)
-            await self._write_weights(new_champion, current_block, result)
+            await self._write_weights(
+                new_champion, current_block, result,
+                previous_champion=champion,
+            )
             logger.info(
                 f"FlowScheduler: champion uid {champion.uid} dethroned by "
                 f"uid {battle.challenger.uid}"
@@ -573,9 +576,12 @@ class FlowScheduler:
 
     async def _write_weights(
         self, champion: ChampionRecord, block_number: int, result: Any,
+        previous_champion: Optional[ChampionRecord] = None,
     ) -> None:
         """Build per-uid subjects (1.0 for champion, 0.0 for everyone else)
         and persist via ``WeightWriter``."""
+        champion_env_scores = _comparison_scores_by_env(result, role="challenger")
+        previous_champion_env_scores = _comparison_scores_by_env(result, role="champion")
         valid = await self._list_valid_miners()
         subjects: List[WeightSubject] = []
         seen: set = set()
@@ -592,7 +598,14 @@ class FlowScheduler:
                     model=str(m.get("model", "")),
                     first_block=int(m.get("first_block", 0)),
                     is_champion=(uid == champion.uid),
-                    scores_by_env={},
+                    scores_by_env=(
+                        champion_env_scores if uid == champion.uid
+                        else (
+                            previous_champion_env_scores
+                            if previous_champion and uid == previous_champion.uid
+                            else {}
+                        )
+                    ),
                     total_samples=int(m.get("total_samples", 0)),
                 )
             )
@@ -602,7 +615,7 @@ class FlowScheduler:
                     uid=champion.uid, hotkey=champion.hotkey,
                     revision=champion.revision, model=champion.model,
                     first_block=0, is_champion=True,
-                    scores_by_env={}, total_samples=0,
+                    scores_by_env=champion_env_scores, total_samples=0,
                 )
             )
         await self.weight_writer.write(
@@ -637,4 +650,47 @@ def _deployments_from_result(result: targon_lifecycle.DeployResult) -> List[Depl
                 base_url=result.base_url,
             )
         )
+    return out
+
+
+def _comparison_scores_by_env(result: Any, *, role: str) -> Dict[str, Dict[str, Any]]:
+    """Build rank-table metadata from a comparator result.
+
+    ``role='challenger'`` carries the old get-rank threshold format:
+    score-on-common, lose-below threshold, win-above threshold, and common
+    task count. ``role='champion'`` carries the reference mean and count.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for env_result in getattr(result, "per_env", []) or []:
+        env = getattr(env_result, "env", None)
+        if not env:
+            continue
+        champion_avg = getattr(env_result, "champion_avg", None)
+        champion_basis = champion_avg if isinstance(champion_avg, (int, float)) else 0.0
+        if role == "challenger":
+            challenger_avg = getattr(env_result, "challenger_avg", None)
+            if not isinstance(challenger_avg, (int, float)):
+                continue
+            margin = float(getattr(env_result, "margin", 0.0) or 0.0)
+            tolerance = float(getattr(env_result, "not_worse_tolerance", 0.0) or 0.0)
+            common_tasks = int(getattr(env_result, "challenger_n", 0) or 0)
+            out[str(env)] = {
+                "score": challenger_avg,
+                "score_on_common": challenger_avg,
+                "sample_count": common_tasks,
+                "common_tasks": common_tasks,
+                "not_worse_threshold": champion_basis * (1.0 - tolerance),
+                "dethrone_threshold": champion_basis + margin,
+                "verdict": getattr(env_result, "verdict", ""),
+                "reason": getattr(env_result, "reason", ""),
+            }
+        else:
+            if not isinstance(champion_avg, (int, float)):
+                continue
+            sample_count = int(getattr(env_result, "champion_n", 0) or 0)
+            out[str(env)] = {
+                "score": champion_avg,
+                "sample_count": sample_count,
+                "historical_count": sample_count,
+            }
     return out

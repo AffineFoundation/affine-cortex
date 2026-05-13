@@ -62,7 +62,16 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
                 "model": "org/challenger",
                 "overall_score": 0.0,
                 "is_valid": True,
-                "scores_by_env": {"SWE": {"score": 0.7, "sample_count": 9}},
+                "scores_by_env": {
+                    "SWE": {
+                        "score": 0.7,
+                        "score_on_common": 0.7,
+                        "common_tasks": 9,
+                        "sample_count": 9,
+                        "not_worse_threshold": 0.79,
+                        "dethrone_threshold": 0.81,
+                    }
+                },
             },
             {
                 "uid": 3,
@@ -86,7 +95,7 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     assert "BATTLING" in out
     assert "QUEUE #1" in out
     assert "80.00/10" in out
-    assert "70.00/9" in out
+    assert "70.00[79.00,81.00]/9" in out
     assert out.count("⚡| org/") == 2
     assert "Sampling: ⚡ marks miners in the current live sampling set" in out
 
@@ -125,6 +134,52 @@ def test_rank_table_groups_invalid_miners_below_valid_rows():
 
     assert out.index("good") < out.index("bad")
     assert "model_misma" in out
+
+
+def test_rank_table_does_not_show_unknown_status_for_missing_validity():
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 4,
+                "miner_hotkey": "hk",
+                "model": "org/model",
+                "overall_score": 0.0,
+                "is_valid": None,
+                "scores_by_env": {},
+            },
+        ],
+    }
+
+    out = _render_rank(None, None, scores)
+
+    assert "UNKNOWN" not in out
+    assert "VALID" in out
+    assert "     -" in out
+
+
+def test_rank_table_infers_champion_from_weight_without_sampling_mark():
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 7,
+                "miner_hotkey": "champ",
+                "model": "org/champ",
+                "overall_score": 1.0,
+                "is_valid": True,
+                "scores_by_env": {},
+            },
+        ],
+    }
+
+    out = _render_rank({"champion": None, "battle": None}, [], scores)
+
+    assert "Champion:   UID 7" in out
+    assert "CHAMPION" in out
+    assert "⚡| org/champ" not in out
 
 
 def test_queue_renders_none_safely():

@@ -39,6 +39,12 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _number(value: Any) -> Optional[float]:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
 def _format_relative_time(epoch_seconds: Optional[int]) -> str:
     if not epoch_seconds:
         return "unknown"
@@ -75,10 +81,26 @@ def _env_names(scores: List[Dict[str, Any]]) -> List[str]:
 def _env_cell(payload: Any) -> str:
     if not isinstance(payload, dict):
         return "-"
+    score_on_common = _number(payload.get("score_on_common"))
+    lower = _number(payload.get("not_worse_threshold"))
+    upper = _number(payload.get("dethrone_threshold"))
+    common_tasks = payload.get("common_tasks")
+    if (
+        score_on_common is not None
+        and lower is not None
+        and upper is not None
+        and isinstance(common_tasks, int)
+    ):
+        return (
+            f"{score_on_common * 100:.2f}"
+            f"[{lower * 100:.2f},{upper * 100:.2f}]"
+            f"/{common_tasks}"
+        )
+
     score = None
     for key in ("score", "mean", "average_score", "score_on_common"):
-        if isinstance(payload.get(key), (int, float)):
-            score = float(payload[key])
+        score = _number(payload.get(key))
+        if score is not None:
             break
     if score is None:
         return "-"
@@ -97,7 +119,7 @@ def _valid_mark(value: Any) -> str:
         return "yes"
     if value is False:
         return "no"
-    return "?"
+    return "-"
 
 
 def _status_for(
@@ -117,7 +139,7 @@ def _status_for(
         return "BATTLING"
     if uid in queue_positions:
         return f"QUEUE #{queue_positions[uid]}"
-    return "VALID" if row.get("is_valid") is True else "UNKNOWN"
+    return "VALID"
 
 
 def _sampling_mark(uid: Any, champion_uid: Optional[int], battle_uid: Optional[int]) -> str:
@@ -168,8 +190,22 @@ def _print_rank_table(
     envs = _env_names(scores)
     champion = (window or {}).get("champion") or {}
     battle = ((window or {}).get("battle") or {}).get("challenger") or {}
-    champion_uid = champion.get("uid")
+    live_champion_uid = champion.get("uid")
+    champion_uid = live_champion_uid
     battle_uid = battle.get("uid")
+    if champion_uid is None:
+        weight_champions = [
+            row for row in scores
+            if _as_float(row.get("overall_score")) > 0.0
+        ]
+        if len(weight_champions) == 1:
+            inferred = weight_champions[0]
+            champion_uid = inferred.get("uid")
+            champion = {
+                "uid": inferred.get("uid"),
+                "hotkey": inferred.get("miner_hotkey"),
+                "model": inferred.get("model"),
+            }
     queue_positions = {
         int(row["uid"]): int(row.get("position") or idx + 1)
         for idx, row in enumerate(queue or [])
@@ -230,7 +266,7 @@ def _print_rank_table(
         row_parts = [
             f"{_short(row.get('miner_hotkey'), 8):8s}",
             f"{int(row.get('uid') or -1):4d}",
-            f"{_sampling_mark(row.get('uid'), champion_uid, battle_uid)}| "
+            f"{_sampling_mark(row.get('uid'), live_champion_uid, battle_uid)}| "
             f"{_short(row.get('model'), 25):25s}",
         ]
         scores_by_env = row.get("scores_by_env") or {}
