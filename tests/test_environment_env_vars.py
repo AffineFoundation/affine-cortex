@@ -62,12 +62,21 @@ def test_no_api_key_set_no_aliases_emitted():
     assert "OPENAI_API_KEY" not in env_vars
 
 
-def test_liveweb_requires_dashscope_api_key():
+def test_liveweb_requires_dashscope_api_key_and_validator_base_url():
     with pytest.raises(ValueError, match="DASHSCOPE_API_KEY"):
         _get_env_vars_with(
             {
                 "API_KEY": "k123",
                 "COINGECKO_API_KEY": "cg",
+            },
+            env_name="liveweb",
+        )
+    with pytest.raises(ValueError, match="VALIDATOR_BASE_URL"):
+        _get_env_vars_with(
+            {
+                "API_KEY": "k123",
+                "COINGECKO_API_KEY": "cg",
+                "DASHSCOPE_API_KEY": "dashscope",
             },
             env_name="liveweb",
         )
@@ -79,9 +88,11 @@ def test_liveweb_forwards_dashscope_api_key():
             "API_KEY": "k123",
             "COINGECKO_API_KEY": "cg",
             "DASHSCOPE_API_KEY": "dashscope",
+            "VALIDATOR_BASE_URL": "https://validator.example",
         },
         env_name="liveweb",
     )
 
     assert env_vars["COINGECKO_API_KEY"] == "cg"
     assert env_vars["DASHSCOPE_API_KEY"] == "dashscope"
+    assert env_vars["VALIDATOR_BASE_URL"] == "https://validator.example"
