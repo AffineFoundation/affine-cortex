@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
+from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.monitor.live_scores_monitor import LIVE_SCORES_KEY
@@ -138,6 +139,38 @@ def _live_sampling_uids(
     return out
 
 
+async def _past_champions_split() -> List[Dict[str, Any]]:
+    """Past-N champions currently sharing weight, for ``af get-rank``.
+
+    Returns an empty list when:
+
+      * the split feature is off (``system_config['weights_split_after_block']``
+        missing or ``0``), or
+      * no eligible past champion currently maps to a registered, valid
+        miner, or
+      * any DDB-level error occurs while resolving the split — rank
+        rendering is a read surface and should not fail just because
+        the split lookup transiently can't be served.
+
+    Shape per row: ``{"uid", "hotkey", "model", "revision", "share"}``.
+    ``share`` is the same value the validator sets on chain (``1/N``),
+    not the snapshot's stale ``overall_score``.
+    """
+    # Local import to avoid a circular ``routers.scores`` ↔ ``rank_state``
+    # cycle at module load (the scores router itself imports nothing from
+    # this module today, but keeping the import local insulates against
+    # future churn).
+    from affine.api.routers.scores import compute_split_payees
+
+    try:
+        payees = await compute_split_payees(
+            ScoreSnapshotsDAO(), MinersDAO(), SystemConfigDAO(),
+        )
+    except Exception:
+        return []
+    return payees or []
+
+
 async def get_current_state() -> Dict[str, Any]:
     """Build the live state section used by ``/rank/current``."""
     store = _state_store()
@@ -148,8 +181,16 @@ async def get_current_state() -> Dict[str, Any]:
     task_state = await store.get_task_state()
     envs = await store.get_environments()
     sample_counts, sample_averages = await _sample_counts_and_averages(task_state)
+    past_champions = await _past_champions_split()
     return {
         "champion": _miner_summary(champion) if champion else None,
+        # Past N champions currently sharing the on-chain weight. Empty
+        # list when the split feature is off; otherwise the most recent
+        # N distinct hotkeys, resolved to their current uid and each
+        # carrying ``share = 1/N``. ``af get-rank`` surfaces this in a
+        # dedicated table column / header line so operators can see who
+        # is being paid and at what proportion.
+        "past_champions": past_champions,
         "battle": {
             "challenger": _miner_summary(battle.challenger),
             "started_at_block": battle.started_at_block,

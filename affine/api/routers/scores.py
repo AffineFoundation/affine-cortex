@@ -514,15 +514,16 @@ def _winner_hotkey_from_snapshot(snapshot: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-async def _resolve_current_uids_by_hotkey(
+async def _resolve_split_payees(
     snapshots: List[Dict[str, Any]],
     miners_dao: MinersDAO,
     *,
     needed: int,
-) -> List[int]:
+) -> List[Dict[str, Any]]:
     """Walk ``snapshots`` (newest-first), dedupe past champions by hotkey,
-    look up each hotkey's *current* uid in the miners table, and keep the
-    first ``needed`` whose miner is still registered AND currently valid.
+    look up each hotkey's *current* miner row in the miners table, and
+    keep the first ``needed`` whose miner is still registered AND
+    currently valid.
 
     Two filters are applied at resolution time:
 
@@ -538,8 +539,12 @@ async def _resolve_current_uids_by_hotkey(
     Either filter outcome causes us to walk further back in history to
     backfill the count, so churn at the top of the leaderboard doesn't
     shrink the split unnecessarily.
+
+    Returns rows ``{"uid", "hotkey", "model", "revision"}`` so callers
+    that need display metadata (e.g. ``af get-rank``) don't have to
+    re-query the miners table.
     """
-    out: List[int] = []
+    out: List[Dict[str, Any]] = []
     seen_hotkeys: set = set()
     for snap in snapshots:
         if len(out) >= needed:
@@ -559,8 +564,63 @@ async def _resolve_current_uids_by_hotkey(
             uid = int(miner.get("uid"))
         except (TypeError, ValueError):
             continue
-        out.append(uid)
+        out.append({
+            "uid": uid,
+            "hotkey": hotkey,
+            "model": miner.get("model") or "",
+            "revision": miner.get("revision") or "",
+        })
     return out
+
+
+async def compute_split_payees(
+    snapshots_dao: ScoreSnapshotsDAO,
+    miners_dao: MinersDAO,
+    config_dao: SystemConfigDAO,
+) -> Optional[List[Dict[str, Any]]]:
+    """Compute the active reward-split list, or ``None`` if the feature
+    is currently off.
+
+    Shared by ``/scores/weights/latest`` (chain weights) and
+    ``/rank/current`` (display) so both surfaces stay in lockstep.
+    Off → ``None``. On with no eligible payees → ``[]`` (caller decides
+    how to handle: weights endpoint 404s, rank surface just hides the
+    section). On with payees → list of
+    ``{"uid", "hotkey", "model", "revision", "share"}`` rows; ``share``
+    is ``1/len(payees)`` so the caller can render percentages directly.
+    """
+    activation_block = await _get_int_param(
+        config_dao, WEIGHTS_SPLIT_AFTER_BLOCK_PARAM, default=0,
+    )
+    if activation_block <= 0:
+        return None
+
+    snapshots = await snapshots_dao.get_recent_snapshots(
+        limit=_SPLIT_SNAPSHOT_SCAN_LIMIT,
+    )
+    if not snapshots:
+        return None
+    latest_block = snapshots[0].get("block_number")
+    if not (isinstance(latest_block, int) and latest_block >= activation_block):
+        return None
+
+    champion_count = max(
+        1,
+        await _get_int_param(
+            config_dao,
+            WEIGHTS_SPLIT_CHAMPION_COUNT_PARAM,
+            default=_DEFAULT_SPLIT_CHAMPION_COUNT,
+        ),
+    )
+    payees = await _resolve_split_payees(
+        snapshots, miners_dao, needed=champion_count,
+    )
+    if not payees:
+        return []
+    share = 1.0 / len(payees)
+    for p in payees:
+        p["share"] = share
+    return payees
 
 
 async def _get_int_param(
@@ -600,51 +660,34 @@ async def get_latest_weights(
     deregistered is skipped (we don't accidentally pay the successor on
     its recycled uid) and we keep walking history to backfill the count.
     """
-    activation_block = await _get_int_param(
-        config_dao, WEIGHTS_SPLIT_AFTER_BLOCK_PARAM, default=0,
-    )
-    champion_count = max(
-        1,
-        await _get_int_param(
-            config_dao,
-            WEIGHTS_SPLIT_CHAMPION_COUNT_PARAM,
-            default=_DEFAULT_SPLIT_CHAMPION_COUNT,
-        ),
-    )
+    payees = await compute_split_payees(snapshots_dao, miners_dao, config_dao)
 
-    snapshots = await snapshots_dao.get_recent_snapshots(
-        limit=_SPLIT_SNAPSHOT_SCAN_LIMIT,
-    )
-    if not snapshots:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No score snapshots found",
-        )
-
-    latest = snapshots[0]
-    latest_block = latest.get("block_number")
-
-    activated = (
-        activation_block > 0
-        and isinstance(latest_block, int)
-        and latest_block >= activation_block
-    )
-
-    if activated:
-        champion_uids = await _resolve_current_uids_by_hotkey(
-            snapshots, miners_dao, needed=champion_count,
-        )
-        if not champion_uids:
+    if payees is not None:
+        # Feature on. Need at least one valid payee to set anything on
+        # chain; refuse rather than send a malformed weight vector.
+        if not payees:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="No registered past-champion hotkeys in recent snapshots",
             )
-        share = 1.0 / len(champion_uids)
+        # Latest block lives on the freshest snapshot in the same scan
+        # the resolver walked — fetch one more time for the response
+        # envelope. (Cheap: GSI Limit=1.)
+        latest = await snapshots_dao.get_latest_snapshot()
         return {
-            "block_number": latest_block,
-            "weights": {str(uid): {"weight": share} for uid in champion_uids},
+            "block_number": (latest or {}).get("block_number"),
+            "weights": {
+                str(p["uid"]): {"weight": p["share"]} for p in payees
+            },
         }
 
+    # Feature off → legacy winner-takes-all pass-through.
+    latest = await snapshots_dao.get_latest_snapshot()
+    if not latest:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No score snapshots found",
+        )
     statistics = latest.get("statistics", {}) or {}
     raw_weights = (
         statistics.get("final_weights")
@@ -666,6 +709,6 @@ async def get_latest_weights(
         weights_response[str(uid_str)] = {"weight": w}
 
     return {
-        "block_number": latest_block,
+        "block_number": latest.get("block_number"),
         "weights": weights_response,
     }

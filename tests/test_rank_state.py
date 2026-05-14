@@ -50,6 +50,9 @@ async def test_current_state_on_empty_state(monkeypatch):
         "sample_counts": {},
         "sample_averages": {},
         "live_sampling_uids": [],
+        # Reward-split feature is off by default → field is always
+        # present but empty.
+        "past_champions": [],
     }
 
 
