@@ -388,6 +388,44 @@ def test_rank_table_uses_live_count_only_for_non_threshold_cells():
     assert "80.00[70.00,90.00]/321" not in out
 
 
+def test_rank_table_keeps_thresholds_when_using_live_running_average():
+    window = {
+        "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
+        "battle": {
+            "challenger": {"uid": 2, "hotkey": "chal", "model": "org/chal"},
+            "started_at_block": 42,
+        },
+        "sample_counts": {"2": {"SWE": 178}},
+        "sample_averages": {"2": {"SWE": 0.4816}},
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 2,
+                "miner_hotkey": "chal",
+                "model": "org/chal",
+                "overall_score": 0.0,
+                "is_valid": True,
+                "scores_by_env": {
+                    "SWE": {
+                        "score": 0.0,
+                        "score_on_common": 0.0,
+                        "common_tasks": 0,
+                        "not_worse_threshold": 0.4849,
+                        "dethrone_threshold": 0.5248,
+                    },
+                },
+            },
+        ],
+    }
+
+    out = _render_rank(window, [], scores)
+
+    assert "48.16[48.49,52.48]/178" in out
+
+
 def test_rank_table_uses_color_on_tty(monkeypatch):
     class _TTYBuffer(io.StringIO):
         def isatty(self):

@@ -98,19 +98,20 @@ def _env_cell(
     live_count: Optional[int] = None,
     live_avg: Optional[float] = None,
 ) -> str:
-    # Live running average from the current refresh_block trumps the
-    # snapshot — a miner mid-battle has a real running score even if
-    # the last decided snapshot has them at 0.00. Falls through to the
-    # snapshot path when no live average is available (queue rows,
-    # post-decide views).
-    if live_avg is not None and live_count is not None and live_count > 0:
-        return f"{live_avg * 100:.2f}/{live_count}"
     if not isinstance(payload, dict):
+        if live_avg is not None and live_count is not None and live_count > 0:
+            return f"{live_avg * 100:.2f}/{live_count}"
         return "-"
-    score_on_common = _number(payload.get("score_on_common"))
+    # Live running average from the current refresh_block trumps the
+    # snapshot score — a miner mid-battle has a real running score even
+    # if the last decided snapshot has them at 0.00. Threshold metadata
+    # still belongs in the cell when present, otherwise the live row
+    # hides the actual battle bounds.
+    has_live_avg = live_avg is not None and live_count is not None and live_count > 0
+    score_on_common = live_avg if has_live_avg else _number(payload.get("score_on_common"))
     lower = _number(payload.get("not_worse_threshold"))
     upper = _number(payload.get("dethrone_threshold"))
-    common_tasks = payload.get("common_tasks")
+    common_tasks = live_count if has_live_avg else payload.get("common_tasks")
     if (
         score_on_common is not None
         and lower is not None
@@ -124,10 +125,13 @@ def _env_cell(
         )
 
     score = None
-    for key in ("score", "mean", "average_score", "score_on_common"):
-        score = _number(payload.get(key))
-        if score is not None:
-            break
+    if has_live_avg:
+        score = live_avg
+    else:
+        for key in ("score", "mean", "average_score", "score_on_common"):
+            score = _number(payload.get(key))
+            if score is not None:
+                break
     if score is None:
         return "-"
     samples = live_count

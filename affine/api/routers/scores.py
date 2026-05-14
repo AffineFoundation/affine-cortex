@@ -5,6 +5,7 @@ Endpoints for querying score calculations.
 """
 
 import asyncio
+import time as _time
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -27,6 +28,48 @@ from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scorer.window_state import StateStore
 
 router = APIRouter(prefix="/scores", tags=["Scores"])
+
+
+# Process-local cache for per-(hotkey, revision) score aggregates.
+# Each entry stores ``(by_env, total, cached_at)``; the caller
+# decides freshness at lookup time via ``cache_ttl_s`` so a status
+# transition (e.g. sampling → in_progress) automatically invalidates
+# a stale entry instead of being trapped by the TTL stored at write
+# time. Process-local; survives until the API process restarts. Size
+# capped at ~256 keys × ~200B = under 0.5 MB total.
+_AVG_CACHE: Dict[
+    Tuple[str, str], Tuple[Dict[str, Dict[str, Any]], int, float],
+] = {}
+
+# Active and queue-waiting miners refresh at most this often. 10 min
+# keeps rank scores within one battle's natural tempo while making
+# API request cost effectively independent of request rate (one
+# query per miner per 10 min, regardless of caller count).
+_ACTIVE_CACHE_TTL_S = 600
+
+
+def _reset_terminated_cache_for_test() -> None:
+    """Test-only hook: clear the cross-request avg cache so each test
+    starts from a known state."""
+    _AVG_CACHE.clear()
+
+
+def _ttl_for_status(challenge_status: Optional[str]) -> Optional[float]:
+    """Cache TTL for a miner's per-(hotkey, revision) aggregate.
+
+    ``terminated`` is the only status for which the underlying samples
+    are truly frozen — the miner can no longer be sampled (one-shot
+    challenge already used; re-commit creates a new revision = a
+    different cache key). Returns ``None`` (cache forever).
+
+    Every other status (``sampling``, ``in_progress``, ``champion``)
+    can transition into an actively-sampling state, so we use a
+    finite TTL — caching ``sampling`` permanently would trap an
+    empty result and shadow new samples once the miner gets picked.
+    """
+    if challenge_status == "terminated":
+        return None
+    return _ACTIVE_CACHE_TTL_S
 
 
 class _StaticConfigStore:
@@ -83,6 +126,8 @@ async def _avg_scores_for_miner(
     hotkey: str,
     revision: str,
     envs: List[str],
+    *,
+    cache_ttl_s: Optional[float] = None,
 ) -> Tuple[Dict[str, Dict[str, Any]], int]:
     """Per-env avg + total sample count from sample_results for one miner.
 
@@ -92,11 +137,29 @@ async def _avg_scores_for_miner(
     every refresh_block within the table's 30-day TTL, so even
     terminated and post-snapshot miners get real averages instead of
     ``0.00`` placeholders.
+
+    ``cache_ttl_s``:
+      - ``None`` → permanent cache hit if any entry exists (only
+        valid for terminated miners whose rows are frozen).
+      - finite → cache entry is reused if it's younger than this
+        many seconds; otherwise we re-query and overwrite. The
+        check uses the *caller's* TTL, not anything stored at
+        write time, so a status transition (sampling →
+        in_progress) naturally invalidates the previous cached
+        empty result on the next lookup past TTL.
     """
     if not hotkey or not revision or not envs:
         return {}, 0
+    key = (hotkey, revision)
+    now = _time.time()
+    entry = _AVG_CACHE.get(key)
+    if entry is not None:
+        by_env, total, cached_at = entry
+        if cache_ttl_s is None or (now - cached_at) < cache_ttl_s:
+            return by_env, total
     by_env = await samples_dao.get_avg_scores_for_envs(hotkey, revision, envs)
     total = sum(int(p.get("sample_count", 0)) for p in by_env.values())
+    _AVG_CACHE[key] = (by_env, total, now)
     return by_env, total
 
 
@@ -138,8 +201,11 @@ async def _build_score_rows_from_validity(
         snap = snapshot_by_hk.get(hk) or {}
         meta = miner_meta.get(hk) or {}
         revision = snap.get("model_revision") or meta.get("revision") or ""
+        # validity tuple: (is_valid, invalid_reason, challenge_status, ...)
+        challenge_status = (validity.get(hk) or (None, None, None, None))[2]
         agg_scores, agg_total = await _avg_scores_for_miner(
             samples_dao, hk, str(revision), env_list,
+            cache_ttl_s=_ttl_for_status(challenge_status),
         )
         # Snapshot's scores_by_env wins when present (champion / previous
         # champion got real comparator-derived metadata at decide time).
@@ -323,9 +389,17 @@ async def get_score_by_uid(
         scoring_envs = await _scoring_env_names()
         samples_dao = SampleResultsDAO()
 
+        # Validity (and the terminated flag for cache short-circuit)
+        # before the aggregate call so terminated miners hit the
+        # process-local cache instead of the DDB query path.
+        is_valid, invalid_reason, challenge_status, termination_reason = (
+            await _build_validity_map()
+        ).get(hotkey, (None, None, None, None))
+
         env_list = sorted(scoring_envs) if scoring_envs else []
         agg_scores, agg_total = await _avg_scores_for_miner(
             samples_dao, hotkey, revision, env_list,
+            cache_ttl_s=_ttl_for_status(challenge_status),
         )
         snap_env = snap.get("scores_by_env") or {}
         merged_env: Dict[str, Any] = {}
@@ -334,10 +408,6 @@ async def get_score_by_uid(
                 merged_env[env] = snap_env[env]
             elif env in agg_scores:
                 merged_env[env] = agg_scores[env]
-
-        is_valid, invalid_reason, challenge_status, termination_reason = (
-            await _build_validity_map()
-        ).get(hotkey, (None, None, None, None))
 
         overall = snap.get("overall_score")
         if not isinstance(overall, (int, float)):
