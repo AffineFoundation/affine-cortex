@@ -93,7 +93,18 @@ def _env_names(scores: List[Dict[str, Any]]) -> List[str]:
     return sorted(envs)
 
 
-def _env_cell(payload: Any, live_count: Optional[int] = None) -> str:
+def _env_cell(
+    payload: Any,
+    live_count: Optional[int] = None,
+    live_avg: Optional[float] = None,
+) -> str:
+    # Live running average from the current refresh_block trumps the
+    # snapshot — a miner mid-battle has a real running score even if
+    # the last decided snapshot has them at 0.00. Falls through to the
+    # snapshot path when no live average is available (queue rows,
+    # post-decide views).
+    if live_avg is not None and live_count is not None and live_count > 0:
+        return f"{live_avg * 100:.2f}/{live_count}"
     if not isinstance(payload, dict):
         return "-"
     score_on_common = _number(payload.get("score_on_common"))
@@ -254,6 +265,11 @@ def _print_rank_table(
         if row.get("uid") is not None
     }
     live_sample_counts = (window or {}).get("sample_counts") or {}
+    # Per-(uid, env) running average over the current refresh_block —
+    # used to display battle subjects' real progress instead of the
+    # last-decided snapshot's 0.00 placeholder. None for miners not
+    # currently in the sampling set.
+    live_sample_averages = (window or {}).get("sample_averages") or {}
     live_sampling_uids = {
         int(uid)
         for uid in ((window or {}).get("live_sampling_uids") or [])
@@ -323,9 +339,13 @@ def _print_rank_table(
         scores_by_env = row.get("scores_by_env") or {}
         uid_key = str(row.get("uid"))
         row_live_counts = live_sample_counts.get(uid_key) or {}
+        row_live_avgs = live_sample_averages.get(uid_key) or {}
         for env in envs:
             live_count = row_live_counts.get(env)
-            row_parts.append(f"{_env_cell(scores_by_env.get(env), live_count):>24}")
+            live_avg = row_live_avgs.get(env)
+            row_parts.append(
+                f"{_env_cell(scores_by_env.get(env), live_count, live_avg):>24}"
+            )
         row_parts.append(
             _colored_status(status, is_invalid=(row.get("is_valid") is False))
         )

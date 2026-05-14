@@ -21,7 +21,7 @@ from affine.src.scorer.window_state import (
 
 
 async def _empty_counts(champion, battle, task_state):
-    return {}
+    return {}, {}
 
 
 async def _no_inferred_champion():
@@ -30,7 +30,7 @@ async def _no_inferred_champion():
 
 async def _render_current(monkeypatch, store: StateStore):
     monkeypatch.setattr(rank_state, "_state_store", lambda: store)
-    monkeypatch.setattr(rank_state, "_sample_counts", _empty_counts)
+    monkeypatch.setattr(rank_state, "_sample_counts_and_averages", _empty_counts)
     monkeypatch.setattr(rank_state, "_infer_champion_from_scores", _no_inferred_champion)
     return await rank_state.get_current_state()
 
@@ -48,6 +48,7 @@ async def test_current_state_on_empty_state(monkeypatch):
         "battle": None,
         "task_refresh_block": None,
         "sample_counts": {},
+        "sample_averages": {},
         "live_sampling_uids": [],
     }
 
@@ -92,10 +93,10 @@ async def test_current_state_with_battle_in_flight(monkeypatch):
 @pytest.mark.asyncio
 async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(monkeypatch):
     async def _counts(champion, battle, task_state):
-        return {
-            "1": {"ENV_A": 5},
-            "2": {"ENV_A": 2},
-        }
+        return (
+            {"1": {"ENV_A": 5}, "2": {"ENV_A": 2}},
+            {"1": {"ENV_A": 0.42}, "2": {"ENV_A": 0.10}},
+        )
 
     kv = InMemoryConfigStore()
     kv.data["environments"] = {
@@ -118,12 +119,13 @@ async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(mon
         task_ids={"ENV_A": [1, 2, 3, 4, 5, 6]}, refreshed_at_block=42,
     ))
     monkeypatch.setattr(rank_state, "_state_store", lambda: store)
-    monkeypatch.setattr(rank_state, "_sample_counts", _counts)
+    monkeypatch.setattr(rank_state, "_sample_counts_and_averages", _counts)
     monkeypatch.setattr(rank_state, "_infer_champion_from_scores", _no_inferred_champion)
 
     resp = await rank_state.get_current_state()
 
     assert resp["sample_counts"] == {"1": {"ENV_A": 5}, "2": {"ENV_A": 2}}
+    assert resp["sample_averages"] == {"1": {"ENV_A": 0.42}, "2": {"ENV_A": 0.10}}
     assert resp["live_sampling_uids"] == [2]
 
 

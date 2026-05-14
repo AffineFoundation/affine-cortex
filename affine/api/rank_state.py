@@ -59,15 +59,24 @@ async def _infer_champion_from_scores() -> Optional[ChampionRecord]:
     )
 
 
-async def _sample_counts(
+async def _sample_counts_and_averages(
     champion: Optional[ChampionRecord],
     battle: Optional[BattleRecord],
     task_state: Optional[TaskIdState],
-) -> Dict[str, Dict[str, int]]:
+) -> tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, float]]]:
+    """Per-(uid, env) live count + running average from sample_results.
+
+    Reads the per-task scores for the current refresh_block, computes
+    both the count (used by ``af get-rank``'s sample-count column and
+    ``_live_sampling_uids``) and the running average (used by
+    ``af get-rank``'s per-env score cell so battle subjects show their
+    actual current score, not the stale snapshot's 0.00).
+    """
     if task_state is None:
-        return {}
+        return {}, {}
     adapter = SampleResultsAdapter()
-    out: Dict[str, Dict[str, int]] = {}
+    counts: Dict[str, Dict[str, int]] = {}
+    averages: Dict[str, Dict[str, float]] = {}
 
     subjects = []
     if champion is not None:
@@ -78,16 +87,22 @@ async def _sample_counts(
 
     for uid, hotkey, revision in subjects:
         env_counts: Dict[str, int] = {}
+        env_avgs: Dict[str, float] = {}
         for env, task_ids in task_state.task_ids.items():
-            env_counts[env] = await adapter.count_samples_for_tasks(
+            scores = await adapter.read_scores_for_tasks(
                 hotkey,
                 revision,
                 env,
                 task_ids,
                 refresh_block=task_state.refreshed_at_block,
             )
-        out[uid] = env_counts
-    return out
+            env_counts[env] = len(scores)
+            env_avgs[env] = (
+                sum(scores.values()) / len(scores) if scores else 0.0
+            )
+        counts[uid] = env_counts
+        averages[uid] = env_avgs
+    return counts, averages
 
 
 def _live_sampling_uids(
@@ -128,7 +143,9 @@ async def get_current_state() -> Dict[str, Any]:
     battle = await store.get_battle()
     task_state = await store.get_task_state()
     envs = await store.get_environments()
-    sample_counts = await _sample_counts(champion, battle, task_state)
+    sample_counts, sample_averages = await _sample_counts_and_averages(
+        champion, battle, task_state,
+    )
     return {
         "champion": _miner_summary(champion) if champion else None,
         "battle": {
@@ -137,6 +154,10 @@ async def get_current_state() -> Dict[str, Any]:
         } if battle else None,
         "task_refresh_block": task_state.refreshed_at_block if task_state else None,
         "sample_counts": sample_counts,
+        # Per-(uid, env) running average over the current refresh_block.
+        # Battle subjects show their live score in af get-rank instead
+        # of the (stale) last-decided snapshot's 0.00 placeholder.
+        "sample_averages": sample_averages,
         "live_sampling_uids": _live_sampling_uids(
             champion, battle, task_state, envs, sample_counts,
         ),
