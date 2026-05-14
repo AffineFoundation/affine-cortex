@@ -21,8 +21,8 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
   sglang_dp               data-parallel size (8)
   sglang_cache_dir        HF cache mount point (/data)
   sglang_image            (lmsysorg/sglang:latest)
-  sglang_context_len      context length passed to sglang (65536)
-  sglang_mem_fraction     GPU memory fraction passed to sglang (0.8)
+  sglang_context_len      legacy field; deployment no longer passes --context-length
+  sglang_mem_fraction     GPU memory fraction passed to sglang (0.85)
   sglang_chunked_prefill  chunked-prefill size (4096)
   sglang_tool_call_parser parser name, "none" to omit (qwen)
   ready_timeout_sec       seconds to wait for /v1/models (1800)
@@ -54,7 +54,7 @@ DEFAULT_CACHE_DIR = "/data"
 DEFAULT_PORT = 30000
 DEFAULT_DP = 8
 DEFAULT_CONTEXT_LEN = 65536
-DEFAULT_MEM_FRACTION = 0.8
+DEFAULT_MEM_FRACTION = 0.85
 DEFAULT_CHUNKED_PREFILL = 4096
 DEFAULT_TOOL_CALL_PARSER = "qwen"
 DEFAULT_READY_TIMEOUT_SEC = 1800
@@ -158,7 +158,6 @@ def _build_sglang_args(target: DeployTarget, config: "SSHConfig") -> List[str]:
         "--host", "0.0.0.0",
         "--port", str(config.sglang_port),
         "--trust-remote-code",
-        "--context-length", str(config.sglang_context_len),
         "--mem-fraction-static", str(config.sglang_mem_fraction),
         "--chunked-prefill-size", str(config.sglang_chunked_prefill),
     ]
@@ -189,7 +188,6 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
         "-e HF_HOME=/data "
         "-e HF_HUB_CACHE=/data "
         "-e TRANSFORMERS_CACHE=/data "
-        "-e SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 "
     )
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:

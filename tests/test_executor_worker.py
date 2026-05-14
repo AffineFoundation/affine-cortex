@@ -87,6 +87,7 @@ def test_pick_url_stably_shards_tasks_across_urls():
 def test_is_zero_score_error_matches_context_overflow_patterns():
     cases = [
         "BadRequest: This model's maximum context length is 65536 tokens, but the input is longer than the model can handle",
+        "This model supports context lengths of up to 65536 tokens",
         "HTTP 400: prompt exceeds the maximum allowed length",
         "Error: exceeds the maximum context length of 32000 tokens",
     ]

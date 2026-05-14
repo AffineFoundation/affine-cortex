@@ -751,6 +751,7 @@ def _resolve_deployment_id(
 # "the miner's response/prompt blew past the model context window",
 # which is a model property and won't change on retry.
 _ZERO_SCORE_ERROR_PATTERNS = (
+    "context lengths of up to",
     "is longer than the model",
     "exceeds the maximum allowed length",
     "exceeds the maximum context length",
