@@ -12,7 +12,7 @@ from affine.src.scorer.comparator import (
 ENVS = ["env_a", "env_b"]
 
 
-def _cfg(margin=0.01, min_n=10, tol=0.0):
+def _cfg(margin=0.03, min_n=10, tol=0.02):
     return {
         e: EnvComparisonConfig(
             env=e, margin=margin, min_tasks_per_env=min_n,
@@ -62,6 +62,20 @@ def test_strict_pareto_within_margin_blocks():
     assert r.winner == "champion"
 
 
+def test_dominant_requires_strictly_above_additive_margin():
+    cmp = WindowComparator()
+    champ = _scores({"env_a": [0.50] * 20, "env_b": [0.50] * 20})
+    chal = _scores({"env_a": [0.53] * 20, "env_b": [0.60] * 20})
+
+    r = cmp.compare(champ, chal, _cfg(margin=0.03), min_dominant_envs=1)
+
+    assert r.winner == "challenger"
+    by_env = {e.env: e for e in r.per_env}
+    assert by_env["env_a"].verdict == ENV_NOT_WORSE
+    assert by_env["env_b"].verdict == ENV_DOMINANT
+    assert r.dominant_count == 1
+
+
 # ---- partial Pareto (min_dom > 0) ------------------------------------------
 
 
@@ -101,6 +115,31 @@ def test_partial_pareto_insufficient_dominant_count_blocks():
     r = cmp.compare(champ, chal, _cfg(margin=0.01, tol=0.05), min_dominant_envs=2)
     assert r.winner == "champion"
     assert "insufficient_dominant_envs:1<2" in r.reason
+
+
+def test_old_production_rule_one_dominant_env_and_relative_tolerance_wins():
+    cmp = WindowComparator()
+    champ = _scores({"env_a": [0.50] * 20, "env_b": [0.60] * 20})
+    chal = _scores({"env_a": [0.531] * 20, "env_b": [0.589] * 20})
+
+    r = cmp.compare(champ, chal, _cfg(margin=0.03, tol=0.02), min_dominant_envs=1)
+
+    assert r.winner == "challenger"
+    by_env = {e.env: e for e in r.per_env}
+    assert by_env["env_a"].verdict == ENV_DOMINANT
+    assert by_env["env_b"].verdict == ENV_NOT_WORSE
+
+
+def test_old_production_rule_blocks_beyond_relative_tolerance():
+    cmp = WindowComparator()
+    champ = _scores({"env_a": [0.50] * 20, "env_b": [0.60] * 20})
+    chal = _scores({"env_a": [0.531] * 20, "env_b": [0.587] * 20})
+
+    r = cmp.compare(champ, chal, _cfg(margin=0.03, tol=0.02), min_dominant_envs=1)
+
+    assert r.winner == "champion"
+    by_env = {e.env: e for e in r.per_env}
+    assert by_env["env_b"].verdict == ENV_WORSE
 
 
 # ---- sample-count gate -----------------------------------------------------

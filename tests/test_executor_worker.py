@@ -668,11 +668,19 @@ def test_dispatch_proceeds_when_only_battle_has_url():
             )
 
     class _SamplesStub:
-        async def has_sample(self, *a, **kw):
-            return False
+        # Champion has already sampled all 3 task_ids — without that the
+        # new challenger-overlap rule (challenger only attempts task_ids
+        # in champion_done) would dispatch 0 even though the BUG-1 fix
+        # this test guards is about the no-champion-URL path.
+        def __init__(self, champ_done):
+            self._champ_done = champ_done
 
-        async def count_samples_for_tasks(self, *a, **kw):
-            return 0
+        async def read_scores_for_tasks(
+            self, hotkey, revision, env, task_ids, *, refresh_block,
+        ):
+            if hotkey == "champ_hk":
+                return {int(t): 0.5 for t in task_ids if int(t) in self._champ_done}
+            return {}
 
     dispatched: list = []
 
@@ -680,7 +688,7 @@ def test_dispatch_proceeds_when_only_battle_has_url():
         dispatched.append((miner.uid, task_id, base_url))
 
     worker._state = _StateStub()
-    worker._samples = _SamplesStub()
+    worker._samples = _SamplesStub(champ_done={1, 2, 3})
     worker._dispatch_one = _capture_dispatch_one
 
     async def _drive():
@@ -742,6 +750,9 @@ def test_dispatch_skips_when_neither_has_url():
 
         async def count_samples_for_tasks(self, *a, **kw):
             return 0
+
+        async def read_scores_for_tasks(self, *a, **kw):
+            return {}
 
     worker._state = _StateStub()
     worker._samples = _SamplesStub()
@@ -959,3 +970,228 @@ def test_skips_validation_when_no_token_was_captured():
 
     assert len(fx.persist_calls) == 1
     assert fx.worker.metrics.tasks_dropped_drift == 0
+
+
+# ---- challenger overlap + champion completion threshold --------------------
+#
+# See affine/src/scorer/sampling_thresholds.py and the plan in
+# /home/claudeuser/.claude-aly2/plans/zippy-foraging-clarke.md.
+#
+# Champion drains the pool until ``len(champ_done) ≥
+# champion_completion_threshold(sampling_count)`` (95% of pool); the
+# remaining 5% is the deliberately-abandoned long tail. Challenger
+# dispatches every task_id champion has already sampled (NOT the raw
+# pool, NOT capped at sampling_count) and early-stops once the
+# (champion ∩ challenger) overlap reaches sampling_count.
+
+
+def _make_overlap_worker(env="ENV_A"):
+    """Worker + state stubs for the overlap/threshold tests below.
+
+    The state's task_state, env_cfg, champion, battle, and the samples
+    stub's per-miner score dicts are exposed as attributes so each test
+    can mutate them between dispatches."""
+    import asyncio as _asyncio
+
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import (
+        BattleRecord, ChampionRecord, DeploymentRecord, EnvConfig,
+        MinerSnapshot, TaskIdState,
+    )
+
+    worker = ExecutorWorker(worker_id=0, env=env)
+    worker.warmup_sec = 0
+
+    fx = type("Fx", (), {})()
+    fx.worker = worker
+    # 220 = pool size for sampling_count=200 (1.1× buffer with FP rounds
+    # to 221 in production code; we use 220 in tests for arithmetic
+    # cleanliness — the threshold helper accepts whatever pool we feed).
+    fx.task_ids = list(range(220))
+    fx.sampling_count = 200
+    fx.champ_scores = {}      # tid → score
+    fx.chal_scores = {}       # tid → score
+
+    class _StateStub:
+        async def get_task_state(self):
+            return TaskIdState(
+                task_ids={env: list(fx.task_ids)},
+                refreshed_at_block=0,
+            )
+
+        async def get_environments(self):
+            return {
+                env: EnvConfig(
+                    display_name=env, enabled_for_sampling=True,
+                    sampling_count=fx.sampling_count,
+                    dataset_range=[[0, 1000]],
+                ),
+            }
+
+        async def get_champion(self):
+            return ChampionRecord(
+                uid=1, hotkey="champ_hk", revision="champ_rev",
+                model="org/m1", deployment_id="wrk-champ",
+                base_url="https://t/wrk-champ", deployments=[
+                    DeploymentRecord(endpoint_name="b300",
+                                     deployment_id="wrk-champ",
+                                     base_url="https://t/wrk-champ"),
+                ],
+                since_block=0,
+            )
+
+        async def get_battle(self):
+            return BattleRecord(
+                challenger=MinerSnapshot(
+                    uid=2, hotkey="chal_hk", revision="chal_rev",
+                    model="org/m2",
+                ),
+                deployment_id="wrk-chal",
+                base_url="https://t/wrk-chal",
+                started_at_block=0,
+                deployments=[
+                    DeploymentRecord(endpoint_name="b300",
+                                     deployment_id="wrk-chal",
+                                     base_url="https://t/wrk-chal"),
+                ],
+            )
+
+    class _SamplesStub:
+        async def read_scores_for_tasks(
+            self, hotkey, revision, _env, task_ids, *, refresh_block,
+        ):
+            wanted = {int(t) for t in task_ids}
+            if hotkey == "champ_hk":
+                return {t: s for t, s in fx.champ_scores.items() if t in wanted}
+            if hotkey == "chal_hk":
+                return {t: s for t, s in fx.chal_scores.items() if t in wanted}
+            return {}
+
+    fx.state = _StateStub()
+    fx.samples = _SamplesStub()
+    worker._state = fx.state
+    worker._samples = fx.samples
+
+    fx.dispatched = []
+
+    async def _capture(*, miner, task_id, base_url, **_kwargs):
+        fx.dispatched.append((miner.uid, int(task_id)))
+
+    worker._dispatch_one = _capture
+
+    async def _drive(battle_only=False):
+        n = await worker._dispatch_new(set(), set())
+        await _asyncio.sleep(0)
+        return n
+
+    fx.drive = lambda: _asyncio.run(_drive())
+    return fx
+
+
+def test_champion_dispatch_stops_at_completion_threshold():
+    """Champion has reached the 95%-of-pool threshold (210/221 for
+    sampling_count=200) → executor must stop adding new champion
+    candidates for this env. The remaining ~10 task_ids are the
+    deliberately-abandoned long tail."""
+    from affine.src.scorer.sampling_thresholds import champion_completion_threshold
+
+    fx = _make_overlap_worker()
+    threshold = champion_completion_threshold(fx.sampling_count)
+    fx.champ_scores = {t: 0.5 for t in range(threshold)}     # exactly at threshold
+    # Battle exists but challenger is also already at sampling_count overlap
+    # so we isolate the champion-side check.
+    fx.chal_scores = {t: 0.5 for t in range(fx.sampling_count)}
+
+    fx.drive()
+
+    champion_dispatches = [d for d in fx.dispatched if d[0] == 1]
+    assert champion_dispatches == [], (
+        f"champion at threshold should stop dispatching, got {len(champion_dispatches)}"
+    )
+
+
+def test_champion_dispatch_continues_below_threshold():
+    """Champion below the 95% threshold → dispatch every un-sampled
+    task_id (no per-tick cap on champion side)."""
+    fx = _make_overlap_worker()
+    fx.champ_scores = {t: 0.5 for t in range(100)}            # 100 of 220 done
+    fx.chal_scores = {}                                       # battle still ramping
+
+    fx.drive()
+
+    champion_dispatches = [tid for uid, tid in fx.dispatched if uid == 1]
+    assert len(champion_dispatches) == 220 - 100, (
+        f"champion should dispatch 120 remaining, got {len(champion_dispatches)}"
+    )
+    assert set(champion_dispatches) == set(range(100, 220))
+
+
+def test_challenger_only_dispatches_task_ids_in_champion_done():
+    """Challenger ignores task_ids the champion hasn't sampled yet —
+    dispatching them would never contribute to overlap."""
+    fx = _make_overlap_worker()
+    # Champion done on first 210 tasks; tail 210..219 still pending.
+    fx.champ_scores = {t: 0.5 for t in range(210)}
+    fx.chal_scores = {}
+
+    fx.drive()
+
+    challenger_dispatches = {tid for uid, tid in fx.dispatched if uid == 2}
+    assert challenger_dispatches == set(range(210)), (
+        f"challenger should target only champion's 210 done; touched tail "
+        f"{challenger_dispatches - set(range(210))}"
+    )
+
+
+def test_challenger_dispatches_all_champion_done_not_capped_at_sampling_count():
+    """Anti-stall: challenger MUST dispatch the full champion-done set
+    (eg 210), not stop at the base sampling_count (200). Otherwise a
+    handful of permanent failures in the first 200 leaves overlap
+    forever short of threshold."""
+    fx = _make_overlap_worker()
+    fx.champ_scores = {t: 0.5 for t in range(210)}            # champion has 210 done
+    fx.chal_scores = {}                                       # challenger fresh
+
+    fx.drive()
+
+    challenger_dispatches = [tid for uid, tid in fx.dispatched if uid == 2]
+    assert len(challenger_dispatches) == 210, (
+        f"challenger must dispatch all 210 of champion's set, got "
+        f"{len(challenger_dispatches)}"
+    )
+
+
+def test_challenger_stops_when_overlap_reaches_sampling_count():
+    """Challenger early-stop: once (champion ∩ challenger) ≥
+    sampling_count, dispatch nothing more for this env. Saves GPU
+    while waiting for other envs to catch up to their thresholds."""
+    fx = _make_overlap_worker()
+    fx.champ_scores = {t: 0.5 for t in range(210)}            # champion: 210 done
+    fx.chal_scores = {t: 0.5 for t in range(200)}             # challenger: 200 done, overlap=200
+
+    fx.drive()
+
+    challenger_dispatches = [d for d in fx.dispatched if d[0] == 2]
+    assert challenger_dispatches == [], (
+        f"challenger at overlap=sampling_count should stop, got {len(challenger_dispatches)}"
+    )
+
+
+def test_challenger_ignores_existing_samples_outside_champion_set():
+    """Stale challenger rows from before-this-rule (or from a contaminated
+    earlier window) on task_ids champion never sampled don't count
+    toward overlap and don't block fresh dispatches inside champion's
+    set."""
+    fx = _make_overlap_worker()
+    # Champion done on {0..209}; challenger has 5 stale rows at {300..304}
+    # (outside the pool entirely — even more clearly not in champion set).
+    fx.champ_scores = {t: 0.5 for t in range(210)}
+    fx.chal_scores = {300: 0.5, 301: 0.5, 302: 0.5, 303: 0.5, 304: 0.5}
+
+    fx.drive()
+
+    challenger_dispatches = [tid for uid, tid in fx.dispatched if uid == 2]
+    # 5 stale rows don't count toward overlap (overlap=0); challenger
+    # dispatches all 210 of champion's set fresh.
+    assert len(challenger_dispatches) == 210
+    assert all(tid in range(210) for tid in challenger_dispatches)

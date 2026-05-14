@@ -24,6 +24,9 @@ from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.executor.logging_utils import safe_log
 from affine.src.executor.metrics import WorkerMetrics
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
+from affine.src.scorer.sampling_thresholds import (
+    champion_completion_threshold,
+)
 from affine.src.scorer.window_state import (
     DeploymentRecord,
     MinerSnapshot,
@@ -280,12 +283,28 @@ class ExecutorWorker:
         Returns the number of new dispatches so the loop knows whether
         to short-poll (more work to do) or idle-sleep.
 
-        Sampling policy is unchanged:
-          - **Champion** drains the full pool (sampling_count × 1.1
-            buffer from Stage AF).
-          - **Challenger** caps at the base ``sampling_count`` — past
-            that, overlap is sufficient and continuing adds no
-            comparator signal.
+        **Per-env sampling policy** (per-env stop here; the all-env
+        gate that actually advances the battle lives in
+        ``flow.FlowScheduler._samples_complete`` /
+        ``_battle_overlap_ready``):
+
+          - **Champion** drains the pool until ``len(champ_done) ≥
+            champion_completion_threshold(sampling_count)`` (95% of the
+            pool). The remaining 5% is the deliberately-abandoned long
+            tail.
+          - **Challenger** dispatches the full set of task_ids the
+            *champion* has already sampled — never the raw pool — so a
+            permanently-failing task in the long tail can't bias which
+            task_ids the challenger ends up with. We early-stop once
+            ``overlap (champ_done ∩ chal_done) ≥ sampling_count``;
+            extra dispatches past that add no comparator signal.
+
+        Why "challenger samples champion's set" rather than the raw
+        pool: the contest gate (``_battle_overlap_ready``) requires
+        ``overlap ≥ sampling_count``. If challenger sampled task_ids
+        the champion never completed, those samples never count toward
+        overlap and the math can't close — see
+        ``affine/src/scorer/sampling_thresholds.py``.
 
         Concurrency: candidates pass the optional per-env semaphore first,
         then the shared cross-process global semaphore. This keeps all
@@ -335,27 +354,32 @@ class ExecutorWorker:
         if not champion_urls and not battle_urls:
             return 0
 
-        # Build the candidate pool: champion drains everything; challenger
-        # is capped by ``sampling_count``. We shuffle so persistently slow
-        # task_ids don't always end up at the tail across worker restarts.
+        # Read champion's current sample set once; both branches use it
+        # (champion early-stop check + challenger candidate filter).
+        # One Query (paginated) replaces the per-tid GetItems we used to
+        # do via ``has_sample``.
+        champ_done = await self._samples.read_scores_for_tasks(
+            champion.hotkey, champion.revision, self.env,
+            task_ids, refresh_block=refresh_block,
+        )
+        champion_threshold = champion_completion_threshold(sampling_count)
+
         # Each candidate carries the deployment_id we resolved from the
         # state read above. ``_evaluate_and_persist_gated`` re-reads
         # state at persist time and drops the result if this token is
         # no longer current — see ``_is_current_deployment``.
         candidates: List[tuple] = []
-        if champion_urls:
+        if champion_urls and len(champ_done) < champion_threshold:
             champ_snap = MinerSnapshot(
                 uid=champion.uid, hotkey=champion.hotkey,
                 revision=champion.revision, model=champion.model,
             )
             for idx, tid in enumerate(task_ids):
-                key = (champion.hotkey, champion.revision, int(tid))
-                if key in in_flight_keys:
+                tid_int = int(tid)
+                if tid_int in champ_done:
                     continue
-                if await self._samples.has_sample(
-                    champion.hotkey, champion.revision, self.env, tid,
-                    refresh_block=refresh_block,
-                ):
+                key = (champion.hotkey, champion.revision, tid_int)
+                if key in in_flight_keys:
                     continue
                 url = _pick_url(champion_urls, tid, idx)
                 dep_id = _resolve_deployment_id(
@@ -364,23 +388,20 @@ class ExecutorWorker:
                 candidates.append((key, champ_snap, tid, url, dep_id))
 
         if battle is not None and battle_urls:
-            chal_have = await self._samples.count_samples_for_tasks(
-                battle.challenger.hotkey, battle.challenger.revision, self.env,
-                task_ids, refresh_block=refresh_block,
+            chal_done = await self._samples.read_scores_for_tasks(
+                battle.challenger.hotkey, battle.challenger.revision,
+                self.env, task_ids, refresh_block=refresh_block,
             )
-            remaining = sampling_count - chal_have
-            if remaining > 0:
+            overlap_count = len(champ_done.keys() & chal_done.keys())
+            if overlap_count < sampling_count:
                 for idx, tid in enumerate(task_ids):
-                    if remaining <= 0:
-                        break
-                    key = (battle.challenger.hotkey, battle.challenger.revision, int(tid))
+                    tid_int = int(tid)
+                    if tid_int not in champ_done:
+                        continue              # champion hasn't sampled yet
+                    if tid_int in chal_done:
+                        continue              # challenger already done
+                    key = (battle.challenger.hotkey, battle.challenger.revision, tid_int)
                     if key in in_flight_keys:
-                        remaining -= 1
-                        continue
-                    if await self._samples.has_sample(
-                        battle.challenger.hotkey, battle.challenger.revision,
-                        self.env, tid, refresh_block=refresh_block,
-                    ):
                         continue
                     url = _pick_url(battle_urls, tid, idx)
                     dep_id = _resolve_deployment_id(
@@ -389,7 +410,6 @@ class ExecutorWorker:
                     candidates.append(
                         (key, battle.challenger, tid, url, dep_id)
                     )
-                    remaining -= 1
 
         if not candidates:
             return 0

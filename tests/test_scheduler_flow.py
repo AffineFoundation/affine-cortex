@@ -29,7 +29,9 @@ from affine.src.scorer.sampler import WindowSampler
 from affine.src.scorer.weight_writer import WeightWriter
 from affine.src.scorer.window_state import (
     InMemoryConfigStore,
+    MinerSnapshot,
     StateStore,
+    TaskIdState,
 )
 
 
@@ -537,12 +539,12 @@ async def test_post_promotion_crash_recovery_does_not_self_demote():
     }
     # Pre-populate task_state + samples so the flow reaches _decide.
     kv.data["current_task_ids"] = {
-        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "task_ids": {"ENV_A": [1, 2, 3, 4, 5], "ENV_B": [6, 7, 8, 9, 10]},
         "refreshed_at_block": 0,
     }
     deployer = _DeployTracker()
     samples = _SamplesFake()
-    for env, tids in [("ENV_A", [1, 2, 3, 4]), ("ENV_B", [5, 6, 7, 8])]:
+    for env, tids in [("ENV_A", [1, 2, 3, 4, 5]), ("ENV_B", [6, 7, 8, 9, 10])]:
         samples.set_samples("winner_hk", "winner_rev", env, tids, score=0.5)
     weight_writer = _WeightWriterFake()
     scheduler, state, _ = _build_scheduler(
@@ -608,12 +610,12 @@ async def test_recovery_terminates_old_champion_and_writes_weights():
         },
     }
     kv.data["current_task_ids"] = {
-        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "task_ids": {"ENV_A": [1, 2, 3, 4, 5], "ENV_B": [6, 7, 8, 9, 10]},
         "refreshed_at_block": 0,
     }
     deployer = _DeployTracker()
     samples = _SamplesFake()
-    for env, tids in [("ENV_A", [1, 2, 3, 4]), ("ENV_B", [5, 6, 7, 8])]:
+    for env, tids in [("ENV_A", [1, 2, 3, 4, 5]), ("ENV_B", [6, 7, 8, 9, 10])]:
         samples.set_samples("winner_hk", "winner_rev", env, tids, score=0.5)
     weight_writer = _WeightWriterFake()
     scheduler, state, _ = _build_scheduler(
@@ -673,11 +675,11 @@ async def test_recovery_without_previous_champion_still_safe():
         "started_at_block": 40,
     }
     kv.data["current_task_ids"] = {
-        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "task_ids": {"ENV_A": [1, 2, 3, 4, 5], "ENV_B": [6, 7, 8, 9, 10]},
         "refreshed_at_block": 0,
     }
     samples = _SamplesFake()
-    for env, tids in [("ENV_A", [1, 2, 3, 4]), ("ENV_B", [5, 6, 7, 8])]:
+    for env, tids in [("ENV_A", [1, 2, 3, 4, 5]), ("ENV_B", [6, 7, 8, 9, 10])]:
         samples.set_samples("winner_hk", "winner_rev", env, tids, score=0.5)
     weight_writer = _WeightWriterFake()
     scheduler, state, _ = _build_scheduler(
@@ -1081,3 +1083,59 @@ async def test_multi_instance_keeps_champion_deployment_on_loss():
     # independently until tearing down only the loser's.
     assert champ.deployment_id is not None
     assert champ.base_url is not None
+
+
+# ---- new champion-completion threshold (95% of pool) ----------------------
+
+
+@pytest.mark.asyncio
+async def test_samples_complete_uses_pool_completion_ratio_not_sampling_count():
+    """Champion completion now requires ~95% of the *pool* (eg 210/221
+    for sampling_count=200), not just ``≥ sampling_count``.
+
+    The old threshold made ``_battle_overlap_ready`` mathematically
+    unsatisfiable because challenger overlap with a champion missing
+    10% of pool averages ``sampling_count × 200/220 ≈ 182`` and never
+    reaches the base sampling_count. The new threshold tightens
+    champion's allowed misses to 5% so the math closes."""
+    from affine.src.scorer.sampling_thresholds import champion_completion_threshold
+
+    kv = _seed_state(sampling_count=200)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+    ])
+    threshold = champion_completion_threshold(200)
+
+    class _Counter:
+        def __init__(self, n):
+            self.n = n
+
+        async def count_samples_for_tasks(self, *a, **kw):
+            return self.n
+
+        async def read_scores_for_tasks(self, *a, **kw):
+            return {}  # unused on this code path
+
+    # 1) sample_count = old threshold (200) — under new rule, NOT enough.
+    samples = _Counter(200)
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=_DeployTracker(),
+        samples=samples,
+    )
+    await state.set_task_state(TaskIdState(
+        task_ids={"ENV_A": list(range(221)), "ENV_B": list(range(221))},
+        refreshed_at_block=0,
+    ))
+    miner = MinerSnapshot(uid=1, hotkey="champ_hk", revision="champ_rev",
+                          model="org/champ")
+    envs = await state.get_environments()
+    task_state = await state.get_task_state()
+    assert not await scheduler._samples_complete(miner, envs=envs, task_state=task_state), (
+        "200 samples (old threshold) must NOT be enough under new 95%-of-pool rule"
+    )
+
+    # 2) sample_count = new threshold — now enough.
+    scheduler._sample_count = _Counter(threshold).count_samples_for_tasks
+    assert await scheduler._samples_complete(miner, envs=envs, task_state=task_state), (
+        f"{threshold} samples must satisfy the new threshold"
+    )

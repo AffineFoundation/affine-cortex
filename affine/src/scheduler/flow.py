@@ -38,6 +38,10 @@ from affine.src.scorer.comparator import (
     WindowComparator,
 )
 from affine.src.scorer.sampler import EnvSamplingConfig, WindowSampler
+from affine.src.scorer.sampling_thresholds import (
+    SAMPLE_BUFFER_RATIO,
+    champion_completion_threshold,
+)
 from affine.src.scorer.weight_writer import WeightSubject, WeightWriter
 from affine.src.scorer.window_state import (
     BattleRecord,
@@ -60,23 +64,20 @@ import math
 WINDOW_BLOCKS = 7200
 """How often the per-env task_id pool is regenerated."""
 
-DEFAULT_MARGIN = 0.01
-"""Per-env score margin the challenger must clear to be ``dominant``."""
+DEFAULT_MARGIN = 0.03
+"""Per-env additive margin the challenger must clear to be ``dominant``."""
 
-DEFAULT_NOT_WORSE_TOLERANCE = 0.0
-"""Multiplicative regression tolerance — 0 means strict no-regression."""
+DEFAULT_NOT_WORSE_TOLERANCE = 0.02
+"""Multiplicative regression tolerance; challenger must keep >= champion * 0.98."""
 
-WIN_MIN_DOMINANT_ENVS = 0
-"""0 → strict Pareto (every env must dominate). >0 → partial Pareto."""
+WIN_MIN_DOMINANT_ENVS = 1
+"""Partial Pareto: at least one env must be dominant; the rest must not regress."""
 
 MIN_TASK_RATIO = 0.8
 """``min_tasks_per_env`` is derived as ``sampling_count * MIN_TASK_RATIO``."""
 
-SAMPLE_BUFFER_RATIO = 0.1
-"""Extra task_ids beyond the comparison threshold to absorb latency tail
-and per-task evaluation errors. With 10% buffer, a contest can decide
-as soon as the (champion ∩ challenger) overlap reaches the base
-``sampling_count`` — the slow-tail / errored ~10% don't block decide."""
+# ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
+# re-exported above so downstream importers (and tests) keep working.
 
 
 # ---- callable types --------------------------------------------------------
@@ -170,6 +171,18 @@ class FlowScheduler:
         # 4. Cold start.
         if champion is None:
             await self._cold_start(current_block)
+            return
+
+        # Crash-recovery must run before deployment/sample gates. If a
+        # previous tick promoted the challenger then crashed before
+        # ``clear_battle()``, the persisted state has the same UID in
+        # champion and battle.challenger. Waiting for fresh samples here
+        # can leave that stale battle stuck forever after threshold changes.
+        if battle is not None and champion.uid == battle.challenger.uid:
+            scoring_envs = await self.state.get_scoring_environments()
+            await self._decide(
+                champion, battle, scoring_envs, task_state, current_block,
+            )
             return
 
         # 5. Champion needs inference. During a single-instance battle the
@@ -360,11 +373,18 @@ class FlowScheduler:
         self, miner: MinerSnapshot, *,
         envs: Mapping[str, EnvConfig], task_state: TaskIdState,
     ) -> bool:
-        """True iff ``miner`` has ≥ ``sampling_count`` current-refresh
-        samples in every sampling-enabled env. The pool is oversampled to
-        ``ceil(sampling_count * 1.1)`` to absorb the slow-tail; we only
-        require the base count to be ready, so a single slow / errored
-        task at the end doesn't block decide."""
+        """True iff ``miner`` has ≥ ``champion_completion_threshold`` (95%
+        of the pool) current-refresh samples in every sampling-enabled
+        env. The pool is oversampled to ``ceil(sampling_count * 1.1)``;
+        the 5% gap between the threshold and the full pool is the
+        deliberately-abandoned long tail.
+
+        Lower thresholds (eg the original ``sampling_count``) made
+        ``_battle_overlap_ready`` mathematically unsatisfiable —
+        challenger overlap with a champion missing 10% of the pool
+        averages ``sampling_count × 200/220 ≈ 182`` and never hits the
+        base ``sampling_count``. See
+        ``affine/src/scorer/sampling_thresholds.py``."""
         for env, env_cfg in envs.items():
             tasks = task_state.task_ids.get(env, [])
             if not tasks:
@@ -373,7 +393,7 @@ class FlowScheduler:
                 miner.hotkey, miner.revision, env, tasks,
                 task_state.refreshed_at_block,
             )
-            if n < env_cfg.sampling_count:
+            if n < champion_completion_threshold(env_cfg.sampling_count):
                 return False
         return True
 
