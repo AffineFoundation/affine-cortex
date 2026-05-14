@@ -423,6 +423,24 @@ def test_adaptive_caps_do_not_hand_entire_budget_to_first_fast_env():
     assert caps["LIVEWEB"] < caps["SWE-INFINITE"]
 
 
+def test_adaptive_caps_use_idle_budget_for_saturated_slow_env_after_fair_share():
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    caps = _compute_adaptive_env_caps(
+        ["LIVEWEB", "SWE-INFINITE"],
+        {
+            "LIVEWEB": {"target": 800, "done": 100, "running": 150, "delta": 0},
+            "SWE-INFINITE": {"target": 300, "done": 100, "running": 150, "delta": 2},
+        },
+        {"LIVEWEB": 150, "SWE-INFINITE": 150},
+        global_budget=400,
+    )
+
+    assert caps["LIVEWEB"] > 150
+    assert caps["LIVEWEB"] <= 250
+    assert sum(caps.values()) <= 400
+
+
 def test_sampling_count_for_env_reads_current_config():
     from affine.src.executor.main import _sampling_count_for_env
 

@@ -359,6 +359,7 @@ def _compute_adaptive_env_caps(
         for env in envs
     }
     weights: Dict[str, float] = {}
+    opportunistic_weights: Dict[str, float] = {}
     ceilings: Dict[str, int] = {}
     for env in active:
         row = stats.get(env, {})
@@ -390,12 +391,15 @@ def _compute_adaptive_env_caps(
             if delta <= 0:
                 # Saturated but no recent completions means either a slow
                 # env or a stall. Grow up to fair share when it is still
-                # below fair, but decay inflated caps back to fair so one
-                # stuck env cannot keep hoarding launch capacity.
+                # below fair. Once it has reached fair, it can still receive
+                # idle capacity slowly, but never a one-tick blow-up.
                 if prev < remaining_cap:
                     caps[env] = max(floor, min(remaining_cap, prev + ramp))
                 else:
                     caps[env] = remaining_cap
+                    if remaining > caps[env]:
+                        ceilings[env] = min(remaining, prev + ramp)
+                        opportunistic_weights[env] = max(1.0, float(remaining))
                 continue
             # Saturated envs compete for the shared budget by pressure.
             # Keep only the probe floor before allocation so a nearly done
@@ -426,10 +430,18 @@ def _compute_adaptive_env_caps(
         return caps
 
     extra = global_budget - total
-    if extra <= 0 or not weights:
+    if extra <= 0 or (not weights and not opportunistic_weights):
         return caps
 
     _allocate_weighted_extra(caps, weights, ceilings, extra)
+    used_extra = sum(caps[env] for env in active) - total
+    if used_extra < extra:
+        _allocate_weighted_extra(
+            caps,
+            opportunistic_weights,
+            ceilings,
+            extra - used_extra,
+        )
     caps.update(
         _trim_caps(
             {env: caps[env] for env in active},
