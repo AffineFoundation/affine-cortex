@@ -472,16 +472,19 @@ _SPLIT_SNAPSHOT_SCAN_LIMIT = 500
 
 
 def _winner_uid_from_snapshot(snapshot: Dict[str, Any]) -> Optional[int]:
-    """Extract the integer winner uid from a snapshot, tolerating both the
-    explicit ``statistics.winner_uid`` field and the older shape where the
-    winner is implied by the ``"1.0"`` entry in ``final_weights``."""
+    """Extract the integer winner uid from a snapshot, tolerating three
+    historical shapes: the current ``statistics.winner_uid`` field, the
+    pre-Stage-U ``statistics.champion_uid`` field, and the implicit shape
+    where the winner is the ``"1.0"`` entry in ``final_weights`` /
+    ``miner_final_scores``."""
     stats = snapshot.get("statistics", {}) or {}
-    direct = stats.get("winner_uid")
-    if direct is not None:
-        try:
-            return int(direct)
-        except (TypeError, ValueError):
-            pass
+    for key in ("winner_uid", "champion_uid"):
+        direct = stats.get(key)
+        if direct is not None:
+            try:
+                return int(direct)
+            except (TypeError, ValueError):
+                continue
     raw_weights = (
         stats.get("final_weights")
         or stats.get("miner_final_scores")
@@ -498,13 +501,16 @@ def _winner_uid_from_snapshot(snapshot: Dict[str, Any]) -> Optional[int]:
 
 def _winner_hotkey_from_snapshot(snapshot: Dict[str, Any]) -> Optional[str]:
     """Return the SS58 hotkey of the snapshot's winner, or ``None`` when
-    the snapshot does not carry one. Hotkey-less legacy snapshots can't
-    be deduped or resolved to a current uid, so they're skipped instead
-    of silently paying out to whoever now sits on their stale uid."""
+    the snapshot does not carry one. Accepts both the current
+    ``winner_hotkey`` field and the legacy ``champion_hotkey`` field so
+    pre-Stage-U snapshots aren't silently skipped (which would shrink the
+    past-N-champions split to ``N=1`` until the new flow has written N
+    transitions of its own)."""
     stats = snapshot.get("statistics", {}) or {}
-    hk = stats.get("winner_hotkey")
-    if isinstance(hk, str) and hk:
-        return hk
+    for key in ("winner_hotkey", "champion_hotkey"):
+        hk = stats.get(key)
+        if isinstance(hk, str) and hk:
+            return hk
     return None
 
 
@@ -516,12 +522,22 @@ async def _resolve_current_uids_by_hotkey(
 ) -> List[int]:
     """Walk ``snapshots`` (newest-first), dedupe past champions by hotkey,
     look up each hotkey's *current* uid in the miners table, and keep the
-    first ``needed`` whose miner is still registered.
+    first ``needed`` whose miner is still registered AND currently valid.
 
-    Champions whose hotkey has deregistered are skipped — paying them out
-    on their old uid would in fact pay whoever now sits on that uid. We
-    continue further back in history to backfill, so a hotkey churn at the
-    top of the leaderboard doesn't shrink the split unnecessarily.
+    Two filters are applied at resolution time:
+
+    * **Deregistered hotkeys** are skipped. Paying them on their stale
+      snapshot uid would in fact pay whoever now sits on that uid.
+    * **Currently-invalid hotkeys** (``is_valid != "true"``: model
+      mismatch, anticopy, multi-commit, …) are skipped. They were valid
+      when they won the championship but have since been flagged; the
+      legacy single-champion path can't even surface this case (the
+      active champion is valid by construction), so the split path
+      shouldn't either.
+
+    Either filter outcome causes us to walk further back in history to
+    backfill the count, so churn at the top of the leaderboard doesn't
+    shrink the split unnecessarily.
     """
     out: List[int] = []
     seen_hotkeys: set = set()
@@ -535,6 +551,10 @@ async def _resolve_current_uids_by_hotkey(
         miner = await miners_dao.get_miner_by_hotkey(hotkey)
         if not miner:
             continue  # hotkey no longer registered → don't pay its successor
+        # ``is_valid`` is stored as the string ``"true"`` / ``"false"``
+        # to be a GSI partition key, so compare against the string form.
+        if str(miner.get("is_valid") or "").lower() != "true":
+            continue  # registered but currently flagged invalid → skip
         try:
             uid = int(miner.get("uid"))
         except (TypeError, ValueError):

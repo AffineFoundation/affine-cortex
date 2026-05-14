@@ -859,12 +859,28 @@ async def test_weights_endpoint_accepts_legacy_miner_final_scores():
 
 def _miners_by_hotkey(*rows):
     """Build a _FakeMinersDAO seeded so ``get_miner_by_hotkey`` resolves
-    each ``(hotkey, uid)`` pair (None uid models a deregistered hotkey)."""
+    each row tuple.
+
+    Tuple shapes accepted (all default to ``is_valid='true'`` unless
+    overridden):
+      * ``(hotkey, uid)`` — registered, valid.
+      * ``(hotkey, None)`` — deregistered.
+      * ``(hotkey, uid, is_valid_bool)`` — explicit validity flag.
+    """
     seeded = {}
-    for hotkey, uid in rows:
+    for row in rows:
+        if len(row) == 2:
+            hotkey, uid = row
+            is_valid = True
+        else:
+            hotkey, uid, is_valid = row
         if uid is None:
             continue
-        seeded[("hotkey", hotkey)] = {"hotkey": hotkey, "uid": uid}
+        seeded[("hotkey", hotkey)] = {
+            "hotkey": hotkey,
+            "uid": uid,
+            "is_valid": "true" if is_valid else "false",
+        }
     return _FakeMinersDAO(seeded)
 
 
@@ -1079,6 +1095,100 @@ async def test_weights_endpoint_respects_custom_champion_count():
         "weights": {
             "8": {"weight": share},
             "7": {"weight": share},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_skips_currently_invalid_hotkey_and_backfills():
+    # hk-g is still registered but its miner row carries is_valid=false
+    # (e.g. flagged by anticopy or model_mismatch after its championship).
+    # The split must NOT pay it — keep walking history to backfill from
+    # an older champion that is currently registered AND valid.
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+        {
+            "block_number": 400,
+            "statistics": {"winner_uid": 7, "winner_hotkey": "hk-g"},
+        },
+        {
+            "block_number": 300,
+            "statistics": {"winner_uid": 213, "winner_hotkey": "hk-x"},
+        },
+        {
+            "block_number": 200,
+            "statistics": {"winner_uid": 5, "winner_hotkey": "hk-e"},
+        },
+    ]
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(
+            ("hk-h", 8),
+            ("hk-g", 7, False),  # registered but currently invalid
+            ("hk-x", 42),
+            ("hk-e", 5),
+        ),
+        config_dao=_split_config(after_block=300, count=3),
+    )
+
+    share = pytest.approx(1.0 / 3)
+    assert response == {
+        "block_number": 500,
+        "weights": {
+            "8": {"weight": share},
+            "42": {"weight": share},
+            "5": {"weight": share},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_reads_legacy_champion_fields():
+    # Pre-Stage-U snapshots write ``champion_hotkey`` / ``champion_uid``
+    # instead of ``winner_*`` and use ``miner_final_scores`` instead of
+    # ``final_weights``. They must still count toward the N-champion
+    # split — otherwise the rolling window collapses to just the new
+    # scheduler's transitions and the split degenerates to N=1 until the
+    # new flow has written N transitions of its own.
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {
+                "winner_uid": 8, "winner_hotkey": "hk-h",
+                "final_weights": {"8": "1.0"},
+            },
+        },
+        {  # legacy row
+            "block_number": 400,
+            "statistics": {
+                "champion_uid": 7, "champion_hotkey": "hk-g",
+                "miner_final_scores": {"7": 1, "8": 0},
+            },
+        },
+        {  # legacy row (different champion)
+            "block_number": 300,
+            "statistics": {
+                "champion_uid": 213, "champion_hotkey": "hk-x",
+                "miner_final_scores": {"213": 1, "7": 0},
+            },
+        },
+    ]
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(("hk-h", 8), ("hk-g", 7), ("hk-x", 42)),
+        config_dao=_split_config(after_block=300, count=3),
+    )
+
+    share = pytest.approx(1.0 / 3)
+    assert response == {
+        "block_number": 500,
+        "weights": {
+            "8": {"weight": share},
+            "7": {"weight": share},
+            "42": {"weight": share},
         },
     }
 
