@@ -464,7 +464,7 @@ async def get_score_by_uid(
 # TTL out — a block number is immutable and validator-native.
 WEIGHTS_SPLIT_AFTER_BLOCK_PARAM = "weights_split_after_block"
 WEIGHTS_SPLIT_CHAMPION_COUNT_PARAM = "weights_split_champion_count"
-_DEFAULT_SPLIT_CHAMPION_COUNT = 3
+_DEFAULT_SPLIT_CHAMPION_COUNT = 5
 
 # Cap snapshot fan-out. One row per championship transition; TTL is now
 # 365 days, so 500 comfortably covers a year of swaps.
@@ -574,7 +574,7 @@ async def get_latest_weights(
     accepted).
 
     Post-activation we split weight evenly across the most recent
-    ``weights_split_champion_count`` (default 3) distinct champion
+    ``weights_split_champion_count`` (default 5) distinct champion
     hotkeys, resolved to their *current* on-chain uid via the miners
     table. Each carries ``1/N`` weight. A hotkey that has since
     deregistered is skipped (we don't accidentally pay the successor on
