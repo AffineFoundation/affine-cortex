@@ -8,7 +8,7 @@ from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.system_config import SystemConfigDAO
-from affine.src.scorer.dao_adapters import SampleResultsAdapter
+from affine.src.monitor.live_scores_monitor import LIVE_SCORES_KEY
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
@@ -60,48 +60,52 @@ async def _infer_champion_from_scores() -> Optional[ChampionRecord]:
 
 
 async def _sample_counts_and_averages(
-    champion: Optional[ChampionRecord],
-    battle: Optional[BattleRecord],
     task_state: Optional[TaskIdState],
 ) -> tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, float]]]:
-    """Per-(uid, env) live count + running average from sample_results.
+    """Per-(uid, env) live count + running average for every valid miner.
 
-    Reads the per-task scores for the current refresh_block, computes
-    both the count (used by ``af get-rank``'s sample-count column and
-    ``_live_sampling_uids``) and the running average (used by
-    ``af get-rank``'s per-env score cell so battle subjects show their
-    actual current score, not the stale snapshot's 0.00).
+    Reads the precomputed cache at ``system_config['live_scores']`` —
+    populated by :class:`affine.src.monitor.live_scores_monitor.LiveScoresMonitor`
+    on a fixed cadence (~30 min). Returning empty dicts is fine: the
+    rank UI then renders ``-`` instead of a stale snapshot value, which
+    is exactly what we want when the monitor hasn't produced a payload
+    yet (or has produced one for a different refresh_block).
+
+    The cache is keyed by ``refresh_block``. When the scheduler refreshes
+    the task pool between monitor cycles the cached entry is treated as
+    expired and dropped — readers must not see scores belonging to a
+    previous pool.
     """
     if task_state is None:
         return {}, {}
-    adapter = SampleResultsAdapter()
+    payload = await SystemConfigDAO().get_param_value(LIVE_SCORES_KEY, default=None)
+    if not isinstance(payload, dict):
+        return {}, {}
+    if int(payload.get("refresh_block") or 0) != int(task_state.refreshed_at_block):
+        return {}, {}
+    raw = payload.get("scores") or {}
+    if not isinstance(raw, dict):
+        return {}, {}
+
     counts: Dict[str, Dict[str, int]] = {}
     averages: Dict[str, Dict[str, float]] = {}
-
-    subjects = []
-    if champion is not None:
-        subjects.append((str(champion.uid), champion.hotkey, champion.revision))
-    if battle is not None:
-        challenger = battle.challenger
-        subjects.append((str(challenger.uid), challenger.hotkey, challenger.revision))
-
-    for uid, hotkey, revision in subjects:
+    for uid_key, env_map in raw.items():
+        if not isinstance(env_map, dict):
+            continue
+        uid = str(uid_key)
         env_counts: Dict[str, int] = {}
         env_avgs: Dict[str, float] = {}
-        for env, task_ids in task_state.task_ids.items():
-            scores = await adapter.read_scores_for_tasks(
-                hotkey,
-                revision,
-                env,
-                task_ids,
-                refresh_block=task_state.refreshed_at_block,
-            )
-            env_counts[env] = len(scores)
-            env_avgs[env] = (
-                sum(scores.values()) / len(scores) if scores else 0.0
-            )
-        counts[uid] = env_counts
-        averages[uid] = env_avgs
+        for env, entry in env_map.items():
+            if not isinstance(entry, dict):
+                continue
+            try:
+                env_counts[str(env)] = int(entry.get("count") or 0)
+                env_avgs[str(env)] = float(entry.get("avg") or 0.0)
+            except (TypeError, ValueError):
+                continue
+        if env_counts:
+            counts[uid] = env_counts
+            averages[uid] = env_avgs
     return counts, averages
 
 
@@ -143,9 +147,7 @@ async def get_current_state() -> Dict[str, Any]:
     battle = await store.get_battle()
     task_state = await store.get_task_state()
     envs = await store.get_environments()
-    sample_counts, sample_averages = await _sample_counts_and_averages(
-        champion, battle, task_state,
-    )
+    sample_counts, sample_averages = await _sample_counts_and_averages(task_state)
     return {
         "champion": _miner_summary(champion) if champion else None,
         "battle": {
