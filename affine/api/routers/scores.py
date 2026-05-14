@@ -388,11 +388,13 @@ async def get_latest_weights(
 ):
     """Return the latest snapshot's per-UID weights.
 
-    The queue-window scorer writes ``statistics.final_weights`` as
+    The queue-window scheduler writes ``statistics.final_weights`` as
     ``{uid_str: weight_str}`` — exactly one uid carries ``"1.0"`` (the
-    champion) and everyone else carries ``"0.0"``. We reshape into
-    ``{uid_str: {"weight": float}}`` so :class:`WeightSetter` can consume
-    it directly.
+    champion) and everyone else carries ``"0.0"``. Legacy scorer snapshots
+    used the equivalent ``statistics.miner_final_scores`` field. Accept
+    both persisted field names so validators can keep setting weights
+    between the old scorer's last snapshot and the scheduler's first
+    championship-transition snapshot.
     """
     snapshot = await snapshots_dao.get_latest_snapshot()
     if not snapshot:
@@ -402,7 +404,11 @@ async def get_latest_weights(
         )
 
     statistics = snapshot.get("statistics", {}) or {}
-    raw_weights = statistics.get("final_weights") or {}
+    raw_weights = (
+        statistics.get("final_weights")
+        or statistics.get("miner_final_scores")
+        or {}
+    )
     if not raw_weights:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

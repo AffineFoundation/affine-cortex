@@ -604,6 +604,29 @@ async def test_weights_endpoint_does_not_expose_snapshot_config():
 
 
 @pytest.mark.asyncio
+async def test_weights_endpoint_accepts_legacy_miner_final_scores():
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO({
+            "block_number": 123,
+            "statistics": {
+                "miner_final_scores": {
+                    "7": 1,
+                    "8": 0,
+                }
+            },
+        })
+    )
+
+    assert response == {
+        "block_number": 123,
+        "weights": {
+            "7": {"weight": 1.0},
+            "8": {"weight": 0.0},
+        },
+    }
+
+
+@pytest.mark.asyncio
 async def test_logs_router_maps_dao_rows_to_response_model():
     dao = _FakeExecutionLogsDAO([
         {
