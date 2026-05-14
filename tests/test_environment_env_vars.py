@@ -13,7 +13,11 @@ environment.
 
 from __future__ import annotations
 
+import json
+import time
+from types import SimpleNamespace
 from unittest.mock import patch
+
 import pytest
 
 
@@ -96,3 +100,45 @@ def test_liveweb_forwards_dashscope_api_key():
     assert env_vars["COINGECKO_API_KEY"] == "cg"
     assert env_vars["DASHSCOPE_API_KEY"] == "dashscope"
     assert env_vars["VALIDATOR_BASE_URL"] == "https://validator.example"
+
+
+def test_build_result_removes_all_base_url_fields():
+    from affine.core import environments as env_mod
+
+    with patch.object(env_mod.SDKEnvironment, "_load_environment", return_value=None):
+        sdk = env_mod.SDKEnvironment("terminal")
+
+    miner = SimpleNamespace(hotkey="hk", revision="rev")
+    result = sdk._build_result(
+        {
+            "score": 1.0,
+            "success": True,
+            "extra": {
+                "base_url": "http://10.0.0.1:8000/v1",
+                "baseUrl": "http://10.0.0.2:8000/v1",
+                "nested": {
+                    "base-url": "http://10.0.0.3:8000/v1",
+                    "ok": True,
+                },
+            },
+        },
+        miner,
+        {
+            "task_id": 123,
+            "model": "org/model",
+            "base_url": "http://10.0.0.4:8000/v1",
+        },
+        time.monotonic(),
+    )
+
+    payload = json.dumps(result.extra)
+    assert "base_url" not in result.extra
+    assert "baseUrl" not in result.extra
+    assert "base-url" not in result.extra["nested"]
+    assert "base_url" not in result.extra["request"]
+    assert "10.0.0.1" not in payload
+    assert "10.0.0.2" not in payload
+    assert "10.0.0.3" not in payload
+    assert "10.0.0.4" not in payload
+    assert result.extra["nested"]["ok"] is True
+    assert result.extra["request"]["model"] == "org/model"
