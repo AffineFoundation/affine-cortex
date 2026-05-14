@@ -44,7 +44,7 @@ You're out for good with that hotkey. The "multi-commit rule" prevents re-trying
 
 **Q7: What kind of tasks does the subnet evaluate?**
 
-The environments are configured in `system_config.environments` and currently include SWE-INFINITE, LIVEWEB, NAVWORLD, MEMORY, DISTILL, TERMINAL (LOGPROBS is disabled by default). Each environment evaluates several hundred tasks per window (e.g. SWE evaluates 300 of its latest task IDs; LIVEWEB samples 400 deterministically-random task IDs).
+The environments are configured in `system_config.environments` and currently include SWE-INFINITE, LIVEWEB, NAVWORLD, MEMORY, DISTILL, TERMINAL (LOGPROBS is disabled by default). Each environment evaluates a bounded task window.
 
 **Q8: How does the subnet handle model copying?**
 
