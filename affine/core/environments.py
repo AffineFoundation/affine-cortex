@@ -245,9 +245,9 @@ _ENV_CONFIGS_CANONICAL = {
         eval_params={
             "max_iterations": 50,
             "temperature": 0.0,
-            "timeout": 2700,
+            "timeout": 3600,
         },
-        proxy_timeout=2800,
+        proxy_timeout=3700,
     ),
     "print": EnvConfig(
         name="print",
