@@ -182,25 +182,44 @@ def _sort_scores(
     battle_uid: Optional[int],  # noqa: ARG001 — kept for signature stability
     queue_positions: Dict[int, int],  # noqa: ARG001 — kept for signature stability
 ) -> List[Dict[str, Any]]:
-    """Champion first, everyone else by commit time (``first_block`` ASC).
+    """Champion at top, then active miners, then inactive miners.
 
-    Earlier commits surface higher so the table reads as "challenger
-    history" (oldest at top, newest at bottom). Rows missing
-    ``first_block`` fall to the very bottom; uid is the tiebreaker so
-    the order is stable across calls.
+    Three buckets, each sorted by commit time (``first_block`` ASC):
+
+      - **champion** (single row): pinned to the top
+      - **active**: ``is_valid=true`` AND ``challenge_status != 'terminated'`` —
+        the queue / battling / valid rows the user actually cares about
+      - **inactive**: terminated, invalid (model check failure, no commit,
+        blacklist, etc) — kept for visibility but pushed below the
+        active set
+
+    Within each bucket: ``first_block`` ASC (earliest committer first),
+    then uid as a final tiebreaker. Rows missing ``first_block`` sink
+    to the end of their bucket so they don't displace real
+    chronological entries.
     """
     def key(row: Dict[str, Any]) -> tuple:
         uid = row.get("uid")
         is_champion = (uid == champion_uid) if champion_uid is not None else False
+        chal_status = str(row.get("challenge_status") or "")
+        is_terminated = (chal_status == "terminated")
+        is_invalid = (row.get("is_valid") is False)
         first_block = row.get("first_block")
         try:
             fb = int(first_block) if first_block is not None else None
         except (TypeError, ValueError):
             fb = None
+        has_fb = fb is not None and fb > 0
+
+        if is_champion:
+            bucket = 0
+        elif is_terminated or is_invalid:
+            bucket = 2
+        else:
+            bucket = 1
         return (
-            0 if is_champion else 1,
-            # Rows without a first_block sort after everyone with one.
-            (0, fb) if fb is not None else (1, 0),
+            bucket,
+            (0, fb) if has_fb else (1, 0),
             int(uid) if isinstance(uid, int) else 9999,
         )
 
