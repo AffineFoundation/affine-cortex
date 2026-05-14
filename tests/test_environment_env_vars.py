@@ -14,9 +14,10 @@ environment.
 from __future__ import annotations
 
 from unittest.mock import patch
+import pytest
 
 
-def _get_env_vars_with(env_lookup: dict):
+def _get_env_vars_with(env_lookup: dict, env_name: str = "affine:ded-v2"):
     """Run ``SDKEnvironment._get_env_vars`` for a known env, substituting
     ``os.getenv`` with a lookup against ``env_lookup``. Bypasses
     ``_load_environment`` (which spawns docker)."""
@@ -26,7 +27,7 @@ def _get_env_vars_with(env_lookup: dict):
         return env_lookup.get(name, default)
 
     with patch.object(env_mod.SDKEnvironment, "_load_environment", return_value=None):
-        sdk = env_mod.SDKEnvironment("affine:ded-v2")
+        sdk = env_mod.SDKEnvironment(env_name)
     with patch.object(env_mod.os, "getenv", side_effect=fake_getenv):
         return sdk._get_env_vars()
 
@@ -59,3 +60,28 @@ def test_no_api_key_set_no_aliases_emitted():
     assert "API_KEY" not in env_vars
     assert "CHUTES_API_KEY" not in env_vars
     assert "OPENAI_API_KEY" not in env_vars
+
+
+def test_liveweb_requires_dashscope_api_key():
+    with pytest.raises(ValueError, match="DASHSCOPE_API_KEY"):
+        _get_env_vars_with(
+            {
+                "API_KEY": "k123",
+                "COINGECKO_API_KEY": "cg",
+            },
+            env_name="liveweb",
+        )
+
+
+def test_liveweb_forwards_dashscope_api_key():
+    env_vars = _get_env_vars_with(
+        {
+            "API_KEY": "k123",
+            "COINGECKO_API_KEY": "cg",
+            "DASHSCOPE_API_KEY": "dashscope",
+        },
+        env_name="liveweb",
+    )
+
+    assert env_vars["COINGECKO_API_KEY"] == "cg"
+    assert env_vars["DASHSCOPE_API_KEY"] == "dashscope"
