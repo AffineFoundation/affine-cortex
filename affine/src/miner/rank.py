@@ -54,12 +54,6 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _number(value: Any) -> Optional[float]:
-    if isinstance(value, (int, float)):
-        return float(value)
-    return None
-
-
 def _format_relative_time(epoch_seconds: Optional[int]) -> str:
     if not epoch_seconds:
         return "unknown"
@@ -94,69 +88,35 @@ def _env_names(scores: List[Dict[str, Any]]) -> List[str]:
 
 
 def _env_cell(
-    payload: Any,
+    payload: Any,  # noqa: ARG001 — kept for signature stability with callers
     live_count: Optional[int] = None,
     live_avg: Optional[float] = None,
     *,
     champion_live_avg: Optional[float] = None,
 ) -> str:
-    if not isinstance(payload, dict):
-        if live_avg is not None and live_count is not None and live_count > 0:
-            return f"{live_avg * 100:.2f}/{live_count}"
-        return "-"
-    # Live running average from the current refresh_block trumps the
-    # snapshot score — a miner mid-battle has a real running score even
-    # if the last decided snapshot has them at 0.00. Threshold metadata
-    # still belongs in the cell when present, otherwise the live row
-    # hides the actual battle bounds.
-    has_live_avg = live_avg is not None and live_count is not None and live_count > 0
-    score_on_common = live_avg if has_live_avg else _number(payload.get("score_on_common"))
-    # Brackets must reflect the *current* champion when there's a live
-    # battle — the snapshot ones are from the last DECIDED contest and
-    # can be wildly stale (eg [19.83, 23.23] when the current champion's
-    # live SWE-INFINITE avg is ~54%). Compute live brackets from the
-    # current champion's live_avg whenever we have it; fall back to
-    # snapshot only when no live data exists.
-    if champion_live_avg is not None:
-        from affine.src.scorer.comparator import (
-            DEFAULT_MARGIN, DEFAULT_NOT_WORSE_TOLERANCE,
-        )
-        lower = champion_live_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
-        upper = champion_live_avg + DEFAULT_MARGIN
-    else:
-        lower = _number(payload.get("not_worse_threshold"))
-        upper = _number(payload.get("dethrone_threshold"))
-    common_tasks = live_count if has_live_avg else payload.get("common_tasks")
-    if (
-        score_on_common is not None
-        and lower is not None
-        and upper is not None
-        and isinstance(common_tasks, int)
-    ):
-        return (
-            f"{score_on_common * 100:.2f}"
-            f"[{lower * 100:.2f},{upper * 100:.2f}]"
-            f"/{common_tasks}"
-        )
+    """Render one env cell as ``{score%}[{lower%},{upper%}]/{n}``.
 
-    score = None
-    if has_live_avg:
-        score = live_avg
-    else:
-        for key in ("score", "mean", "average_score", "score_on_common"):
-            score = _number(payload.get(key))
-            if score is not None:
-                break
-    if score is None:
+    Data source is the live ``system_config['live_scores']`` cache only;
+    the ``payload`` parameter (a ``scores_by_env[env]`` snapshot dict
+    from the affine_scores table) is intentionally ignored — that
+    snapshot is only refreshed on champion change, so it can be days
+    stale for a miner that lost its last battle. Showing ``-`` is
+    correct when the live cache has no entry for this miner.
+    """
+    if live_avg is None or live_count is None or live_count <= 0:
         return "-"
-    samples = live_count
-    for key in ("sample_count", "historical_count", "common_tasks", "count"):
-        if samples is None and isinstance(payload.get(key), int):
-            samples = int(payload[key])
-            break
-    if samples is None:
-        return f"{score * 100:.2f}"
-    return f"{score * 100:.2f}/{samples}"
+    if champion_live_avg is None:
+        return f"{live_avg * 100:.2f}/{live_count}"
+    from affine.src.scorer.comparator import (
+        DEFAULT_MARGIN, DEFAULT_NOT_WORSE_TOLERANCE,
+    )
+    lower = champion_live_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
+    upper = champion_live_avg + DEFAULT_MARGIN
+    return (
+        f"{live_avg * 100:.2f}"
+        f"[{lower * 100:.2f},{upper * 100:.2f}]"
+        f"/{live_count}"
+    )
 
 
 def _status_for(
