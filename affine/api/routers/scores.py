@@ -31,31 +31,20 @@ router = APIRouter(prefix="/scores", tags=["Scores"])
 
 
 # Process-local cache for per-(hotkey, revision) score aggregates.
-# Every entry carries a ``max_age_s`` deadline:
-#
-#   - ``None`` (static): the underlying samples can no longer change
-#     (``terminated`` — one-shot challenge done; or ``sampling`` —
-#     queue-waiting and not yet picked, so no executor is writing
-#     rows for this revision yet). Cached indefinitely.
-#   - finite seconds (active): the miner is currently being sampled
-#     (``in_progress`` or ``champion``); refreshed when stale so
-#     scores trail the live battle by at most that many seconds.
-#
-# The lifecycle is single-direction
-# (``sampling → in_progress → champion | terminated``) so a static
-# entry can't silently turn active and serve stale data — once
-# status moves we re-evaluate the cache key with the new status's
-# TTL. Process-local; survives until the API process restarts. Size
+# Each entry stores ``(by_env, total, cached_at)``; the caller
+# decides freshness at lookup time via ``cache_ttl_s`` so a status
+# transition (e.g. sampling → in_progress) automatically invalidates
+# a stale entry instead of being trapped by the TTL stored at write
+# time. Process-local; survives until the API process restarts. Size
 # capped at ~256 keys × ~200B = under 0.5 MB total.
 _AVG_CACHE: Dict[
-    Tuple[str, str], Tuple[Dict[str, Dict[str, Any]], int, float, Optional[float]],
+    Tuple[str, str], Tuple[Dict[str, Dict[str, Any]], int, float],
 ] = {}
 
-# Active miners (champion / in_progress challenger) refresh at most
-# this often. 10 min keeps rank scores within one battle's natural
-# tempo while making API request cost effectively independent of
-# request rate (one query per miner per 10 min, regardless of caller
-# count).
+# Active and queue-waiting miners refresh at most this often. 10 min
+# keeps rank scores within one battle's natural tempo while making
+# API request cost effectively independent of request rate (one
+# query per miner per 10 min, regardless of caller count).
 _ACTIVE_CACHE_TTL_S = 600
 
 
@@ -68,12 +57,17 @@ def _reset_terminated_cache_for_test() -> None:
 def _ttl_for_status(challenge_status: Optional[str]) -> Optional[float]:
     """Cache TTL for a miner's per-(hotkey, revision) aggregate.
 
-    Returns ``None`` for ``terminated``/``sampling`` (data is frozen,
-    cache forever) and ``_ACTIVE_CACHE_TTL_S`` for active states
-    (``in_progress``, ``champion``) so callers see an aggregate that
-    trails the live battle by at most one TTL window.
+    ``terminated`` is the only status for which the underlying samples
+    are truly frozen — the miner can no longer be sampled (one-shot
+    challenge already used; re-commit creates a new revision = a
+    different cache key). Returns ``None`` (cache forever).
+
+    Every other status (``sampling``, ``in_progress``, ``champion``)
+    can transition into an actively-sampling state, so we use a
+    finite TTL — caching ``sampling`` permanently would trap an
+    empty result and shadow new samples once the miner gets picked.
     """
-    if challenge_status in ("terminated", "sampling"):
+    if challenge_status == "terminated":
         return None
     return _ACTIVE_CACHE_TTL_S
 
@@ -145,27 +139,27 @@ async def _avg_scores_for_miner(
     ``0.00`` placeholders.
 
     ``cache_ttl_s``:
-      - ``None`` and entry exists → permanent cache (terminated/
-        sampling miners; their rows can't change).
-      - finite → at most one DDB query per ``cache_ttl_s`` window
-        for this (hotkey, revision); enough to bound API cost to
-        ~1 query per active miner per TTL regardless of caller rate.
-      - 0 → bypass cache entirely (fresh-read every call).
+      - ``None`` → permanent cache hit if any entry exists (only
+        valid for terminated miners whose rows are frozen).
+      - finite → cache entry is reused if it's younger than this
+        many seconds; otherwise we re-query and overwrite. The
+        check uses the *caller's* TTL, not anything stored at
+        write time, so a status transition (sampling →
+        in_progress) naturally invalidates the previous cached
+        empty result on the next lookup past TTL.
     """
     if not hotkey or not revision or not envs:
         return {}, 0
     key = (hotkey, revision)
     now = _time.time()
-    if cache_ttl_s != 0:
-        entry = _AVG_CACHE.get(key)
-        if entry is not None:
-            by_env, total, cached_at, max_age = entry
-            if max_age is None or (now - cached_at) < max_age:
-                return by_env, total
+    entry = _AVG_CACHE.get(key)
+    if entry is not None:
+        by_env, total, cached_at = entry
+        if cache_ttl_s is None or (now - cached_at) < cache_ttl_s:
+            return by_env, total
     by_env = await samples_dao.get_avg_scores_for_envs(hotkey, revision, envs)
     total = sum(int(p.get("sample_count", 0)) for p in by_env.values())
-    if cache_ttl_s != 0:
-        _AVG_CACHE[key] = (by_env, total, now, cache_ttl_s)
+    _AVG_CACHE[key] = (by_env, total, now)
     return by_env, total
 
 

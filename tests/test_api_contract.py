@@ -592,6 +592,84 @@ async def test_terminated_miners_cache_avoids_repeat_dao_queries(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cache_does_not_trap_sampling_to_active_transition(monkeypatch):
+    """Regression: a queue-waiting (sampling) miner had no samples,
+    cache stored an empty aggregate. When the same miner gets picked
+    as a challenger (status flips to in_progress) the cache lookup
+    must NOT keep serving the stale empty result — the new TTL
+    (active = 10 min) overrides any earlier-stored permanent flag.
+    """
+    scores_router._reset_terminated_cache_for_test()
+    monkeypatch.setattr(scores_router, "_ACTIVE_CACHE_TTL_S", 0.1)
+
+    # Mutable status holder so we can flip mid-test.
+    state_box = {"status": "sampling"}
+
+    class _DynamicStatsDAO:
+        async def build_challenge_state_map(self, miners):
+            return {
+                ("X", "rev"): {
+                    "challenge_status": state_box["status"],
+                    "termination_reason": "",
+                },
+            }
+        async def get_challenge_state(self, hk, rev):
+            return {"challenge_status": state_box["status"], "termination_reason": ""}
+
+    miners = {("uid", 1): {
+        "uid": 1, "hotkey": "X", "revision": "rev", "model": "org/x",
+        "first_block": 1, "is_valid": "true",
+    }}
+    monkeypatch.setattr(scores_router, "MinersDAO", lambda: _FakeMinersDAO(miners))
+    monkeypatch.setattr(scores_router, "MinerStatsDAO", lambda: _DynamicStatsDAO())
+    monkeypatch.setattr(
+        scores_router, "SystemConfigDAO", lambda: _FakeSystemConfigDAO({
+            "environments": {
+                "SWE": {
+                    "enabled_for_sampling": True, "enabled_for_scoring": True,
+                    "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]]},
+                },
+            },
+        }),
+    )
+    samples_dao = _FakeSampleResultsDAO()  # initially: no samples
+    monkeypatch.setattr(scores_router, "SampleResultsDAO", lambda: samples_dao)
+
+    fake_scores_dao = _FakeScoresDAO({
+        "block_number": 100, "calculated_at": 200, "scores": [],
+    })
+
+    # Phase 1: sampling, no samples → cache empty
+    resp = await get_latest_scores(top=256, dao=fake_scores_dao)
+    assert resp.scores[0].scores_by_env == {}
+    initial_calls = len(samples_dao.calls)
+
+    # Phase 2: status flips to in_progress, samples start landing
+    state_box["status"] = "in_progress"
+    samples_dao._by_subject[("X", "rev")] = {"SWE": [0.7, 0.8]}
+
+    # Within TTL: still serves cached empty (acceptable, will refresh
+    # at next TTL boundary; better than the previous bug of serving
+    # stale empty FOREVER).
+    resp = await get_latest_scores(top=256, dao=fake_scores_dao)
+    assert resp.scores[0].scores_by_env == {}, (
+        "within TTL, cache hit is expected even after status flip"
+    )
+
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.15)
+
+    # After TTL: cache is invalidated by the new (caller-side) TTL,
+    # fresh query picks up the now-real samples.
+    resp = await get_latest_scores(top=256, dao=fake_scores_dao)
+    assert resp.scores[0].scores_by_env["SWE"]["score"] == pytest.approx(0.75)
+    assert len(samples_dao.calls) > initial_calls, (
+        "must re-query DDB after status flipped sampling→in_progress "
+        "and the active TTL elapsed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_active_miners_aggregate_refreshes_after_ttl(monkeypatch):
     """Active miners' (champion + in_progress) cache entry must fall
     out of the cache after the TTL so rank scores trail the live
