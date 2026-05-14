@@ -1051,6 +1051,211 @@ async def test_single_instance_clears_champion_on_challenger_loss():
 
 
 @pytest.mark.asyncio
+async def test_winning_challenger_must_top_up_samples_before_next_battle():
+    """WIN path: when the challenger wins, it only needed ``sampling_count``
+    overlap (the ``_battle_overlap_ready`` threshold) to be allowed to
+    battle. But the champion threshold is the higher 95%-of-pool. The
+    just-promoted champion must therefore complete supplementary
+    sampling — step 6 must block step 7 until the new champion reaches
+    the champion threshold."""
+    from affine.src.scheduler.flow import FlowConfig
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+        # uid=3 is queued so we can check whether step 7 fires prematurely.
+        _make_miner(3, "next_hk", 300, revision="next_rev"),
+    ])
+    samples = _SamplesFake()
+    deployer = _DeployTracker()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)  # refresh: pool of 5 per env
+    await scheduler.tick(current_block=51)  # deploy champion
+    task_state = await state.get_task_state()
+    rb = task_state.refreshed_at_block
+    # Champion is fully sampled — 5/5 per env. (pool = ceil(4*1.1) = 5,
+    # threshold = ceil(5*0.95) = 5.)
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("champ_hk", "champ_rev", env,
+                            task_state.task_ids[env], score=0.5, refresh_block=rb)
+    await scheduler.tick(current_block=52)  # start battle uid=2
+
+    # Challenger samples ONLY sampling_count tasks per env (4 out of 5):
+    # enough to satisfy _battle_overlap_ready but NOT samples_complete.
+    for env in ("ENV_A", "ENV_B"):
+        partial_tasks = task_state.task_ids[env][:4]
+        samples.set_samples("chal_hk", "chal_rev", env,
+                            partial_tasks, score=0.9, refresh_block=rb)
+    await scheduler.tick(current_block=53)  # decide — challenger wins
+
+    # Promotion happened.
+    new_champ = await state.get_champion()
+    assert new_champ.uid == 2, "challenger should be the new champion"
+    assert await state.get_battle() is None
+
+    n_deploys_before = len(deployer.deploys)
+    # Next tick: new champion has 4 samples per env, but threshold is 5.
+    # _samples_complete must return False → no new battle, no deploy.
+    await scheduler.tick(current_block=54)
+
+    assert await state.get_battle() is None, (
+        "step 6 must block step 7 until new champion reaches 95%-pool threshold"
+    )
+    assert len(deployer.deploys) == n_deploys_before, (
+        "no challenger should be dispatched while new champion is still ramping samples"
+    )
+
+    # Now add the 5th sample to push new champion to the threshold.
+    for env in ("ENV_A", "ENV_B"):
+        all_tasks = task_state.task_ids[env]
+        samples.set_samples("chal_hk", "chal_rev", env,
+                            all_tasks, score=0.9, refresh_block=rb)
+
+    # And now step 6 passes → step 7 dispatches uid=3.
+    await scheduler.tick(current_block=55)
+    battle = await state.get_battle()
+    assert battle is not None and battle.challenger.uid == 3, (
+        "once new champion samples are complete, next challenger should be dispatched"
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_instance_loss_skips_champion_redeploy_when_queue_nonempty():
+    """Single-instance fast-path: after a challenger loses, the champion's
+    samples are still valid (loss doesn't touch sample_results). If a next
+    challenger is queued, step 5 should skip the ~2-minute champion
+    redeploy and dispatch the next challenger directly — step 7 would
+    overwrite the deployment within seconds anyway."""
+    from affine.src.scheduler.flow import FlowConfig
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+        _make_miner(3, "next_hk", 300, revision="next_rev"),
+    ])
+    samples = _SamplesFake()
+    state = StateStore(kv)
+    queue = ChallengerQueue(miner_store)
+    sampler = WindowSampler()
+    comparator = WindowComparator()
+    weight_writer = _WeightWriterFake()
+    deployer = _DeployTracker()
+
+    async def list_valid_miners_fn():
+        return [r for r in miner_store.rows.values()
+                if str(r.get("is_valid", "")).lower() == "true"]
+
+    scheduler = FlowScheduler(
+        config=FlowConfig(window_blocks=WINDOW_BLOCKS, single_instance_provider=True),
+        state=state, queue=queue, sampler=sampler,
+        comparator=comparator, weight_writer=weight_writer,
+        deploy_fn=deployer.deploy, teardown_fn=deployer.teardown,
+        sample_count_fn=samples.count_samples_for_tasks,
+        scores_reader=samples.read_scores_for_tasks,
+        list_valid_miners_fn=list_valid_miners_fn,
+    )
+
+    # Drive through one full battle ending in a loss for uid=2.
+    await scheduler.tick(current_block=50)  # refresh
+    await scheduler.tick(current_block=51)  # deploy champion
+    task_state = await state.get_task_state()
+    rb = task_state.refreshed_at_block
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("champ_hk", "champ_rev", env,
+                            task_state.task_ids[env], score=0.9, refresh_block=rb)
+    await scheduler.tick(current_block=52)  # start battle uid=2
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("chal_hk", "chal_rev", env,
+                            task_state.task_ids[env], score=0.3, refresh_block=rb)
+    await scheduler.tick(current_block=53)  # decide — champion holds
+
+    champ = await state.get_champion()
+    assert champ.uid == 1
+    assert champ.deployment_id is None  # cleared at battle start, not restored
+    assert await state.get_battle() is None
+    n_deploys_before = len(deployer.deploys)
+
+    # Next tick: fast-path should pick uid=3 directly.
+    await scheduler.tick(current_block=54)
+
+    new_deploys = deployer.deploys[n_deploys_before:]
+    assert len(new_deploys) == 1, (
+        f"expected single deploy (challenger), got {[d.uid for d in new_deploys]}"
+    )
+    assert new_deploys[0].uid == 3, "fast-path must dispatch next challenger, not redeploy champion"
+
+    battle = await state.get_battle()
+    assert battle is not None and battle.challenger.uid == 3, "battle should be in flight with uid=3"
+
+    champ = await state.get_champion()
+    assert champ.uid == 1, "canonical champion unchanged"
+    assert champ.deployment_id is None, "no wasted champion redeploy"
+
+
+@pytest.mark.asyncio
+async def test_single_instance_loss_redeploys_champion_when_queue_empty():
+    """Single-instance fast-path corner: when the queue is empty after a
+    loss, fall through to redeploying the champion so b300 isn't idle."""
+    from affine.src.scheduler.flow import FlowConfig
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+        # No uid=3 — once uid=2 loses, queue is empty.
+    ])
+    samples = _SamplesFake()
+    state = StateStore(kv)
+    queue = ChallengerQueue(miner_store)
+    sampler = WindowSampler()
+    comparator = WindowComparator()
+    weight_writer = _WeightWriterFake()
+    deployer = _DeployTracker()
+
+    async def list_valid_miners_fn():
+        return [r for r in miner_store.rows.values()
+                if str(r.get("is_valid", "")).lower() == "true"]
+
+    scheduler = FlowScheduler(
+        config=FlowConfig(window_blocks=WINDOW_BLOCKS, single_instance_provider=True),
+        state=state, queue=queue, sampler=sampler,
+        comparator=comparator, weight_writer=weight_writer,
+        deploy_fn=deployer.deploy, teardown_fn=deployer.teardown,
+        sample_count_fn=samples.count_samples_for_tasks,
+        scores_reader=samples.read_scores_for_tasks,
+        list_valid_miners_fn=list_valid_miners_fn,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    rb = task_state.refreshed_at_block
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("champ_hk", "champ_rev", env,
+                            task_state.task_ids[env], score=0.9, refresh_block=rb)
+    await scheduler.tick(current_block=52)
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("chal_hk", "chal_rev", env,
+                            task_state.task_ids[env], score=0.3, refresh_block=rb)
+    await scheduler.tick(current_block=53)  # uid=2 loses, queue now empty
+
+    n_deploys_before = len(deployer.deploys)
+    await scheduler.tick(current_block=54)
+
+    # Fast-path tried _start_battle, found empty queue, fell through.
+    new_deploys = deployer.deploys[n_deploys_before:]
+    assert len(new_deploys) == 1, (
+        f"expected single deploy (champion fallback), got {[d.uid for d in new_deploys]}"
+    )
+    assert new_deploys[0].uid == 1, "fallback must redeploy champion when queue empty"
+
+    champ = await state.get_champion()
+    assert champ.deployment_id is not None, "champion redeployed so b300 has a live model"
+
+
+@pytest.mark.asyncio
 async def test_multi_instance_keeps_champion_deployment_on_loss():
     """Targon-style multi-instance (default): champion's deployment is
     independent of the challenger's. Don't touch it on a challenger loss."""
