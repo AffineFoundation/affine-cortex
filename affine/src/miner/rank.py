@@ -125,10 +125,17 @@ def _status_for(
     champion_uid: Optional[int],
     battle_uid: Optional[int],
     queue_positions: Dict[int, int],
+    co_champion_shares: Optional[Dict[int, float]] = None,
 ) -> str:
     uid = row.get("uid")
     if uid == champion_uid:
         return "CHAMPION"
+    # Past champion still drawing a share of the on-chain weight. We
+    # render this above the BATTLING / VALID / TERMINATED branches so
+    # an active reward recipient is never hidden behind a queue marker.
+    if co_champion_shares and uid in co_champion_shares:
+        pct = int(round(co_champion_shares[uid] * 100))
+        return f"CO {pct:>2d}%"
     # Terminated lifecycle state lives in miner_stats, not the current
     # miners snapshot.
     chal_status = str(row.get("challenge_status") or "")
@@ -156,6 +163,8 @@ def _colored_status(status: str, *, is_invalid: bool) -> str:
     text = f"{status:>11}"
     if status == "CHAMPION":
         return _ansi(text, "1;93")
+    if status.startswith("CO "):  # past champion still drawing a share
+        return _ansi(text, "1;93")
     if status == "BATTLING":
         return _ansi(text, "1;96")
     if status.startswith("QUEUE #"):
@@ -181,26 +190,34 @@ def _sort_scores(
     champion_uid: Optional[int],
     battle_uid: Optional[int],  # noqa: ARG001 — kept for signature stability
     queue_positions: Dict[int, int],  # noqa: ARG001 — kept for signature stability
+    co_champion_uids: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
-    """Champion at top, then active miners, then inactive miners.
+    """Champion at top, co-champions next, then active, then inactive.
 
-    Three buckets, each sorted by commit time (``first_block`` ASC):
+    Buckets (each sorted by commit time ``first_block`` ASC):
 
-      - **champion** (single row): pinned to the top
-      - **active**: ``is_valid=true`` AND ``challenge_status != 'terminated'`` —
-        the queue / battling / valid rows the user actually cares about
-      - **inactive**: terminated, invalid (model check failure, no commit,
-        blacklist, etc) — kept for visibility but pushed below the
-        active set
+      - **0 champion** (single row): the active title holder
+      - **1 co-champions**: past champions still drawing a share of the
+        on-chain weight via the reward-split feature — pinned high so
+        operators see at a glance who's being paid
+      - **2 active**: ``is_valid=true`` AND ``challenge_status != 'terminated'``
+      - **3 inactive**: terminated, invalid (model check failure, no
+        commit, blacklist, etc) — kept for visibility but pushed below
+        the active set
 
     Within each bucket: ``first_block`` ASC (earliest committer first),
     then uid as a final tiebreaker. Rows missing ``first_block`` sink
     to the end of their bucket so they don't displace real
     chronological entries.
     """
+    co_champion_uids = co_champion_uids or set()
+
     def key(row: Dict[str, Any]) -> tuple:
         uid = row.get("uid")
         is_champion = (uid == champion_uid) if champion_uid is not None else False
+        is_co_champion = (
+            (not is_champion) and uid in co_champion_uids
+        )
         chal_status = str(row.get("challenge_status") or "")
         is_terminated = (chal_status == "terminated")
         is_invalid = (row.get("is_valid") is False)
@@ -213,10 +230,12 @@ def _sort_scores(
 
         if is_champion:
             bucket = 0
-        elif is_terminated or is_invalid:
-            bucket = 2
-        else:
+        elif is_co_champion:
             bucket = 1
+        elif is_terminated or is_invalid:
+            bucket = 3
+        else:
+            bucket = 2
         return (
             bucket,
             (0, fb) if has_fb else (1, 0),
@@ -281,6 +300,23 @@ def _print_rank_table(
         for uid in ((window or {}).get("live_sampling_uids") or [])
         if isinstance(uid, int)
     }
+    # Past-N champions currently sharing the on-chain weight. Map uid →
+    # share (e.g. 0.20 for N=5) for fast lookup in row rendering and
+    # bucket sorting. The active champion is included in the API payload
+    # (it's one of the N) but we exclude it here so its row keeps the
+    # plain CHAMPION status / weight rather than the CO-share label.
+    co_champion_shares: Dict[int, float] = {}
+    for entry in (window or {}).get("past_champions") or []:
+        try:
+            uid = int(entry.get("uid"))
+            share = float(entry.get("share") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if champion_uid is not None and uid == champion_uid:
+            continue
+        if share <= 0:
+            continue
+        co_champion_shares[uid] = share
 
     header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
     header_parts.extend(f"{env[:24]:>24}" for env in envs)
@@ -308,6 +344,28 @@ def _print_rank_table(
         )
     else:
         print("Champion:   (none)")
+    # Reward-split: one summary line listing each past champion still
+    # drawing a share. We render even when the only payee is the active
+    # champion (so operators see the split is enabled) but format the
+    # split level so it's distinct from the plain Champion: line above.
+    past_champions = (window or {}).get("past_champions") or []
+    if past_champions:
+        total_share = sum(
+            _as_float(entry.get("share")) for entry in past_champions
+        )
+        share_pct = (
+            int(round((1.0 / len(past_champions)) * 100))
+            if past_champions else 0
+        )
+        parts = []
+        for entry in past_champions:
+            uid = entry.get("uid")
+            hk = _short(entry.get("hotkey"), 6)
+            parts.append(f"UID {uid} {hk}…")
+        print(
+            f"Reward:     {len(past_champions)}-way split ({share_pct}% each, "
+            f"total {total_share:.2f}) — {', '.join(parts)}"
+        )
     if battle:
         battle_hk = _short(battle.get("hotkey"), 8)
         started = ((window or {}).get("battle") or {}).get("started_at_block")
@@ -329,12 +387,14 @@ def _print_rank_table(
         champion_uid=champion_uid,
         battle_uid=battle_uid,
         queue_positions=queue_positions,
+        co_champion_uids=set(co_champion_shares.keys()),
     ):
         status = _status_for(
             row,
             champion_uid=champion_uid,
             battle_uid=battle_uid,
             queue_positions=queue_positions,
+            co_champion_shares=co_champion_shares,
         )
         row_parts = [
             f"{_short(row.get('miner_hotkey'), 8):8s}",
@@ -364,7 +424,31 @@ def _print_rank_table(
         )
         if show_reason:
             row_parts.append(f"{_reason_for(row, status):18s}")
-        row_parts.append(f"{_as_float(row.get('overall_score')):>7.4f}")
+        # ``overall_score`` is the snapshot's stale weight (1.0 for last
+        # write's single champion). Override with the live split share
+        # when this row is a current payee so the Weight column reflects
+        # what the validator actually sets on chain.
+        uid_int = row.get("uid")
+        weight_to_show = (
+            co_champion_shares[uid_int]
+            if isinstance(uid_int, int) and uid_int in co_champion_shares
+            else _as_float(row.get("overall_score"))
+        )
+        # Also override the active champion when a split is on (its
+        # share is 1/N, not 1.0). past_champions includes the active
+        # champion; look it up there.
+        if (
+            uid_int == champion_uid
+            and (window or {}).get("past_champions")
+        ):
+            for entry in (window or {}).get("past_champions") or []:
+                try:
+                    if int(entry.get("uid")) == champion_uid:
+                        weight_to_show = _as_float(entry.get("share"))
+                        break
+                except (TypeError, ValueError):
+                    continue
+        row_parts.append(f"{weight_to_show:>7.4f}")
         print(" | ".join(row_parts))
 
     print(_ansi("=" * width, "2"))

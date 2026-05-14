@@ -246,6 +246,95 @@ def test_rank_table_sorts_champion_active_inactive_buckets_by_commit_time():
     assert "lost_to_champion:" not in out
 
 
+def test_rank_table_renders_past_champions_split():
+    """When the reward-split feature is on, ``af get-rank`` should:
+
+    * print a ``Reward:`` summary line listing each past-N champion +
+      their share %.
+    * mark each *non-active* past champion with status ``CO {pct}%``.
+    * show the share (1/N) in the Weight column instead of the
+      snapshot's stale 0.0 for past-champion rows AND for the active
+      champion row (its on-chain weight is also 1/N now, not 1.0).
+    * pin co-champions in bucket 2 (right after the active champion),
+      above the rest of the valid set.
+    """
+    window = {
+        "champion": {"uid": 9, "hotkey": "hkChamp", "model": "org/champ"},
+        "past_champions": [
+            # Active champion is always one of the N — included so the
+            # frontend can display the full split in one place.
+            {"uid": 9, "hotkey": "hkChamp",
+             "model": "org/champ", "share": 0.5},
+            {"uid": 3, "hotkey": "hkPast",
+             "model": "org/past", "share": 0.5},
+        ],
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 9, "miner_hotkey": "hkChamp", "model": "org/champ",
+                "overall_score": 1.0, "is_valid": True,
+                "first_block": 500, "scores_by_env": {},
+            },
+            # Past champion. Its scores-table overall_score is 0.0
+            # (snapshot was winner-takes-all) — we expect the Weight
+            # column to surface the live 0.5 share instead.
+            {
+                "uid": 3, "miner_hotkey": "hkPast", "model": "org/past",
+                "overall_score": 0.0, "is_valid": True,
+                "first_block": 300, "scores_by_env": {},
+            },
+            # Plain valid miner — should sort below the co-champion.
+            {
+                "uid": 7, "miner_hotkey": "hkValid", "model": "org/v",
+                "overall_score": 0.0, "is_valid": True,
+                "first_block": 100, "scores_by_env": {},
+            },
+        ],
+    }
+
+    out = _render_rank(window, None, scores)
+
+    # Summary header line.
+    assert "Reward:" in out
+    assert "2-way split (50% each" in out
+
+    # The hotkeys also appear in the "Champion:" / "Reward:" header
+    # block above the table. Pick the *table* row for each hotkey by
+    # scanning lines and taking the first one that starts with the
+    # hotkey (header lines start with "Champion:" / "Reward:" /
+    # column-padding spaces, so the row line is the first match).
+    def _row(out_text: str, hotkey: str) -> str:
+        for line in out_text.splitlines():
+            if line.startswith(hotkey + " "):
+                return line
+        raise AssertionError(f"row for {hotkey!r} not found in:\n{out_text}")
+
+    champ_row = _row(out, "hkChamp")
+    past_row = _row(out, "hkPast")
+    valid_row = _row(out, "hkValid")
+
+    # Champion's Weight column shows 0.5 (= split share), not the stale
+    # snapshot's 1.0.
+    assert "CHAMPION" in champ_row
+    assert "0.5000" in champ_row
+    # Past champion's status reads "CO 50%" and Weight is 0.5 (not 0).
+    assert "CO 50%" in past_row
+    assert "0.5000" in past_row
+    # Plain valid row keeps its 0.0 overall_score.
+    assert "0.0000" in valid_row
+
+    # Sort order in the table: champion → co-champion → plain valid
+    # (even though plain valid has the earlier first_block).
+    lines = out.splitlines()
+    champ_line_no = next(i for i, l in enumerate(lines) if l.startswith("hkChamp "))
+    past_line_no = next(i for i, l in enumerate(lines) if l.startswith("hkPast "))
+    valid_line_no = next(i for i, l in enumerate(lines) if l.startswith("hkValid "))
+    assert champ_line_no < past_line_no < valid_line_no
+
+
 def test_rank_table_can_show_reason_column_when_requested():
     scores = {
         "block_number": 100,
