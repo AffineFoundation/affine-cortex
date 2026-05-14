@@ -21,6 +21,29 @@ _ENV_CACHE: Dict[str, Any] = {}
 _ENV_LOCK = Lock()
 
 
+def _is_base_url_key(key: Any) -> bool:
+    return "".join(ch for ch in str(key).lower() if ch.isalnum()) == "baseurl"
+
+
+def _remove_base_url_fields(value: Any) -> Any:
+    """Return ``value`` without any base_url fields.
+
+    The inference endpoint is wire-only routing metadata. It must not become
+    part of persisted sample extras or public/debug sample surfaces.
+    """
+    if isinstance(value, dict):
+        return {
+            key: _remove_base_url_fields(item)
+            for key, item in value.items()
+            if not _is_base_url_key(key)
+        }
+    if isinstance(value, list):
+        return [_remove_base_url_fields(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_remove_base_url_fields(item) for item in value)
+    return value
+
+
 # ========================= Utility Functions =========================
 
 def convert_memory_format(mem_limit: str, mode: str) -> str:
@@ -765,19 +788,9 @@ class SDKEnvironment:
     def _build_result(self, result: Dict[str, Any], miner: Optional["Miner"],
                      payload: Dict[str, Any], start_time: float) -> Result:
         """Build Result object from evaluation result."""
-        extra = result.get("extra", {}).copy()
+        extra = _remove_base_url_fields(result.get("extra", {}) or {})
         extra["image"] = self.docker_image
-        # Strip the wire ``base_url`` from the persisted ``extra.request``
-        # when the miner is served by a private provider (Targon today,
-        # B300 tomorrow) — those URLs carry tenant-specific paths and
-        # shouldn't be redistributable. Detect via the optional
-        # ``public_base_url`` slot the queue-window scorer sets on its
-        # ``_Miner`` shim; SDK callers without a miner object leave the
-        # full URL in the record (useful for local replay).
-        sanitized = payload.copy()
-        public_url = getattr(miner, "public_base_url", None) if miner else None
-        if public_url is not None:
-            sanitized.pop("base_url", None)
+        sanitized = _remove_base_url_fields(payload)
         extra["request"] = sanitized
         
         return Result(
