@@ -734,7 +734,7 @@ def list_endpoints():
 @click.option("--sglang-image", default="lmsysorg/sglang:latest")
 @click.option("--sglang-cache-dir", default="/data")
 @click.option("--sglang-context-len", type=int, default=65536)
-@click.option("--sglang-mem-fraction", type=float, default=0.8)
+@click.option("--sglang-mem-fraction", type=float, default=0.85)
 @click.option("--sglang-chunked-prefill", type=int, default=4096)
 @click.option("--sglang-tool-call-parser", default="qwen",
               help='Tool-call parser name; set to "none" to omit')

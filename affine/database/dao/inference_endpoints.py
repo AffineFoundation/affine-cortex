@@ -52,7 +52,7 @@ class Endpoint:
     sglang_image: str = "lmsysorg/sglang:latest"
     sglang_cache_dir: str = "/data"
     sglang_context_len: int = 65536
-    sglang_mem_fraction: float = 0.8
+    sglang_mem_fraction: float = 0.85
     sglang_chunked_prefill: int = 4096
     sglang_tool_call_parser: str = "qwen"
     ready_timeout_sec: int = 1800

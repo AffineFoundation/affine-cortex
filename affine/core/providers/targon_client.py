@@ -268,9 +268,6 @@ class TargonClient:
             {"name": "HF_HUB_CACHE", "value": mount},
             {"name": "MODEL_ID", "value": model_hf_repo},
             {"name": "MODEL_REVISION", "value": revision},
-            # Allow sglang to honor a context_length larger than the model's
-            # derived max_position_embeddings.
-            {"name": "SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN", "value": "1"},
         ]
         hf_token = os.getenv("HF_TOKEN", "")
         if hf_token:
@@ -284,15 +281,10 @@ class TargonClient:
         commands: Optional[List[str]] = (
             ["python", "-m", "sglang.launch_server"] if eng == "sglang" else None
         )
-        # Default 65536 for current Affine miners. sglang would reject
-        # context-length > model's max_position_embeddings without the
-        # SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 env var injected above.
-        # 40k was too tight for SWE-INFINITE agent traces.
-        max_model_len = os.getenv("TARGON_MAX_MODEL_LEN") or os.getenv("TARGON_VLLM_MAX_MODEL_LEN", "65536")
-        # Default 0.8 is conservative enough to avoid KV cache OOM across the
+        # Default 0.85 is conservative enough to avoid KV cache OOM across the
         # diverse miner models (Qwen / Llama / Mistral). Operator overrides
         # win via env.
-        mem_fraction = os.getenv("TARGON_MEM_FRACTION") or os.getenv("TARGON_VLLM_GPU_MEM_UTIL", "0.8")
+        mem_fraction = os.getenv("TARGON_MEM_FRACTION") or os.getenv("TARGON_VLLM_GPU_MEM_UTIL", "0.85")
         # sglang-specific perf knobs. chunked-prefill-size caps the per-step
         # prefill batch; tool-call-parser enables OpenAI tool_calls for Qwen-
         # family models (the predominant Affine miner architecture).
@@ -332,7 +324,6 @@ class TargonClient:
                 "--host", "0.0.0.0",
                 "--port", str(port),
                 "--trust-remote-code",
-                "--context-length", max_model_len,
                 "--mem-fraction-static", mem_fraction,
                 "--chunked-prefill-size", chunked_prefill_size,
             ]
@@ -354,7 +345,6 @@ class TargonClient:
                 "--host", "0.0.0.0",
                 "--port", str(port),
                 "--trust-remote-code",
-                "--max-model-len", max_model_len,
                 "--gpu-memory-utilization", mem_fraction,
             ]
             if tp > 1:

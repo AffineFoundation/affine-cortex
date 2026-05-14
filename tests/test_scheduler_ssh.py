@@ -152,8 +152,7 @@ def test_sglang_args_include_required_perf_flags():
         ("--download-dir", "/data"),
         ("--host", "0.0.0.0"),
         ("--port", "30000"),
-        ("--context-length", "65536"),
-        ("--mem-fraction-static", "0.8"),
+        ("--mem-fraction-static", "0.85"),
         ("--chunked-prefill-size", "4096"),
         ("--tool-call-parser", "qwen"),
         ("--dp", "8"),
@@ -266,7 +265,7 @@ def test_config_from_endpoint_overrides_module_defaults():
     args = _build_sglang_args(_target(), cfg)
     assert args[args.index("--port") + 1] == "31000"
     assert args[args.index("--download-dir") + 1] == "/srv/cache"
-    assert args[args.index("--context-length") + 1] == "32768"
+    assert "--context-length" not in args
     assert args[args.index("--mem-fraction-static") + 1] == "0.7"
     assert args[args.index("--chunked-prefill-size") + 1] == "2048"
     assert args[args.index("--dp") + 1] == "4"
