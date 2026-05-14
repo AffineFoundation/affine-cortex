@@ -20,7 +20,7 @@ from affine.src.scorer.window_state import (
 )
 
 
-async def _empty_counts(champion, battle, task_state):
+async def _empty_counts(task_state):
     return {}, {}
 
 
@@ -92,7 +92,7 @@ async def test_current_state_with_battle_in_flight(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(monkeypatch):
-    async def _counts(champion, battle, task_state):
+    async def _counts(task_state):
         return (
             {"1": {"ENV_A": 5}, "2": {"ENV_A": 2}},
             {"1": {"ENV_A": 0.42}, "2": {"ENV_A": 0.10}},
