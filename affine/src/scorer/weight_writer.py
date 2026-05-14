@@ -14,7 +14,7 @@ the new flow.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Protocol
+from typing import Any, Dict, List, Optional, Protocol
 
 
 @dataclass
@@ -82,9 +82,9 @@ class WeightWriter:
         window_id: int,
         block_number: int,
         scorer_hotkey: str,
-        envs: List[str],
         subjects: List[WeightSubject],
         outcome: Dict[str, Any],
+        rules: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Write one ``scores`` row per subject + one ``score_snapshots`` row.
 
@@ -92,9 +92,14 @@ class WeightWriter:
             window_id: Logical window identifier (recorded in snapshot config).
             block_number: Block at which the snapshot is taken.
             scorer_hotkey: Identity persisted into snapshot.
-            envs: Environments evaluated in this window.
             subjects: Miners to score. Exactly one must be ``is_champion``.
-            outcome: ``WindowComparator`` outcome payload (winner, reason, per_env).
+            outcome: ``WindowComparator`` outcome payload (winner, reason,
+                per_env). Persisted into ``snapshot.config.outcome`` for
+                audit; the public API filters it out of the response.
+            rules: Optional flat dict of rule constants. When provided,
+                merged into ``snapshot.config`` at the top level so
+                clients see eg. ``config.win_min_dominant_envs`` at the
+                pre-#449 path.
         """
         champions = [s for s in subjects if s.is_champion]
         if len(champions) != 1:
@@ -126,14 +131,19 @@ class WeightWriter:
                 str(s.uid): "1.0" if s.is_champion else "0.0" for s in subjects
             },
         }
+        config_payload: Dict[str, Any] = {
+            "window_id": window_id,
+            "outcome": outcome,
+        }
+        if rules:
+            # Rule constants live at the top of ``config`` (pre-#449
+            # layout) so eg ``config.win_min_dominant_envs`` is at the
+            # original path.
+            config_payload.update(rules)
         await self._snapshots.save_snapshot(
             block_number=block_number,
             scorer_hotkey=scorer_hotkey,
-            config={
-                "window_id": window_id,
-                "environments": list(envs),
-                "outcome": outcome,
-            },
+            config=config_payload,
             statistics=statistics,
         )
 

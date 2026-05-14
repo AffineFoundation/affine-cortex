@@ -45,17 +45,16 @@ class ScoreSnapshotsDAO(BaseDAO):
         Args:
             block_number: Block number for this snapshot
             scorer_hotkey: Hotkey of the scheduler service
-            config: Configuration used for this scoring
-                {
-                    "environments": [env1, env2, ...],
-                    "error_rate_reduction": float,
-                    "burn_percentage": float
-                }
+            config: Configuration used for this decision. Free-form
+                dict — the scheduler writes the flat rule constants
+                (eg ``win_margin``, ``win_not_worse_tolerance``,
+                ``win_min_dominant_envs``) plus ``window_id`` plus
+                an ``outcome`` block carrying the per-env detail.
             statistics: Statistics about this scoring run
                 {
                     "total_miners": int,
-                    "valid_miners": int,
-                    "invalid_miners": int,
+                    "winner_uid": int,
+                    "winner_hotkey": str,
                     "final_weights": {"uid": "weight", ...}
                 }
             ttl_days: Days until automatic deletion (default 365). The

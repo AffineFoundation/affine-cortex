@@ -73,9 +73,6 @@ DEFAULT_NOT_WORSE_TOLERANCE = 0.02
 WIN_MIN_DOMINANT_ENVS = 1
 """Partial Pareto: at least one env must be dominant; the rest must not regress."""
 
-MIN_TASK_RATIO = 0.8
-"""``min_tasks_per_env`` is derived as ``sampling_count * MIN_TASK_RATIO``."""
-
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
 
@@ -632,7 +629,11 @@ class FlowScheduler:
             env: EnvComparisonConfig(
                 env=env,
                 margin=DEFAULT_MARGIN,
-                min_tasks_per_env=max(1, int(cfg.sampling_count * MIN_TASK_RATIO)),
+                # Comparator's per-env sample-count gate. Aligned with
+                # ``_battle_overlap_ready`` (which requires overlap ≥
+                # ``sampling_count``) so the two gates can't disagree:
+                # SWE=200, MEMORY=100, etc. — full coverage required.
+                min_tasks_per_env=max(1, int(cfg.sampling_count)),
                 not_worse_tolerance=DEFAULT_NOT_WORSE_TOLERANCE,
             )
             for env, cfg in envs.items()
@@ -787,13 +788,9 @@ class FlowScheduler:
             window_id=block_number,  # snapshots are keyed by block, not window
             block_number=block_number,
             scorer_hotkey=self.cfg.scorer_hotkey,
-            envs=[],  # snapshot envs no longer used by validator
             subjects=subjects,
-            outcome={
-                "winner": "challenger",
-                "champion_uid": champion.uid,
-                "reason": getattr(result, "reason", ""),
-            },
+            outcome=_outcome_for_snapshot(result, champion),
+            rules=_rules_for_snapshot(),
         )
 
 
@@ -815,6 +812,90 @@ def _deployments_from_result(result: targon_lifecycle.DeployResult) -> List[Depl
                 base_url=result.base_url,
             )
         )
+    return out
+
+
+def _as_float_or_none(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _env_comparison_to_dict(e: Any) -> Dict[str, Any]:
+    """Serialize one ``EnvComparison`` row into a plain dict for the
+    snapshot. Captures every field the comparator considered for this
+    env so the snapshot is self-describing for audit."""
+    return {
+        "env": getattr(e, "env", ""),
+        "champion_avg": _as_float_or_none(getattr(e, "champion_avg", None)),
+        "challenger_avg": _as_float_or_none(getattr(e, "challenger_avg", None)),
+        "champion_n": int(getattr(e, "champion_n", 0) or 0),
+        "challenger_n": int(getattr(e, "challenger_n", 0) or 0),
+        "delta": _as_float_or_none(getattr(e, "delta", None)),
+        "margin": float(getattr(e, "margin", 0.0) or 0.0),
+        "not_worse_tolerance": float(getattr(e, "not_worse_tolerance", 0.0) or 0.0),
+        "verdict": getattr(e, "verdict", ""),
+        "reason": getattr(e, "reason", ""),
+    }
+
+
+def _rules_for_snapshot() -> Dict[str, Any]:
+    """Rule constants persisted flat at the top of ``snapshot.config``.
+
+    Pre-#449 the API returned ``ScorerConfig.to_dict()`` directly as
+    ``snapshot.config``, so clients read ``config.win_min_dominant_envs``
+    (etc.) at the top level. Keep them flat here so the response shape
+    stays at the original path; the field names match the pre-refactor
+    ones where the concept is preserved.
+
+    - ``win_margin``: pre-refactor ``win_margin_end`` (the old system
+      had a start/end ramp; the new system uses a single static value).
+    - ``win_not_worse_tolerance``: same name as pre-refactor.
+    - ``win_min_dominant_envs``: same name as pre-refactor.
+
+    The comparator's per-env sample-count gate is now strictly
+    ``sampling_count`` (no separate ratio), aligned with
+    ``_battle_overlap_ready`` so the two gates can't disagree."""
+    return {
+        "win_margin": DEFAULT_MARGIN,
+        "win_not_worse_tolerance": DEFAULT_NOT_WORSE_TOLERANCE,
+        "win_min_dominant_envs": WIN_MIN_DOMINANT_ENVS,
+    }
+
+
+def _outcome_for_snapshot(result: Any, champion: ChampionRecord) -> Dict[str, Any]:
+    """Build the ``outcome`` dict — the *decision detail* the snapshot
+    keeps alongside the (flat) rule constants.
+
+    Pre-refactor there was no equivalent on-snapshot record for
+    per-decision detail (winner / per-env verdicts / counts) — those
+    were either reconstructed from ``scores.scores_by_env`` rows or
+    inferred from logs. The new ``config.outcome.*`` paths are
+    additive and have no path conflict with the pre-#449 layout.
+
+    ``result`` may be ``None`` on the crash-recovery path, in which
+    case minimal identity fields are emitted (counts at 0, per_env
+    empty)."""
+    out: Dict[str, Any] = {
+        "winner": "challenger" if result is not None else "recovery",
+        "champion_uid": champion.uid,
+        "reason": getattr(result, "reason", "") if result is not None else "",
+    }
+    if result is None:
+        out["dominant_count"] = 0
+        out["not_worse_count"] = 0
+        out["worse_count"] = 0
+        out["per_env"] = []
+        return out
+    out["dominant_count"] = int(getattr(result, "dominant_count", 0) or 0)
+    out["not_worse_count"] = int(getattr(result, "not_worse_count", 0) or 0)
+    out["worse_count"] = int(getattr(result, "worse_count", 0) or 0)
+    out["per_env"] = [
+        _env_comparison_to_dict(e) for e in (getattr(result, "per_env", []) or [])
+    ]
     return out
 
 
