@@ -179,28 +179,29 @@ def _sort_scores(
     rows: List[Dict[str, Any]],
     *,
     champion_uid: Optional[int],
-    battle_uid: Optional[int],
-    queue_positions: Dict[int, int],
+    battle_uid: Optional[int],  # noqa: ARG001 — kept for signature stability
+    queue_positions: Dict[int, int],  # noqa: ARG001 — kept for signature stability
 ) -> List[Dict[str, Any]]:
+    """Champion first, everyone else by commit time (``first_block`` ASC).
+
+    Earlier commits surface higher so the table reads as "challenger
+    history" (oldest at top, newest at bottom). Rows missing
+    ``first_block`` fall to the very bottom; uid is the tiebreaker so
+    the order is stable across calls.
+    """
     def key(row: Dict[str, Any]) -> tuple:
         uid = row.get("uid")
-        chal_status = str(row.get("challenge_status") or "")
-        if uid == champion_uid:
-            bucket = 0
-        elif uid == battle_uid:
-            bucket = 1
-        elif uid in queue_positions:
-            bucket = 2
-        elif chal_status == "terminated":
-            bucket = 4
-        elif row.get("is_valid") is False:
-            bucket = 5
-        else:
-            bucket = 3
+        is_champion = (uid == champion_uid) if champion_uid is not None else False
+        first_block = row.get("first_block")
+        try:
+            fb = int(first_block) if first_block is not None else None
+        except (TypeError, ValueError):
+            fb = None
         return (
-            bucket,
-            queue_positions.get(uid, 9999),
-            int(uid if isinstance(uid, int) else 9999),
+            0 if is_champion else 1,
+            # Rows without a first_block sort after everyone with one.
+            (0, fb) if fb is not None else (1, 0),
+            int(uid) if isinstance(uid, int) else 9999,
         )
 
     return sorted(rows, key=key)
