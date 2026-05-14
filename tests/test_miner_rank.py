@@ -60,6 +60,7 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
         },
         "task_refresh_block": 40,
         "sample_counts": {"1": {"SWE": 300}, "2": {"SWE": 77}},
+        "sample_averages": {"1": {"SWE": 0.80}, "2": {"SWE": 0.70}},
         "live_sampling_uids": [1, 2],
     }
     queue = [
@@ -117,8 +118,14 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     assert "CHAMPION" in out
     assert "BATTLING" in out
     assert "QUEUE #1" in out
+    # Champion row: live count + live avg, no brackets (champion never
+    # shows thresholds against itself).
     assert "80.00/300" in out
-    assert "70.00[79.00,81.00]/9" in out
+    # Challenger row: brackets computed from champion's live_avg (0.80)
+    # via DEFAULT_NOT_WORSE_TOLERANCE=0.02 and DEFAULT_MARGIN=0.03 →
+    # [0.784, 0.830], score is challenger's live_avg, count is its
+    # live_count from sample_counts.
+    assert "70.00[78.40,83.00]/77" in out
     assert out.count("⚡| org/") == 2
     assert "  | org/q" in out
     assert "Sampling: ⚡ marks miners in the current live sampling set" in out
@@ -357,6 +364,7 @@ def test_rank_table_uses_live_count_only_for_non_threshold_cells():
         "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
         "battle": None,
         "sample_counts": {"1": {"SWE": 321}},
+        "sample_averages": {"1": {"SWE": 0.80}},
     }
     scores = {
         "block_number": 100,
@@ -384,19 +392,28 @@ def test_rank_table_uses_live_count_only_for_non_threshold_cells():
 
     out = _render_rank(window, [], scores)
 
-    assert "80.00[70.00,90.00]/10" in out
-    assert "80.00[70.00,90.00]/321" not in out
+    # Champion row: live_avg + live_count from window; no brackets
+    # (champion never shows thresholds against itself).
+    assert "80.00/321" in out
+    # Snapshot's own threshold metadata (not_worse_threshold,
+    # dethrone_threshold) is never used for bracket rendering — only
+    # the *champion's* live_avg drives brackets, and a champion row has
+    # no brackets at all.
+    assert "[70.00,90.00]" not in out
 
 
 def test_rank_table_keeps_thresholds_when_using_live_running_average():
+    # Champion live_avg drives the bracket math:
+    #   lower = champ * (1 - DEFAULT_NOT_WORSE_TOLERANCE=0.02) = 0.4851
+    #   upper = champ + DEFAULT_MARGIN=0.03                   = 0.5249
     window = {
         "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
         "battle": {
             "challenger": {"uid": 2, "hotkey": "chal", "model": "org/chal"},
             "started_at_block": 42,
         },
-        "sample_counts": {"2": {"SWE": 178}},
-        "sample_averages": {"2": {"SWE": 0.4816}},
+        "sample_counts": {"1": {"SWE": 213}, "2": {"SWE": 178}},
+        "sample_averages": {"1": {"SWE": 0.4950}, "2": {"SWE": 0.4816}},
     }
     scores = {
         "block_number": 100,
@@ -408,22 +425,14 @@ def test_rank_table_keeps_thresholds_when_using_live_running_average():
                 "model": "org/chal",
                 "overall_score": 0.0,
                 "is_valid": True,
-                "scores_by_env": {
-                    "SWE": {
-                        "score": 0.0,
-                        "score_on_common": 0.0,
-                        "common_tasks": 0,
-                        "not_worse_threshold": 0.4849,
-                        "dethrone_threshold": 0.5248,
-                    },
-                },
+                "scores_by_env": {"SWE": {}},
             },
         ],
     }
 
     out = _render_rank(window, [], scores)
 
-    assert "48.16[48.49,52.48]/178" in out
+    assert "48.16[48.51,52.50]/178" in out
 
 
 def test_rank_table_uses_color_on_tty(monkeypatch):
@@ -582,11 +591,14 @@ def test_rank_table_uses_live_brackets_from_current_champion_average():
     )
 
 
-def test_rank_table_falls_back_to_snapshot_brackets_when_no_live_champion_avg():
-    """Backward-compat: when the champion has no live_avg for this env
-    (eg between battles, or championship was just inferred from
-    weights), keep using the snapshot ``not_worse_threshold`` /
-    ``dethrone_threshold`` rather than dropping them silently."""
+def test_rank_table_omits_brackets_when_no_live_champion_avg():
+    """When the champion has no ``live_avg`` for this env (eg between
+    battles, championship was just inferred from weights, or the
+    live_scores cache hasn't been populated yet), the cell shows
+    just ``score/count`` with no brackets. The snapshot's
+    ``not_worse_threshold`` / ``dethrone_threshold`` fields are
+    intentionally NOT consumed — they go stale across champion
+    changes and would mislead readers."""
     window = {
         "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
         "battle": {
@@ -617,7 +629,9 @@ def test_rank_table_falls_back_to_snapshot_brackets_when_no_live_champion_avg():
     }
 
     out = _render_rank(window, [], scores)
-    assert "48.16[48.49,52.48]/178" in out
+    assert "48.16/178" in out
+    # Snapshot brackets are NOT fallback-rendered.
+    assert "[48.49,52.48]" not in out
 
 
 def test_rank_table_champion_row_never_displays_live_brackets():

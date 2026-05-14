@@ -217,6 +217,16 @@ class SampleResultsAdapter:
         Single Query on the (pk = MINER#hk#REV#rev#ENV#env) partition,
         then filter in Python to the requested task_id subset AND to the
         current refresh.
+
+        Uses ``ConsistentRead=True``: the scheduler reads this just
+        before deciding a contest. With the default eventually-consistent
+        read a fresh sample row visible to ``_battle_overlap_ready`` can
+        be invisible to the follow-up read inside ``_decide`` (different
+        replica), shrinking a per-env mean enough to flip the challenger
+        from ``not_worse`` to ``worse`` on an env where the true mean is
+        comfortably above threshold. Strongly consistent reads on the
+        main table close that race; the cost is 2x RCU which is fine at
+        this query rate.
         """
         if not task_ids:
             return {}
@@ -235,6 +245,7 @@ class SampleResultsAdapter:
                     ":sk": {"S": "TASK#"},
                 },
                 "ProjectionExpression": "task_id, score, refresh_block",
+                "ConsistentRead": True,
             }
             if exclusive_start:
                 params["ExclusiveStartKey"] = exclusive_start
