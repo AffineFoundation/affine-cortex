@@ -17,6 +17,7 @@ from affine.api.dependencies import (
     get_scores_dao,
     get_score_snapshots_dao,
     get_miners_dao,
+    get_system_config_dao,
     rate_limit_read,
 )
 from affine.database.dao.scores import ScoresDAO
@@ -452,28 +453,199 @@ async def get_score_by_uid(
         )
 
 
+# --- past-N-champions reward split ------------------------------------------
+#
+# Activation threshold lives in ``system_config`` under the key below so an
+# operator can flip it on / change it / turn it off with one DAO write
+# (``SystemConfigDAO.set_param``) — no env vars, no redeploy. Stores an
+# integer block_number; missing or ``0`` keeps the legacy winner-takes-all
+# behaviour. Anchored to ``block_number`` (snapshot PK) rather than to a
+# uid or a hotkey because uids recycle and hotkeys' snapshots eventually
+# TTL out — a block number is immutable and validator-native.
+WEIGHTS_SPLIT_AFTER_BLOCK_PARAM = "weights_split_after_block"
+WEIGHTS_SPLIT_CHAMPION_COUNT_PARAM = "weights_split_champion_count"
+_DEFAULT_SPLIT_CHAMPION_COUNT = 5
+
+# Cap snapshot fan-out. One row per championship transition; TTL is now
+# 365 days, so 500 comfortably covers a year of swaps.
+_SPLIT_SNAPSHOT_SCAN_LIMIT = 500
+
+
+def _winner_uid_from_snapshot(snapshot: Dict[str, Any]) -> Optional[int]:
+    """Extract the integer winner uid from a snapshot, tolerating three
+    historical shapes: the current ``statistics.winner_uid`` field, the
+    pre-Stage-U ``statistics.champion_uid`` field, and the implicit shape
+    where the winner is the ``"1.0"`` entry in ``final_weights`` /
+    ``miner_final_scores``."""
+    stats = snapshot.get("statistics", {}) or {}
+    for key in ("winner_uid", "champion_uid"):
+        direct = stats.get(key)
+        if direct is not None:
+            try:
+                return int(direct)
+            except (TypeError, ValueError):
+                continue
+    raw_weights = (
+        stats.get("final_weights")
+        or stats.get("miner_final_scores")
+        or {}
+    )
+    for uid_str, weight in raw_weights.items():
+        try:
+            if float(weight) >= 1.0:
+                return int(uid_str)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _winner_hotkey_from_snapshot(snapshot: Dict[str, Any]) -> Optional[str]:
+    """Return the SS58 hotkey of the snapshot's winner, or ``None`` when
+    the snapshot does not carry one. Accepts both the current
+    ``winner_hotkey`` field and the legacy ``champion_hotkey`` field so
+    pre-Stage-U snapshots aren't silently skipped (which would shrink the
+    past-N-champions split to ``N=1`` until the new flow has written N
+    transitions of its own)."""
+    stats = snapshot.get("statistics", {}) or {}
+    for key in ("winner_hotkey", "champion_hotkey"):
+        hk = stats.get(key)
+        if isinstance(hk, str) and hk:
+            return hk
+    return None
+
+
+async def _resolve_current_uids_by_hotkey(
+    snapshots: List[Dict[str, Any]],
+    miners_dao: MinersDAO,
+    *,
+    needed: int,
+) -> List[int]:
+    """Walk ``snapshots`` (newest-first), dedupe past champions by hotkey,
+    look up each hotkey's *current* uid in the miners table, and keep the
+    first ``needed`` whose miner is still registered AND currently valid.
+
+    Two filters are applied at resolution time:
+
+    * **Deregistered hotkeys** are skipped. Paying them on their stale
+      snapshot uid would in fact pay whoever now sits on that uid.
+    * **Currently-invalid hotkeys** (``is_valid != "true"``: model
+      mismatch, anticopy, multi-commit, …) are skipped. They were valid
+      when they won the championship but have since been flagged; the
+      legacy single-champion path can't even surface this case (the
+      active champion is valid by construction), so the split path
+      shouldn't either.
+
+    Either filter outcome causes us to walk further back in history to
+    backfill the count, so churn at the top of the leaderboard doesn't
+    shrink the split unnecessarily.
+    """
+    out: List[int] = []
+    seen_hotkeys: set = set()
+    for snap in snapshots:
+        if len(out) >= needed:
+            break
+        hotkey = _winner_hotkey_from_snapshot(snap)
+        if hotkey is None or hotkey in seen_hotkeys:
+            continue
+        seen_hotkeys.add(hotkey)
+        miner = await miners_dao.get_miner_by_hotkey(hotkey)
+        if not miner:
+            continue  # hotkey no longer registered → don't pay its successor
+        # ``is_valid`` is stored as the string ``"true"`` / ``"false"``
+        # to be a GSI partition key, so compare against the string form.
+        if str(miner.get("is_valid") or "").lower() != "true":
+            continue  # registered but currently flagged invalid → skip
+        try:
+            uid = int(miner.get("uid"))
+        except (TypeError, ValueError):
+            continue
+        out.append(uid)
+    return out
+
+
+async def _get_int_param(
+    dao: SystemConfigDAO, name: str, default: int,
+) -> int:
+    """Read an integer system_config param, tolerating missing rows and
+    string-typed values (DDB items round-trip numbers as strings via the
+    document loader in some paths)."""
+    raw = await dao.get_param_value(name, default=default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 @router.get("/weights/latest", dependencies=[Depends(rate_limit_read)])
 async def get_latest_weights(
     snapshots_dao: ScoreSnapshotsDAO = Depends(get_score_snapshots_dao),
+    miners_dao: MinersDAO = Depends(get_miners_dao),
+    config_dao: SystemConfigDAO = Depends(get_system_config_dao),
 ):
-    """Return the latest snapshot's per-UID weights.
+    """Return per-UID weights derived from recent score snapshots.
 
-    The queue-window scheduler writes ``statistics.final_weights`` as
-    ``{uid_str: weight_str}`` — exactly one uid carries ``"1.0"`` (the
-    champion) and everyone else carries ``"0.0"``. Legacy scorer snapshots
-    used the equivalent ``statistics.miner_final_scores`` field. Accept
-    both persisted field names so validators can keep setting weights
-    between the old scorer's last snapshot and the scheduler's first
-    championship-transition snapshot.
+    Pre-activation (``system_config`` row
+    ``weights_split_after_block`` missing or ``0``, or the latest
+    snapshot's ``block_number`` is below that threshold) this passes
+    through the scheduler's winner-takes-all snapshot:
+    ``statistics.final_weights`` as ``{uid_str: weight_str}`` — exactly
+    one uid at ``"1.0"`` and everyone else at ``"0.0"`` (legacy snapshots
+    used the equivalent ``statistics.miner_final_scores`` field; both are
+    accepted).
+
+    Post-activation we split weight evenly across the most recent
+    ``weights_split_champion_count`` (default 5) distinct champion
+    hotkeys, resolved to their *current* on-chain uid via the miners
+    table. Each carries ``1/N`` weight. A hotkey that has since
+    deregistered is skipped (we don't accidentally pay the successor on
+    its recycled uid) and we keep walking history to backfill the count.
     """
-    snapshot = await snapshots_dao.get_latest_snapshot()
-    if not snapshot:
+    activation_block = await _get_int_param(
+        config_dao, WEIGHTS_SPLIT_AFTER_BLOCK_PARAM, default=0,
+    )
+    champion_count = max(
+        1,
+        await _get_int_param(
+            config_dao,
+            WEIGHTS_SPLIT_CHAMPION_COUNT_PARAM,
+            default=_DEFAULT_SPLIT_CHAMPION_COUNT,
+        ),
+    )
+
+    snapshots = await snapshots_dao.get_recent_snapshots(
+        limit=_SPLIT_SNAPSHOT_SCAN_LIMIT,
+    )
+    if not snapshots:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="No score snapshots found",
         )
 
-    statistics = snapshot.get("statistics", {}) or {}
+    latest = snapshots[0]
+    latest_block = latest.get("block_number")
+
+    activated = (
+        activation_block > 0
+        and isinstance(latest_block, int)
+        and latest_block >= activation_block
+    )
+
+    if activated:
+        champion_uids = await _resolve_current_uids_by_hotkey(
+            snapshots, miners_dao, needed=champion_count,
+        )
+        if not champion_uids:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No registered past-champion hotkeys in recent snapshots",
+            )
+        share = 1.0 / len(champion_uids)
+        return {
+            "block_number": latest_block,
+            "weights": {str(uid): {"weight": share} for uid in champion_uids},
+        }
+
+    statistics = latest.get("statistics", {}) or {}
     raw_weights = (
         statistics.get("final_weights")
         or statistics.get("miner_final_scores")
@@ -494,6 +666,6 @@ async def get_latest_weights(
         weights_response[str(uid_str)] = {"weight": w}
 
     return {
-        "block_number": snapshot.get("block_number"),
+        "block_number": latest_block,
         "weights": weights_response,
     }
