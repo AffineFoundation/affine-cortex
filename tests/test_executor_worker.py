@@ -292,6 +292,23 @@ def test_adaptive_caps_keep_probe_floor_for_backlogged_envs():
     assert sum(caps.values()) < 600
 
 
+def test_adaptive_caps_start_backlogged_envs_at_fair_share():
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    envs = ["LIVEWEB", "MEMORY", "NAVWORLD", "SWE-INFINITE"]
+    caps = _compute_adaptive_env_caps(
+        envs,
+        {
+            env: {"target": 1000, "done": 0, "running": 0, "delta": 0}
+            for env in envs
+        },
+        {},
+        global_budget=600,
+    )
+
+    assert caps == {env: 150 for env in envs}
+
+
 def test_adaptive_caps_shift_capacity_from_underused_to_saturated_backlog():
     from affine.src.executor.main import _compute_adaptive_env_caps
 
@@ -328,7 +345,7 @@ def test_adaptive_caps_prioritize_lagging_saturated_env():
     assert sum(caps.values()) <= 300
 
 
-def test_adaptive_caps_do_not_expand_zero_progress_saturated_env():
+def test_adaptive_caps_ramp_zero_progress_saturated_env_to_fair_share():
     from affine.src.executor.main import _compute_adaptive_env_caps
 
     caps = _compute_adaptive_env_caps(
@@ -341,8 +358,8 @@ def test_adaptive_caps_do_not_expand_zero_progress_saturated_env():
         global_budget=300,
     )
 
-    assert caps["LIVEWEB"] == 120
-    assert caps["TERMINAL"] > caps["LIVEWEB"]
+    assert caps["LIVEWEB"] == 150
+    assert caps["TERMINAL"] == 150
 
 
 def test_adaptive_caps_decay_inflated_zero_progress_saturated_env_to_fair_share():
@@ -377,6 +394,33 @@ def test_adaptive_caps_release_completed_env_capacity():
 
     assert 1 < caps["MEMORY"] < caps["TERMINAL"]
     assert caps["TERMINAL"] > 150
+
+
+def test_adaptive_caps_do_not_hand_entire_budget_to_first_fast_env():
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    caps = _compute_adaptive_env_caps(
+        ["LIVEWEB", "MEMORY", "NAVWORLD", "SWE-INFINITE", "TERMINAL"],
+        {
+            "LIVEWEB": {"target": 841, "done": 516, "running": 25, "delta": 0},
+            "MEMORY": {"target": 421, "done": 421, "running": 0, "delta": 0},
+            "NAVWORLD": {"target": 841, "done": 841, "running": 0, "delta": 0},
+            "SWE-INFINITE": {"target": 630, "done": 410, "running": 25, "delta": 1},
+            "TERMINAL": {"target": 630, "done": 625, "running": 5, "delta": 0},
+        },
+        {
+            "LIVEWEB": 25,
+            "MEMORY": 120,
+            "NAVWORLD": 120,
+            "SWE-INFINITE": 25,
+            "TERMINAL": 25,
+        },
+        global_budget=600,
+    )
+
+    assert caps["LIVEWEB"] > 25
+    assert caps["SWE-INFINITE"] <= 200
+    assert caps["LIVEWEB"] < caps["SWE-INFINITE"]
 
 
 def test_sampling_count_for_env_reads_current_config():

@@ -333,13 +333,12 @@ def _compute_adaptive_env_caps(
     """Adapt per-env in-flight caps from live progress.
 
     The objective is shortest wall-clock completion, not static fairness:
-    every backlogged env keeps a probe floor so it cannot starve, envs
-    that cannot consume their current cap release capacity, and the
-    remaining budget goes to saturated envs weighted by estimated time
-    to finish (remaining work divided by recent completions). If no env
-    is actually able to consume more slots, the function intentionally
-    returns less than ``global_budget`` instead of refilling the pool
-    with caps that would only create waiting coroutines.
+    every backlogged env gets enough launch capacity to make progress,
+    envs that cannot consume their current cap release capacity, and
+    saturated envs grow gradually instead of one fast-returning env
+    taking the whole global budget. Slow envs with no recent completions
+    still ramp while they are saturated so long-running environments
+    cannot starve behind short-window ``delta=0`` readings.
     """
     active = [
         env for env in envs
@@ -351,6 +350,7 @@ def _compute_adaptive_env_caps(
         return {env: initial for env in envs}
     fair = _initial_env_cap(active, global_budget)
     floor = max(1, fair // 8)
+    ramp = max(floor, fair // 4)
     # Envs with no current work keep their previous cap so a new battle
     # can ramp immediately between status ticks. They do not enter the
     # active budget math below because they are not consuming slots.
@@ -359,6 +359,7 @@ def _compute_adaptive_env_caps(
         for env in envs
     }
     weights: Dict[str, float] = {}
+    ceilings: Dict[str, int] = {}
     for env in active:
         row = stats.get(env, {})
         target = int(row.get("target", 0) or 0)
@@ -376,18 +377,32 @@ def _compute_adaptive_env_caps(
             continue
 
         saturated = running >= max(floor, int(prev * 0.75))
+        remaining_cap = max(floor, min(remaining, fair))
+        growth_cap = max(remaining_cap, min(remaining, prev + ramp))
+        if running <= 0:
+            # Cold start / restart: give every backlogged env its fair
+            # launch share immediately. A probe-only start is exactly what
+            # starves long-latency envs after executor restarts.
+            caps[env] = remaining_cap
+            continue
+
         if saturated:
             if delta <= 0:
-                # Saturated but no recent completions: preserve a bounded
-                # fair-share launch cap so long-running calls can finish,
-                # but do not keep a previously inflated cap forever.
-                caps[env] = max(floor, min(prev, fair))
+                # Saturated but no recent completions means either a slow
+                # env or a stall. Grow up to fair share when it is still
+                # below fair, but decay inflated caps back to fair so one
+                # stuck env cannot keep hoarding launch capacity.
+                if prev < remaining_cap:
+                    caps[env] = max(floor, min(remaining_cap, prev + ramp))
+                else:
+                    caps[env] = remaining_cap
                 continue
             # Saturated envs compete for the shared budget by pressure.
             # Keep only the probe floor before allocation so a nearly done
             # env can release future launch capacity to a lagging peer even
             # while its existing calls are still draining.
             caps[env] = floor
+            ceilings[env] = growth_cap
             # Remaining / delta approximates intervals-to-finish. With no
             # completions yet, the branch above keeps the env at its current
             # share instead of amplifying a possible stall.
@@ -397,7 +412,7 @@ def _compute_adaptive_env_caps(
             # enough slots to prove it can make progress after cold starts,
             # container stalls, or transient DB gaps. Underused envs stay at
             # this local-demand cap and do not receive extra budget.
-            caps[env] = max(floor, min(prev, running + floor))
+            caps[env] = max(floor, min(remaining, running + ramp))
 
     total = sum(caps[env] for env in active)
     if total > global_budget:
@@ -414,23 +429,7 @@ def _compute_adaptive_env_caps(
     if extra <= 0 or not weights:
         return caps
 
-    total_weight = sum(weights.values())
-    allocations: Dict[str, int] = {}
-    fractions: List[tuple[float, str]] = []
-    used = 0
-    for env, weight in weights.items():
-        raw = extra * (weight / total_weight)
-        whole = int(raw)
-        allocations[env] = whole
-        fractions.append((raw - whole, env))
-        used += whole
-    for _, env in sorted(fractions, reverse=True):
-        if used >= extra:
-            break
-        allocations[env] += 1
-        used += 1
-    for env, add in allocations.items():
-        caps[env] += add
+    _allocate_weighted_extra(caps, weights, ceilings, extra)
     caps.update(
         _trim_caps(
             {env: caps[env] for env in active},
@@ -439,6 +438,32 @@ def _compute_adaptive_env_caps(
         )
     )
     return caps
+
+
+def _allocate_weighted_extra(
+    caps: Dict[str, int],
+    weights: Dict[str, float],
+    ceilings: Dict[str, int],
+    extra: int,
+) -> None:
+    """Distribute spare cap without allowing a one-tick blow-up.
+
+    The loop is intentionally simple: ``global_budget`` is small (hundreds),
+    and one-slot-at-a-time allocation respects per-env ceilings exactly.
+    """
+    if extra <= 0 or not weights:
+        return
+    allocated = {env: 0 for env in weights}
+    for _ in range(extra):
+        candidates = [
+            env for env in weights
+            if caps.get(env, 0) < ceilings.get(env, caps.get(env, 0))
+        ]
+        if not candidates:
+            return
+        env = max(candidates, key=lambda e: weights[e] / (allocated[e] + 1))
+        caps[env] += 1
+        allocated[env] += 1
 
 
 def _sampling_count_for_env(envs_raw: Any, env: str, default: int) -> int:
