@@ -137,7 +137,9 @@ def test_rank_table_renders_empty_scores_safely():
     assert "No scores found" in out
 
 
-def test_rank_table_groups_invalid_miners_below_valid_rows():
+def test_rank_table_invalid_reason_is_rendered_but_truncated():
+    """Invalid-miner ``invalid_reason`` shows up in the status column,
+    truncated to fit the column width (no leak of the full message)."""
     scores = {
         "block_number": 100,
         "calculated_at": 0,
@@ -149,6 +151,7 @@ def test_rank_table_groups_invalid_miners_below_valid_rows():
                 "overall_score": 0.0,
                 "is_valid": False,
                 "invalid_reason": "model_mismatch:detail",
+                "first_block": 100,
                 "scores_by_env": {},
             },
             {
@@ -157,6 +160,7 @@ def test_rank_table_groups_invalid_miners_below_valid_rows():
                 "model": "org/good",
                 "overall_score": 0.0,
                 "is_valid": True,
+                "first_block": 200,
                 "scores_by_env": {},
             },
         ],
@@ -164,62 +168,81 @@ def test_rank_table_groups_invalid_miners_below_valid_rows():
 
     out = _render_rank(None, None, scores)
 
-    assert out.index("good") < out.index("bad")
     assert "model_misma" in out
     assert "model_mismatch:de" not in out
 
 
-def test_rank_table_sorts_miners_by_status_then_uid_not_score():
+def test_rank_table_sorts_champion_active_inactive_buckets_by_commit_time():
+    """Three buckets in order, each sorted by ``first_block`` ASC:
+
+      1. champion (pinned)
+      2. active rows (``is_valid=true`` and not terminated)
+      3. inactive rows (terminated or ``is_valid=false`` — model check
+         failure, no commit, blacklist, etc.)
+
+    Within a bucket, earlier commits win. Rows missing ``first_block``
+    sink to the bottom of their own bucket.
+    """
+    window = {
+        "champion": {"uid": 9, "hotkey": "hkChamp", "model": "org/champ"},
+    }
     scores = {
         "block_number": 100,
         "calculated_at": 0,
         "scores": [
             {
-                "uid": 9,
-                "miner_hotkey": "uid9",
-                "model": "org/uid9",
-                "overall_score": 0.99,
-                "is_valid": True,
-                "scores_by_env": {},
+                "uid": 9, "miner_hotkey": "hkChamp", "model": "org/champ",
+                "overall_score": 1.0, "is_valid": True,
+                "first_block": 500, "scores_by_env": {},
+            },
+            # Active (valid, not terminated). first_block 50 / 250 / none.
+            {
+                "uid": 3, "miner_hotkey": "hkEarly", "model": "org/early",
+                "overall_score": 0.0, "is_valid": True,
+                "first_block": 50, "scores_by_env": {},
             },
             {
-                "uid": 3,
-                "miner_hotkey": "uid3",
-                "model": "org/uid3",
-                "overall_score": 0.01,
-                "is_valid": True,
-                "scores_by_env": {},
+                "uid": 6, "miner_hotkey": "hkLate", "model": "org/late",
+                "overall_score": 0.0, "is_valid": True,
+                "first_block": 250, "scores_by_env": {},
             },
             {
-                "uid": 4,
-                "miner_hotkey": "terminated",
-                "model": "org/terminated",
-                "overall_score": 1.0,
-                "is_valid": False,
+                "uid": 7, "miner_hotkey": "hkNoFb", "model": "org/nofb",
+                "overall_score": 0.0, "is_valid": True,
+                "scores_by_env": {},
+            },
+            # Inactive: terminated and invalid. first_block 75 / 80.
+            {
+                "uid": 4, "miner_hotkey": "hkTerm", "model": "org/term",
+                "overall_score": 0.0, "is_valid": False,
                 "invalid_reason": "hf_model_fetch_failed",
                 "challenge_status": "terminated",
                 "termination_reason": "lost_to_champion:abc",
-                "scores_by_env": {},
+                "first_block": 75, "scores_by_env": {},
             },
             {
-                "uid": 2,
-                "miner_hotkey": "invalid",
-                "model": "org/invalid",
-                "overall_score": 1.0,
-                "is_valid": False,
-                "invalid_reason": "model_check:bad",
-                "scores_by_env": {},
+                "uid": 2, "miner_hotkey": "hkInval", "model": "org/inval",
+                "overall_score": 0.0, "is_valid": False,
+                "invalid_reason": "no_commit",
+                "first_block": 80, "scores_by_env": {},
             },
         ],
     }
 
-    out = _render_rank(None, None, scores)
+    out = _render_rank(window, None, scores)
 
-    assert out.index("uid3") < out.index("uid9")
-    assert out.index("uid9") < out.index("invalid")
-    assert out.index("uid9") < out.index("terminated")
-    assert out.index("terminated") < out.index("invalid")
+    # Bucket 1: champion (uid 9) first.
+    assert out.index("hkChamp") < out.index("hkEarly")
+    # Bucket 2: active rows by first_block ASC, no-first_block row at
+    # the bottom of the active group.
+    assert out.index("hkEarly") < out.index("hkLate")
+    assert out.index("hkLate") < out.index("hkNoFb")
+    # Bucket 3: every inactive row comes after every active row.
+    assert out.index("hkNoFb") < out.index("hkTerm")
+    assert out.index("hkTerm") < out.index("hkInval")
+    # Terminated / invalid status still renders in the status column.
     assert "TERMINATED" in out
+    # Truncated termination reason should NOT leak into other columns.
     assert "lost_to_champion:" not in out
 
 

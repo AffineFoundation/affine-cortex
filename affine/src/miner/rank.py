@@ -179,28 +179,48 @@ def _sort_scores(
     rows: List[Dict[str, Any]],
     *,
     champion_uid: Optional[int],
-    battle_uid: Optional[int],
-    queue_positions: Dict[int, int],
+    battle_uid: Optional[int],  # noqa: ARG001 — kept for signature stability
+    queue_positions: Dict[int, int],  # noqa: ARG001 — kept for signature stability
 ) -> List[Dict[str, Any]]:
+    """Champion at top, then active miners, then inactive miners.
+
+    Three buckets, each sorted by commit time (``first_block`` ASC):
+
+      - **champion** (single row): pinned to the top
+      - **active**: ``is_valid=true`` AND ``challenge_status != 'terminated'`` —
+        the queue / battling / valid rows the user actually cares about
+      - **inactive**: terminated, invalid (model check failure, no commit,
+        blacklist, etc) — kept for visibility but pushed below the
+        active set
+
+    Within each bucket: ``first_block`` ASC (earliest committer first),
+    then uid as a final tiebreaker. Rows missing ``first_block`` sink
+    to the end of their bucket so they don't displace real
+    chronological entries.
+    """
     def key(row: Dict[str, Any]) -> tuple:
         uid = row.get("uid")
+        is_champion = (uid == champion_uid) if champion_uid is not None else False
         chal_status = str(row.get("challenge_status") or "")
-        if uid == champion_uid:
+        is_terminated = (chal_status == "terminated")
+        is_invalid = (row.get("is_valid") is False)
+        first_block = row.get("first_block")
+        try:
+            fb = int(first_block) if first_block is not None else None
+        except (TypeError, ValueError):
+            fb = None
+        has_fb = fb is not None and fb > 0
+
+        if is_champion:
             bucket = 0
-        elif uid == battle_uid:
-            bucket = 1
-        elif uid in queue_positions:
+        elif is_terminated or is_invalid:
             bucket = 2
-        elif chal_status == "terminated":
-            bucket = 4
-        elif row.get("is_valid") is False:
-            bucket = 5
         else:
-            bucket = 3
+            bucket = 1
         return (
             bucket,
-            queue_positions.get(uid, 9999),
-            int(uid if isinstance(uid, int) else 9999),
+            (0, fb) if has_fb else (1, 0),
+            int(uid) if isinstance(uid, int) else 9999,
         )
 
     return sorted(rows, key=key)
