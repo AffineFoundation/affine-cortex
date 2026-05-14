@@ -1051,6 +1051,90 @@ async def test_single_instance_clears_champion_on_challenger_loss():
 
 
 @pytest.mark.asyncio
+async def test_decided_battle_snapshot_outcome_persists_battle_rules():
+    """``score_snapshots`` is the audit record for each decided battle.
+    The data the writer receives must carry every parameter that
+    shaped the decision so the snapshot is self-describing:
+
+    - global rule constants (margin / tolerance, partial-Pareto
+      threshold) — passed via the ``rules`` kwarg, end up flat at the
+      top of ``snapshot.config``
+    - aggregate counts (dominant / not_worse / worse) — in ``outcome``
+    - per-env detail (averages, sample counts, delta, margin, tolerance,
+      verdict, reason) — in ``outcome.per_env``
+    """
+    from affine.src.scheduler.flow import (
+        DEFAULT_MARGIN, DEFAULT_NOT_WORSE_TOLERANCE,
+        WIN_MIN_DOMINANT_ENVS,
+    )
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    weight_writer = _WeightWriterFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples, weight_writer=weight_writer,
+    )
+
+    await scheduler.tick(current_block=50)  # refresh
+    await scheduler.tick(current_block=51)  # deploy champ
+    task_state = await state.get_task_state()
+    rb = task_state.refreshed_at_block
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("champ_hk", "champ_rev", env,
+                            task_state.task_ids[env], score=0.5, refresh_block=rb)
+    await scheduler.tick(current_block=52)
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("chal_hk", "chal_rev", env,
+                            task_state.task_ids[env], score=0.9, refresh_block=rb)
+    await scheduler.tick(current_block=53)  # decide — challenger wins
+
+    assert len(weight_writer.calls) == 1
+    call = weight_writer.calls[0]
+
+    # Rule constants are passed via the separate ``rules`` kwarg so the
+    # writer can merge them flat at the top of ``snapshot.config``
+    # (matching the pre-#449 path eg ``config.win_min_dominant_envs``).
+    assert call["rules"] == {
+        "win_margin": DEFAULT_MARGIN,
+        "win_not_worse_tolerance": DEFAULT_NOT_WORSE_TOLERANCE,
+        "win_min_dominant_envs": WIN_MIN_DOMINANT_ENVS,
+    }
+
+    outcome = call["outcome"]
+    # Outcome carries the new decision detail only (no rules nested here).
+    assert "rules" not in outcome
+    # Aggregate counts: 2 envs both dominant for challenger (0.9 vs 0.5, delta=+0.4 > margin)
+    assert outcome["dominant_count"] == 2
+    assert outcome["not_worse_count"] == 2
+    assert outcome["worse_count"] == 0
+    assert outcome["winner"] == "challenger"
+    assert outcome["champion_uid"] == 2  # new champion is the just-promoted challenger
+
+    # Per-env detail must include ALL parameters that fed the decision
+    per_env = outcome["per_env"]
+    assert len(per_env) == 2
+    for env_row in per_env:
+        for required_field in (
+            "env", "champion_avg", "challenger_avg",
+            "champion_n", "challenger_n", "delta",
+            "margin", "not_worse_tolerance", "verdict", "reason",
+        ):
+            assert required_field in env_row, f"per_env row missing {required_field!r}: {env_row}"
+        # Verify values are floats/ints (not None / dataclass leaks)
+        assert env_row["margin"] == DEFAULT_MARGIN
+        assert env_row["not_worse_tolerance"] == DEFAULT_NOT_WORSE_TOLERANCE
+        assert env_row["verdict"] == "dominant"
+        assert env_row["reason"] == "challenger_better"
+        assert abs(env_row["champion_avg"] - 0.5) < 1e-9
+        assert abs(env_row["challenger_avg"] - 0.9) < 1e-9
+        assert abs(env_row["delta"] - 0.4) < 1e-9
+
+
+@pytest.mark.asyncio
 async def test_winning_challenger_must_top_up_samples_before_next_battle():
     """WIN path: when the challenger wins, it only needed ``sampling_count``
     overlap (the ``_battle_overlap_ready`` threshold) to be allowed to

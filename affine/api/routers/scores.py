@@ -623,6 +623,24 @@ async def compute_split_payees(
     return payees
 
 
+def _config_response_from_snapshot(
+    snapshot: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Filter the snapshot's ``config`` block for the public response.
+
+    Keeps the flat rule constants (``win_margin``,
+    ``win_not_worse_tolerance``, ``win_min_dominant_envs``) plus
+    bookkeeping (``window_id``). Strips ``outcome`` — that block holds
+    the full ``ComparisonResult`` (per_env detail, verdicts, deltas)
+    which is persisted into the snapshot for internal audit but is not
+    part of the public surface (pre-#449 ``config`` shape).
+    """
+    return {
+        k: v for k, v in ((snapshot or {}).get("config") or {}).items()
+        if k != "outcome"
+    }
+
+
 async def _get_int_param(
     dao: SystemConfigDAO, name: str, default: int,
 ) -> int:
@@ -659,6 +677,15 @@ async def get_latest_weights(
     table. Each carries ``1/N`` weight. A hotkey that has since
     deregistered is skipped (we don't accidentally pay the successor on
     its recycled uid) and we keep walking history to backfill the count.
+
+    Both paths also include a ``config`` block derived from the latest
+    snapshot — flat rule constants (``win_margin``,
+    ``win_not_worse_tolerance``, ``win_min_dominant_envs``) plus
+    ``window_id`` (matching the pre-#449 path so legacy clients reading
+    ``config.win_min_dominant_envs`` etc. still work). The
+    decision-detail block (``outcome``: per-env verdicts / deltas) is
+    persisted into the snapshot for internal audit but stripped from
+    this response.
     """
     payees = await compute_split_payees(snapshots_dao, miners_dao, config_dao)
 
@@ -676,6 +703,7 @@ async def get_latest_weights(
         latest = await snapshots_dao.get_latest_snapshot()
         return {
             "block_number": (latest or {}).get("block_number"),
+            "config": _config_response_from_snapshot(latest),
             "weights": {
                 str(p["uid"]): {"weight": p["share"]} for p in payees
             },
@@ -710,5 +738,6 @@ async def get_latest_weights(
 
     return {
         "block_number": latest.get("block_number"),
+        "config": _config_response_from_snapshot(latest),
         "weights": weights_response,
     }

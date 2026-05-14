@@ -802,21 +802,33 @@ async def test_score_by_uid_for_miner_missing_from_snapshot(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_weights_endpoint_does_not_expose_snapshot_config():
+async def test_weights_endpoint_exposes_flat_rule_constants_and_filters_outcome():
+    """``/scores/weights/latest`` matches the pre-#449 response shape:
+    flat rule constants at the top of ``config`` so legacy clients
+    reading ``config.win_min_dominant_envs`` (etc.) still find them at
+    the original path.
+
+    ``outcome`` is persisted into the snapshot for audit (writer-side
+    test in test_weight_writer.py covers that) but is *filtered* from
+    the public API response — the API only carries rule constants +
+    bookkeeping."""
+    persisted_config = {
+        "win_margin": 0.03,
+        "win_not_worse_tolerance": 0.02,
+        "win_min_dominant_envs": 1,
+        "window_id": 8181357,
+        # Audit-only — must be stripped from the response.
+        "outcome": {
+            "winner": "challenger",
+            "per_env": [{"env": "TERMINAL", "verdict": "dominant"}],
+        },
+    }
     response = await get_latest_weights(
         snapshots_dao=_FakeScoreSnapshotsDAO({
             "block_number": 123,
-            "config": {
-                "window_id": 17,
-                "environments": ["SWE", "DISTILL"],
-                "current_task_ids": {"SWE": [1, 2, 3]},
-                "inference_endpoints": [{"name": "ssh-a"}],
-            },
+            "config": persisted_config,
             "statistics": {
-                "final_weights": {
-                    "7": "1.0",
-                    "8": "0.0",
-                }
+                "final_weights": {"7": "1.0", "8": "0.0"},
             },
         }),
         miners_dao=_FakeMinersDAO({}),
@@ -825,11 +837,18 @@ async def test_weights_endpoint_does_not_expose_snapshot_config():
 
     assert response == {
         "block_number": 123,
+        "config": {
+            "win_margin": 0.03,
+            "win_not_worse_tolerance": 0.02,
+            "win_min_dominant_envs": 1,
+            "window_id": 8181357,
+        },
         "weights": {
             "7": {"weight": 1.0},
             "8": {"weight": 0.0},
         },
     }
+    assert "outcome" not in response["config"]
 
 
 @pytest.mark.asyncio
@@ -850,6 +869,7 @@ async def test_weights_endpoint_accepts_legacy_miner_final_scores():
 
     assert response == {
         "block_number": 123,
+        "config": {},  # legacy snapshot has no config block
         "weights": {
             "7": {"weight": 1.0},
             "8": {"weight": 0.0},
@@ -932,6 +952,7 @@ async def test_weights_endpoint_splits_evenly_after_activation_block():
     # weight goes to uid 42 — not to the new occupant of uid 213.
     assert response == {
         "block_number": 500,
+        "config": {},
         "weights": {
             "8": {"weight": share},
             "7": {"weight": share},
@@ -962,6 +983,7 @@ async def test_weights_endpoint_legacy_payload_when_split_disabled():
 
     assert response == {
         "block_number": 500,
+        "config": {},
         "weights": {
             "8": {"weight": 1.0},
             "7": {"weight": 0.0},
@@ -990,6 +1012,7 @@ async def test_weights_endpoint_legacy_payload_before_activation_block():
 
     assert response == {
         "block_number": 500,
+        "config": {},
         "weights": {
             "8": {"weight": 1.0},
             "7": {"weight": 0.0},
@@ -1036,6 +1059,7 @@ async def test_weights_endpoint_skips_deregistered_hotkey_and_backfills():
     share = pytest.approx(1.0 / 3)
     assert response == {
         "block_number": 500,
+        "config": {},
         "weights": {
             "8": {"weight": share},
             "42": {"weight": share},
@@ -1062,6 +1086,7 @@ async def test_weights_endpoint_splits_what_history_has_when_fewer_than_three():
 
     assert response == {
         "block_number": 500,
+        "config": {},
         "weights": {"8": {"weight": 1.0}},
     }
 
@@ -1092,6 +1117,7 @@ async def test_weights_endpoint_respects_custom_champion_count():
     share = pytest.approx(1.0 / 2)
     assert response == {
         "block_number": 500,
+        "config": {},
         "weights": {
             "8": {"weight": share},
             "7": {"weight": share},
@@ -1137,6 +1163,7 @@ async def test_weights_endpoint_skips_currently_invalid_hotkey_and_backfills():
     share = pytest.approx(1.0 / 3)
     assert response == {
         "block_number": 500,
+        "config": {},
         "weights": {
             "8": {"weight": share},
             "42": {"weight": share},
@@ -1185,6 +1212,7 @@ async def test_weights_endpoint_reads_legacy_champion_fields():
     share = pytest.approx(1.0 / 3)
     assert response == {
         "block_number": 500,
+        "config": {},
         "weights": {
             "8": {"weight": share},
             "7": {"weight": share},

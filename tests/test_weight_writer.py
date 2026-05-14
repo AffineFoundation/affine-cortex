@@ -44,7 +44,6 @@ async def test_champion_gets_weight_1_others_0():
         window_id=10,
         block_number=72000,
         scorer_hotkey="5Scorer",
-        envs=["A", "B"],
         subjects=[
             _subject(1, "champ", is_champion=True),
             _subject(2, "chal", is_champion=False),
@@ -57,21 +56,19 @@ async def test_champion_gets_weight_1_others_0():
 
 
 @pytest.mark.asyncio
-async def test_snapshot_records_window_id_and_envs():
+async def test_snapshot_records_window_id_and_outcome():
     scores, snaps = _FakeScores(), _FakeSnapshots()
     w = WeightWriter(scores, snaps)
     await w.write(
         window_id=42,
         block_number=72000,
         scorer_hotkey="5Scorer",
-        envs=["X", "Y", "Z"],
         subjects=[_subject(1, "champ", is_champion=True)],
         outcome={"winner": "challenger", "reason": "all_envs_better"},
     )
     assert len(snaps.rows) == 1
     cfg = snaps.rows[0]["config"]
     assert cfg["window_id"] == 42
-    assert sorted(cfg["environments"]) == ["X", "Y", "Z"]
     assert cfg["outcome"]["reason"] == "all_envs_better"
     assert snaps.rows[0]["statistics"]["winner_uid"] == 1
     assert snaps.rows[0]["statistics"]["final_weights"] == {"1": "1.0"}
@@ -85,7 +82,6 @@ async def test_average_score_from_env_payload_dicts():
         window_id=1,
         block_number=1,
         scorer_hotkey="s",
-        envs=["A", "B"],
         subjects=[
             _subject(
                 1, "champ", is_champion=True,
@@ -107,7 +103,6 @@ async def test_zero_subjects_or_no_champion_raises():
             window_id=1,
             block_number=1,
             scorer_hotkey="s",
-            envs=[],
             subjects=[_subject(1, "loser", is_champion=False)],
             outcome={"winner": "champion"},
         )
@@ -122,7 +117,6 @@ async def test_two_champions_raises():
             window_id=1,
             block_number=1,
             scorer_hotkey="s",
-            envs=[],
             subjects=[
                 _subject(1, "c1", is_champion=True),
                 _subject(2, "c2", is_champion=True),
@@ -139,7 +133,6 @@ async def test_payload_carries_revision_model_first_block():
         window_id=1,
         block_number=1,
         scorer_hotkey="s",
-        envs=[],
         subjects=[_subject(7, "h7", is_champion=True)],
         outcome={"winner": "champion"},
     )
