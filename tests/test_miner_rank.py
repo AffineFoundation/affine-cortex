@@ -60,6 +60,7 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
         },
         "task_refresh_block": 40,
         "sample_counts": {"1": {"SWE": 300}, "2": {"SWE": 77}},
+        "live_sampling_uids": [1, 2],
     }
     queue = [
         {"position": 1, "uid": 3, "hotkey": "queued", "revision": "rq", "model": "org/q"},
@@ -348,7 +349,7 @@ def test_rank_table_infers_active_champion_from_weight_when_window_is_empty():
 
     assert "Champion:   UID 7" in out
     assert "CHAMPION" in out
-    assert "⚡| org/champ" in out
+    assert "⚡| org/champ" not in out
 
 
 def test_rank_table_uses_live_count_only_for_non_threshold_cells():
