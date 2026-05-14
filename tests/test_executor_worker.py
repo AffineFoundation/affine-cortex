@@ -609,6 +609,111 @@ def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
     assert manager.env_cap_values["ENV_A"].value == 600
 
 
+def test_status_label_includes_uid_for_each_role(caplog):
+    """STATUS label must carry the UID so operators don't read role as
+    identity. ``[champion U213]`` / ``[challenger U228]`` instead of
+    ambiguous ``[champion]`` / ``[challenger]``."""
+    import asyncio as _asyncio
+    import logging
+
+    manager = ExecutorManager(["ENV_A"])
+    ids = list(range(10))
+
+    class _SC:
+        async def get_param_value(self, name, default=None):
+            return {
+                "current_task_ids": {"task_ids": {"ENV_A": ids}, "refreshed_at_block": 1},
+                "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
+                "current_battle": {"challenger": {
+                    "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
+                }},
+                "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
+            }.get(name, default)
+
+    class _Samples:
+        async def count_samples_for_tasks(self, hotkey, revision, env, task_ids, *, refresh_block):
+            return 5
+
+    with caplog.at_level(logging.INFO, logger="affine"):
+        _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
+
+    assert any("[challenger U228]" in r.message for r in caplog.records), (
+        "active subject is the challenger in a live battle — STATUS label must say [challenger U228]"
+    )
+
+    # Now clear the battle: label flips to [champion U213].
+    caplog.clear()
+
+    class _SC2:
+        async def get_param_value(self, name, default=None):
+            return {
+                "current_task_ids": {"task_ids": {"ENV_A": ids}, "refreshed_at_block": 1},
+                "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
+                "current_battle": {},
+                "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
+            }.get(name, default)
+
+    with caplog.at_level(logging.INFO, logger="affine"):
+        _asyncio.run(manager._emit_status_line(_SC2(), _Samples()))
+
+    assert any("[champion U213]" in r.message for r in caplog.records), (
+        "no battle in flight — STATUS label must say [champion U213]"
+    )
+
+
+def test_status_delta_zeroes_on_subject_change(caplog):
+    """Between two STATUS prints the active subject can change (battle
+    decided → role flips). The per-env delta is otherwise computed as
+    ``current_subject_count - previous_subject_count`` — a meaningless
+    cross-miner subtraction. The first frame after a subject change
+    must report ``+0`` instead of that phantom delta."""
+    import asyncio as _asyncio
+    import logging
+
+    manager = ExecutorManager(["ENV_A"])
+    ids = list(range(10))
+
+    sample_counts = {("chal_hk", "chal_rev"): 7, ("champ_hk", "champ_rev"): 9}
+
+    def _make_sc(battle):
+        class _SC:
+            async def get_param_value(_self, name, default=None):
+                return {
+                    "current_task_ids": {"task_ids": {"ENV_A": ids},
+                                         "refreshed_at_block": 1},
+                    "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
+                    "current_battle": battle,
+                    "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
+                }.get(name, default)
+        return _SC()
+
+    class _Samples:
+        async def count_samples_for_tasks(self, hotkey, revision, env, task_ids, *, refresh_block):
+            return sample_counts.get((hotkey, revision), 0)
+
+    # First print: challenger active, done=7. Baseline (no delta shown).
+    _asyncio.run(manager._emit_status_line(
+        _make_sc({"challenger": {"uid": 228, "hotkey": "chal_hk", "revision": "chal_rev"}}),
+        _Samples(),
+    ))
+    assert manager._last_subject_key == ("challenger", "chal_hk", "chal_rev")
+    assert manager._last_done["ENV_A"] == 7
+
+    # Second print: battle cleared, champion is now the active subject.
+    # Done count flips to 9 (champion's count). Without the guard, delta
+    # would be 9-7=+2 (false). With the guard, delta=0.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="affine"):
+        _asyncio.run(manager._emit_status_line(_make_sc({}), _Samples()))
+
+    log_text = " ".join(r.message for r in caplog.records)
+    assert "[champion U213]" in log_text, "subject flipped to champion"
+    assert "+0 " in log_text or "+0\n" in log_text or log_text.endswith("+0"), (
+        f"delta on subject change must be 0, got: {log_text!r}"
+    )
+    assert "+2" not in log_text, "phantom cross-subject delta must be suppressed"
+
+
 def test_dispatch_proceeds_when_only_battle_has_url():
     """Regression: under SSH single-instance providers, ``_start_battle``
     clears the champion's deployment so the host can serve the

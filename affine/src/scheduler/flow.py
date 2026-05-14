@@ -188,7 +188,25 @@ class FlowScheduler:
         # 5. Champion needs inference. During a single-instance battle the
         # champion may intentionally have no live deployment because its
         # samples were completed before the challenger reused the machine.
+        #
+        # Single-instance loss-path fast-path: when the just-ended battle
+        # was a loss, the champion is unchanged so its samples are still
+        # complete (loss doesn't touch sample_results). Skip the ~2-minute
+        # champion redeploy and dispatch the next challenger directly —
+        # ``_start_battle`` would overwrite this deployment within seconds
+        # anyway. When the queue is empty we fall through to the redeploy
+        # so b300 isn't sitting empty.
         if battle is None and (not champion.deployment_id or not champion.base_url):
+            if self.cfg.single_instance_provider and await self._samples_complete(
+                MinerSnapshot(uid=champion.uid, hotkey=champion.hotkey,
+                              revision=champion.revision, model=champion.model),
+                envs=envs, task_state=task_state,
+            ):
+                await self._start_battle(champion, current_block)
+                if await self.state.get_battle() is not None:
+                    return
+                # Queue empty — fall through to redeploy champion so the
+                # endpoint isn't idle until a new challenger arrives.
             await self._deploy_champion(champion)
             return
 

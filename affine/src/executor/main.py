@@ -19,7 +19,7 @@ import asyncio
 import math
 import multiprocessing
 import signal
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import click
 
@@ -34,6 +34,15 @@ from affine.src.scorer.dao_adapters import SampleResultsAdapter
 
 HEALTH_CHECK_INTERVAL_SEC = 10
 STATUS_PRINT_INTERVAL_SEC = 60
+
+
+def _as_uid(raw: Any) -> Optional[int]:
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 class ExecutorManager:
@@ -68,6 +77,13 @@ class ExecutorManager:
         # compute "finished in last interval" + rate/h.
         self._last_status_at: float = 0.0
         self._last_done: Dict[str, int] = {env: 0 for env in envs}
+        # (kind, hotkey, revision) of the subject the previous status was
+        # reporting. When it changes between two ticks (challenger lost →
+        # role flips to champion, or new challenger picked), the per-env
+        # delta would otherwise be `current_subject_count - prior_subject_count`
+        # — a meaningless cross-miner subtraction — so we zero deltas for
+        # one frame.
+        self._last_subject_key: Optional[tuple] = None
         self.running = False
         logger.info(
             f"ExecutorManager init: envs={envs}, "
@@ -169,16 +185,30 @@ class ExecutorManager:
         envs_raw = await sc.get_param_value("environments", default={}) or {}
         task_ids_by_env: Dict[str, List[int]] = tids.get("task_ids", {}) or {}
         refresh_block = int(tids.get("refreshed_at_block", 0) or 0)
-        subjects: List[tuple[str, str, str]] = []
+        # subjects: (kind, uid, hotkey, revision). uid is carried so the
+        # STATUS label can disambiguate "[champion U213]" vs the new
+        # challenger UID — operators were misreading the role-only label
+        # as identity.
+        subjects: List[tuple[str, Optional[int], str, str]] = []
         if champion.get("hotkey") and champion.get("revision"):
-            subjects.append(("champion", str(champion["hotkey"]), str(champion["revision"])))
+            subjects.append((
+                "champion",
+                _as_uid(champion.get("uid")),
+                str(champion["hotkey"]),
+                str(champion["revision"]),
+            ))
         challenger = battle.get("challenger") if isinstance(battle, dict) else None
         if (
             isinstance(challenger, dict)
             and challenger.get("hotkey")
             and challenger.get("revision")
         ):
-            pair = ("challenger", str(challenger["hotkey"]), str(challenger["revision"]))
+            pair = (
+                "challenger",
+                _as_uid(challenger.get("uid")),
+                str(challenger["hotkey"]),
+                str(challenger["revision"]),
+            )
             if pair not in subjects:
                 subjects.append(pair)
 
@@ -198,12 +228,28 @@ class ExecutorManager:
         # champion is finished — operators want to see how close the
         # challenger is to ``sampling_count`` so they can predict decide.
         active_kind: Optional[str] = None
-        for kind, _, _ in subjects:
+        active_uid: Optional[int] = None
+        active_subject_key: Optional[tuple] = None
+        for kind, uid, hk, rev in subjects:
             if kind == "challenger":
                 active_kind = "challenger"
+                active_uid = uid
+                active_subject_key = (kind, hk, rev)
                 break
         if active_kind is None and subjects:
-            active_kind = subjects[0][0]  # champion phase
+            kind, uid, hk, rev = subjects[0]  # champion phase
+            active_kind = kind
+            active_uid = uid
+            active_subject_key = (kind, hk, rev)
+
+        # The subject changed when the role+identity tuple differs from the
+        # previous status print. On the first frame after a change, zero
+        # deltas so we don't subtract one miner's count from another's.
+        subject_changed = (
+            self._last_subject_key is not None
+            and active_subject_key is not None
+            and active_subject_key != self._last_subject_key
+        )
 
         for env in sorted(self.envs):
             ids = task_ids_by_env.get(env, []) or []
@@ -216,7 +262,7 @@ class ExecutorManager:
             # active-subject row).
             per_done: Dict[str, int] = {}
             if ids and subjects and refresh_block:
-                for kind, hk, rev in subjects:
+                for kind, _uid, hk, rev in subjects:
                     try:
                         count = await samples.count_samples_for_tasks(
                             hk, rev, env, ids, refresh_block=refresh_block,
@@ -228,14 +274,17 @@ class ExecutorManager:
             target = subject_targets.get(active_kind, 0) if active_kind else 0
             done = per_done.get(active_kind, 0) if active_kind else 0
             running = int(self.in_flight_values[env].value)
-            prev = self._last_done.get(env, 0)
-            delta = max(0, done - prev) if self._last_status_at else 0
+            if subject_changed:
+                delta = 0
+            else:
+                prev = self._last_done.get(env, 0)
+                delta = max(0, done - prev) if self._last_status_at else 0
             # Adaptive cap math still uses the combined (champ + chal) target
             # and per-cycle delta so an env that finished one subject doesn't
             # look "complete" from the cap planner's POV while the other
             # subject still has work.
-            combined_target = sum(subject_targets[k] for k, _, _ in subjects)
-            combined_done = sum(per_done.get(k, 0) for k, _, _ in subjects)
+            combined_target = sum(subject_targets[k] for k, _uid, _hk, _rev in subjects)
+            combined_done = sum(per_done.get(k, 0) for k, _uid, _hk, _rev in subjects)
             env_stats[env] = {
                 "target": combined_target,
                 "done": combined_done,
@@ -282,7 +331,12 @@ class ExecutorManager:
                 per_env_parts.append(f"{short}@{done}/{target} run:{running}/{cap}")
 
         total_rate = (total_delta / elapsed_s * 3600) if (elapsed_s and total_delta) else 0
-        kind_label = f"[{active_kind}]" if active_kind else ""
+        if active_kind and active_uid is not None:
+            kind_label = f"[{active_kind} U{active_uid}]"
+        elif active_kind:
+            kind_label = f"[{active_kind}]"
+        else:
+            kind_label = ""
         if self._last_status_at:
             head = (
                 f"[STATUS] {kind_label} "
@@ -298,6 +352,7 @@ class ExecutorManager:
             )
         logger.info(f"{head} | " + " | ".join(per_env_parts))
         self._last_status_at = now
+        self._last_subject_key = active_subject_key
 
 
 async def _enabled_envs() -> List[str]:
