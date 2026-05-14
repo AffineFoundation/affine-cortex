@@ -9,7 +9,9 @@ import affine.api.routers.rank as rank_router
 import affine.api.routers.scores as scores_router
 from affine.api.routers.miners import get_miner_by_hotkey, get_miner_by_uid
 from affine.api.routers.logs import get_miner_logs
-from affine.api.routers.scores import get_latest_scores, get_latest_weights
+from affine.api.routers.scores import (
+    get_latest_scores, get_latest_weights, get_score_by_uid,
+)
 
 
 class _FakeMinersDAO:
@@ -84,6 +86,28 @@ class _FakeSystemConfigDAO:
 
     async def get_param_value(self, key, default=None):
         return self.rows.get(key, default)
+
+
+class _FakeSampleResultsDAO:
+    """In-test stand-in for sample_results aggregation. Stores per
+    (hotkey, revision, env) the list of scores the test wants present."""
+
+    def __init__(self, by_subject=None):
+        # {(hotkey, revision): {env: [scores]}}
+        self._by_subject = by_subject or {}
+
+    async def get_avg_scores_for_envs(self, hotkey, revision, envs):
+        bucket = self._by_subject.get((hotkey, revision)) or {}
+        out = {}
+        for env in envs:
+            scores = bucket.get(env) or []
+            if not scores:
+                continue
+            out[env] = {
+                "score": sum(scores) / len(scores),
+                "sample_count": len(scores),
+            }
+        return out
 
 
 def test_public_server_does_not_mount_internal_logs_by_default():
@@ -277,6 +301,9 @@ async def test_scores_latest_filters_to_current_miners(monkeypatch):
         "SystemConfigDAO",
         lambda: _FakeSystemConfigDAO({}),
     )
+    monkeypatch.setattr(
+        scores_router, "SampleResultsDAO", lambda: _FakeSampleResultsDAO(),
+    )
 
     response = await get_latest_scores(
         top=256,
@@ -352,6 +379,9 @@ async def test_scores_latest_filters_disabled_scoring_envs(monkeypatch):
             },
         }),
     )
+    monkeypatch.setattr(
+        scores_router, "SampleResultsDAO", lambda: _FakeSampleResultsDAO(),
+    )
 
     response = await get_latest_scores(
         top=256,
@@ -378,6 +408,170 @@ async def test_scores_latest_filters_disabled_scoring_envs(monkeypatch):
     )
 
     assert response.scores[0].scores_by_env == {"SWE": {"score": 0.8}}
+
+
+@pytest.mark.asyncio
+async def test_scores_latest_includes_miners_missing_from_snapshot(monkeypatch):
+    """Newly-online miners (registered after the last decided snapshot)
+    must still appear in /scores/latest, with per-env averages computed
+    from sample_results — not be silently dropped because the snapshot
+    only contains miners that were valid at the last decide block.
+    """
+    monkeypatch.setattr(
+        scores_router,
+        "MinersDAO",
+        lambda: _FakeMinersDAO({
+            ("uid", 7): {
+                "uid": 7,
+                "hotkey": "old-hk",
+                "revision": "rev-old",
+                "is_valid": "true",
+                "model": "org/old",
+                "first_block": 100,
+            },
+            ("uid", 99): {
+                "uid": 99,
+                "hotkey": "new-hk",
+                "revision": "rev-new",
+                "is_valid": "true",
+                "model": "org/new",
+                "first_block": 500,
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        scores_router,
+        "MinerStatsDAO",
+        lambda: _FakeMinerStatsDAO({
+            ("old-hk", "rev-old"): {
+                "challenge_status": "champion",
+                "termination_reason": "",
+            },
+            ("new-hk", "rev-new"): {
+                "challenge_status": "sampling",
+                "termination_reason": "",
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        scores_router,
+        "SystemConfigDAO",
+        lambda: _FakeSystemConfigDAO({
+            "environments": {
+                "SWE": {
+                    "enabled_for_sampling": True,
+                    "enabled_for_scoring": True,
+                    "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]]},
+                },
+            },
+        }),
+    )
+    # new-hk has 4 historical samples in sample_results; old-hk has 2.
+    monkeypatch.setattr(
+        scores_router,
+        "SampleResultsDAO",
+        lambda: _FakeSampleResultsDAO({
+            ("old-hk", "rev-old"): {"SWE": [0.5, 0.6]},
+            ("new-hk", "rev-new"): {"SWE": [0.7, 0.7, 0.8, 0.9]},
+        }),
+    )
+
+    response = await get_latest_scores(
+        top=256,
+        dao=_FakeScoresDAO({
+            "block_number": 100,
+            "calculated_at": 200,
+            "scores": [
+                # only the OLD champion is in the snapshot — new-hk
+                # registered after the last decide so it's absent here.
+                {
+                    "uid": 7,
+                    "miner_hotkey": "old-hk",
+                    "model_revision": "rev-old",
+                    "model": "org/old",
+                    "first_block": 100,
+                    "overall_score": 1.0,
+                    "average_score": 0.55,
+                    "scores_by_env": {"SWE": {"score": 0.55, "sample_count": 2}},
+                    "total_samples": 2,
+                },
+            ],
+        }),
+    )
+
+    by_uid = {row.uid: row for row in response.scores}
+    # Both miners must show up — old-hk from snapshot, new-hk from
+    # validity + sample_results aggregation.
+    assert set(by_uid.keys()) == {7, 99}
+    # Snapshot's per-env scores win for the champion.
+    assert by_uid[7].scores_by_env["SWE"]["score"] == pytest.approx(0.55)
+    # New miner's per-env score comes from sample_results aggregation.
+    assert by_uid[99].scores_by_env["SWE"]["score"] == pytest.approx(0.775)
+    assert by_uid[99].scores_by_env["SWE"]["sample_count"] == 4
+    # Sort order: champion (overall=1.0) above new miner (overall=0.0).
+    assert response.scores[0].uid == 7
+
+
+@pytest.mark.asyncio
+async def test_score_by_uid_for_miner_missing_from_snapshot(monkeypatch):
+    """``af get-miner`` (single-miner score lookup) must not 404 just
+    because the miner isn't in the latest decided snapshot — falls
+    back to sample_results aggregation for per-env scores."""
+    miner_row = {
+        "uid": 99,
+        "hotkey": "new-hk",
+        "revision": "rev-new",
+        "model": "org/new",
+        "first_block": 500,
+        "is_valid": "true",
+    }
+    miners_dao = _FakeMinersDAO({("uid", 99): miner_row})
+    monkeypatch.setattr(scores_router, "MinersDAO", lambda: miners_dao)
+    monkeypatch.setattr(
+        scores_router,
+        "MinerStatsDAO",
+        lambda: _FakeMinerStatsDAO({
+            ("new-hk", "rev-new"): {
+                "challenge_status": "sampling",
+                "termination_reason": "",
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        scores_router,
+        "SystemConfigDAO",
+        lambda: _FakeSystemConfigDAO({
+            "environments": {
+                "SWE": {
+                    "enabled_for_sampling": True,
+                    "enabled_for_scoring": True,
+                    "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]]},
+                },
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        scores_router,
+        "SampleResultsDAO",
+        lambda: _FakeSampleResultsDAO({
+            ("new-hk", "rev-new"): {"SWE": [0.4, 0.6]},
+        }),
+    )
+
+    response = await get_score_by_uid(
+        uid=99,
+        dao=_FakeScoresDAO({
+            "block_number": 100,
+            "calculated_at": 200,
+            "scores": [],
+        }),
+        miners_dao=miners_dao,
+    )
+
+    assert response.uid == 99
+    assert response.miner_hotkey == "new-hk"
+    assert response.scores_by_env["SWE"]["score"] == pytest.approx(0.5)
+    assert response.scores_by_env["SWE"]["sample_count"] == 2
 
 
 @pytest.mark.asyncio

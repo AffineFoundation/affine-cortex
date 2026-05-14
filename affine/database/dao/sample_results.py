@@ -264,14 +264,14 @@ class SampleResultsDAO(BaseDAO):
         env: str
     ) -> set:
         """Get set of completed task_ids for a miner's env.
-        
+
         Used by task generator to determine which dataset indices are missing.
-        
+
         Args:
             miner_hotkey: Miner's hotkey
             model_revision: Model revision hash
             env: Environment name
-            
+
         Returns:
             Set of completed task_ids (integers representing dataset indices)
         """
@@ -282,16 +282,81 @@ class SampleResultsDAO(BaseDAO):
             'ExpressionAttributeValues': {':pk': {'S': pk}},
             'ProjectionExpression': 'task_id'
         }
-        
+
         items = await self._query_all_pages(get_client(), params)
         task_ids = set()
-        
+
         for item in items:
             task_id = self._parse_task_id(item.get('task_id', {}))
             if task_id is not None:
                 task_ids.add(task_id)
-        
+
         return task_ids
+
+    async def get_avg_scores_for_envs(
+        self,
+        miner_hotkey: str,
+        model_revision: str,
+        envs: List[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Per-env average score across every sample_results row for a
+        (hotkey, revision) pair.
+
+        Spans every ``refresh_block`` still in the table's 30-day TTL,
+        so it's a useful "recent-history score" for any miner that has
+        ever been sampled — covers terminated miners and post-decide
+        rows that no longer carry populated scores in the latest
+        ``scores`` snapshot. The rank UI uses this so currently-online
+        but post-snapshot miners can still display real per-env
+        averages instead of ``0.00`` placeholders.
+
+        Envs with no samples are omitted from the returned dict;
+        callers treat absence as "no data".
+
+        Args:
+            miner_hotkey: Miner's hotkey
+            model_revision: Model revision hash
+            envs: Env names to query. Each env hits one ``Query``
+                under its own PK; envs are awaited in parallel via
+                ``asyncio.gather`` so total latency is one Query's
+                worth regardless of env count.
+
+        Returns:
+            ``{env: {"score": float_avg, "sample_count": int}}`` with
+            only envs that have at least one sample row.
+        """
+        if not envs:
+            return {}
+        client = get_client()
+
+        async def _avg_for_env(env: str):
+            pk = self._make_pk(miner_hotkey, model_revision, env)
+            params = {
+                'TableName': self.table_name,
+                'KeyConditionExpression': 'pk = :pk',
+                'ExpressionAttributeValues': {':pk': {'S': pk}},
+                'ProjectionExpression': 'score',
+            }
+            items = await self._query_all_pages(client, params)
+            scores: List[float] = []
+            for item in items:
+                raw = item.get('score', {})
+                val = raw.get('N') if isinstance(raw, dict) else None
+                if val is None:
+                    continue
+                try:
+                    scores.append(float(val))
+                except (TypeError, ValueError):
+                    continue
+            if not scores:
+                return env, None
+            return env, {
+                "score": sum(scores) / len(scores),
+                "sample_count": len(scores),
+            }
+
+        results = await asyncio.gather(*(_avg_for_env(env) for env in envs))
+        return {env: payload for env, payload in results if payload is not None}
     
     async def _query_all_pages(
         self,
