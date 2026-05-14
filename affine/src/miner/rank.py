@@ -97,6 +97,8 @@ def _env_cell(
     payload: Any,
     live_count: Optional[int] = None,
     live_avg: Optional[float] = None,
+    *,
+    champion_live_avg: Optional[float] = None,
 ) -> str:
     if not isinstance(payload, dict):
         if live_avg is not None and live_count is not None and live_count > 0:
@@ -109,8 +111,21 @@ def _env_cell(
     # hides the actual battle bounds.
     has_live_avg = live_avg is not None and live_count is not None and live_count > 0
     score_on_common = live_avg if has_live_avg else _number(payload.get("score_on_common"))
-    lower = _number(payload.get("not_worse_threshold"))
-    upper = _number(payload.get("dethrone_threshold"))
+    # Brackets must reflect the *current* champion when there's a live
+    # battle — the snapshot ones are from the last DECIDED contest and
+    # can be wildly stale (eg [19.83, 23.23] when the current champion's
+    # live SWE-INFINITE avg is ~54%). Compute live brackets from the
+    # current champion's live_avg whenever we have it; fall back to
+    # snapshot only when no live data exists.
+    if champion_live_avg is not None:
+        from affine.src.scorer.comparator import (
+            DEFAULT_MARGIN, DEFAULT_NOT_WORSE_TOLERANCE,
+        )
+        lower = champion_live_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
+        upper = champion_live_avg + DEFAULT_MARGIN
+    else:
+        lower = _number(payload.get("not_worse_threshold"))
+        upper = _number(payload.get("dethrone_threshold"))
     common_tasks = live_count if has_live_avg else payload.get("common_tasks")
     if (
         score_on_common is not None
@@ -274,6 +289,13 @@ def _print_rank_table(
     # last-decided snapshot's 0.00 placeholder. None for miners not
     # currently in the sampling set.
     live_sample_averages = (window or {}).get("sample_averages") or {}
+    # Champion's per-env live averages — used to compute LIVE bracket
+    # thresholds for challenger rows in ``_env_cell``. Without this, the
+    # brackets fall back to the last-decided snapshot's stale values.
+    champion_live_avgs: Dict[str, float] = (
+        (live_sample_averages.get(str(champion_uid)) or {})
+        if champion_uid is not None else {}
+    )
     live_sampling_uids = {
         int(uid)
         for uid in ((window or {}).get("live_sampling_uids") or [])
@@ -344,11 +366,18 @@ def _print_rank_table(
         uid_key = str(row.get("uid"))
         row_live_counts = live_sample_counts.get(uid_key) or {}
         row_live_avgs = live_sample_averages.get(uid_key) or {}
+        is_champion_row = row.get("uid") == champion_uid
         for env in envs:
             live_count = row_live_counts.get(env)
             live_avg = row_live_avgs.get(env)
+            # Only the *challenger* row needs live brackets — the
+            # champion's own row shouldn't display thresholds against
+            # itself.
+            champ_live = (
+                None if is_champion_row else champion_live_avgs.get(env)
+            )
             row_parts.append(
-                f"{_env_cell(scores_by_env.get(env), live_count, live_avg):>24}"
+                f"{_env_cell(scores_by_env.get(env), live_count, live_avg, champion_live_avg=champ_live):>24}"
             )
         row_parts.append(
             _colored_status(status, is_invalid=(row.get("is_valid") is False))

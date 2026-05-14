@@ -509,3 +509,145 @@ def test_get_rank_reports_aggregate_endpoint_errors_without_fallback(monkeypatch
 
     assert client.calls == ["/rank/current?top=256&queue_limit=10"]
     assert "failed to fetch /rank/current" in err.getvalue()
+
+
+# ---- live-bracket thresholds (replaces stale snapshot thresholds) ---------
+#
+# The snapshot's ``not_worse_threshold`` / ``dethrone_threshold`` are
+# baked from the LAST DECIDED battle. When a new battle is mid-flight
+# against a stronger champion, those numbers can be wildly off — the
+# challenger row would mix a live ``score_on_common`` with stale
+# brackets, suggesting an easy win that isn't actually happening.
+# The fix overrides the brackets with values computed live from the
+# CURRENT champion's per-env average whenever that average is present
+# in ``sample_averages``. See ``affine/src/scorer/comparator.py`` for
+# ``DEFAULT_MARGIN`` / ``DEFAULT_NOT_WORSE_TOLERANCE``.
+
+
+def test_rank_table_uses_live_brackets_from_current_champion_average():
+    """Challenger row's brackets must come from CURRENT champion's
+    live_avg (champion_live × 0.98, champion_live + 0.03), not from
+    the stale snapshot ``not_worse_threshold`` / ``dethrone_threshold``
+    that was written by the last decided battle.
+    """
+    window = {
+        "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
+        "battle": {
+            "challenger": {"uid": 2, "hotkey": "chal", "model": "org/chal"},
+            "started_at_block": 42,
+        },
+        "sample_counts": {
+            "1": {"SWE": 213},
+            "2": {"SWE": 78},
+        },
+        "sample_averages": {
+            "1": {"SWE": 0.5455},   # current champion's live SWE avg
+            "2": {"SWE": 0.5273},   # current challenger's live SWE avg
+        },
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 1, "miner_hotkey": "champ", "model": "org/champ",
+                "overall_score": 1.0, "is_valid": True,
+                "scores_by_env": {"SWE": {"score": 0.3662, "sample_count": 213}},
+            },
+            {
+                "uid": 2, "miner_hotkey": "chal", "model": "org/chal",
+                "overall_score": 0.0, "is_valid": True,
+                "scores_by_env": {
+                    "SWE": {
+                        # Stale snapshot brackets from a prior battle
+                        # against a much weaker champion.
+                        "score": 0.0, "score_on_common": 0.0,
+                        "common_tasks": 0,
+                        "not_worse_threshold": 0.1983,
+                        "dethrone_threshold": 0.2323,
+                    },
+                },
+            },
+        ],
+    }
+
+    out = _render_rank(window, [], scores)
+
+    # Live brackets = champion_live (0.5455) × 0.98 and + 0.03.
+    # not_worse = 53.46, dethrone = 57.55. NOT the stale 19.83 / 23.23.
+    assert "52.73[53.46,57.55]/78" in out
+    assert "[19.83," not in out, (
+        "stale snapshot brackets must not appear when current champion "
+        "has a live average"
+    )
+
+
+def test_rank_table_falls_back_to_snapshot_brackets_when_no_live_champion_avg():
+    """Backward-compat: when the champion has no live_avg for this env
+    (eg between battles, or championship was just inferred from
+    weights), keep using the snapshot ``not_worse_threshold`` /
+    ``dethrone_threshold`` rather than dropping them silently."""
+    window = {
+        "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
+        "battle": {
+            "challenger": {"uid": 2, "hotkey": "chal", "model": "org/chal"},
+            "started_at_block": 42,
+        },
+        # Champion has no sample_averages entry — only challenger does.
+        "sample_counts": {"2": {"SWE": 178}},
+        "sample_averages": {"2": {"SWE": 0.4816}},
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 2, "miner_hotkey": "chal", "model": "org/chal",
+                "overall_score": 0.0, "is_valid": True,
+                "scores_by_env": {
+                    "SWE": {
+                        "score": 0.0, "score_on_common": 0.0,
+                        "common_tasks": 0,
+                        "not_worse_threshold": 0.4849,
+                        "dethrone_threshold": 0.5248,
+                    },
+                },
+            },
+        ],
+    }
+
+    out = _render_rank(window, [], scores)
+    assert "48.16[48.49,52.48]/178" in out
+
+
+def test_rank_table_champion_row_never_displays_live_brackets():
+    """The champion's own row must NOT show live brackets — we'd be
+    rendering thresholds against itself. Champion's payload typically
+    has no ``not_worse_threshold`` either; the cell stays as plain
+    ``score/count``."""
+    window = {
+        "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
+        "battle": {
+            "challenger": {"uid": 2, "hotkey": "chal", "model": "org/chal"},
+            "started_at_block": 42,
+        },
+        "sample_counts": {"1": {"SWE": 213}, "2": {"SWE": 78}},
+        "sample_averages": {"1": {"SWE": 0.5455}, "2": {"SWE": 0.5273}},
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 1, "miner_hotkey": "champ", "model": "org/champ",
+                "overall_score": 1.0, "is_valid": True,
+                "scores_by_env": {"SWE": {"score": 0.5455, "sample_count": 213}},
+            },
+        ],
+    }
+
+    out = _render_rank(window, [], scores)
+    # Champion row uses its live_avg (54.55) and live_count (213), no
+    # brackets injected from its own average.
+    assert "54.55/213" in out
+    assert "[" not in out.split("|")[3]  # SWE cell has no brackets
