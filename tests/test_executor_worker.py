@@ -117,6 +117,109 @@ def test_is_zero_score_error_is_case_insensitive():
     assert _is_zero_score_error(Exception("EXCEEDS THE MAXIMUM CONTEXT LENGTH"))
 
 
+def test_executor_does_not_persist_structured_error_results():
+    import asyncio as _asyncio
+    from affine.core.models import Result
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import MinerSnapshot
+
+    worker = ExecutorWorker(worker_id=0, env="NAVWORLD")
+
+    class _EnvStub:
+        async def evaluate(self, *, miner, task_id):
+            return Result(
+                env="NAVWORLD",
+                score=0.0,
+                latency_seconds=1.0,
+                success=False,
+                error="Model returned empty reply",
+                task_id=task_id,
+                extra={"error": "Model returned empty reply"},
+            )
+
+    class _SamplesStub:
+        def __init__(self):
+            self.persist_calls = []
+
+        async def persist(self, **kwargs):
+            self.persist_calls.append(kwargs)
+
+    samples = _SamplesStub()
+    worker._env_executor = _EnvStub()
+    worker._samples = samples
+
+    async def _drive():
+        await worker._evaluate_and_persist_gated(
+            miner=MinerSnapshot(
+                uid=213,
+                hotkey="hk",
+                revision="rev",
+                model="org/model",
+            ),
+            task_id=123,
+            base_url="https://example/v1",
+            refresh_block=10,
+            miner_obj=object(),
+        )
+
+    _asyncio.run(_drive())
+
+    assert samples.persist_calls == []
+
+
+def test_executor_persists_structured_context_overflow_as_zero():
+    import asyncio as _asyncio
+    from affine.core.models import Result
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import MinerSnapshot
+
+    worker = ExecutorWorker(worker_id=0, env="SWE-INFINITE")
+
+    class _EnvStub:
+        async def evaluate(self, *, miner, task_id):
+            return Result(
+                env="SWE-INFINITE",
+                score=0.0,
+                latency_seconds=1.0,
+                success=False,
+                error="prompt exceeds the maximum context length",
+                task_id=task_id,
+                extra={"error": "prompt exceeds the maximum context length"},
+            )
+
+    class _SamplesStub:
+        def __init__(self):
+            self.persist_calls = []
+
+        async def persist(self, **kwargs):
+            self.persist_calls.append(kwargs)
+
+    samples = _SamplesStub()
+    worker._env_executor = _EnvStub()
+    worker._samples = samples
+
+    async def _drive():
+        await worker._evaluate_and_persist_gated(
+            miner=MinerSnapshot(
+                uid=213,
+                hotkey="hk",
+                revision="rev",
+                model="org/model",
+            ),
+            task_id=123,
+            base_url="https://example/v1",
+            refresh_block=10,
+            miner_obj=object(),
+        )
+
+    _asyncio.run(_drive())
+
+    assert len(samples.persist_calls) == 1
+    persisted = samples.persist_calls[0]
+    assert persisted["score"] == 0.0
+    assert persisted["extra"]["zero_score_reason"] == "context_overflow"
+
+
 def test_global_slot_acquire_release_round_trip():
     import asyncio as _asyncio
     import multiprocessing as _mp

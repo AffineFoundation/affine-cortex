@@ -6,7 +6,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 300,
+        "sampling_count": 200,
         "dataset_range": [[0, 5000]],
         "sampling_mode": "latest",
         "dataset_range_source": {
@@ -21,7 +21,7 @@
       "enabled_for_sampling": false,
       "enabled_for_scoring": false,
       "sampling": {
-        "sampling_count": 300,
+        "sampling_count": 200,
         "dataset_range": [[0, 1000]],
         "sampling_mode": "latest",
         "dataset_range_source": {
@@ -36,7 +36,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 400,
+        "sampling_count": 200,
         "dataset_range": [[0, 78060000]],
         "sampling_mode": "random"
       }
@@ -46,7 +46,7 @@
       "enabled_for_sampling": false,
       "enabled_for_scoring": false,
       "sampling": {
-        "sampling_count": 500,
+        "sampling_count": 200,
         "dataset_range": [[100000000, 300000000], [400000000, 500000000]],
         "sampling_mode": "random"
       }
@@ -56,7 +56,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 400,
+        "sampling_count": 200,
         "dataset_range": [[0, 1000000000]],
         "sampling_mode": "random"
       }
@@ -66,7 +66,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 200,
+        "sampling_count": 100,
         "dataset_range": [[0, 1000000000]],
         "sampling_mode": "random"
       }
@@ -76,7 +76,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 300,
+        "sampling_count": 200,
         "dataset_range": [[0, 132000000]],
         "sampling_mode": "random"
       }

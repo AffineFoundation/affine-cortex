@@ -433,9 +433,10 @@ class ExecutorWorker:
             task_id. The shuffle keeps us from always blocking on the
             same flaky task. The 10% buffer absorbs permanent infra-only
             failures; beyond that operators step in.
-          - ``Result.success=False`` from a non-raising evaluate: the
-            env returned a structured failure verdict alongside a score.
-            Persist whatever score the env supplied (handled below).
+          - ``Result.success=False`` / ``error`` from a non-raising
+            evaluate: the env returned a structured invalid attempt.
+            **Don't persist** — rows with ``extra.error`` are not valid
+            samples and must not count toward completion or comparison.
         """
         miner_obj = _Miner(
             hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
@@ -510,7 +511,10 @@ class ExecutorWorker:
                         task_id=task_id,
                         score=0.0,
                         latency_ms=latency_ms,
-                        extra={"error": error_brief, "zero_score_reason": "context_overflow"},
+                        extra={
+                            "error": error_brief,
+                            "zero_score_reason": "context_overflow",
+                        },
                         block_number=0,
                         refresh_block=refresh_block,
                     )
@@ -527,8 +531,32 @@ class ExecutorWorker:
         error = getattr(result, "error", None)
         extra = dict(getattr(result, "extra", {}) or {})
         latency_ms = int((time.monotonic() - started) * 1000)
-        if not success:
-            extra.setdefault("error", error)
+        if error or extra.get("error"):
+            error_brief = str(error or extra.get("error")).replace("\n", " ").replace("\r", " ")[:200]
+            if _is_zero_score_error(Exception(error_brief)):
+                await self._samples.persist(
+                    miner_hotkey=miner.hotkey,
+                    model_revision=miner.revision,
+                    model=miner.model,
+                    env=self.env,
+                    task_id=task_id,
+                    score=0.0,
+                    latency_ms=latency_ms,
+                    extra={
+                        "error": error_brief,
+                        "zero_score_reason": "context_overflow",
+                    },
+                    block_number=0,
+                    refresh_block=refresh_block,
+                )
+                self.metrics.record_completion(success=False, latency_ms=latency_ms)
+                return
+            logger.info(
+                f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
+                f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {error_brief}"
+            )
+            self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            return
         await self._samples.persist(
             miner_hotkey=miner.hotkey,
             model_revision=miner.revision,
