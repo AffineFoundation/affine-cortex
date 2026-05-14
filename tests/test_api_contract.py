@@ -90,13 +90,16 @@ class _FakeSystemConfigDAO:
 
 class _FakeSampleResultsDAO:
     """In-test stand-in for sample_results aggregation. Stores per
-    (hotkey, revision, env) the list of scores the test wants present."""
+    (hotkey, revision, env) the list of scores the test wants present
+    and counts each call so tests can assert on the cache short-circuit."""
 
     def __init__(self, by_subject=None):
         # {(hotkey, revision): {env: [scores]}}
         self._by_subject = by_subject or {}
+        self.calls: list = []
 
     async def get_avg_scores_for_envs(self, hotkey, revision, envs):
+        self.calls.append((hotkey, revision, tuple(envs)))
         bucket = self._by_subject.get((hotkey, revision)) or {}
         out = {}
         for env in envs:
@@ -510,6 +513,140 @@ async def test_scores_latest_includes_miners_missing_from_snapshot(monkeypatch):
     assert by_uid[99].scores_by_env["SWE"]["sample_count"] == 4
     # Sort order: champion (overall=1.0) above new miner (overall=0.0).
     assert response.scores[0].uid == 7
+
+
+@pytest.mark.asyncio
+async def test_terminated_miners_cache_avoids_repeat_dao_queries(monkeypatch):
+    """Terminated state is permanent for a (hotkey, revision) — re-commit
+    creates a new revision, which is a different cache key. Two
+    consecutive /scores/latest calls should read sample_results once
+    per terminated miner and reuse the cached aggregate on the second
+    call. Active (sampling/champion) miners keep hitting the DAO every
+    time because their data is still moving.
+    """
+    scores_router._reset_terminated_cache_for_test()
+    miners = {
+        ("uid", 1): {
+            "uid": 1, "hotkey": "champ-hk", "revision": "champ-rev",
+            "model": "org/champ", "first_block": 10, "is_valid": "true",
+        },
+        ("uid", 2): {
+            "uid": 2, "hotkey": "term-hk", "revision": "term-rev",
+            "model": "org/term", "first_block": 20, "is_valid": "true",
+        },
+    }
+    monkeypatch.setattr(scores_router, "MinersDAO", lambda: _FakeMinersDAO(miners))
+    monkeypatch.setattr(
+        scores_router, "MinerStatsDAO", lambda: _FakeMinerStatsDAO({
+            ("champ-hk", "champ-rev"): {
+                "challenge_status": "champion", "termination_reason": "",
+            },
+            ("term-hk", "term-rev"): {
+                "challenge_status": "terminated",
+                "termination_reason": "lost_to_champion",
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        scores_router, "SystemConfigDAO", lambda: _FakeSystemConfigDAO({
+            "environments": {
+                "SWE": {
+                    "enabled_for_sampling": True, "enabled_for_scoring": True,
+                    "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]]},
+                },
+            },
+        }),
+    )
+    samples_dao = _FakeSampleResultsDAO({
+        ("champ-hk", "champ-rev"): {"SWE": [0.8, 0.9]},
+        ("term-hk", "term-rev"): {"SWE": [0.4, 0.5]},
+    })
+    monkeypatch.setattr(scores_router, "SampleResultsDAO", lambda: samples_dao)
+
+    fake_scores_dao = _FakeScoresDAO({
+        "block_number": 100, "calculated_at": 200, "scores": [],
+    })
+
+    # First call: warm-cache for both miners.
+    await get_latest_scores(top=256, dao=fake_scores_dao)
+    first_call_subjects = {(c[0], c[1]) for c in samples_dao.calls}
+    assert ("champ-hk", "champ-rev") in first_call_subjects
+    assert ("term-hk", "term-rev") in first_call_subjects
+    first_call_count = len(samples_dao.calls)
+
+    # Second call: terminated miner should not re-query, AND champion
+    # also hits the cache because we're well within the active TTL
+    # (default ~10 min). The point is: API request cost stays bounded
+    # even if the caller hammers /scores/latest in a tight loop.
+    await get_latest_scores(top=256, dao=fake_scores_dao)
+
+    second_pass_calls = samples_dao.calls[first_call_count:]
+    second_pass_subjects = {(c[0], c[1]) for c in second_pass_calls}
+    assert ("term-hk", "term-rev") not in second_pass_subjects, (
+        "terminated miner should hit permanent cache, not re-query DAO"
+    )
+    assert ("champ-hk", "champ-rev") not in second_pass_subjects, (
+        "champion within TTL window should hit cache; "
+        "API requests must not scale linearly with caller rate"
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_miners_aggregate_refreshes_after_ttl(monkeypatch):
+    """Active miners' (champion + in_progress) cache entry must fall
+    out of the cache after the TTL so rank scores trail the live
+    battle by at most one window. This pins the TTL behavior down so
+    a future change can't accidentally turn the active path into
+    permanent caching."""
+    scores_router._reset_terminated_cache_for_test()
+    monkeypatch.setattr(scores_router, "_ACTIVE_CACHE_TTL_S", 0.1)
+
+    miners = {
+        ("uid", 1): {
+            "uid": 1, "hotkey": "champ-hk", "revision": "champ-rev",
+            "model": "org/champ", "first_block": 10, "is_valid": "true",
+        },
+    }
+    monkeypatch.setattr(scores_router, "MinersDAO", lambda: _FakeMinersDAO(miners))
+    monkeypatch.setattr(
+        scores_router, "MinerStatsDAO", lambda: _FakeMinerStatsDAO({
+            ("champ-hk", "champ-rev"): {
+                "challenge_status": "champion", "termination_reason": "",
+            },
+        }),
+    )
+    monkeypatch.setattr(
+        scores_router, "SystemConfigDAO", lambda: _FakeSystemConfigDAO({
+            "environments": {
+                "SWE": {
+                    "enabled_for_sampling": True, "enabled_for_scoring": True,
+                    "sampling": {"sampling_count": 10, "dataset_range": [[0, 100]]},
+                },
+            },
+        }),
+    )
+    samples_dao = _FakeSampleResultsDAO({
+        ("champ-hk", "champ-rev"): {"SWE": [0.5]},
+    })
+    monkeypatch.setattr(scores_router, "SampleResultsDAO", lambda: samples_dao)
+
+    fake_scores_dao = _FakeScoresDAO({
+        "block_number": 100, "calculated_at": 200, "scores": [],
+    })
+
+    await get_latest_scores(top=256, dao=fake_scores_dao)
+    assert sum(1 for c in samples_dao.calls if c[0] == "champ-hk") == 1
+
+    # Within TTL: cache hit, no new query.
+    await get_latest_scores(top=256, dao=fake_scores_dao)
+    assert sum(1 for c in samples_dao.calls if c[0] == "champ-hk") == 1
+
+    import asyncio as _asyncio
+    await _asyncio.sleep(0.15)  # past the 0.1s TTL set above
+
+    # After TTL: refresh, one more query.
+    await get_latest_scores(top=256, dao=fake_scores_dao)
+    assert sum(1 for c in samples_dao.calls if c[0] == "champ-hk") == 2
 
 
 @pytest.mark.asyncio
