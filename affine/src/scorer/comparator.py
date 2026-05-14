@@ -3,8 +3,8 @@ Window comparator — Pareto-with-tolerance rule.
 
 For each env the challenger lands in one of three buckets vs the champion:
 
-  - **dominant**  : ``chal_avg ≥ champ_avg + margin`` — strictly better by
-                    at least the per-env margin.
+  - **dominant**  : ``chal_avg > champ_avg + margin`` — strictly better by
+                    more than the per-env margin.
   - **not_worse** : ``chal_avg ≥ champ_avg * (1 - not_worse_tolerance)``
                     — within an acceptable regression tolerance of the
                     champion's score (multiplicative, matching the old
@@ -42,17 +42,17 @@ from typing import Dict, List, Optional
 
 #: Default per-env additive margin: challenger's mean must exceed champion's
 #: by this absolute amount to count as "dominant" in that env.
-DEFAULT_MARGIN: float = 0.01
+DEFAULT_MARGIN: float = 0.03
 
 #: Default multiplicative regression tolerance: an env is "not_worse" iff
 #: ``chal_avg >= champ_avg * (1 - tol)``. 0.0 means any regression at all
 #: pushes the env to "worse".
-DEFAULT_NOT_WORSE_TOLERANCE: float = 0.0
+DEFAULT_NOT_WORSE_TOLERANCE: float = 0.02
 
 #: How many envs the challenger must be "dominant" in to dethrone the
-#: champion. 0 ⇒ strict Pareto (must dominate every env). >0 ⇒ partial
-#: Pareto (dominate N envs + not_worse in the rest).
-WIN_MIN_DOMINANT_ENVS: int = 0
+#: champion. The latest old-system setting is partial Pareto: dominate at
+#: least one env and stay not_worse in the rest.
+WIN_MIN_DOMINANT_ENVS: int = 1
 
 
 @dataclass(frozen=True)
@@ -152,7 +152,7 @@ class WindowComparator:
             champ_basis = champ_avg if champ_avg is not None else 0.0
             delta = chal_avg - champ_basis  # type: ignore[operator]
 
-            if chal_avg >= champ_basis + cfg.margin:
+            if chal_avg > champ_basis + cfg.margin + 1e-9:
                 verdict = ENV_DOMINANT
                 reason = "challenger_better"
             else:
@@ -162,7 +162,7 @@ class WindowComparator:
                 # formula — the caller picks ``not_worse_tolerance`` per env
                 # and is responsible for the score scale.
                 not_worse_threshold = champ_basis * (1.0 - cfg.not_worse_tolerance)
-                if chal_avg >= not_worse_threshold:
+                if chal_avg >= not_worse_threshold - 1e-9:
                     verdict = ENV_NOT_WORSE
                     reason = "tie_within_tolerance"
                 else:
