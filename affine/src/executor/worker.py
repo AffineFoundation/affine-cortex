@@ -338,6 +338,10 @@ class ExecutorWorker:
         # Build the candidate pool: champion drains everything; challenger
         # is capped by ``sampling_count``. We shuffle so persistently slow
         # task_ids don't always end up at the tail across worker restarts.
+        # Each candidate carries the deployment_id we resolved from the
+        # state read above. ``_evaluate_and_persist_gated`` re-reads
+        # state at persist time and drops the result if this token is
+        # no longer current — see ``_is_current_deployment``.
         candidates: List[tuple] = []
         if champion_urls:
             champ_snap = MinerSnapshot(
@@ -353,7 +357,11 @@ class ExecutorWorker:
                     refresh_block=refresh_block,
                 ):
                     continue
-                candidates.append((key, champ_snap, tid, _pick_url(champion_urls, tid, idx)))
+                url = _pick_url(champion_urls, tid, idx)
+                dep_id = _resolve_deployment_id(
+                    url, champion.deployments, champion.deployment_id,
+                )
+                candidates.append((key, champ_snap, tid, url, dep_id))
 
         if battle is not None and battle_urls:
             chal_have = await self._samples.count_samples_for_tasks(
@@ -374,8 +382,12 @@ class ExecutorWorker:
                         self.env, tid, refresh_block=refresh_block,
                     ):
                         continue
+                    url = _pick_url(battle_urls, tid, idx)
+                    dep_id = _resolve_deployment_id(
+                        url, battle.deployments, battle.deployment_id,
+                    )
                     candidates.append(
-                        (key, battle.challenger, tid, _pick_url(battle_urls, tid, idx))
+                        (key, battle.challenger, tid, url, dep_id)
                     )
                     remaining -= 1
 
@@ -387,13 +399,14 @@ class ExecutorWorker:
         # Launch each candidate as a free-standing task. The wrapper
         # removes the key from ``in_flight_keys`` on completion so a
         # failed-but-not-persisted task can be retried next poll.
-        for key, miner, task_id, base_url in candidates:
+        for key, miner, task_id, base_url, dep_id in candidates:
             in_flight_keys.add(key)
             t = asyncio.create_task(
                 self._dispatch_one(
                     miner=miner, task_id=task_id, base_url=base_url,
                     refresh_block=refresh_block, key=key,
                     in_flight_keys=in_flight_keys,
+                    expected_deployment_id=dep_id,
                 )
             )
             in_flight_tasks.add(t)
@@ -402,11 +415,13 @@ class ExecutorWorker:
     async def _dispatch_one(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, key: tuple, in_flight_keys: set,
+        expected_deployment_id: Optional[str] = None,
     ) -> None:
         try:
             await self._evaluate_and_persist(
                 miner=miner, task_id=task_id, base_url=base_url,
                 refresh_block=refresh_block,
+                expected_deployment_id=expected_deployment_id,
             )
         finally:
             in_flight_keys.discard(key)
@@ -414,6 +429,7 @@ class ExecutorWorker:
     async def _evaluate_and_persist(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int,
+        expected_deployment_id: Optional[str] = None,
     ) -> None:
         """Run one (env, task_id, miner) through affinetes, write result
         tagged with the task-id pool's ``refresh_block`` so the scheduler
@@ -445,6 +461,7 @@ class ExecutorWorker:
         await self._evaluate_and_persist_gated(
             miner=miner, task_id=task_id, base_url=base_url,
             refresh_block=refresh_block, miner_obj=miner_obj,
+            expected_deployment_id=expected_deployment_id,
         )
 
     def _current_env_cap(self) -> int:
@@ -472,9 +489,86 @@ class ExecutorWorker:
             self._release_global_slot()
             await asyncio.sleep(0.05)
 
+    async def _is_current_deployment(
+        self, *, miner: MinerSnapshot, expected_deployment_id: Optional[str],
+    ) -> bool:
+        """True iff the deployment we dispatched against is still current
+        for this miner in its current subject role.
+
+        The drift this guards: between ``_dispatch_new`` and
+        ``_samples.persist`` the scheduler may have swapped the inference
+        deployment serving ``miner`` (e.g. champion lost, single-instance
+        host re-tasked to a new challenger). The in-flight ``evaluate``
+        call hits a base_url that's now serving a *different model*, so
+        persisting its result would attribute new-model output to
+        ``miner``. Drop instead.
+
+        We accept the result iff the captured ``expected_deployment_id``
+        still appears among the current champion's or current
+        challenger's deployments. The challenger-wins case is naturally
+        covered: when a challenger wins, its ``deployment_id`` is
+        transferred into the new champion record, so the captured token
+        still matches.
+
+        ``expected_deployment_id is None`` means we couldn't resolve a
+        token at dispatch (legacy record with neither ``deployments`` nor
+        ``deployment_id``). We don't drop in that case — we have no way
+        to detect drift, so preserve pre-validation behavior.
+        """
+        if expected_deployment_id is None:
+            return True
+        champion = await self._state.get_champion()
+        if champion is not None and (
+            champion.hotkey == miner.hotkey
+            and champion.revision == miner.revision
+        ):
+            if champion.deployment_id == expected_deployment_id:
+                return True
+            if any(
+                d.deployment_id == expected_deployment_id
+                for d in champion.deployments
+            ):
+                return True
+        battle = await self._state.get_battle()
+        if battle is not None and (
+            battle.challenger.hotkey == miner.hotkey
+            and battle.challenger.revision == miner.revision
+        ):
+            if battle.deployment_id == expected_deployment_id:
+                return True
+            if any(
+                d.deployment_id == expected_deployment_id
+                for d in battle.deployments
+            ):
+                return True
+        return False
+
+    async def _validate_or_drop(
+        self, *, miner: MinerSnapshot, task_id: int,
+        expected_deployment_id: Optional[str], latency_ms: int,
+    ) -> bool:
+        """Returns True if the persist should proceed, False to drop.
+
+        On drop we increment ``tasks_dropped_drift`` and log; we do
+        *not* call ``record_completion`` — the row was never written so
+        the next dispatch tick will re-attempt this task_id against the
+        new (current) deployment."""
+        if await self._is_current_deployment(
+            miner=miner, expected_deployment_id=expected_deployment_id,
+        ):
+            return True
+        self.metrics.tasks_dropped_drift += 1
+        logger.warning(
+            f"[DRIFT] U{miner.uid:<4} │ {self.env:<20} │     DROPPED │ "
+            f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ "
+            f"deployment {expected_deployment_id} no longer current"
+        )
+        return False
+
     async def _evaluate_and_persist_gated(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, miner_obj: "_Miner",
+        expected_deployment_id: Optional[str] = None,
     ) -> None:
         await self._acquire_dispatch_slot()
         started = time.monotonic()
@@ -503,6 +597,12 @@ class ExecutorWorker:
                 if zero_score:
                     # Miner-capability limit (context overflow). Persist as
                     # score=0 — retrying would yield the same error.
+                    if not await self._validate_or_drop(
+                        miner=miner, task_id=task_id,
+                        expected_deployment_id=expected_deployment_id,
+                        latency_ms=latency_ms,
+                    ):
+                        return
                     await self._samples.persist(
                         miner_hotkey=miner.hotkey,
                         model_revision=miner.revision,
@@ -534,6 +634,12 @@ class ExecutorWorker:
         if error or extra.get("error"):
             error_brief = str(error or extra.get("error")).replace("\n", " ").replace("\r", " ")[:200]
             if _is_zero_score_error(Exception(error_brief)):
+                if not await self._validate_or_drop(
+                    miner=miner, task_id=task_id,
+                    expected_deployment_id=expected_deployment_id,
+                    latency_ms=latency_ms,
+                ):
+                    return
                 await self._samples.persist(
                     miner_hotkey=miner.hotkey,
                     model_revision=miner.revision,
@@ -556,6 +662,12 @@ class ExecutorWorker:
                 f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {error_brief}"
             )
             self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            return
+        if not await self._validate_or_drop(
+            miner=miner, task_id=task_id,
+            expected_deployment_id=expected_deployment_id,
+            latency_ms=latency_ms,
+        ):
             return
         await self._samples.persist(
             miner_hotkey=miner.hotkey,
@@ -608,6 +720,24 @@ def _pick_url(urls: List[str], task_id: int, index: int) -> str:
     if len(urls) == 1:
         return urls[0]
     return urls[(int(task_id) + index) % len(urls)]
+
+
+def _resolve_deployment_id(
+    base_url: str,
+    deployments: List[DeploymentRecord],
+    legacy_id: Optional[str],
+) -> Optional[str]:
+    """Map ``base_url`` → its serving ``deployment_id``.
+
+    Multi-instance providers populate ``deployments`` (one entry per
+    serving host, each with its own ``deployment_id``); legacy
+    single-instance records leave that list empty and only set
+    ``legacy_id`` + a single ``base_url``. We need a stable token to
+    detect mid-evaluate model swaps (see ``_is_current_deployment``)."""
+    for d in deployments:
+        if d.base_url == base_url:
+            return d.deployment_id
+    return legacy_id
 
 
 # Pre-refactor parity (see PR #439): only errors that point at a miner

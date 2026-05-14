@@ -19,6 +19,11 @@ class WorkerMetrics:
     tasks_succeeded: int = 0
     tasks_failed: int = 0
     tasks_in_flight: int = 0
+    # Results dropped because the deployment we dispatched against is no
+    # longer the current one for this miner — the model was swapped (or
+    # the miner exited the subject role) mid-evaluate, so persisting
+    # would attribute new-model output to the old miner.
+    tasks_dropped_drift: int = 0
     total_execution_ms: int = 0
     last_task_at: Optional[float] = None
 

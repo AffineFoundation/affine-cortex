@@ -1,4 +1,9 @@
-from affine.src.executor.worker import _base_urls, _is_zero_score_error, _pick_url
+from affine.src.executor.worker import (
+    _base_urls,
+    _is_zero_score_error,
+    _pick_url,
+    _resolve_deployment_id,
+)
 from affine.src.executor.main import ExecutorManager
 from affine.src.scorer.window_state import DeploymentRecord
 
@@ -744,3 +749,212 @@ def test_dispatch_skips_when_neither_has_url():
         return await worker._dispatch_new(set(), set())
 
     assert _asyncio.run(_drive()) == 0
+
+
+# ---- deployment_id drift validation -----------------------------------------
+#
+# Bug context: during sglang model swap, the executor's in-flight
+# ``evaluate`` calls for the old miner kept hitting the same val:8100
+# tunnel — but the host behind that tunnel was now serving the new
+# miner's model. The results got persisted under the old miner's
+# (hotkey, revision), contaminating ~916 sample_results rows for uid=32.
+#
+# Fix: capture ``deployment_id`` at dispatch and re-validate before
+# persist. If the captured token is no longer current for this miner
+# (in either champion or challenger role), drop the row.
+
+
+def test_resolve_deployment_id_picks_matching_url():
+    deps = [
+        DeploymentRecord(endpoint_name="a", deployment_id="da", base_url="http://a/v1"),
+        DeploymentRecord(endpoint_name="b", deployment_id="db", base_url="http://b/v1"),
+    ]
+    assert _resolve_deployment_id("http://b/v1", deps, legacy_id="legacy") == "db"
+
+
+def test_resolve_deployment_id_falls_back_to_legacy_when_deployments_empty():
+    assert _resolve_deployment_id(
+        "http://single/v1", deployments=[], legacy_id="wrk-legacy",
+    ) == "wrk-legacy"
+
+
+def test_resolve_deployment_id_returns_none_when_unmatched_and_no_legacy():
+    deps = [DeploymentRecord(endpoint_name="a", deployment_id="da", base_url="http://a/v1")]
+    assert _resolve_deployment_id("http://other/v1", deps, legacy_id=None) is None
+
+
+class _DeploymentDriftFixture:
+    """Stubs that let a single ``_evaluate_and_persist_gated`` call run
+    end-to-end against a controllable champion / battle / samples.
+
+    The state objects are stored as attributes so a test can rewrite
+    them between dispatch (capture) and persist (re-read) to simulate a
+    mid-evaluate model swap."""
+
+    def __init__(self, *, env="ENV_A"):
+        from affine.core.models import Result
+        from affine.src.executor.worker import ExecutorWorker
+
+        self.env = env
+        self.worker = ExecutorWorker(worker_id=0, env=env)
+        self.worker.warmup_sec = 0
+        self.champion = None
+        self.battle = None
+        self.persist_calls = []
+        self.score = 0.7
+        self._Result = Result
+
+        fixture = self
+
+        class _StateStub:
+            async def get_champion(self):
+                return fixture.champion
+
+            async def get_battle(self):
+                return fixture.battle
+
+        class _SamplesStub:
+            async def persist(self, **kwargs):
+                fixture.persist_calls.append(kwargs)
+
+        class _EnvStub:
+            async def evaluate(self, *, miner, task_id):
+                return fixture._Result(
+                    env=fixture.env,
+                    score=fixture.score,
+                    latency_seconds=0.1,
+                    success=True,
+                    task_id=task_id,
+                )
+
+        self.worker._state = _StateStub()
+        self.worker._samples = _SamplesStub()
+        self.worker._env_executor = _EnvStub()
+
+    async def run(self, *, miner, expected_deployment_id, task_id=10):
+        await self.worker._evaluate_and_persist_gated(
+            miner=miner, task_id=task_id,
+            base_url="https://t/wrk-X",
+            refresh_block=0,
+            miner_obj=object(),
+            expected_deployment_id=expected_deployment_id,
+        )
+
+
+def test_persists_when_deployment_id_unchanged():
+    """Happy path: champion's deployment hasn't moved → persist."""
+    import asyncio as _asyncio
+
+    from affine.src.scorer.window_state import ChampionRecord, MinerSnapshot
+
+    fx = _DeploymentDriftFixture()
+    fx.champion = ChampionRecord(
+        uid=1, hotkey="hk", revision="rev", model="org/m",
+        deployment_id="wrk-current", base_url="https://t/wrk-X",
+        deployments=[], since_block=0,
+    )
+    miner = MinerSnapshot(uid=1, hotkey="hk", revision="rev", model="org/m")
+
+    _asyncio.run(fx.run(miner=miner, expected_deployment_id="wrk-current"))
+
+    assert len(fx.persist_calls) == 1
+    assert fx.worker.metrics.tasks_dropped_drift == 0
+    assert fx.worker.metrics.tasks_succeeded == 1
+
+
+def test_drops_when_champion_deployment_swapped_mid_evaluate():
+    """sglang model swap: evaluate returns a result but the deployment
+    that produced it is no longer the champion's serving deployment.
+    Persisting would attribute new-model output to the old miner."""
+    import asyncio as _asyncio
+
+    from affine.src.scorer.window_state import ChampionRecord, MinerSnapshot
+
+    fx = _DeploymentDriftFixture()
+    # State at persist time: champion still same identity, but on a new
+    # deployment_id (the old one was torn down during swap).
+    fx.champion = ChampionRecord(
+        uid=1, hotkey="hk", revision="rev", model="org/m",
+        deployment_id="wrk-NEW", base_url="https://t/wrk-NEW",
+        deployments=[], since_block=0,
+    )
+    miner = MinerSnapshot(uid=1, hotkey="hk", revision="rev", model="org/m")
+
+    _asyncio.run(fx.run(miner=miner, expected_deployment_id="wrk-OLD"))
+
+    assert fx.persist_calls == []
+    assert fx.worker.metrics.tasks_dropped_drift == 1
+    # Drift drops are not counted as success or failure — the row will
+    # be re-attempted next dispatch tick against the new deployment.
+    assert fx.worker.metrics.tasks_succeeded == 0
+    assert fx.worker.metrics.tasks_failed == 0
+
+
+def test_persists_when_challenger_wins_and_deployment_id_transferred():
+    """Challenger wins: the challenger's deployment_id is transferred
+    into the new champion record (same hotkey/revision). The captured
+    token still matches the new champion's deployment_id, so an
+    in-flight challenger task that completes after the transfer must
+    still persist — those samples are valid for the new champion."""
+    import asyncio as _asyncio
+
+    from affine.src.scorer.window_state import ChampionRecord, MinerSnapshot
+
+    fx = _DeploymentDriftFixture()
+    # New champion = the former challenger. battle is now cleared.
+    fx.champion = ChampionRecord(
+        uid=2, hotkey="chal_hk", revision="chal_rev", model="org/m2",
+        deployment_id="wrk-CHAL", base_url="https://t/wrk-CHAL",
+        deployments=[], since_block=42,
+    )
+    fx.battle = None
+    miner = MinerSnapshot(uid=2, hotkey="chal_hk", revision="chal_rev", model="org/m2")
+
+    _asyncio.run(fx.run(miner=miner, expected_deployment_id="wrk-CHAL"))
+
+    assert len(fx.persist_calls) == 1
+    assert fx.worker.metrics.tasks_dropped_drift == 0
+
+
+def test_drops_when_miner_no_longer_subject():
+    """Miner has dropped out of both champion and challenger roles
+    (e.g. battle ended with old champion losing, or scheduler purged
+    them). No subject role → drop."""
+    import asyncio as _asyncio
+
+    from affine.src.scorer.window_state import ChampionRecord, MinerSnapshot
+
+    fx = _DeploymentDriftFixture()
+    fx.champion = ChampionRecord(
+        uid=99, hotkey="other_hk", revision="other_rev", model="org/o",
+        deployment_id="wrk-OTHER", base_url="https://t/wrk-OTHER",
+        deployments=[], since_block=0,
+    )
+    fx.battle = None
+    miner = MinerSnapshot(uid=1, hotkey="lost_hk", revision="lost_rev", model="org/m")
+
+    _asyncio.run(fx.run(miner=miner, expected_deployment_id="wrk-LOST"))
+
+    assert fx.persist_calls == []
+    assert fx.worker.metrics.tasks_dropped_drift == 1
+
+
+def test_skips_validation_when_no_token_was_captured():
+    """Backward-compat: if dispatch had nothing to capture (legacy record
+    with neither ``deployments`` nor ``deployment_id``), we can't detect
+    drift, so behave as before — persist."""
+    import asyncio as _asyncio
+
+    from affine.src.scorer.window_state import ChampionRecord, MinerSnapshot
+
+    fx = _DeploymentDriftFixture()
+    fx.champion = ChampionRecord(
+        uid=1, hotkey="hk", revision="rev", model="org/m",
+        deployment_id=None, base_url=None, deployments=[], since_block=0,
+    )
+    miner = MinerSnapshot(uid=1, hotkey="hk", revision="rev", model="org/m")
+
+    _asyncio.run(fx.run(miner=miner, expected_deployment_id=None))
+
+    assert len(fx.persist_calls) == 1
+    assert fx.worker.metrics.tasks_dropped_drift == 0
