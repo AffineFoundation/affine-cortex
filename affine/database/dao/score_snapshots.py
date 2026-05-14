@@ -38,7 +38,7 @@ class ScoreSnapshotsDAO(BaseDAO):
         scorer_hotkey: str,
         config: Dict[str, Any],
         statistics: Dict[str, Any],
-        ttl_days: int = 30
+        ttl_days: int = 365,
     ) -> Dict[str, Any]:
         """Save a scoring snapshot metadata.
         
@@ -58,7 +58,10 @@ class ScoreSnapshotsDAO(BaseDAO):
                     "invalid_miners": int,
                     "final_weights": {"uid": "weight", ...}
                 }
-            ttl_days: Days until automatic deletion (default 30)
+            ttl_days: Days until automatic deletion (default 365). The
+                weights endpoint walks recent snapshots to find the past
+                N distinct champions, so we keep at least a year of
+                history to survive a long-tenured champion's win-streak.
             
         Returns:
             Saved item

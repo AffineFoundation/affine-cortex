@@ -59,11 +59,23 @@ class _FakeExecutionLogsDAO:
 
 
 class _FakeScoreSnapshotsDAO:
-    def __init__(self, snapshot):
-        self.snapshot = snapshot
+    """Test stand-in. Accepts either a single snapshot (back-compat with
+    legacy callers) or an explicit ``snapshots`` list ordered newest-first
+    so the weights endpoint can scan recent history."""
+
+    def __init__(self, snapshot=None, *, snapshots=None):
+        if snapshots is not None:
+            self.snapshots = list(snapshots)
+        elif snapshot is not None:
+            self.snapshots = [snapshot]
+        else:
+            self.snapshots = []
 
     async def get_latest_snapshot(self):
-        return self.snapshot
+        return self.snapshots[0] if self.snapshots else None
+
+    async def get_recent_snapshots(self, limit=10):
+        return self.snapshots[:limit]
 
 
 class _FakeScoresDAO:
@@ -806,7 +818,9 @@ async def test_weights_endpoint_does_not_expose_snapshot_config():
                     "8": "0.0",
                 }
             },
-        })
+        }),
+        miners_dao=_FakeMinersDAO({}),
+        config_dao=_FakeSystemConfigDAO({}),
     )
 
     assert response == {
@@ -829,7 +843,9 @@ async def test_weights_endpoint_accepts_legacy_miner_final_scores():
                     "8": 0,
                 }
             },
-        })
+        }),
+        miners_dao=_FakeMinersDAO({}),
+        config_dao=_FakeSystemConfigDAO({}),
     )
 
     assert response == {
@@ -839,6 +855,251 @@ async def test_weights_endpoint_accepts_legacy_miner_final_scores():
             "8": {"weight": 0.0},
         },
     }
+
+
+def _miners_by_hotkey(*rows):
+    """Build a _FakeMinersDAO seeded so ``get_miner_by_hotkey`` resolves
+    each ``(hotkey, uid)`` pair (None uid models a deregistered hotkey)."""
+    seeded = {}
+    for hotkey, uid in rows:
+        if uid is None:
+            continue
+        seeded[("hotkey", hotkey)] = {"hotkey": hotkey, "uid": uid}
+    return _FakeMinersDAO(seeded)
+
+
+def _split_config(after_block=0, count=3):
+    return _FakeSystemConfigDAO({
+        "weights_split_after_block": after_block,
+        "weights_split_champion_count": count,
+    })
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_splits_evenly_after_activation_block():
+    # Threshold = 300, latest snapshot block = 500 → split fires. Past 3
+    # distinct champion hotkeys each resolve to a *currently-registered*
+    # uid via miners_dao; each carries 1/3.
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+        {
+            "block_number": 400,
+            "statistics": {"winner_uid": 7, "winner_hotkey": "hk-g"},
+        },
+        # Duplicate hotkey — dedup'd; the next distinct hotkey below
+        # still counts toward the 3-share.
+        {
+            "block_number": 350,
+            "statistics": {"winner_uid": 7, "winner_hotkey": "hk-g"},
+        },
+        {
+            "block_number": 300,
+            "statistics": {"winner_uid": 213, "winner_hotkey": "hk-x"},
+        },
+        {
+            "block_number": 200,
+            "statistics": {"winner_uid": 5, "winner_hotkey": "hk-e"},
+        },
+    ]
+
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(("hk-h", 8), ("hk-g", 7), ("hk-x", 42)),
+        config_dao=_split_config(after_block=300, count=3),
+    )
+
+    share = pytest.approx(1.0 / 3)
+    # hk-x's *current* uid is 42 (it moved off uid 213), so the chain
+    # weight goes to uid 42 — not to the new occupant of uid 213.
+    assert response == {
+        "block_number": 500,
+        "weights": {
+            "8": {"weight": share},
+            "7": {"weight": share},
+            "42": {"weight": share},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_legacy_payload_when_split_disabled():
+    # No ``weights_split_after_block`` row in system_config → feature
+    # off → keep the legacy winner-takes-all payload exactly as the
+    # scheduler wrote it.
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {
+                "winner_uid": 8,
+                "final_weights": {"8": "1.0", "7": "0.0"},
+            },
+        },
+    ]
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_FakeMinersDAO({}),
+        config_dao=_FakeSystemConfigDAO({}),  # no split keys present
+    )
+
+    assert response == {
+        "block_number": 500,
+        "weights": {
+            "8": {"weight": 1.0},
+            "7": {"weight": 0.0},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_legacy_payload_before_activation_block():
+    # Feature enabled but latest block (500) below threshold (1000) →
+    # still legacy.
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {
+                "winner_uid": 8, "winner_hotkey": "hk-h",
+                "final_weights": {"8": "1.0", "7": "0.0"},
+            },
+        },
+    ]
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(("hk-h", 8)),
+        config_dao=_split_config(after_block=1000, count=3),
+    )
+
+    assert response == {
+        "block_number": 500,
+        "weights": {
+            "8": {"weight": 1.0},
+            "7": {"weight": 0.0},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_skips_deregistered_hotkey_and_backfills():
+    # hk-g (the second-most-recent champion) has deregistered — the
+    # endpoint must NOT credit whoever now sits on its old uid. Instead
+    # it walks further back to hk-x and includes that one. Result: 3
+    # *currently-registered* hotkeys share the weight.
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+        {
+            "block_number": 400,
+            "statistics": {"winner_uid": 7, "winner_hotkey": "hk-g"},
+        },
+        {
+            "block_number": 300,
+            "statistics": {"winner_uid": 213, "winner_hotkey": "hk-x"},
+        },
+        {
+            "block_number": 200,
+            "statistics": {"winner_uid": 5, "winner_hotkey": "hk-e"},
+        },
+    ]
+
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(
+            ("hk-h", 8),
+            # hk-g intentionally absent → deregistered.
+            ("hk-x", 42),
+            ("hk-e", 5),
+        ),
+        config_dao=_split_config(after_block=300, count=3),
+    )
+
+    share = pytest.approx(1.0 / 3)
+    assert response == {
+        "block_number": 500,
+        "weights": {
+            "8": {"weight": share},
+            "42": {"weight": share},
+            "5": {"weight": share},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_splits_what_history_has_when_fewer_than_three():
+    # Only one distinct registered hotkey on record → it gets the full
+    # 1.0 so the validator still has something to set on chain.
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+    ]
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(("hk-h", 8)),
+        config_dao=_split_config(after_block=300, count=3),
+    )
+
+    assert response == {
+        "block_number": 500,
+        "weights": {"8": {"weight": 1.0}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_respects_custom_champion_count():
+    # Operator bumped weights_split_champion_count to 2 → split 1/2.
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+        {
+            "block_number": 400,
+            "statistics": {"winner_uid": 7, "winner_hotkey": "hk-g"},
+        },
+        {
+            "block_number": 300,
+            "statistics": {"winner_uid": 213, "winner_hotkey": "hk-x"},
+        },
+    ]
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(("hk-h", 8), ("hk-g", 7), ("hk-x", 42)),
+        config_dao=_split_config(after_block=300, count=2),
+    )
+
+    share = pytest.approx(1.0 / 2)
+    assert response == {
+        "block_number": 500,
+        "weights": {
+            "8": {"weight": share},
+            "7": {"weight": share},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_404s_when_all_recent_hotkeys_deregistered():
+    # Split fires but every past champion hotkey is gone → we refuse to
+    # return weights (better than crediting random successor uids).
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+    ]
+    with pytest.raises(Exception) as excinfo:
+        await get_latest_weights(
+            snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+            miners_dao=_FakeMinersDAO({}),  # nobody is registered
+            config_dao=_split_config(after_block=300, count=3),
+        )
+    assert "404" in str(excinfo.value) or "registered" in str(excinfo.value).lower()
 
 
 @pytest.mark.asyncio
