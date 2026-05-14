@@ -12,6 +12,7 @@ from affine.src.scorer.dao_adapters import SampleResultsAdapter
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
+    EnvConfig,
     StateStore,
     SystemConfigKVAdapter,
     TaskIdState,
@@ -89,6 +90,35 @@ async def _sample_counts(
     return out
 
 
+def _live_sampling_uids(
+    champion: Optional[ChampionRecord],
+    battle: Optional[BattleRecord],
+    task_state: Optional[TaskIdState],
+    envs: Dict[str, EnvConfig],
+    sample_counts: Dict[str, Dict[str, int]],
+) -> List[int]:
+    if task_state is None:
+        return []
+    out: List[int] = []
+
+    def _is_active(uid: int) -> bool:
+        counts = sample_counts.get(str(uid)) or {}
+        for env, cfg in envs.items():
+            task_ids = task_state.task_ids.get(env) or []
+            if not task_ids:
+                continue
+            target = min(len(task_ids), int(cfg.sampling_count))
+            if target > 0 and int(counts.get(env) or 0) < target:
+                return True
+        return False
+
+    if champion is not None and _is_active(champion.uid):
+        out.append(champion.uid)
+    if battle is not None and _is_active(battle.challenger.uid):
+        out.append(battle.challenger.uid)
+    return out
+
+
 async def get_current_state() -> Dict[str, Any]:
     """Build the live state section used by ``/rank/current``."""
     store = _state_store()
@@ -97,6 +127,8 @@ async def get_current_state() -> Dict[str, Any]:
         champion = await _infer_champion_from_scores()
     battle = await store.get_battle()
     task_state = await store.get_task_state()
+    envs = await store.get_environments()
+    sample_counts = await _sample_counts(champion, battle, task_state)
     return {
         "champion": _miner_summary(champion) if champion else None,
         "battle": {
@@ -104,7 +136,10 @@ async def get_current_state() -> Dict[str, Any]:
             "started_at_block": battle.started_at_block,
         } if battle else None,
         "task_refresh_block": task_state.refreshed_at_block if task_state else None,
-        "sample_counts": await _sample_counts(champion, battle, task_state),
+        "sample_counts": sample_counts,
+        "live_sampling_uids": _live_sampling_uids(
+            champion, battle, task_state, envs, sample_counts,
+        ),
     }
 
 

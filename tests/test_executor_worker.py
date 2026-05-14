@@ -434,7 +434,7 @@ def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
 
     _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
 
-    assert manager._last_done["ENV_A"] == 841
+    assert manager._last_done["ENV_A"] == 400
     assert manager.env_cap_values["ENV_A"].value == 600
 
 

@@ -813,9 +813,9 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
         rb = int(tids.get("refreshed_at_block", 0))
 
         subjects = []
-        if miner_filter in ("champion", "both") and champion.get("hotkey"):
+        if miner_filter in ("active", "champion", "both") and champion.get("hotkey"):
             subjects.append(("champion", champion["uid"], champion["hotkey"], champion["revision"]))
-        if miner_filter in ("challenger", "both") and battle:
+        if miner_filter in ("active", "challenger", "both") and battle:
             chal = battle.get("challenger") or {}
             if chal.get("hotkey"):
                 subjects.append(("challenger", chal["uid"], chal["hotkey"], chal["revision"]))
@@ -834,21 +834,17 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
         win_label = window_spec if win_secs > 0 else "all-time"
         click.echo(f"refresh_block={rb}  window={win_label}")
 
+        active_seen = False
         for role, uid, hk, rev in subjects:
-            click.echo("")
-            click.echo(f"=== {role}  uid={uid}  ({hk[:14]}...@{rev[:8]}) ===")
-            click.echo(
-                f"{'env':<14}{'tgt':>5}{'done':>6}{'%':>5}  {'rate/m':>8}{'eta':>8}"
-                f"  {'in_fly':>7}{'ok':>7}{'fail':>6}{'avg_lat':>9}  {'last':>10}{'age':>5}"
-            )
-
             now_ms = int(now * 1000)
             cutoff_ms = now_ms - win_secs * 1000 if win_secs > 0 else 0
+            env_lines = []
+            subject_active = False
 
             for env_name in sorted(envs.keys()):
                 cfg = envs[env_name]
                 if not cfg.get("enabled_for_sampling", False):
-                    click.echo(f"{env_name:<14}  (disabled)")
+                    env_lines.append(f"{env_name:<14}  (disabled)")
                     continue
 
                 # --- progress columns ---
@@ -879,6 +875,8 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
                     and "timestamp" in r
                 ]
                 done = len(current)
+                if target and done < target:
+                    subject_active = True
                 pct = (100 * done // target) if target else 0
                 last_str = (
                     datetime.fromtimestamp(max(current) / 1000).strftime("%H:%M:%S")
@@ -914,12 +912,28 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
                 age = int(now - reported_at) if reported_at else None
                 age_str = f"{age}s" if age is not None else "—"
 
-                click.echo(
+                env_lines.append(
                     f"{env_name:<14}{target:>5}{done:>6}{pct:>4}%  "
                     f"{rate_per_min:>6.1f}/m{eta:>8}  "
                     f"{in_flight:>7}{succ:>7}{fail:>6}{avg_lat:>9}  "
                     f"{last_str:>10}{age_str:>5}"
                 )
+            if not subject_active:
+                continue
+
+            active_seen = True
+            click.echo("")
+            click.echo(f"=== {role}  uid={uid}  ({hk[:14]}...@{rev[:8]}) ===")
+            click.echo(
+                f"{'env':<14}{'tgt':>5}{'done':>6}{'%':>5}  {'rate/m':>8}{'eta':>8}"
+                f"  {'in_fly':>7}{'ok':>7}{'fail':>6}{'avg_lat':>9}  {'last':>10}{'age':>5}"
+            )
+            for line in env_lines:
+                click.echo(line)
+
+        if not active_seen:
+            click.echo("")
+            click.echo("No active sampling subjects to report.")
     finally:
         await close_client()
 
@@ -927,9 +941,9 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
 @db.command("sample-progress")
 @click.option("--window", default="5m",
               help="Rate window: '30s', '5m', '2h', or 'all' (default: 5m)")
-@click.option("--miner", default="champion",
-              type=click.Choice(["champion", "challenger", "both"]),
-              help="Which miner to report (default: champion)")
+@click.option("--miner", default="active",
+              type=click.Choice(["active", "champion", "challenger", "both"]),
+              help="Which miner to report (default: active)")
 def sample_progress(window, miner):
     """Per-env sample progress + rate + ETA + live executor concurrency.
 

@@ -191,6 +191,20 @@ class ExecutorManager:
         env_stats: Dict[str, Dict[str, int]] = {}
         rows: Dict[str, Dict[str, Any]] = {}
 
+        # Display the currently-sampling miner's progress only:
+        #   no battle → champion (still ramping samples)
+        #   battle in flight → challenger (champion already done by definition)
+        # Cumulative champion+challenger numbers are misleading once
+        # champion is finished — operators want to see how close the
+        # challenger is to ``sampling_count`` so they can predict decide.
+        active_kind: Optional[str] = None
+        for kind, _, _ in subjects:
+            if kind == "challenger":
+                active_kind = "challenger"
+                break
+        if active_kind is None and subjects:
+            active_kind = subjects[0][0]  # champion phase
+
         for env in sorted(self.envs):
             ids = task_ids_by_env.get(env, []) or []
             sampling_count = _sampling_count_for_env(envs_raw, env, len(ids))
@@ -198,23 +212,33 @@ class ExecutorManager:
                 "champion": len(ids),
                 "challenger": min(len(ids), sampling_count),
             }
-            target = sum(subject_targets[kind] for kind, _, _ in subjects)
-            done = 0
+            # Per-subject done (used for adaptive cap math + the displayed
+            # active-subject row).
+            per_done: Dict[str, int] = {}
             if ids and subjects and refresh_block:
                 for kind, hk, rev in subjects:
                     try:
                         count = await samples.count_samples_for_tasks(
                             hk, rev, env, ids, refresh_block=refresh_block,
                         )
-                        done += min(count, subject_targets[kind])
+                        per_done[kind] = min(count, subject_targets[kind])
                     except Exception as e:
                         logger.debug(f"status count failed for {env}: {e}")
+                        per_done[kind] = 0
+            target = subject_targets.get(active_kind, 0) if active_kind else 0
+            done = per_done.get(active_kind, 0) if active_kind else 0
             running = int(self.in_flight_values[env].value)
             prev = self._last_done.get(env, 0)
             delta = max(0, done - prev) if self._last_status_at else 0
+            # Adaptive cap math still uses the combined (champ + chal) target
+            # and per-cycle delta so an env that finished one subject doesn't
+            # look "complete" from the cap planner's POV while the other
+            # subject still has work.
+            combined_target = sum(subject_targets[k] for k, _, _ in subjects)
+            combined_done = sum(per_done.get(k, 0) for k, _, _ in subjects)
             env_stats[env] = {
-                "target": target,
-                "done": done,
+                "target": combined_target,
+                "done": combined_done,
                 "running": running,
                 "delta": delta,
             }
@@ -258,15 +282,18 @@ class ExecutorManager:
                 per_env_parts.append(f"{short}@{done}/{target} run:{running}/{cap}")
 
         total_rate = (total_delta / elapsed_s * 3600) if (elapsed_s and total_delta) else 0
+        kind_label = f"[{active_kind}]" if active_kind else ""
         if self._last_status_at:
             head = (
-                f"[STATUS] running={in_flight_total}/{GLOBAL_DISPATCH_BUDGET} | "
+                f"[STATUS] {kind_label} "
+                f"running={in_flight_total}/{GLOBAL_DISPATCH_BUDGET} | "
                 f"done={total_done}/{total_target} +{total_delta} in {elapsed_s}s "
                 f"rate:{total_rate:.0f}/h"
             )
         else:
             head = (
-                f"[STATUS] running={in_flight_total}/{GLOBAL_DISPATCH_BUDGET} | "
+                f"[STATUS] {kind_label} "
+                f"running={in_flight_total}/{GLOBAL_DISPATCH_BUDGET} | "
                 f"done={total_done}/{total_target} (baseline)"
             )
         logger.info(f"{head} | " + " | ".join(per_env_parts))

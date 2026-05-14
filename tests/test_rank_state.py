@@ -48,6 +48,7 @@ async def test_current_state_on_empty_state(monkeypatch):
         "battle": None,
         "task_refresh_block": None,
         "sample_counts": {},
+        "live_sampling_uids": [],
     }
 
 
@@ -86,6 +87,44 @@ async def test_current_state_with_battle_in_flight(monkeypatch):
     assert resp["battle"]["challenger"]["uid"] == 2
     assert resp["battle"]["started_at_block"] == 42
     assert resp["task_refresh_block"] == 42
+
+
+@pytest.mark.asyncio
+async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(monkeypatch):
+    async def _counts(champion, battle, task_state):
+        return {
+            "1": {"ENV_A": 5},
+            "2": {"ENV_A": 2},
+        }
+
+    kv = InMemoryConfigStore()
+    kv.data["environments"] = {
+        "ENV_A": {
+            "display_name": "A",
+            "enabled_for_sampling": True,
+            "sampling": {"sampling_count": 5, "dataset_range": [[0, 100]]},
+        },
+    }
+    store = StateStore(kv)
+    await store.set_champion(ChampionRecord(
+        uid=1, hotkey="A", revision="r1", model="org/a",
+        deployment_id="wrk-A", base_url="https://t/A", since_block=0,
+    ))
+    await store.set_battle(BattleRecord(
+        challenger=MinerSnapshot(uid=2, hotkey="B", revision="r2", model="org/b"),
+        deployment_id="wrk-B", base_url="https://t/B", started_at_block=42,
+    ))
+    await store.set_task_state(TaskIdState(
+        task_ids={"ENV_A": [1, 2, 3, 4, 5, 6]}, refreshed_at_block=42,
+    ))
+    monkeypatch.setattr(rank_state, "_state_store", lambda: store)
+    monkeypatch.setattr(rank_state, "_sample_counts", _counts)
+    monkeypatch.setattr(rank_state, "_infer_champion_from_scores", _no_inferred_champion)
+
+    resp = await rank_state.get_current_state()
+
+    assert resp["sample_counts"] == {"1": {"ENV_A": 5}, "2": {"ENV_A": 2}}
+    assert resp["live_sampling_uids"] == [2]
 
 
 class _FakeScoresDAO:

@@ -179,8 +179,8 @@ def _colored_status(status: str, *, is_invalid: bool) -> str:
     return text
 
 
-def _sampling_mark(uid: Any, champion_uid: Optional[int], battle_uid: Optional[int]) -> str:
-    if uid == champion_uid or uid == battle_uid:
+def _sampling_mark(uid: Any, live_sampling_uids: set[int]) -> str:
+    if uid in live_sampling_uids:
         return _ansi("⚡", "1;92")
     return "  "
 
@@ -254,6 +254,11 @@ def _print_rank_table(
         if row.get("uid") is not None
     }
     live_sample_counts = (window or {}).get("sample_counts") or {}
+    live_sampling_uids = {
+        int(uid)
+        for uid in ((window or {}).get("live_sampling_uids") or [])
+        if isinstance(uid, int)
+    }
 
     header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
     header_parts.extend(f"{env[:24]:>24}" for env in envs)
@@ -312,7 +317,7 @@ def _print_rank_table(
         row_parts = [
             f"{_short(row.get('miner_hotkey'), 8):8s}",
             f"{int(row.get('uid') or -1):4d}",
-            f"{_sampling_mark(row.get('uid'), live_champion_uid, battle_uid)}| "
+            f"{_sampling_mark(row.get('uid'), live_sampling_uids)}| "
             f"{_short(row.get('model'), 25):25s}",
         ]
         scores_by_env = row.get("scores_by_env") or {}
