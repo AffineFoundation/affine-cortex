@@ -1732,3 +1732,233 @@ async def test_early_regression_single_instance_clears_champion_deployment():
     champ_after = await state.get_champion()
     assert champ_after.deployment_id is None
     assert champ_after.base_url is None
+
+
+@pytest.mark.asyncio
+async def test_no_trigger_when_challenger_at_exact_not_worse_threshold():
+    """Challenger sitting exactly at ``champion * (1 - tolerance)`` is
+    boundary: comparator treats it as NOT_WORSE (the ``- 1e-9`` slack
+    in ``comparator.py``'s ENV_WORSE branch). Step 7.5 mirrors that —
+    a contest right on the line is not a definitive regression."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+    task_state = await _drive_through_start_of_battle(
+        scheduler, state, samples, champion_score=1.0,
+    )
+
+    # threshold = 1.0 * (1 - 0.02) = 0.98. Challenger sits exactly there.
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_A", task_state.task_ids["ENV_A"],
+        score=0.98, refresh_block=task_state.refreshed_at_block,
+    )
+    # ENV_B kept short so step 8 (full-overlap_ready) doesn't fire and
+    # we're testing 7.5 in isolation.
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_B", task_state.task_ids["ENV_B"][:1],
+        score=0.98, refresh_block=task_state.refreshed_at_block,
+    )
+
+    await scheduler.tick(current_block=77)
+
+    # No early-LOST: at-threshold is NOT_WORSE, battle continues.
+    assert (await state.get_battle()) is not None
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_regression_in_sampling_only_env_does_not_trigger():
+    """A non-scoring env (``enabled_for_scoring=False``) is excluded
+    from the comparator's verdict — a regression on it must NOT fire
+    step 7.5 either, regardless of overlap depth. Mirrors how
+    ``_decide`` only sees scoring envs."""
+    kv = InMemoryConfigStore()
+    kv.data["environments"] = {
+        "ENV_SCORING": {
+            "display_name": "S", "enabled_for_sampling": True,
+            "enabled_for_scoring": True,
+            "sampling": {"sampling_count": 4, "dataset_range": [[0, 1000]],
+                         "sampling_mode": "random"},
+        },
+        "ENV_SAMPLING_ONLY": {
+            "display_name": "SO", "enabled_for_sampling": True,
+            "enabled_for_scoring": False,  # excluded from verdict
+            "sampling": {"sampling_count": 4, "dataset_range": [[0, 1000]],
+                         "sampling_mode": "random"},
+        },
+    }
+    kv.data["champion"] = {
+        "uid": 1, "hotkey": "champ_hk", "revision": "champ_rev",
+        "model": "org/champ",
+        "deployment_id": None, "base_url": None, "since_block": 0,
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+
+    # Warmup; champion fills both envs (sampling-only still gets sampled).
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    for env in ("ENV_SCORING", "ENV_SAMPLING_ONLY"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            score=0.9, refresh_block=task_state.refreshed_at_block,
+        )
+    await scheduler.tick(current_block=52)
+    assert (await state.get_battle()) is not None
+
+    # Heavy regression in the sampling-only env at FULL overlap;
+    # scoring env clean and with only one sample (insufficient).
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_SAMPLING_ONLY",
+        task_state.task_ids["ENV_SAMPLING_ONLY"],
+        score=0.0, refresh_block=task_state.refreshed_at_block,
+    )
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_SCORING",
+        task_state.task_ids["ENV_SCORING"][:1],
+        score=0.9, refresh_block=task_state.refreshed_at_block,
+    )
+
+    await scheduler.tick(current_block=77)
+
+    # No early-LOST: the regression env isn't in scoring_envs.
+    assert (await state.get_battle()) is not None
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_regression_detected_in_any_scoring_env_not_just_first():
+    """Step 7.5 walks every scoring env — a regression in ENV_B (second
+    in config order) must trigger even when ENV_A is healthy. Pins the
+    "any single env regression is sufficient" rule."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+    task_state = await _drive_through_start_of_battle(
+        scheduler, state, samples, champion_score=0.9,
+    )
+
+    # ENV_A: full overlap, matches champion → NOT_WORSE.
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_A", task_state.task_ids["ENV_A"],
+        score=0.9, refresh_block=task_state.refreshed_at_block,
+    )
+    # ENV_B: full overlap, deep regression.
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_B", task_state.task_ids["ENV_B"],
+        score=0.4, refresh_block=task_state.refreshed_at_block,
+    )
+
+    await scheduler.tick(current_block=77)
+
+    row = miner_store.rows[2]
+    assert row["challenge_status"] == STATUS_TERMINATED
+    assert "early_regression_in_ENV_B" in row["termination_reason"]
+
+
+@pytest.mark.asyncio
+async def test_no_trigger_when_regressing_env_below_sampling_count():
+    """A regressing env that hasn't yet reached ``sampling_count``
+    overlap is not yet decisive — the comparator wouldn't act on it
+    either (its sample-count gate is identical). Tick must wait."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+    task_state = await _drive_through_start_of_battle(
+        scheduler, state, samples, champion_score=0.9,
+    )
+
+    # ENV_A: full overlap, matches champion (clean).
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_A", task_state.task_ids["ENV_A"],
+        score=0.9, refresh_block=task_state.refreshed_at_block,
+    )
+    # ENV_B: deep regression but only 2 samples — well below
+    # sampling_count=4, so neither 7.5 nor 8 fires.
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_B", task_state.task_ids["ENV_B"][:2],
+        score=0.0, refresh_block=task_state.refreshed_at_block,
+    )
+
+    await scheduler.tick(current_block=77)
+
+    assert (await state.get_battle()) is not None
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_early_regression_reason_format_pins_hotkey_prefix():
+    """Frozen reason is exactly ``lost_to_champion:<hotkey[:10]>:
+    early_regression_in_<env>``. Backfill scripts and the rank UI key
+    off this format; changing it silently breaks downstream tooling."""
+    kv = _seed_state(sampling_count=4)
+    # Override the seeded champion's hotkey to a recognisable 16-char
+    # string so the [:10] prefix is unambiguous in the assertion.
+    kv.data["champion"]["hotkey"] = "champ_long_hotkey"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_long_hotkey", 100,
+                    status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+
+    # Inline warmup (the helper hardcodes ``champ_hk``).
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    rb = task_state.refreshed_at_block
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_long_hotkey", "champ_rev", env, task_state.task_ids[env],
+            score=0.9, refresh_block=rb,
+        )
+    await scheduler.tick(current_block=52)
+    assert (await state.get_battle()) is not None
+
+    samples.set_samples(
+        "chal_hk", "chal_rev", "ENV_A", task_state.task_ids["ENV_A"],
+        score=0.4, refresh_block=rb,
+    )
+
+    await scheduler.tick(current_block=77)
+
+    reason = miner_store.rows[2]["termination_reason"]
+    assert reason == "lost_to_champion:champ_long:early_regression_in_ENV_A"
