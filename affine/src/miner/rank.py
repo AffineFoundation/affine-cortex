@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import os
 import sys
-import time
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from affine.utils.api_client import cli_api_client
 
 
 _RANK_FETCH_LIMIT = 256
-_QUEUE_PREVIEW = 10
+# Show every eligible miner as part of the queue. Sized to the active
+# subnet ceiling on netuid 120 (256 UIDs) — matches the scores table's
+# fetch limit so every row that *is* in the queue shows its position,
+# even in the (unrealistic) edge case where all 256 UIDs are sampling.
+_QUEUE_PREVIEW = _RANK_FETCH_LIMIT
 
 
 def _is_color_tty() -> bool:
@@ -52,30 +54,6 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def _format_relative_time(epoch_seconds: Optional[int]) -> str:
-    if not epoch_seconds:
-        return "unknown"
-    delta = int(time.time()) - int(epoch_seconds)
-    if delta < 0:
-        return "just now"
-    if delta < 60:
-        return f"{delta}s ago"
-    if delta < 3600:
-        return f"{delta // 60}m ago"
-    if delta < 86400:
-        hours, rem = divmod(delta, 3600)
-        return f"{hours}h {rem // 60}m ago"
-    return f"{delta // 86400}d ago"
-
-
-def _format_iso(epoch_seconds: Optional[int]) -> str:
-    if not epoch_seconds:
-        return "unknown"
-    return datetime.fromtimestamp(
-        int(epoch_seconds), tz=timezone.utc,
-    ).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def _env_names(scores: List[Dict[str, Any]]) -> List[str]:
@@ -328,19 +306,16 @@ def _print_rank_table(
     width = max(88, len(header_line))
 
     block_number = scores_resp.get("block_number")
-    calculated_at = scores_resp.get("calculated_at")
 
     print(_ansi("=" * width, "2"))
     print(_ansi(f"CHAMPION CHALLENGE RANKING - Block {block_number}", "1;96"))
-    print(
-        f"Calculated: {_format_relative_time(calculated_at)} "
-        f"({_format_iso(calculated_at)})"
-    )
     if champion:
         champ_hk = _short(champion.get("hotkey"), 8)
+        since_block = champion.get("since_block")
+        since_str = f"  since block {since_block}" if since_block else ""
         print(
             f"Champion:   UID {champion.get('uid')}  {champ_hk}...  "
-            f"{champion.get('model', '-')}"
+            f"{champion.get('model', '-')}{since_str}"
         )
     else:
         print("Champion:   (none)")
