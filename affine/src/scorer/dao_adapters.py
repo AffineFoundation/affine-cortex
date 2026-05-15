@@ -83,6 +83,9 @@ class MinersQueueAdapter:
         hotkey: Optional[str] = None,
         revision: Optional[str] = None,
         model: str = "",
+        scores_by_env: Optional[Dict[str, Dict[str, float]]] = None,
+        scores_refresh_block: Optional[int] = None,
+        terminated_at_block: Optional[int] = None,
     ) -> None:
         if not hotkey or not revision:
             miner = await self._dao.get_miner_by_uid(uid)
@@ -99,6 +102,9 @@ class MinersQueueAdapter:
             revision=str(miner["revision"]),
             status=new_status,
             termination_reason=reason,
+            scores_by_env=scores_by_env,
+            scores_refresh_block=scores_refresh_block,
+            terminated_at_block=terminated_at_block,
         )
 
 

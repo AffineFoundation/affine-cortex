@@ -71,30 +71,66 @@ def _env_cell(
     live_avg: Optional[float] = None,
     *,
     champion_live_avg: Optional[float] = None,
+    terminal_entry: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Render one env cell as ``{score%}[{lower%},{upper%}]/{n}``.
 
-    Data source is the live ``system_config['live_scores']`` cache only;
-    the ``payload`` parameter (a ``scores_by_env[env]`` snapshot dict
-    from the affine_scores table) is intentionally ignored — that
-    snapshot is only refreshed on champion change, so it can be days
-    stale for a miner that lost its last battle. Showing ``-`` is
-    correct when the live cache has no entry for this miner.
+    Two data sources in priority order:
+
+    1. ``live_*`` — the current refresh_block's running average from the
+       live cache. Only the champion + currently-battling challenger
+       (and miners terminated within the current refresh window) appear
+       here. ``champion_live_avg`` supplies the comparator threshold
+       basis when the row is a challenger.
+    2. ``terminal_entry`` — the comparator's decide-time snapshot frozen
+       onto the miner's ``miner_stats`` row at termination. Surfaces
+       count / avg / threshold for miners that have already been
+       terminated, so the rank table stays informative after the
+       refresh_block rolls and the live cache forgets them. The frozen
+       ``champion_overlap_avg`` (the basis used to decide this miner's
+       contest) is the threshold basis here — not the current champion's
+       avg, since the contest was against whoever was champion at the
+       time.
+
+    Falls back to ``-`` only when neither source has an entry. The
+    historical ``scores_by_env`` snapshot (``payload``) is intentionally
+    ignored — it only refreshes on champion change and can be days
+    stale; ``terminal_entry`` carries the same data fresh-frozen at
+    termination.
     """
-    if live_avg is None or live_count is None or live_count <= 0:
-        return "-"
-    if champion_live_avg is None:
-        return f"{live_avg * 100:.2f}/{live_count}"
     from affine.src.scorer.comparator import (
         DEFAULT_MARGIN, DEFAULT_NOT_WORSE_TOLERANCE,
     )
-    lower = champion_live_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
-    upper = champion_live_avg + DEFAULT_MARGIN
-    return (
-        f"{live_avg * 100:.2f}"
-        f"[{lower * 100:.2f},{upper * 100:.2f}]"
-        f"/{live_count}"
-    )
+
+    if live_avg is not None and live_count is not None and live_count > 0:
+        if champion_live_avg is None:
+            return f"{live_avg * 100:.2f}/{live_count}"
+        lower = champion_live_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
+        upper = champion_live_avg + DEFAULT_MARGIN
+        return (
+            f"{live_avg * 100:.2f}"
+            f"[{lower * 100:.2f},{upper * 100:.2f}]"
+            f"/{live_count}"
+        )
+
+    if isinstance(terminal_entry, dict):
+        try:
+            t_count = int(terminal_entry.get("count") or 0)
+            t_avg = float(terminal_entry.get("avg"))
+        except (TypeError, ValueError):
+            return "-"
+        if t_count > 0:
+            basis = terminal_entry.get("champion_overlap_avg")
+            if isinstance(basis, (int, float)):
+                lower = float(basis) * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
+                upper = float(basis) + DEFAULT_MARGIN
+                return (
+                    f"{t_avg * 100:.2f}"
+                    f"[{lower * 100:.2f},{upper * 100:.2f}]"
+                    f"/{t_count}"
+                )
+            return f"{t_avg * 100:.2f}/{t_count}"
+    return "-"
 
 
 def _status_for(
@@ -266,12 +302,28 @@ def _print_rank_table(
     # last-decided snapshot's 0.00 placeholder. None for miners not
     # currently in the sampling set.
     live_sample_averages = (window or {}).get("sample_averages") or {}
-    # Champion's per-env live averages — used to compute LIVE bracket
-    # thresholds for challenger rows in ``_env_cell``. Without this, the
-    # brackets fall back to the last-decided snapshot's stale values.
+    # Per-row threshold basis. Prefer the comparator's decide-time
+    # value (champion avg over (champion ∩ row) overlap), fall back
+    # to the champion's full-set avg when overlap isn't recorded.
     champion_live_avgs: Dict[str, float] = (
         (live_sample_averages.get(str(champion_uid)) or {})
         if champion_uid is not None else {}
+    )
+    # Live cache's per-(challenger, env) overlap-restricted champion avg
+    # — comparator's decide-time basis if the contest finished right now.
+    # Used as the threshold basis for currently-battling rows; falls
+    # back to ``champion_live_avgs`` (champion's full-set avg) when no
+    # overlap is recorded for that row.
+    champion_overlap_avgs: Dict[str, Dict[str, float]] = (
+        (window or {}).get("champion_overlap_avgs") or {}
+    )
+    # Comparator-frozen scores written when a miner is terminated.
+    # ``{uid_str: {env: {count, avg, champion_overlap_avg}}}``. Used by
+    # ``_env_cell`` as the fallback when the live cache has no entry
+    # for this row, so terminated miners keep showing real numbers
+    # after the refresh_block rolls them out of the live cache.
+    terminal_scores: Dict[str, Dict[str, Dict[str, Any]]] = (
+        (window or {}).get("terminal_scores") or {}
     )
     live_sampling_uids = {
         int(uid)
@@ -381,18 +433,24 @@ def _print_rank_table(
         uid_key = str(row.get("uid"))
         row_live_counts = live_sample_counts.get(uid_key) or {}
         row_live_avgs = live_sample_averages.get(uid_key) or {}
+        row_overlap_avgs = champion_overlap_avgs.get(uid_key) or {}
+        row_terminal = terminal_scores.get(uid_key) or {}
         is_champion_row = row.get("uid") == champion_uid
         for env in envs:
             live_count = row_live_counts.get(env)
             live_avg = row_live_avgs.get(env)
-            # Only the *challenger* row needs live brackets — the
-            # champion's own row shouldn't display thresholds against
-            # itself.
-            champ_live = (
-                None if is_champion_row else champion_live_avgs.get(env)
-            )
+            # Champion's own row skips threshold rendering. Challengers
+            # use the overlap-restricted basis; fall back to the global
+            # champion avg when no overlap is recorded.
+            if is_champion_row:
+                champ_live = None
+            else:
+                # ``or`` would mistakenly fall back when overlap avg is 0.0.
+                champ_live = row_overlap_avgs.get(env)
+                if champ_live is None:
+                    champ_live = champion_live_avgs.get(env)
             row_parts.append(
-                f"{_env_cell(scores_by_env.get(env), live_count, live_avg, champion_live_avg=champ_live):>24}"
+                f"{_env_cell(scores_by_env.get(env), live_count, live_avg, champion_live_avg=champ_live, terminal_entry=row_terminal.get(env)):>24}"
             )
         row_parts.append(
             _colored_status(status, is_invalid=(row.get("is_valid") is False))

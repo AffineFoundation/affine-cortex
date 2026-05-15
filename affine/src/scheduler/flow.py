@@ -695,6 +695,11 @@ class FlowScheduler:
                 hotkey=champion.hotkey,
                 revision=champion.revision,
                 model=champion.model,
+                scores_by_env=_final_scores_from_result(
+                    result, role="champion",
+                ),
+                scores_refresh_block=task_state.refreshed_at_block,
+                terminated_at_block=current_block,
             )
             await self._write_weights(
                 new_champion, current_block, result,
@@ -713,6 +718,11 @@ class FlowScheduler:
                 hotkey=battle.challenger.hotkey,
                 revision=battle.challenger.revision,
                 model=battle.challenger.model,
+                scores_by_env=_final_scores_from_result(
+                    result, role="challenger",
+                ),
+                scores_refresh_block=task_state.refreshed_at_block,
+                terminated_at_block=current_block,
             )
             # Single-instance provider: the teardown just emptied the
             # inference host (champion's container went away with the
@@ -822,6 +832,38 @@ def _as_float_or_none(v: Any) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _final_scores_from_result(
+    result: Any, *, role: str,
+) -> Dict[str, Dict[str, float]]:
+    """Build ``{env: {count, avg, champion_overlap_avg}}`` for one side of
+    a finished contest. Used to freeze the comparator's decide-time view
+    of the loser onto their miner_stats row, so rank UI keeps showing
+    count / avg / threshold after the live cache forgets them.
+
+    ``role`` is ``"champion"`` (record for a displaced champion) or
+    ``"challenger"`` (record for a challenger that lost). The opposing
+    side's avg is recorded as ``champion_overlap_avg`` — the basis the
+    comparator actually used to decide this contest.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    for e in getattr(result, "per_env", []) or []:
+        if role == "champion":
+            own_n = int(getattr(e, "champion_n", 0) or 0)
+            own_avg = _as_float_or_none(getattr(e, "champion_avg", None))
+            opp_avg = _as_float_or_none(getattr(e, "challenger_avg", None))
+        else:
+            own_n = int(getattr(e, "challenger_n", 0) or 0)
+            own_avg = _as_float_or_none(getattr(e, "challenger_avg", None))
+            opp_avg = _as_float_or_none(getattr(e, "champion_avg", None))
+        if own_n <= 0 or own_avg is None:
+            continue
+        entry: Dict[str, float] = {"count": own_n, "avg": own_avg}
+        if opp_avg is not None:
+            entry["champion_overlap_avg"] = opp_avg
+        out[str(getattr(e, "env", ""))] = entry
+    return out
 
 
 def _env_comparison_to_dict(e: Any) -> Dict[str, Any]:
