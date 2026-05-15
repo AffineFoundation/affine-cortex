@@ -63,17 +63,6 @@ class ValidatorService:
         self.last_block_number = None
         self.watchdog_task = None
 
-        # Weight-snapshot dedup. The scheduler writes a fresh score_snapshot
-        # every time the champion changes (Stage U flow — could be several
-        # times within a 7200-block task-id window, or zero if no challenger
-        # ever wins). On-chain set_weights has a per-hotkey rate limit, so
-        # re-emitting the *same* snapshot block wastes the slot.
-        # ``last_set_snapshot_block`` records the scores row we last
-        # committed so we can skip identical follow-up polls. Each new
-        # championship transition has its own ``block_number``, so the
-        # dedup only fires when nothing actually changed since last write.
-        self.last_set_snapshot_block: Optional[int] = None
-        
     async def fetch_weights_from_api(self, max_retries: int = 12, retry_interval: int = 3) -> Optional[Dict]:
         """Fetch latest weights from backend API with retry logic
         
@@ -242,22 +231,21 @@ class ValidatorService:
         return next_window_start
 
     async def run_iteration(self):
-        """Run one iteration of weight setting."""
+        """Run one iteration of weight setting.
+
+        Every iteration re-emits the latest API weights to chain.
+        Bittensor's per-validator weight-set rate limit is enforced by
+        the outer cadence (``run_iteration`` is gated by the tempo
+        countdown), not by a snapshot-block dedup here. The scheduler
+        only writes a fresh ``score_snapshots`` row on champion
+        change, so dedup'ing on ``block_number`` would silently halt
+        on-chain weight emission for any window where the same champion
+        keeps holding — that's bad for vTRUST and contradicts the
+        pre-#449 design where every iteration emitted unconditionally.
+        """
         self.update_watchdog("fetching weights")
         weights_data = await self.fetch_weights_from_api()
         if not weights_data:
-            return
-
-        # Dedup: only one snapshot per scorer window — skip if we've
-        # already committed this snapshot. A None block_number is treated
-        # as "always emit" so a misbehaving endpoint doesn't accidentally
-        # halt us forever.
-        snapshot_block = weights_data.get("block_number")
-        if snapshot_block is not None and snapshot_block == self.last_set_snapshot_block:
-            logger.info(
-                f"Weights at scorer snapshot block {snapshot_block} already "
-                f"committed; skipping this iteration"
-            )
             return
 
         self.update_watchdog("fetching config")
@@ -272,7 +260,7 @@ class ValidatorService:
         try:
             # Timeout is less than the 10-min watchdog so a hung set_weights
             # call surfaces here rather than at the watchdog SIGTERM.
-            success = await asyncio.wait_for(
+            await asyncio.wait_for(
                 self.weight_setter.set_weights(
                     weights_data.get("weights", {}),
                     burn_percentage,
@@ -280,8 +268,6 @@ class ValidatorService:
                 timeout=480,
             )
             self.update_watchdog("weights set completed")
-            if success and snapshot_block is not None:
-                self.last_set_snapshot_block = snapshot_block
         except asyncio.TimeoutError:
             logger.error("set_weights timed out after 480s")
             self.update_watchdog("weights set timeout")
