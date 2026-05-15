@@ -1,33 +1,34 @@
 """
 Live scores monitor.
 
-Periodically computes per-(uid, env) live count + running average from the
-current refresh_block's sample_results, and writes the result into
-``system_config['live_scores']`` for the rank API to read.
+Periodically computes per-(uid, env) live count + running average from
+the current refresh_block's sample_results, and writes the result into
+``system_config['live_scores']`` for the rank API to read. Per-API-call
+queries would cost ``len(valid) × envs`` DDB hits; precomputed on a
+fixed cadence instead.
 
-Why this exists: the ``af get-rank`` table needs to show every valid
-miner's *current* battle performance — not the last-decided snapshot's
-``scores_by_env``, which can be many days stale (eg a miner that lost
-its last battle keeps its scores_by_env frozen at the time of that
-loss). Computing it on every API call would cost ``len(valid) × envs``
-DDB queries per request, so we precompute on a fixed cadence.
+Also records, per non-champion miner, the champion's average on the
+(champion ∩ miner) task overlap — matches the comparator's decide-time
+basis (see ``flow.py:_decide``), so the CLI can render row-specific
+``[lower, upper]`` thresholds that line up with what ``_decide`` would
+compute, rather than one shared global number per env.
 
 Storage shape::
 
     {
       "refreshed_at": <epoch seconds>,
-      "refresh_block": <int — the task_state.refreshed_at_block this maps to>,
+      "refresh_block": <int — task_state.refreshed_at_block>,
+      "champion_uid": <int | null>,
       "scores": {
         "<uid>": {
-          "<env>": {"count": <int>, "avg": <float>}
-        },
-        ...
+          "<env>": {
+            "count": <int>,
+            "avg": <float>,
+            "champion_overlap_avg": <float>   // omitted on champion + no-overlap
+          }
+        }
       }
     }
-
-The ``refresh_block`` field lets readers detect "this cache is for the
-previous task pool — discard it" when the scheduler refreshes the pool
-between cache cycles.
 """
 
 from __future__ import annotations
@@ -136,15 +137,20 @@ class LiveScoresMonitor:
             logger.info("[LiveScoresMonitor] no valid miners; skipping cycle")
             return None
 
+        champion = await self._state.get_champion()
+        champion_uid = champion.uid if champion is not None else None
+
         start = time.time()
         scores = await self._compute_scores(
             valid_miners, scoring_envs, task_state,
+            champion_uid=champion_uid,
         )
         elapsed = time.time() - start
 
         payload = {
             "refreshed_at": int(time.time()),
             "refresh_block": int(task_state.refreshed_at_block),
+            "champion_uid": champion_uid,
             "scores": scores,
         }
         await self._config_dao.set_param(
@@ -165,11 +171,13 @@ class LiveScoresMonitor:
         valid_miners: List[Dict[str, Any]],
         scoring_envs: List[str],
         task_state: TaskIdState,
+        champion_uid: Optional[int] = None,
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-        """Return ``{uid_str: {env: {"count": int, "avg": float}}}`` for
-        every (valid miner × scoring env) pair that has at least one
-        sample row in the current refresh_block. Envs with zero samples
-        are omitted from the per-miner dict to keep the payload tight."""
+        """Return ``{uid_str: {env: {"count", "avg", "champion_overlap_avg"?}}}``
+        for every (valid miner × scoring env) with at least one sample
+        row at the current refresh_block. ``champion_overlap_avg``
+        omitted on the champion's row and when (champion ∩ miner) is
+        empty."""
 
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
@@ -184,10 +192,7 @@ class LiveScoresMonitor:
                 )
             if not scored:
                 return uid, env, None
-            return uid, env, {
-                "count": len(scored),
-                "avg": float(mean(scored.values())),
-            }
+            return uid, env, scored
 
         coros = []
         for m in valid_miners:
@@ -199,9 +204,34 @@ class LiveScoresMonitor:
             for env in scoring_envs:
                 coros.append(_one(uid, hotkey, str(revision), env))
 
-        out: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        for uid, env, entry in await asyncio.gather(*coros):
-            if entry is None:
+        # Two-pass: gather raw {task_id: score} maps first so the
+        # second pass can intersect each challenger with the champion.
+        per_miner_env: Dict[int, Dict[str, Dict[int, float]]] = {}
+        for uid, env, scored in await asyncio.gather(*coros):
+            if scored is None:
                 continue
-            out.setdefault(str(uid), {})[env] = entry
+            per_miner_env.setdefault(uid, {})[env] = scored
+
+        champ_per_env = (
+            per_miner_env.get(int(champion_uid))
+            if champion_uid is not None else None
+        )
+        out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for uid, env_to_scored in per_miner_env.items():
+            for env, scored in env_to_scored.items():
+                entry: Dict[str, Any] = {
+                    "count": len(scored),
+                    "avg": float(mean(scored.values())),
+                }
+                if (
+                    champ_per_env is not None
+                    and uid != champion_uid
+                    and env in champ_per_env
+                ):
+                    overlap = set(scored.keys()) & set(champ_per_env[env].keys())
+                    if overlap:
+                        entry["champion_overlap_avg"] = float(
+                            mean(champ_per_env[env][t] for t in overlap)
+                        )
+                out.setdefault(str(uid), {})[env] = entry
         return out

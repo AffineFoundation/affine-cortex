@@ -266,12 +266,15 @@ def _print_rank_table(
     # last-decided snapshot's 0.00 placeholder. None for miners not
     # currently in the sampling set.
     live_sample_averages = (window or {}).get("sample_averages") or {}
-    # Champion's per-env live averages — used to compute LIVE bracket
-    # thresholds for challenger rows in ``_env_cell``. Without this, the
-    # brackets fall back to the last-decided snapshot's stale values.
+    # Per-row threshold basis. Prefer the comparator's decide-time
+    # value (champion avg over (champion ∩ row) overlap), fall back
+    # to the champion's full-set avg when overlap isn't recorded.
     champion_live_avgs: Dict[str, float] = (
         (live_sample_averages.get(str(champion_uid)) or {})
         if champion_uid is not None else {}
+    )
+    champion_overlap_avgs: Dict[str, Dict[str, float]] = (
+        (window or {}).get("champion_overlap_avgs") or {}
     )
     live_sampling_uids = {
         int(uid)
@@ -381,16 +384,21 @@ def _print_rank_table(
         uid_key = str(row.get("uid"))
         row_live_counts = live_sample_counts.get(uid_key) or {}
         row_live_avgs = live_sample_averages.get(uid_key) or {}
+        row_overlap_avgs = champion_overlap_avgs.get(uid_key) or {}
         is_champion_row = row.get("uid") == champion_uid
         for env in envs:
             live_count = row_live_counts.get(env)
             live_avg = row_live_avgs.get(env)
-            # Only the *challenger* row needs live brackets — the
-            # champion's own row shouldn't display thresholds against
-            # itself.
-            champ_live = (
-                None if is_champion_row else champion_live_avgs.get(env)
-            )
+            # Champion's own row skips threshold rendering. Challengers
+            # use the overlap-restricted basis; fall back to the global
+            # champion avg when no overlap is recorded.
+            if is_champion_row:
+                champ_live = None
+            else:
+                # ``or`` would mistakenly fall back when overlap avg is 0.0.
+                champ_live = row_overlap_avgs.get(env)
+                if champ_live is None:
+                    champ_live = champion_live_avgs.get(env)
             row_parts.append(
                 f"{_env_cell(scores_by_env.get(env), live_count, live_avg, champion_live_avg=champ_live):>24}"
             )

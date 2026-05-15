@@ -21,7 +21,7 @@ from affine.src.scorer.window_state import (
 
 
 async def _empty_counts(task_state):
-    return {}, {}
+    return {}, {}, {}
 
 
 async def _no_inferred_champion():
@@ -49,6 +49,7 @@ async def test_current_state_on_empty_state(monkeypatch):
         "task_refresh_block": None,
         "sample_counts": {},
         "sample_averages": {},
+        "champion_overlap_avgs": {},
         "live_sampling_uids": [],
         # Reward-split feature is off by default → field is always
         # present but empty.
@@ -99,6 +100,7 @@ async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(mon
         return (
             {"1": {"ENV_A": 5}, "2": {"ENV_A": 2}},
             {"1": {"ENV_A": 0.42}, "2": {"ENV_A": 0.10}},
+            {},
         )
 
     kv = InMemoryConfigStore()

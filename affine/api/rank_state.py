@@ -69,40 +69,43 @@ async def _infer_champion_from_scores() -> Optional[ChampionRecord]:
 
 async def _sample_counts_and_averages(
     task_state: Optional[TaskIdState],
-) -> tuple[Dict[str, Dict[str, int]], Dict[str, Dict[str, float]]]:
-    """Per-(uid, env) live count + running average for every valid miner.
+) -> tuple[
+    Dict[str, Dict[str, int]],
+    Dict[str, Dict[str, float]],
+    Dict[str, Dict[str, float]],
+]:
+    """Per-(uid, env) live count, running average, and per-challenger
+    champion-overlap average. Reads ``system_config['live_scores']``
+    populated by :class:`LiveScoresMonitor`; returns empty dicts when
+    the cache is missing or stale (different refresh_block) — the CLI
+    then renders ``-`` instead of stale numbers.
 
-    Reads the precomputed cache at ``system_config['live_scores']`` —
-    populated by :class:`affine.src.monitor.live_scores_monitor.LiveScoresMonitor`
-    on a fixed cadence (~30 min). Returning empty dicts is fine: the
-    rank UI then renders ``-`` instead of a stale snapshot value, which
-    is exactly what we want when the monitor hasn't produced a payload
-    yet (or has produced one for a different refresh_block).
-
-    The cache is keyed by ``refresh_block``. When the scheduler refreshes
-    the task pool between monitor cycles the cached entry is treated as
-    expired and dropped — readers must not see scores belonging to a
-    previous pool.
+    Third return value is the comparator's decide-time basis: champion
+    avg restricted to (champion ∩ this-uid) task overlap. Lets the CLI
+    show per-row ``[lower, upper]`` thresholds matching what ``_decide``
+    would compute, not a single global number per env.
     """
     if task_state is None:
-        return {}, {}
+        return {}, {}, {}
     payload = await SystemConfigDAO().get_param_value(LIVE_SCORES_KEY, default=None)
     if not isinstance(payload, dict):
-        return {}, {}
+        return {}, {}, {}
     if int(payload.get("refresh_block") or 0) != int(task_state.refreshed_at_block):
-        return {}, {}
+        return {}, {}, {}
     raw = payload.get("scores") or {}
     if not isinstance(raw, dict):
-        return {}, {}
+        return {}, {}, {}
 
     counts: Dict[str, Dict[str, int]] = {}
     averages: Dict[str, Dict[str, float]] = {}
+    champion_overlap_avgs: Dict[str, Dict[str, float]] = {}
     for uid_key, env_map in raw.items():
         if not isinstance(env_map, dict):
             continue
         uid = str(uid_key)
         env_counts: Dict[str, int] = {}
         env_avgs: Dict[str, float] = {}
+        env_overlap_avgs: Dict[str, float] = {}
         for env, entry in env_map.items():
             if not isinstance(entry, dict):
                 continue
@@ -111,10 +114,15 @@ async def _sample_counts_and_averages(
                 env_avgs[str(env)] = float(entry.get("avg") or 0.0)
             except (TypeError, ValueError):
                 continue
+            raw_overlap = entry.get("champion_overlap_avg")
+            if isinstance(raw_overlap, (int, float)):
+                env_overlap_avgs[str(env)] = float(raw_overlap)
         if env_counts:
             counts[uid] = env_counts
             averages[uid] = env_avgs
-    return counts, averages
+        if env_overlap_avgs:
+            champion_overlap_avgs[uid] = env_overlap_avgs
+    return counts, averages, champion_overlap_avgs
 
 
 def _live_sampling_uids(
@@ -187,7 +195,9 @@ async def get_current_state() -> Dict[str, Any]:
     battle = await store.get_battle()
     task_state = await store.get_task_state()
     envs = await store.get_environments()
-    sample_counts, sample_averages = await _sample_counts_and_averages(task_state)
+    sample_counts, sample_averages, champion_overlap_avgs = (
+        await _sample_counts_and_averages(task_state)
+    )
     past_champions = await _past_champions_split()
     return {
         "champion": _miner_summary(champion) if champion else None,
@@ -208,6 +218,9 @@ async def get_current_state() -> Dict[str, Any]:
         # Battle subjects show their live score in af get-rank instead
         # of the (stale) last-decided snapshot's 0.00 placeholder.
         "sample_averages": sample_averages,
+        # Per-(uid, env) champion-on-overlap avg; absence → CLI falls
+        # back to global champion full-set avg (see ``_env_cell``).
+        "champion_overlap_avgs": champion_overlap_avgs,
         "live_sampling_uids": _live_sampling_uids(
             champion, battle, task_state, envs, sample_counts,
         ),
