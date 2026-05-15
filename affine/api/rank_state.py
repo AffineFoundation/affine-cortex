@@ -32,6 +32,13 @@ def _miner_summary(snapshot) -> Optional[Dict[str, Any]]:
         "hotkey": snapshot.hotkey,
         "revision": snapshot.revision,
         "model": snapshot.model,
+        # ``since_block`` is on ``ChampionRecord`` (the canonical champion
+        # in system_config) but not on the snapshot-inferred fallback
+        # (``_infer_champion_from_scores`` builds a synthetic record
+        # with ``since_block=int(latest.block_number)``). Either way the
+        # field is exposed for the CLI to show how long the champion has
+        # held the crown.
+        "since_block": getattr(snapshot, "since_block", None),
     }
 
 
@@ -207,10 +214,15 @@ async def get_current_state() -> Dict[str, Any]:
     }
 
 
-async def get_queue(limit: int = 20) -> List[Dict[str, Any]]:
-    """Build the challenger queue head used by ``/rank/current``."""
-    if limit <= 0 or limit > 100:
-        limit = 20
+async def get_queue(limit: int = 256) -> List[Dict[str, Any]]:
+    """Build the challenger queue head used by ``/rank/current``.
+
+    Default and upper bound are both the active subnet ceiling (256
+    UIDs on netuid 120) so ``af get-rank`` can render every eligible
+    miner as part of the queue, not just the head. Callers wanting a
+    shorter slice still pass an explicit smaller ``limit``."""
+    if limit <= 0 or limit > 256:
+        limit = 256
     miners = await MinersDAO().get_valid_miners()
     state_map = await MinerStatsDAO().build_challenge_state_map(miners)
     pending = []

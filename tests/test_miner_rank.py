@@ -615,7 +615,7 @@ def test_rank_table_respects_no_color(monkeypatch):
 
 def test_get_rank_reports_aggregate_endpoint_errors_without_fallback(monkeypatch):
     client = _FakeClient({
-        "/rank/current?top=256&queue_limit=10": RuntimeError("HTTP 404"),
+        "/rank/current?top=256&queue_limit=256": RuntimeError("HTTP 404"),
     })
     monkeypatch.setattr(rank, "cli_api_client", lambda: _FakeClientContext(client))
 
@@ -628,7 +628,7 @@ def test_get_rank_reports_aggregate_endpoint_errors_without_fallback(monkeypatch
         else:
             raise AssertionError("expected get_rank_command to exit")
 
-    assert client.calls == ["/rank/current?top=256&queue_limit=10"]
+    assert client.calls == ["/rank/current?top=256&queue_limit=256"]
     assert "failed to fetch /rank/current" in err.getvalue()
 
 

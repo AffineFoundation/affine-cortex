@@ -22,7 +22,7 @@ router = APIRouter(
 @router.get("/current")
 async def get_current_rank(
     top: int = Query(256, ge=1, le=256),
-    queue_limit: int = Query(10, ge=1, le=100),
+    queue_limit: int = Query(256, ge=1, le=256),
 ) -> Dict[str, Any]:
     """One public rank payload for the CLI/table view.
 
