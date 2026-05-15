@@ -179,12 +179,12 @@ class AntiCopyScoresIndexDAO(BaseDAO):
         copy_of: str,
         decision_median: float,
         decision_per_env: Optional[Dict[str, float]] = None,
+        closest_peer_model: Optional[str] = None,
     ) -> None:
         """Refresh the verdict + diagnostics. ``decision_per_env`` is
         the per-env breakdown of the winning (or closest) peer pair;
-        callers may omit it to leave the existing breakdown alone.
-        Stored as a DDB Map so operators can read per-env numbers
-        without re-running pairwise."""
+        ``closest_peer_model`` is the HF repo string of that peer.
+        Either may be omitted to leave the existing column alone."""
         client = get_client()
         update_parts = [
             "verdict_copy_of = :copy_of",
@@ -196,6 +196,9 @@ class AntiCopyScoresIndexDAO(BaseDAO):
             ":dec": {"N": str(float(decision_median))},
             ":now": {"N": str(int(time.time()))},
         }
+        if closest_peer_model is not None:
+            update_parts.append("closest_peer_model = :closest")
+            values[":closest"] = {"S": str(closest_peer_model)}
         if decision_per_env is not None:
             update_parts.append("decision_per_env = :per_env")
             values[":per_env"] = {

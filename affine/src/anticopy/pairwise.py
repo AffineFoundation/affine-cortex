@@ -207,11 +207,19 @@ def is_copy_verdict(
 
 @dataclass
 class CopyDecision:
-    copy_of_hotkey: str = ""        # "" means independent / not enough data
-    # Aggregate ``decision_median`` across envs (MIN of per-env values).
-    # ``-1.0`` is the "no peer had evidence" sentinel. Kept for fast
-    # threshold filtering (one float per row); ``decision_per_env`` is
-    # the diagnostic source of truth.
+    # The peer the candidate is judged a copy of. ``""`` means
+    # independent (no peer crossed ``nll_threshold``).
+    copy_of_hotkey: str = ""
+    # The peer with the smallest ``decision_median_combined`` against
+    # this candidate, whether or not the threshold was crossed. Stored
+    # as the HuggingFace model string (``org/repo``) rather than
+    # hotkey so operators reading the row don't need to join against
+    # ``miners`` to see who is similar. Empty when no peer carried
+    # any decision-position evidence.
+    closest_peer_model: str = ""
+    # Combined cross-env decision median against the winning peer
+    # (or the closest one if no peer crossed the threshold). ``-1.0``
+    # is the "no peer had evidence" sentinel.
     decision_median: float = -1.0
     # Per-env breakdown of the winning (or closest) peer pair.
     # ``{env_name: median |Δlogp|}`` for envs with ≥1 decision token.
@@ -264,6 +272,7 @@ def detect_copies(
     new_hotkey = new_score.get("hotkey", "")
 
     closest_pair: Optional[PairResult] = None
+    closest_peer_model: str = ""
     closest_median = -1.0
     candidates: List[Tuple[int, str, Dict[str, Any], PairResult]] = []
     for peer in all_peer_scores:
@@ -278,6 +287,7 @@ def detect_copies(
         if pair_med >= 0 and (closest_median < 0 or pair_med < closest_median):
             closest_median = pair_med
             closest_pair = pair
+            closest_peer_model = str(peer.get("model", ""))
         if pair.n_overlap_tokens < min_overlap:
             continue
         if not is_copy_verdict(
@@ -285,6 +295,11 @@ def detect_copies(
         ):
             continue
         candidates.append((peer_first_block, peer_hotkey, peer, pair))
+
+    # ``closest_peer_model`` records who the candidate is most similar
+    # to even when no peer crossed the threshold — useful for "this
+    # almost flagged copy_of X" diagnostics.
+    decision.closest_peer_model = closest_peer_model
 
     if not candidates:
         decision.decision_median = closest_median
@@ -295,7 +310,11 @@ def detect_copies(
     # Earliest committer wins (smallest (first_block, hotkey)).
     candidates.sort(key=lambda x: (x[0], x[1]))
     winning_pair = candidates[0][3]
+    winning_peer = candidates[0][2]
     decision.copy_of_hotkey = candidates[0][1]
     decision.decision_median = _aggregate_decision_median(winning_pair)
     decision.decision_per_env = _per_env_decision_medians(winning_pair)
+    # When a winner exists, the closest peer IS the winner. Reset so
+    # the two fields agree.
+    decision.closest_peer_model = str(winning_peer.get("model", ""))
     return decision

@@ -414,7 +414,12 @@ class ForwardWorker:
             )
 
             # 5) Pairwise vs every existing score; flag copy if found.
-            verdict_hotkey, decision_med, decision_per_env = await self._run_verdict(
+            (
+                verdict_hotkey,
+                decision_med,
+                decision_per_env,
+                closest_peer_model,
+            ) = await self._run_verdict(
                 cfg=cfg,
                 new_score=score_payload,
                 new_first_block=first_block,
@@ -424,6 +429,7 @@ class ForwardWorker:
                 copy_of=verdict_hotkey,
                 decision_median=decision_med,
                 decision_per_env=decision_per_env,
+                closest_peer_model=closest_peer_model,
             )
             per_env_str = " ".join(
                 f"{env}={med:.4f}" for env, med in sorted(decision_per_env.items())
@@ -433,6 +439,12 @@ class ForwardWorker:
                     f"[anticopy.worker] {hotkey[:10]} verdict "
                     f"copy_of={verdict_hotkey[:10]} dec_med={decision_med:.4f} "
                     f"per_env={{{per_env_str}}} recorded in scores_index"
+                )
+            elif closest_peer_model:
+                logger.info(
+                    f"[anticopy.worker] {hotkey[:10]} independent — "
+                    f"closest peer {closest_peer_model[:40]} "
+                    f"dec_med={decision_med:.4f}"
                 )
 
             # Done — ``scores_index`` row above is the durable marker
@@ -1055,6 +1067,7 @@ class ForwardWorker:
             decision.copy_of_hotkey,
             decision.decision_median,
             dict(decision.decision_per_env),
+            decision.closest_peer_model,
         )
 
     async def _refresh_later_peer_verdicts(
@@ -1109,6 +1122,7 @@ class ForwardWorker:
                     copy_of=refreshed.copy_of_hotkey,
                     decision_median=refreshed.decision_median,
                     decision_per_env=dict(refreshed.decision_per_env),
+                    closest_peer_model=refreshed.closest_peer_model,
                 )
                 logger.info(
                     f"[anticopy.worker] retroactive verdict {peer_hk[:10]} "
