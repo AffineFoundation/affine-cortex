@@ -4,7 +4,7 @@
 x-affine-image: &affine_image
   image: affine:local
   build:
-    context: ..
+    context: .
     dockerfile: Dockerfile
 
 services:
