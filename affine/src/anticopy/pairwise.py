@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -192,13 +192,25 @@ def is_copy_verdict(
 @dataclass
 class CopyDecision:
     copy_of_hotkey: str = ""        # "" means independent / not enough data
-    # Median |Δlogp| on decision positions, aggregated across envs of
-    # the winning pair (or the closest pair if no winner). Float in
-    # logprob units — directly comparable to ``nll_threshold``. NaN-safe
-    # sentinel ``-1.0`` means "no peer had any decision-position
-    # evidence" (also used when there is no winner and we have nothing
-    # to report).
+    # Aggregate ``decision_median`` across envs (MIN of per-env values).
+    # ``-1.0`` is the "no peer had evidence" sentinel. Kept for fast
+    # threshold filtering (one float per row); ``decision_per_env`` is
+    # the diagnostic source of truth.
     decision_median: float = -1.0
+    # Per-env breakdown of the winning (or closest) peer pair.
+    # ``{env_name: median |Δlogp|}`` for envs with ≥1 decision token.
+    # Empty when no peer produced usable evidence.
+    decision_per_env: Dict[str, float] = field(default_factory=dict)
+
+
+def _per_env_decision_medians(pair: PairResult) -> Dict[str, float]:
+    """Per-env ``decision_median`` snapshot. Envs with zero decision
+    tokens drop out so the diagnostic only carries envs that voted."""
+    return {
+        env: float(ec.decision_median)
+        for env, ec in pair.per_env.items()
+        if ec.decision_n > 0
+    }
 
 
 def _aggregate_decision_median(pair: PairResult) -> float:
@@ -208,11 +220,7 @@ def _aggregate_decision_median(pair: PairResult) -> float:
     landing under the threshold is what flips ``is_copy_verdict`` when
     ``agreement_ratio`` is low; reporting that env's median makes the
     stored number consistent with the verdict reason."""
-    vals = [
-        ec.decision_median
-        for ec in pair.per_env.values()
-        if ec.decision_n > 0
-    ]
+    vals = list(_per_env_decision_medians(pair).values())
     if not vals:
         return -1.0
     return float(min(vals))
@@ -243,6 +251,7 @@ def detect_copies(
     decision = CopyDecision()
     new_hotkey = new_score.get("hotkey", "")
 
+    closest_pair: Optional[PairResult] = None
     closest_median = -1.0
     candidates: List[Tuple[int, str, Dict[str, Any], PairResult]] = []
     for peer in all_peer_scores:
@@ -256,6 +265,7 @@ def detect_copies(
         pair_med = _aggregate_decision_median(pair)
         if pair_med >= 0 and (closest_median < 0 or pair_med < closest_median):
             closest_median = pair_med
+            closest_pair = pair
         if pair.n_overlap_tokens < min_overlap:
             continue
         if not is_copy_verdict(
@@ -266,10 +276,14 @@ def detect_copies(
 
     if not candidates:
         decision.decision_median = closest_median
+        if closest_pair is not None:
+            decision.decision_per_env = _per_env_decision_medians(closest_pair)
         return decision
 
     # Earliest committer wins (smallest (first_block, hotkey)).
     candidates.sort(key=lambda x: (x[0], x[1]))
+    winning_pair = candidates[0][3]
     decision.copy_of_hotkey = candidates[0][1]
-    decision.decision_median = _aggregate_decision_median(candidates[0][3])
+    decision.decision_median = _aggregate_decision_median(winning_pair)
+    decision.decision_per_env = _per_env_decision_medians(winning_pair)
     return decision

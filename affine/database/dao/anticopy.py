@@ -178,24 +178,37 @@ class AntiCopyScoresIndexDAO(BaseDAO):
         *,
         copy_of: str,
         decision_median: float,
+        decision_per_env: Optional[Dict[str, float]] = None,
     ) -> None:
-        """Refresh just the verdict + its diagnostic ``decision_median``
-        without rewriting the whole row. Called both at first-eval and
-        from the retroactive pass when a newly-arrived earlier-committer
-        flips an existing peer's verdict."""
+        """Refresh the verdict + diagnostics. ``decision_per_env`` is
+        the per-env breakdown of the winning (or closest) peer pair;
+        callers may omit it to leave the existing breakdown alone.
+        Stored as a DDB Map so operators can read per-env numbers
+        without re-running pairwise."""
         client = get_client()
+        update_parts = [
+            "verdict_copy_of = :copy_of",
+            "decision_median = :dec",
+            "verdict_at = :now",
+        ]
+        values: Dict[str, Any] = {
+            ":copy_of": {"S": copy_of},
+            ":dec": {"N": str(float(decision_median))},
+            ":now": {"N": str(int(time.time()))},
+        }
+        if decision_per_env is not None:
+            update_parts.append("decision_per_env = :per_env")
+            values[":per_env"] = {
+                "M": {
+                    str(env): {"N": str(float(med))}
+                    for env, med in decision_per_env.items()
+                }
+            }
         await client.update_item(
             TableName=self.table_name,
             Key={"pk": {"S": self._make_pk(hotkey, revision)}},
-            UpdateExpression=(
-                "SET verdict_copy_of = :copy_of, "
-                "decision_median = :dec, verdict_at = :now"
-            ),
-            ExpressionAttributeValues={
-                ":copy_of": {"S": copy_of},
-                ":dec": {"N": str(float(decision_median))},
-                ":now": {"N": str(int(time.time()))},
-            },
+            UpdateExpression="SET " + ", ".join(update_parts),
+            ExpressionAttributeValues=values,
         )
 
     async def list_all(self) -> List[Dict[str, Any]]:

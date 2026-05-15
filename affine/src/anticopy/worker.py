@@ -341,33 +341,32 @@ class ForwardWorker:
             )
 
             # 5) Pairwise vs every existing score; flag copy if found.
-            verdict_hotkey, decision_med = await self._run_verdict(
+            verdict_hotkey, decision_med, decision_per_env = await self._run_verdict(
                 cfg=cfg,
                 new_score=score_payload,
                 new_first_block=first_block,
             )
             await self.scores_dao.update_verdict(
                 hotkey, revision,
-                copy_of=verdict_hotkey, decision_median=decision_med,
+                copy_of=verdict_hotkey,
+                decision_median=decision_med,
+                decision_per_env=decision_per_env,
             )
+            per_env_str = " ".join(
+                f"{env}={med:.4f}" for env, med in sorted(decision_per_env.items())
+            ) or "(no peers)"
             if verdict_hotkey:
-                # Verdict is persisted to ``anticopy_scores_index`` only.
-                # CEAC never mutates ``miners.invalid_reason`` or
-                # ``miner_stats`` — keeping the verdict in its own table
-                # means a false positive cannot flip a live champion or
-                # strip weight by side-effect. Downstream consumers
-                # (scheduler / weight_setter / dashboards) read the
-                # scores_index directly if they want to act on it.
                 logger.info(
                     f"[anticopy.worker] {hotkey[:10]} verdict "
                     f"copy_of={verdict_hotkey[:10]} dec_med={decision_med:.4f} "
-                    f"recorded in scores_index"
+                    f"per_env={{{per_env_str}}} recorded in scores_index"
                 )
 
             await self.jobs_dao.mark_done(hotkey, revision)
             logger.info(
                 f"[anticopy.worker] {hotkey[:10]} done "
                 f"rollouts={len(per_rollout)} dec_med={decision_med:.4f} "
+                f"per_env={{{per_env_str}}} "
                 f"verdict={verdict_hotkey or 'independent'}"
             )
         except Exception as e:
@@ -985,7 +984,11 @@ class ForwardWorker:
             peer_scores=peer_scores,
         )
 
-        return decision.copy_of_hotkey, decision.decision_median
+        return (
+            decision.copy_of_hotkey,
+            decision.decision_median,
+            dict(decision.decision_per_env),
+        )
 
     async def _refresh_later_peer_verdicts(
         self,
@@ -1038,6 +1041,7 @@ class ForwardWorker:
                     peer_hk, peer_rev,
                     copy_of=refreshed.copy_of_hotkey,
                     decision_median=refreshed.decision_median,
+                    decision_per_env=dict(refreshed.decision_per_env),
                 )
                 logger.info(
                     f"[anticopy.worker] retroactive verdict {peer_hk[:10]} "

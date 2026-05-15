@@ -235,3 +235,57 @@ def test_decision_metric_no_uncertain_positions_means_no_copy():
     )
     assert res.per_env["CDE"].decision_n == 0
     assert not is_copy_verdict(res, nll_threshold=0.05, agreement_ratio=0.5)
+
+
+def test_detect_copies_populates_per_env_breakdown():
+    """The winning pair's per-env decision medians get surfaced on
+    ``CopyDecision.decision_per_env`` so operators can diagnose which
+    envs flipped the verdict without re-running pairwise."""
+    new = _score(
+        "Z",
+        [
+            _rollout("k1", "CDE", [-0.7] * 60),
+            _rollout("k2", "MTH", [-0.7] * 60),
+        ],
+        first_block=1000,
+    )
+    earlier = _score(
+        "A",
+        [
+            _rollout("k1", "CDE", [-0.7] * 60),
+            _rollout("k2", "MTH", [-0.7] * 60),
+        ],
+        first_block=500,
+    )
+    dec = detect_copies(
+        new, new_first_block=1000,
+        all_peer_scores=[earlier],
+        nll_threshold=0.05, min_overlap=10, agreement_ratio=1.0,
+    )
+    assert dec.copy_of_hotkey == "A"
+    assert set(dec.decision_per_env.keys()) == {"CDE", "MTH"}
+    for env, med in dec.decision_per_env.items():
+        assert med == 0.0, f"identical lps in {env} should have med=0"
+
+
+def test_detect_copies_per_env_from_closest_when_no_winner():
+    """No peer crosses the threshold → still report the *closest*
+    pair's per-env breakdown so an operator can see how far it was."""
+    new = _score(
+        "Z",
+        [_rollout("k", "CDE", [-0.7] * 60)],
+        first_block=1000,
+    )
+    far = _score(
+        "A",
+        [_rollout("k", "CDE", [-2.5] * 60)],     # big gap → not copy
+        first_block=500,
+    )
+    dec = detect_copies(
+        new, new_first_block=1000,
+        all_peer_scores=[far],
+        nll_threshold=0.05, min_overlap=10, agreement_ratio=1.0,
+    )
+    assert dec.copy_of_hotkey == ""
+    # Closest-pair's per-env survived even without a winner.
+    assert dec.decision_per_env.get("CDE", -1) > 0.05

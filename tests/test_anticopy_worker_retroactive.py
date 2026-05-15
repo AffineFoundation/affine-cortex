@@ -19,10 +19,15 @@ class _FakeScoresDAO:
     def __init__(self):
         self.update_calls = []
 
-    async def update_verdict(self, hotkey, revision, *, copy_of, decision_median):
+    async def update_verdict(
+        self, hotkey, revision, *,
+        copy_of, decision_median, decision_per_env=None,
+    ):
         self.update_calls.append({
             "hotkey": hotkey, "revision": revision,
-            "copy_of": copy_of, "decision_median": decision_median,
+            "copy_of": copy_of,
+            "decision_median": decision_median,
+            "decision_per_env": decision_per_env or {},
         })
 
 
