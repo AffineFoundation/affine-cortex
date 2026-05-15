@@ -84,7 +84,6 @@ async def init_tables():
     Creates all tables defined in schemas if they don't exist.
     """
     from affine.database.schema import (
-        ANTICOPY_JOBS_SCHEMA,
         ANTICOPY_ROLLOUTS_SCHEMA, ANTICOPY_ROLLOUTS_TTL,
         ANTICOPY_SCORES_INDEX_SCHEMA,
         ANTICOPY_STATE_SCHEMA,
@@ -111,7 +110,6 @@ async def init_tables():
         create_table(INFERENCE_ENDPOINTS_SCHEMA),
         create_table(ANTICOPY_ROLLOUTS_SCHEMA, ttl_attribute=ANTICOPY_ROLLOUTS_TTL["AttributeName"]),
         create_table(ANTICOPY_SCORES_INDEX_SCHEMA),
-        create_table(ANTICOPY_JOBS_SCHEMA),
         create_table(ANTICOPY_STATE_SCHEMA),
     )
 

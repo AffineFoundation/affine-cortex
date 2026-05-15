@@ -360,12 +360,6 @@ ANTICOPY_SCORES_INDEX_SCHEMA = {
 }
 
 
-# ``anticopy_jobs`` — the worker's pull queue. ``miners_monitor``
-# enqueues; ``forward_worker`` polls + dequeues.
-#   PK: JOB#{hotkey}#{revision}
-#   non-key:
-#     hotkey, revision, model, enqueued_at, attempts, last_error
-#     state ∈ {pending, running, done, failed}
 ANTICOPY_STATE_SCHEMA = {
     # Machine-managed metadata for the CEAC subsystem. Holds runtime
     # state the ``anticopy-refresh`` service writes on every daily tick
@@ -383,27 +377,3 @@ ANTICOPY_STATE_SCHEMA = {
 }
 
 
-ANTICOPY_JOBS_SCHEMA = {
-    "TableName": get_table_name("anticopy_jobs"),
-    "KeySchema": [
-        {"AttributeName": "pk", "KeyType": "HASH"},
-    ],
-    "AttributeDefinitions": [
-        {"AttributeName": "pk", "AttributeType": "S"},
-        {"AttributeName": "state", "AttributeType": "S"},
-        {"AttributeName": "enqueued_at", "AttributeType": "N"},
-    ],
-    "GlobalSecondaryIndexes": [
-        {
-            # Pull pending jobs in FIFO order. Worker queries this index
-            # with state='pending' as the hash key.
-            "IndexName": "state-enqueued-index",
-            "KeySchema": [
-                {"AttributeName": "state", "KeyType": "HASH"},
-                {"AttributeName": "enqueued_at", "KeyType": "RANGE"},
-            ],
-            "Projection": {"ProjectionType": "ALL"},
-        },
-    ],
-    "BillingMode": "PAY_PER_REQUEST",
-}

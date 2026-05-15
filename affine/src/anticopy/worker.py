@@ -1,26 +1,32 @@
 """
-CEAC forward worker — runs on the dedicated GPU host alongside the
-anti-copy sglang server. One job at a time:
+CEAC forward worker — runs alongside the anti-copy sglang server,
+pulling its own work directly from the live miners table.
 
-  1. claim a pending ``anticopy_jobs`` row
+One iteration:
+
+  1. scan ``miners`` + ``miner_stats`` + ``anticopy_scores_index``,
+     pick the earliest-committed valid, non-terminated, unscored
+     candidate (same ordering as ``af get-rank``'s active bucket)
   2. download the candidate ckpt into the local HF cache (if absent)
   3. ``/update_weights_from_disk`` the sglang server onto the ckpt
   4. for each rollout in the tokenizer-matching pool: teacher-force
      via sglang ``/generate`` with ``return_logprob=true``
-  5. upload the score blob to R2; write ``anticopy_scores_index``
-  6. run pairwise vs all peer scores; record any copy verdict on
-     ``anticopy_scores_index.verdict_copy_of``
-  7. mark the job done
+  5. upload the score blob to R2 and write ``anticopy_scores_index``
+  6. run pairwise vs every existing score; record any copy verdict
+     on ``anticopy_scores_index.verdict_copy_of`` + retroactively
+     refresh later peers whose origin candidate just landed
 
-CEAC writes its verdict to its own ``anticopy_scores_index`` table
-only — it never mutates ``miners`` or ``miner_stats``. Downstream
-consumers (scheduler / weight_setter / dashboards) read that table
-directly if they want to act on the similarity signal.
+There is no separate jobs queue: ``scores_index`` IS the durable
+"done" marker. A transient failure on candidate X just falls
+through to the next iteration — next loop picks X up again because
+its scores_index row still doesn't exist. CEAC writes only to its
+own ``anticopy_*`` tables; it never mutates ``miners`` or
+``miner_stats``.
 
-The actual teacher-forcing payload follows sglang's native ``/generate``
-contract (``input_ids`` + ``max_new_tokens=0`` + ``logprob_start_len``);
-that's the only API that gives us logprobs on a pre-existing response
-without re-sampling.
+Teacher-forcing follows sglang's native ``/generate`` contract
+(``input_ids`` + ``max_new_tokens=0`` + ``logprob_start_len``);
+that's the only API that gives us logprobs on a pre-existing
+response without re-sampling.
 """
 
 from __future__ import annotations
@@ -39,11 +45,11 @@ from huggingface_hub import scan_cache_dir, snapshot_download
 
 from affine.core.setup import logger
 from affine.database.dao.anticopy import (
-    AntiCopyJobsDAO,
     AntiCopyRolloutsDAO,
     AntiCopyScoresIndexDAO,
     AntiCopyStateDAO,
 )
+from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 
@@ -172,19 +178,19 @@ class ForwardWorker:
     def __init__(
         self,
         *,
-        jobs_dao: Optional[AntiCopyJobsDAO] = None,
         rollouts_dao: Optional[AntiCopyRolloutsDAO] = None,
         scores_dao: Optional[AntiCopyScoresIndexDAO] = None,
         miners_dao: Optional[MinersDAO] = None,
+        miner_stats_dao: Optional[MinerStatsDAO] = None,
         config_dao: Optional[SystemConfigDAO] = None,
         state_dao: Optional[AntiCopyStateDAO] = None,
         r2: Optional[AntiCopyR2] = None,
         sglang_url: str = SGLANG_URL,
     ):
-        self.jobs_dao = jobs_dao or AntiCopyJobsDAO()
         self.rollouts_dao = rollouts_dao or AntiCopyRolloutsDAO()
         self.scores_dao = scores_dao or AntiCopyScoresIndexDAO()
         self.miners_dao = miners_dao or MinersDAO()
+        self.miner_stats_dao = miner_stats_dao or MinerStatsDAO()
         self.config_dao = config_dao or SystemConfigDAO()
         self.state_dao = state_dao or AntiCopyStateDAO()
         self.r2 = r2 or AntiCopyR2()
@@ -202,27 +208,43 @@ class ForwardWorker:
     # ---- main loop ---------------------------------------------------
 
     async def run(self) -> None:
+        """Pull-based loop: every iteration computes the next candidate
+        from the live miners table (same ordering as ``af get-rank``)
+        and runs it. There is no separate jobs queue — ``scores_index``
+        is the single done marker.
+
+        A miner is considered a candidate iff:
+          * it is on the metagraph (has a row in ``miners``),
+          * ``miners.is_valid`` is True,
+          * ``miner_stats.challenge_status`` is not ``terminated``,
+          * ``scores_index`` has no row for ``(hotkey, revision)`` yet.
+
+        Candidates are sorted by ``(first_block ASC, uid ASC)`` so the
+        earliest committer (and ultimately the active champion) is
+        scored first. A transient failure on candidate X just falls
+        through to the next iteration — next loop picks X up again
+        because its ``scores_index`` row still doesn't exist. No
+        backoff state machine, no queue cleanup.
+        """
         self._running = True
         logger.info(f"[anticopy.worker] starting; sglang={self.sglang_url}")
         while self._running:
             try:
-                job = await self.jobs_dao.claim_next()
+                cand = await self._get_next_candidate()
             except Exception as e:
-                logger.error(f"[anticopy.worker] claim_next failed: {e}", exc_info=True)
+                logger.error(
+                    f"[anticopy.worker] candidate lookup failed: {e}",
+                    exc_info=True,
+                )
                 await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
                 continue
 
-            if job is None:
+            if cand is None:
                 await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
                 continue
-
-            # Prefetch is started inside ``_run_job`` AFTER the
-            # current job's own ckpt download completes — running
-            # both in parallel would have N+1 HF streams contending
-            # for the same network bandwidth.
 
             try:
-                await self._run_job(job)
+                await self._run_job(cand)
             finally:
                 # GC after every job (success or fail). Always keeps
                 # the most recently-used model directories so sglang's
@@ -243,6 +265,61 @@ class ForwardWorker:
                 except Exception as e:
                     logger.debug(f"[anticopy.worker] gc skipped: {e}")
 
+    async def _get_next_candidates(
+        self, *, limit: int = 1,
+        exclude: Optional[set] = None,
+    ) -> List[Dict[str, Any]]:
+        """Return the next ``limit`` candidates sorted by commit time
+        (same ordering as ``af get-rank``'s active bucket: earliest
+        ``first_block`` first, uid as tiebreaker). Excludes terminated
+        miners and anything that already has a ``scores_index`` row.
+        ``exclude`` is an optional set of ``(hotkey, revision)`` pairs
+        to skip on top of those filters — used by the prefetcher to
+        avoid the in-flight candidate's revision."""
+        exclude = exclude or set()
+        miners_rows = await self.miners_dao.get_valid_miners()
+        candidates: List[Dict[str, Any]] = []
+        for row in miners_rows:
+            uid = int(row.get("uid", 0) or 0)
+            if uid <= 0:
+                continue                # validator slot / system reserved
+            hk = str(row.get("hotkey") or "")
+            rev = str(row.get("revision") or "")
+            if not hk or not rev:
+                continue
+            if (hk, rev) in exclude:
+                continue
+            try:
+                stats = await self.miner_stats_dao.get_miner_stats(hk, rev)
+            except Exception as e:
+                logger.debug(f"[anticopy.worker] stats lookup {hk[:10]}: {e}")
+                stats = None
+            if stats and stats.get("challenge_status") == "terminated":
+                continue
+            # ``scores_index`` is the done marker — any row there means
+            # the candidate already has a verdict (independent or copy)
+            # and shouldn't be re-scored on every loop iteration.
+            try:
+                score_row = await self.scores_dao.get_score(hk, rev)
+            except Exception as e:
+                logger.debug(f"[anticopy.worker] score lookup {hk[:10]}: {e}")
+                score_row = None
+            if score_row is not None:
+                continue
+            candidates.append(row)
+        candidates.sort(
+            key=lambda r: (
+                int(r.get("first_block", 0) or 0),
+                int(r.get("uid", 0) or 0),
+            )
+        )
+        return candidates[:max(0, int(limit))]
+
+    async def _get_next_candidate(self) -> Optional[Dict[str, Any]]:
+        """Convenience wrapper around :meth:`_get_next_candidates`."""
+        rows = await self._get_next_candidates(limit=1)
+        return rows[0] if rows else None
+
     def stop(self) -> None:
         self._running = False
 
@@ -260,18 +337,12 @@ class ForwardWorker:
         try:
             cfg = await load_anticopy_config(self.config_dao)
             if not cfg.enabled:
-                logger.info("[anticopy.worker] anticopy disabled — resetting job")
-                await self.jobs_dao.reset_to_pending(hotkey, revision)
+                logger.info("[anticopy.worker] anticopy disabled — sleeping")
                 await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
                 return
 
             # 1) Compute the candidate's tokenizer signature once so we
-            # can stamp it on the score row for later filtering. The
-            # actual "tokenizer matches champion" gate lives in
-            # ``miners_monitor`` step 8.0 (which refuses to enqueue a
-            # mismatched candidate in the first place); duplicating the
-            # check here would only mis-fire during cold-start before
-            # the refresh service has populated ``anticopy_state``.
+            # can stamp it on the score row for later filtering.
             cand_sig, _ = await compute_tokenizer_signature(model, revision)
 
             # 2) Stage weights locally + swap the sglang server onto them.
@@ -282,11 +353,13 @@ class ForwardWorker:
             # no-op on the very first job; later jobs hit the running
             # engine via ``/update_weights_from_disk``.
             await self._ensure_sglang_running(local_path)
-            # Kick prefetch of the next pending ckpts now that our own
-            # download is finished — sglang's reload is GPU-bound, so
-            # the network is idle and prefetch won't contend with the
-            # in-flight teacher-force.
-            self._maybe_start_prefetch(current_pk=job.get("pk", ""))
+            # Kick prefetch of the next candidate's ckpts now that our
+            # own download is finished — sglang's reload is GPU-bound,
+            # so the network is idle and prefetch won't contend with
+            # the in-flight teacher-force.
+            self._maybe_start_prefetch(
+                current_hotkey=hotkey, current_revision=revision,
+            )
             await self._update_weights(local_path)
 
             # 3) Teacher-force every eligible rollout.
@@ -362,7 +435,9 @@ class ForwardWorker:
                     f"per_env={{{per_env_str}}} recorded in scores_index"
                 )
 
-            await self.jobs_dao.mark_done(hotkey, revision)
+            # Done — ``scores_index`` row above is the durable marker
+            # next iteration uses to skip this miner. No separate
+            # ``mark_done`` call needed.
             logger.info(
                 f"[anticopy.worker] {hotkey[:10]} done "
                 f"rollouts={len(per_rollout)} dec_med={decision_med:.4f} "
@@ -370,32 +445,24 @@ class ForwardWorker:
                 f"verdict={verdict_hotkey or 'independent'}"
             )
         except Exception as e:
-            attempts = int(job.get("attempts", 0) or 0)
+            # No retry counter to bump — the loop will pick this same
+            # candidate up next iteration as long as the failure didn't
+            # write a ``scores_index`` row. A sleep here avoids
+            # hot-looping on a permanently-broken miner; downstream
+            # the operator can intervene by terminating the miner via
+            # the scheduler.
             logger.error(
-                f"[anticopy.worker] {hotkey[:10]} attempt {attempts}/"
-                f"{MAX_JOB_ATTEMPTS} failed: {e}",
+                f"[anticopy.worker] {hotkey[:10]} job failed: {e}",
                 exc_info=True,
             )
-            try:
-                if attempts < MAX_JOB_ATTEMPTS:
-                    # Re-queue with a fresh enqueued_at so the job sorts to
-                    # the back of the queue. That naturally backs off after
-                    # a transient infra blip (SSH gateway flake, HF 503)
-                    # without spinning on the same broken state.
-                    await self.jobs_dao.reset_to_pending(hotkey, revision)
-                    logger.info(
-                        f"[anticopy.worker] {hotkey[:10]} re-queued "
-                        f"(attempt {attempts}/{MAX_JOB_ATTEMPTS})"
-                    )
-                else:
-                    await self.jobs_dao.mark_failed(hotkey, revision, str(e))
-            except Exception:
-                pass
+            await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
 
     # ---- prefetcher --------------------------------------------------
 
-    def _maybe_start_prefetch(self, *, current_pk: str) -> None:
-        """Fire-and-forget download of the next pending job's ckpt.
+    def _maybe_start_prefetch(
+        self, *, current_hotkey: str, current_revision: str,
+    ) -> None:
+        """Fire-and-forget download of the next candidate's ckpt.
 
         Re-entrant: cancels any prior prefetch task that's still
         running (the previous "next" may now be the "current", so the
@@ -409,27 +476,27 @@ class ForwardWorker:
             # background.
             pass
         self._prefetch_task = asyncio.create_task(
-            self._prefetch_next_pending(current_pk=current_pk)
+            self._prefetch_next_pending(
+                current_hotkey=current_hotkey,
+                current_revision=current_revision,
+            )
         )
 
-    async def _prefetch_next_pending(self, *, current_pk: str) -> None:
-        """Continuously stage upcoming pending jobs' ckpts in the
-        background while the active job runs. Iterates through the
-        queue rather than fetching just ``rows[0]`` — the active
-        ``_update_weights`` step alone takes ~5 min for a 32 B
-        bf16 ckpt, and ckpts that the GC will later evict don't
-        need to round-trip the network on their job's turn.
+    async def _prefetch_next_pending(
+        self, *, current_hotkey: str, current_revision: str,
+    ) -> None:
+        """Stage the next 1-2 candidates' ckpts in the background while
+        the active job runs. Lookup uses the same filters as the main
+        loop (valid + non-terminated + unscored) and excludes the
+        current revision so we don't re-download what we just fetched.
         """
         try:
-            # Cap prefetch lookahead at 2: a deeper queue is unlikely
-            # to overlap with sglang's reload + teacher-force window
-            # anyway, and limiting the look ahead keeps disk and
-            # HF-side rate-limit pressure bounded.
-            rows = await self.jobs_dao.peek_pending(
-                limit=2, exclude_pk=current_pk,
+            rows = await self._get_next_candidates(
+                limit=2,
+                exclude={(current_hotkey, current_revision)},
             )
         except Exception as e:
-            logger.debug(f"[anticopy.worker] peek failed: {e}")
+            logger.debug(f"[anticopy.worker] prefetch lookup failed: {e}")
             return
 
         for nxt in rows:

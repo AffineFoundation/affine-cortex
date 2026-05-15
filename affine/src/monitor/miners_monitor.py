@@ -28,7 +28,6 @@ from huggingface_hub import HfApi
 
 from affine.core.setup import logger
 from affine.database.dao.anticopy import (
-    AntiCopyJobsDAO,
     AntiCopyScoresIndexDAO,
     AntiCopyStateDAO,
 )
@@ -82,7 +81,6 @@ class MinersMonitor:
         self.dao = MinersDAO()
         self.stats_dao = MinerStatsDAO()
         self.config_dao = SystemConfigDAO()
-        self.anticopy_jobs_dao = AntiCopyJobsDAO()
         self.anticopy_scores_dao = AntiCopyScoresIndexDAO()
         self.anticopy_state_dao = AntiCopyStateDAO()
         self.refresh_interval_seconds = refresh_interval_seconds
@@ -220,17 +218,6 @@ class MinersMonitor:
         # in miner_stats, keyed by (hotkey, revision).
         await self._persist_miners(miners, current_block=current_block)
 
-        # Drop CEAC jobs for hotkey/revision pairs that no longer appear
-        # in the current metagraph snapshot. Terminated / re-registered
-        # miners would otherwise sit in ``anticopy_jobs`` forever, and a
-        # worker that claims one wastes a sglang reload + teacher-force
-        # pass on a hotkey that won't influence any scoring decision
-        # anymore.
-        try:
-            await self._prune_stale_anticopy_jobs(miners)
-        except Exception as e:
-            logger.debug(f"[MinersMonitor] anticopy queue prune failed: {e}")
-
         self.last_update = int(time.time())
         valid = {m.key(): m for m in miners if m.is_valid}
         logger.info(
@@ -238,58 +225,6 @@ class MinersMonitor:
             f"({len(valid)} valid, {len(miners) - len(valid)} invalid)"
         )
         return valid
-
-    async def _prune_stale_anticopy_jobs(
-        self, current_miners: list[MinerInfo],
-    ) -> None:
-        """Delete pending ``anticopy_jobs`` whose candidate is no longer
-        worth evaluating. Two cases:
-
-          (a) the ``(hotkey, revision)`` pair is not in the current
-              metagraph snapshot at all (hotkey terminated, re-registered
-              to a new owner, or the miner re-committed to a different
-              revision);
-          (b) the pair IS in the snapshot but ``miner_stats.challenge_status``
-              has reached ``terminated`` — scheduler / scorer has
-              already decided this candidate is out of the running, so
-              an anticopy score has no consumer.
-
-        Running rows are left alone to avoid racing with ``claim_next``;
-        they'll be pruned on the next tick once the worker releases them.
-        """
-        live_pairs = {(m.hotkey, m.revision) for m in current_miners}
-        rows = await self.anticopy_jobs_dao.peek_pending(limit=10000)
-        for row in rows:
-            hk = row.get("hotkey", "")
-            rev = row.get("revision", "")
-            reason = None
-            if (hk, rev) not in live_pairs:
-                reason = "off-metagraph"
-            else:
-                try:
-                    stats_row = await self.stats_dao.get_miner_stats(hk, rev)
-                except Exception as e:
-                    logger.debug(
-                        f"[MinersMonitor] stats lookup failed "
-                        f"{hk[:10]}#{rev[:8]}: {e}"
-                    )
-                    stats_row = None
-                if (
-                    stats_row
-                    and stats_row.get("challenge_status")
-                    == MinerStatsDAO.STATUS_TERMINATED
-                ):
-                    reason = "terminated"
-            if reason is None:
-                continue
-            try:
-                await self.anticopy_jobs_dao.delete(row["pk"])
-                logger.info(
-                    f"[MinersMonitor] pruned stale anticopy job "
-                    f"{hk[:10]}#{rev[:8]} ({reason})"
-                )
-            except Exception as e:
-                logger.debug(f"[MinersMonitor] prune {hk[:10]}: {e}")
 
     # ---- validation -----------------------------------------------------
 
@@ -419,53 +354,12 @@ class MinersMonitor:
         if not info.template_check_result:
             info.template_check_result = "safe"
 
-        # step 8: lazy enqueue into the CEAC job queue. CEAC's verdict
-        # lives in its own ``anticopy_scores_index`` table — the monitor
-        # NEVER flips ``miners.is_valid`` based on a copy verdict. That
-        # keeps a false-positive similarity call from stripping a live
-        # miner's weight by side-effect. Consumers that care about the
-        # similarity signal (scheduler / weight_setter / dashboards)
-        # read scores_index directly.
-        if (
-            uid != 0
-            and anticopy_cfg is not None
-            and anticopy_cfg.enabled
-            and info.tokenizer_sig
-        ):
-            # Skip miners the scheduler has already TERMINATED — they
-            # won't influence any future scoring decision, so a CEAC
-            # score on them is wasted GPU time. Pair the enqueue-side
-            # filter with ``_prune_stale_anticopy_jobs`` (which sweeps
-            # the queue once per tick) so the two together keep
-            # terminated revisions out of the queue end-to-end.
-            try:
-                stats_row = await self.stats_dao.get_miner_stats(hotkey, revision)
-            except Exception as e:
-                logger.debug(
-                    f"[MinersMonitor] stats lookup for enqueue gate failed: {e}"
-                )
-                stats_row = None
-            if (
-                stats_row
-                and stats_row.get("challenge_status")
-                == MinerStatsDAO.STATUS_TERMINATED
-            ):
-                return info
-            try:
-                score_row = await self.anticopy_scores_dao.get_score(hotkey, revision)
-            except Exception as e:
-                logger.debug(f"[MinersMonitor] anticopy score lookup failed: {e}")
-                score_row = None
-            if score_row is None:
-                try:
-                    await self.anticopy_jobs_dao.enqueue(
-                        hotkey=hotkey, revision=revision, model=model, uid=uid,
-                    )
-                except Exception as e:
-                    logger.debug(
-                        f"[MinersMonitor] anticopy enqueue failed uid={uid}: {e}"
-                    )
-
+        # CEAC step 8 (job enqueue) was removed when the worker switched
+        # to a pull-based model: it now reads the live miners table
+        # itself, sorts by commit time, and skips already-scored rows.
+        # The monitor only needs to stamp the tokenizer signature here
+        # (step 8.0 above) and persist ``miners.is_valid``; no queue
+        # write is required.
         return info
 
     async def _safe_load_anticopy_config(self):
