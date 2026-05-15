@@ -109,6 +109,12 @@ class _FakeJobsDAO:
 
 
 def _patched_worker(monkeypatch, peek_rows):
+    # Force the worker into local-snapshot mode for these tests: the
+    # ``REMOTE_SSH_HOST`` module global may otherwise leak in from the
+    # caller's shell env (e.g. an operator's prod ``.env``) and route
+    # the prefetch through ``_remote_snapshot_download``, which would
+    # then try to actually SSH out and break the unit test.
+    monkeypatch.setattr(worker_mod, "REMOTE_SSH_HOST", "")
     worker = ForwardWorker(
         jobs_dao=_FakeJobsDAO(peek_rows),
         rollouts_dao=object(),
