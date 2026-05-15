@@ -110,6 +110,241 @@ class _MemoryMinerStatsDAO(MinerStatsDAO):
         return list(self.rows)
 
 
+class _UpdateRecordingClient:
+    def __init__(self):
+        self.update_calls = []
+
+    async def update_item(self, **kwargs):
+        self.update_calls.append(kwargs)
+
+
+@pytest.mark.asyncio
+async def test_update_challenge_status_persists_scores_and_freeze_marker(monkeypatch):
+    """The comparator's frozen view of a terminated miner shares the
+    SAME ``scores_by_env`` attribute live updates use — the
+    ``terminated_at_block`` flag distinguishes frozen rows. Atomic
+    write so a concurrent live-cycle refresh can't slip in between
+    the status flip and the score persist."""
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+    dao = MinerStatsDAO()
+    await dao.update_challenge_status(
+        hotkey="hk",
+        revision="rev",
+        status=MinerStatsDAO.STATUS_TERMINATED,
+        termination_reason="lost_to_champion:foo",
+        scores_by_env={
+            "ENV_A": {"count": 178, "avg": 0.48,
+                      "champion_overlap_avg": 0.50},
+        },
+        scores_refresh_block=8000,
+        terminated_at_block=9001,
+    )
+    assert len(client.update_calls) == 1
+    call = client.update_calls[0]
+    expr = call["UpdateExpression"]
+    values = call["ExpressionAttributeValues"]
+    assert "scores_by_env = :sc" in expr
+    assert "scores_refresh_block = :srb" in expr
+    assert "terminated_at_block = :tb" in expr
+    assert values[":tb"] == {"N": "9001"}
+    assert values[":srb"] == {"N": "8000"}
+    env_a = values[":sc"]["M"]["ENV_A"]["M"]
+    assert env_a["count"]["N"] == "178"
+    assert env_a["avg"]["N"].startswith("0.48")
+    assert env_a["champion_overlap_avg"]["N"].startswith("0.5")
+
+
+@pytest.mark.asyncio
+async def test_update_challenge_status_omits_score_fields_when_not_provided(monkeypatch):
+    """Status-only callers (recovery, mid-battle invalidation,
+    deploy-failed) don't carry comparator data — those paths must keep
+    producing a clean status-only ``UpdateExpression`` without empty
+    score placeholders."""
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+    dao = MinerStatsDAO()
+    await dao.update_challenge_status(
+        hotkey="hk",
+        revision="rev",
+        status=MinerStatsDAO.STATUS_TERMINATED,
+        termination_reason="dethroned_by:bar:recovery",
+    )
+    expr = client.update_calls[0]["UpdateExpression"]
+    values = client.update_calls[0]["ExpressionAttributeValues"]
+    assert "scores_by_env" not in expr
+    assert "scores_refresh_block" not in expr
+    assert "terminated_at_block" not in expr
+    assert ":sc" not in values
+    assert ":srb" not in values
+    assert ":tb" not in values
+
+
+class _StubMinerStatsForMap(MinerStatsDAO):
+    def __init__(self, rows):
+        super().__init__()
+        self._rows = rows
+
+    async def get_miner_stats(self, hotkey, revision):
+        return self._rows.get((hotkey, revision))
+
+
+@pytest.mark.asyncio
+async def test_build_display_scores_map_drops_stale_live_and_marks_frozen():
+    """One ``scores_by_env`` field on every row; the ``frozen`` flag
+    distinguishes the comparator's decide-time snapshot from a fresh
+    live snapshot. Stale-and-not-frozen rows are dropped because the
+    CLI must not show numbers from a previous task pool."""
+    dao = _StubMinerStatsForMap({
+        # Terminated row → frozen=True regardless of refresh_block.
+        ("hk1", "r1"): {
+            "scores_by_env": {
+                "ENV_A": {"count": 50, "avg": 0.4, "champion_overlap_avg": 0.5},
+            },
+            "scores_refresh_block": 99,  # decide-time block, may differ
+            "terminated_at_block": 9001,
+        },
+        # Fresh live, never terminated → frozen=False.
+        ("hk2", "r2"): {
+            "scores_by_env": {"ENV_A": {"count": 3, "avg": 0.6}},
+            "scores_refresh_block": 100,
+        },
+        # Stale live (different refresh, not terminated) → dropped.
+        ("hk3", "r3"): {
+            "scores_by_env": {"ENV_A": {"count": 1, "avg": 0.9}},
+            "scores_refresh_block": 99,
+        },
+        # Sampling row with nothing → absent from result.
+        ("hk4", "r4"): {"challenge_status": "sampling"},
+    })
+    miners = [
+        {"hotkey": "hk1", "revision": "r1", "uid": 11},
+        {"hotkey": "hk2", "revision": "r2", "uid": 22},
+        {"hotkey": "hk3", "revision": "r3", "uid": 33},
+        {"hotkey": "hk4", "revision": "r4", "uid": 44},
+        {"hotkey": "hk_unknown", "revision": "r9", "uid": 99},  # no row
+    ]
+    out = await dao.build_display_scores_map(miners, current_refresh_block=100)
+
+    assert set(out.keys()) == {"11", "22"}
+    assert out["11"]["frozen"] is True
+    assert out["11"]["scores"]["ENV_A"]["count"] == 50
+    assert out["22"]["frozen"] is False
+    assert out["22"]["scores"]["ENV_A"]["avg"] == 0.6
+
+
+@pytest.mark.asyncio
+async def test_build_display_scores_map_keeps_frozen_when_no_refresh_block():
+    """``current_refresh_block=None`` (no task pool yet) → every live
+    snapshot is treated as stale, but frozen rows still render. So
+    terminated miners survive a cold-start API response."""
+    dao = _StubMinerStatsForMap({
+        ("hk1", "r1"): {
+            "scores_by_env": {"ENV_A": {"count": 50, "avg": 0.4,
+                                        "champion_overlap_avg": 0.5}},
+            "scores_refresh_block": 100,
+            "terminated_at_block": 9000,
+        },
+        ("hk2", "r2"): {
+            "scores_by_env": {"ENV_A": {"count": 7, "avg": 0.8}},
+            "scores_refresh_block": 100,
+        },
+    })
+    miners = [
+        {"hotkey": "hk1", "revision": "r1", "uid": 11},
+        {"hotkey": "hk2", "revision": "r2", "uid": 22},
+    ]
+    out = await dao.build_display_scores_map(miners, current_refresh_block=None)
+    assert list(out.keys()) == ["11"]
+    assert out["11"]["frozen"] is True
+
+
+@pytest.mark.asyncio
+async def test_update_live_scores_writes_per_miner_payload(monkeypatch):
+    """LiveScoresMonitor's per-miner upsert writes to the SAME
+    ``scores_by_env`` attribute the comparator writes to at
+    termination. The conditional ``attribute_not_exists(terminated_at_block)``
+    is what prevents live cycles from clobbering a frozen row."""
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+    dao = MinerStatsDAO()
+    await dao.update_live_scores(
+        hotkey="hk",
+        revision="rev",
+        scores_by_env={
+            "ENV_A": {"count": 10, "avg": 0.45, "champion_overlap_avg": 0.5},
+        },
+        scores_refresh_block=12345,
+    )
+    assert len(client.update_calls) == 1
+    call = client.update_calls[0]
+    expr = call["UpdateExpression"]
+    values = call["ExpressionAttributeValues"]
+    assert "scores_by_env = :sc" in expr
+    assert "scores_refresh_block = :srb" in expr
+    assert call.get("ConditionExpression") == "attribute_not_exists(terminated_at_block)"
+    assert values[":srb"] == {"N": "12345"}
+    env_a = values[":sc"]["M"]["ENV_A"]["M"]
+    assert env_a["count"]["N"] == "10"
+    assert env_a["avg"]["N"].startswith("0.45")
+    assert env_a["champion_overlap_avg"]["N"].startswith("0.5")
+
+
+@pytest.mark.asyncio
+async def test_update_live_scores_swallows_frozen_row_conflict(monkeypatch):
+    """A ``ConditionalCheckFailedException`` from a frozen row is the
+    expected outcome (live cycle tried to overwrite a comparator-set
+    snapshot); the DAO swallows it. Any OTHER ClientError must
+    propagate so the LiveScoresMonitor logs it."""
+    from botocore.exceptions import ClientError
+
+    class _RejectingClient:
+        async def update_item(self, **kwargs):
+            raise ClientError(
+                error_response={"Error": {"Code": "ConditionalCheckFailedException"}},
+                operation_name="UpdateItem",
+            )
+
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: _RejectingClient(),
+    )
+    dao = MinerStatsDAO()
+    # Must not raise.
+    await dao.update_live_scores(
+        hotkey="hk", revision="rev",
+        scores_by_env={"ENV_A": {"count": 1, "avg": 0.5}},
+        scores_refresh_block=10,
+    )
+
+    class _ThrowingClient:
+        async def update_item(self, **kwargs):
+            raise ClientError(
+                error_response={"Error": {"Code": "ProvisionedThroughputExceededException"}},
+                operation_name="UpdateItem",
+            )
+
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: _ThrowingClient(),
+    )
+    with pytest.raises(ClientError):
+        await dao.update_live_scores(
+            hotkey="hk", revision="rev",
+            scores_by_env={"ENV_A": {"count": 1, "avg": 0.5}},
+            scores_refresh_block=10,
+        )
+
+
 @pytest.mark.asyncio
 async def test_miner_stats_hotkey_fallback_blocks_later_revision_claim():
     dao = _MemoryMinerStatsDAO(

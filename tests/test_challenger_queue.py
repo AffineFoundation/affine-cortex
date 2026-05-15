@@ -60,6 +60,9 @@ class InMemoryStore:
         hotkey: str | None = None,
         revision: str | None = None,
         model: str = "",
+        scores_by_env: dict | None = None,
+        scores_refresh_block: int | None = None,
+        terminated_at_block: int | None = None,
     ) -> None:
         self.terminal_calls.append((uid, new_status, reason, hotkey, revision, model))
         row = self.rows.setdefault(uid, {"uid": uid})
@@ -71,6 +74,12 @@ class InMemoryStore:
             row["revision"] = revision
         if model:
             row["model"] = model
+        if scores_by_env is not None:
+            row["scores_by_env"] = scores_by_env
+        if scores_refresh_block is not None:
+            row["scores_refresh_block"] = scores_refresh_block
+        if terminated_at_block is not None:
+            row["terminated_at_block"] = terminated_at_block
 
 
 def _truthy(value) -> bool:

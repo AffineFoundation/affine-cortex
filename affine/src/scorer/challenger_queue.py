@@ -76,6 +76,9 @@ class MinerQueueStore(Protocol):
         hotkey: Optional[str] = None,
         revision: Optional[str] = None,
         model: str = "",
+        scores_by_env: Optional[dict] = None,
+        scores_refresh_block: Optional[int] = None,
+        terminated_at_block: Optional[int] = None,
     ) -> None:
         """Set ``uid``'s historical ``challenge_status``."""
         ...
@@ -131,6 +134,9 @@ class ChallengerQueue:
         hotkey: Optional[str] = None,
         revision: Optional[str] = None,
         model: str = "",
+        scores_by_env: Optional[dict] = None,
+        scores_refresh_block: Optional[int] = None,
+        terminated_at_block: Optional[int] = None,
     ) -> None:
         """Transition ``uid`` to a terminal challenge state."""
         try:
@@ -149,6 +155,9 @@ class ChallengerQueue:
             hotkey=hotkey,
             revision=revision,
             model=model,
+            scores_by_env=scores_by_env,
+            scores_refresh_block=scores_refresh_block,
+            terminated_at_block=terminated_at_block,
         )
 
 

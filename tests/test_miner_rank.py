@@ -746,6 +746,144 @@ def test_rank_table_omits_brackets_when_no_live_champion_avg():
     assert "[48.49,52.48]" not in out
 
 
+def test_rank_table_falls_back_to_terminal_scores_when_no_live_data():
+    """Terminated miners drop out of the live cache after refresh_block
+    rolls. ``terminal_scores`` carries the comparator's frozen
+    decide-time view (count / avg / champion_overlap_avg) onto the
+    miner_stats row at termination, so the rank UI keeps showing real
+    numbers for them.
+
+    Threshold basis is the *frozen* champion_overlap_avg from the
+    contest they lost, NOT the current champion's avg — they were
+    measured against whoever was champion at the time."""
+    window = {
+        "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
+        "battle": None,
+        "sample_counts": {"1": {"SWE": 213}},
+        "sample_averages": {"1": {"SWE": 0.55}},
+        # uid 5 has no live data, but scores_by_env + terminated_at_block were frozen
+        # when they lost: lower=0.50*(1-0.02)=0.49, upper=0.50+0.03=0.53.
+        "terminal_scores": {
+            "5": {"SWE": {"count": 178, "avg": 0.48,
+                          "champion_overlap_avg": 0.50}},
+        },
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 1, "miner_hotkey": "champ", "model": "org/champ",
+                "overall_score": 1.0, "is_valid": True,
+                "scores_by_env": {"SWE": {}},
+            },
+            {
+                "uid": 5, "miner_hotkey": "loser", "model": "org/loser",
+                "overall_score": 0.0, "is_valid": True,
+                "challenge_status": "terminated",
+                "scores_by_env": {"SWE": {}},
+            },
+        ],
+    }
+
+    out = _render_rank(window, [], scores)
+
+    assert "48.00[49.00,53.00]/178" in out
+    assert "TERMINATED" in out
+
+
+def test_rank_table_terminal_scores_without_basis_render_score_count_only():
+    """When the frozen entry has no ``champion_overlap_avg`` (eg the
+    losing miner had samples but the winner's overlap was empty —
+    unlikely in practice), render score/count without brackets."""
+    window = {
+        "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
+        "battle": None,
+        "sample_counts": {"1": {"SWE": 213}},
+        "sample_averages": {"1": {"SWE": 0.55}},
+        "terminal_scores": {
+            "5": {"SWE": {"count": 178, "avg": 0.48}},
+        },
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 5, "miner_hotkey": "loser", "model": "org/loser",
+                "overall_score": 0.0, "is_valid": True,
+                "challenge_status": "terminated",
+                "scores_by_env": {"SWE": {}},
+            },
+        ],
+    }
+
+    out = _render_rank(window, [], scores)
+    assert "48.00/178" in out
+    assert "[" not in out.split("|")[3]
+
+
+def test_rank_table_live_data_wins_over_terminal_scores():
+    """A row that has BOTH live data and terminal_scores (eg terminated
+    very recently, still in the current refresh_block) shows the LIVE
+    numbers — the live cache is fresher and matches the current
+    champion."""
+    window = {
+        "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
+        "battle": None,
+        "sample_counts": {"1": {"SWE": 213}, "5": {"SWE": 50}},
+        "sample_averages": {"1": {"SWE": 0.55}, "5": {"SWE": 0.40}},
+        "terminal_scores": {
+            "5": {"SWE": {"count": 999, "avg": 0.99,
+                          "champion_overlap_avg": 0.99}},
+        },
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 5, "miner_hotkey": "loser", "model": "org/loser",
+                "overall_score": 0.0, "is_valid": True,
+                "challenge_status": "terminated",
+                "scores_by_env": {"SWE": {}},
+            },
+        ],
+    }
+
+    out = _render_rank(window, [], scores)
+    # Live: 40.00, count 50; champion live_avg 0.55 → lower=53.90, upper=58.00.
+    assert "40.00[53.90,58.00]/50" in out
+    assert "99.00" not in out
+    assert "/999" not in out
+
+
+def test_rank_table_missing_terminal_scores_field_still_renders():
+    """Old payload shape (no ``terminal_scores`` key at all) must keep
+    working — backwards compat for any cached or in-flight response."""
+    window = {
+        "champion": {"uid": 1, "hotkey": "champ", "model": "org/champ"},
+        "battle": None,
+        "sample_counts": {"1": {"SWE": 10}},
+        "sample_averages": {"1": {"SWE": 0.5}},
+        # no "terminal_scores" key
+    }
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 1, "miner_hotkey": "champ", "model": "org/champ",
+                "overall_score": 1.0, "is_valid": True,
+                "scores_by_env": {"SWE": {}},
+            },
+        ],
+    }
+
+    out = _render_rank(window, [], scores)
+    assert "50.00/10" in out
+
+
 def test_rank_table_champion_row_never_displays_live_brackets():
     """The champion's own row must NOT show live brackets — we'd be
     rendering thresholds against itself. Champion's payload typically

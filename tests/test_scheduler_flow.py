@@ -68,6 +68,9 @@ class _InMemoryMinerStore:
         hotkey: str | None = None,
         revision: str | None = None,
         model: str = "",
+        scores_by_env: dict | None = None,
+        scores_refresh_block: int | None = None,
+        terminated_at_block: int | None = None,
     ) -> None:
         self.rows.setdefault(uid, {"uid": uid})["challenge_status"] = new_status
         self.rows.setdefault(uid, {"uid": uid})["termination_reason"] = reason
@@ -77,6 +80,12 @@ class _InMemoryMinerStore:
             self.rows[uid]["revision"] = revision
         if model:
             self.rows[uid]["model"] = model
+        if scores_by_env is not None:
+            self.rows[uid]["scores_by_env"] = scores_by_env
+        if scores_refresh_block is not None:
+            self.rows[uid]["scores_refresh_block"] = scores_refresh_block
+        if terminated_at_block is not None:
+            self.rows[uid]["terminated_at_block"] = terminated_at_block
 
 
 @dataclass
@@ -427,6 +436,94 @@ async def test_champion_holds_when_challenger_score_lower():
 
 
 @pytest.mark.asyncio
+async def test_displaced_champion_carries_final_scores_to_miner_stats():
+    """When the challenger wins, the old champion is terminated. The
+    comparator's decide-time view (its own count/avg + the new
+    champion's overlap avg as threshold basis) is frozen onto the
+    miner_stats row so the rank UI can keep showing real numbers after
+    the live cache forgets them."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+
+    await scheduler.tick(current_block=50)   # refresh task_ids
+    await scheduler.tick(current_block=51)   # deploy champion
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("champ_hk", "champ_rev", env, task_state.task_ids[env], score=0.5, refresh_block=task_state.refreshed_at_block)
+    await scheduler.tick(current_block=52)   # start battle
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("chal_hk", "chal_rev", env, task_state.task_ids[env], score=0.9, refresh_block=task_state.refreshed_at_block)
+    await scheduler.tick(current_block=99)   # decide
+
+    old_champ_row = miner_store.rows[1]
+    assert old_champ_row["challenge_status"] == STATUS_TERMINATED
+    # Block recorded at decision time (current_block from the decide tick).
+    assert old_champ_row["terminated_at_block"] == 99
+    # ``scores_refresh_block`` is the task pool block the comparator
+    # actually decided on; readers use it to ignore stale-pool rows
+    # for non-terminated rows (terminated rows always render).
+    assert old_champ_row["scores_refresh_block"] is not None
+    final = old_champ_row["scores_by_env"]
+    assert set(final.keys()) == {"ENV_A", "ENV_B"}
+    for env in ("ENV_A", "ENV_B"):
+        # Old champion's own avg on the overlap; the comparator's basis
+        # for this row is the *winning challenger's* avg.
+        assert final[env]["count"] > 0
+        assert final[env]["avg"] == pytest.approx(0.5)
+        assert final[env]["champion_overlap_avg"] == pytest.approx(0.9)
+
+
+@pytest.mark.asyncio
+async def test_losing_challenger_carries_final_scores_to_miner_stats():
+    """Challenger loses → terminated row picks up the same frozen
+    snapshot, but with own/opponent flipped: challenger's avg as ``avg``,
+    champion's avg as ``champion_overlap_avg``."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("champ_hk", "champ_rev", env, task_state.task_ids[env], score=0.9, refresh_block=task_state.refreshed_at_block)
+    await scheduler.tick(current_block=52)
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("chal_hk", "chal_rev", env, task_state.task_ids[env], score=0.3, refresh_block=task_state.refreshed_at_block)
+    await scheduler.tick(current_block=77)
+
+    loser_row = miner_store.rows[2]
+    assert loser_row["challenge_status"] == STATUS_TERMINATED
+    assert loser_row["terminated_at_block"] == 77
+    final = loser_row["scores_by_env"]
+    for env in ("ENV_A", "ENV_B"):
+        assert final[env]["avg"] == pytest.approx(0.3)
+        assert final[env]["champion_overlap_avg"] == pytest.approx(0.9)
+    # The (winning) champion's row keeps its CHAMPION status. The
+    # _decide LOST path doesn't touch the winner — their scores stay
+    # under live-monitor management until they later get displaced.
+    assert miner_store.rows[1]["challenge_status"] == STATUS_CHAMPION
+    assert "terminated_at_block" not in miner_store.rows[1]
+
+
+@pytest.mark.asyncio
 async def test_deploy_failure_marks_challenger_failed():
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
@@ -773,12 +870,18 @@ async def test_cold_start_set_champion_writes_before_mark_terminated():
         hotkey=None,
         revision=None,
         model="",
+        scores_by_env=None,
+        scores_refresh_block=None,
+        terminated_at_block=None,
     ):
         if status == STATUS_CHAMPION:
             write_log.append(f"mark_won_uid={uid}")
         await orig_set_terminal(
             uid, status, reason=reason,
             hotkey=hotkey, revision=revision, model=model,
+            scores_by_env=scores_by_env,
+            scores_refresh_block=scores_refresh_block,
+            terminated_at_block=terminated_at_block,
         )
 
     kv.set = logged_set

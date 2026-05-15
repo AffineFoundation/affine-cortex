@@ -20,18 +20,28 @@ from affine.src.scorer.window_state import (
 )
 
 
-async def _empty_counts(task_state):
-    return {}, {}
-
-
 async def _no_inferred_champion():
     return None
 
 
+class _EmptyMinersDAO:
+    async def get_valid_miners(self):
+        return []
+
+    async def get_all_miners(self):
+        return []
+
+
+class _EmptyMinerStatsDAO:
+    async def build_display_scores_map(self, miners, *, current_refresh_block=None):
+        return {}
+
+
 async def _render_current(monkeypatch, store: StateStore):
     monkeypatch.setattr(rank_state, "_state_store", lambda: store)
-    monkeypatch.setattr(rank_state, "_sample_counts_and_averages", _empty_counts)
     monkeypatch.setattr(rank_state, "_infer_champion_from_scores", _no_inferred_champion)
+    monkeypatch.setattr(rank_state, "MinersDAO", _EmptyMinersDAO)
+    monkeypatch.setattr(rank_state, "MinerStatsDAO", _EmptyMinerStatsDAO)
     return await rank_state.get_current_state()
 
 
@@ -49,6 +59,8 @@ async def test_current_state_on_empty_state(monkeypatch):
         "task_refresh_block": None,
         "sample_counts": {},
         "sample_averages": {},
+        "champion_overlap_avgs": {},
+        "terminal_scores": {},
         "live_sampling_uids": [],
         # Reward-split feature is off by default → field is always
         # present but empty.
@@ -95,11 +107,27 @@ async def test_current_state_with_battle_in_flight(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(monkeypatch):
-    async def _counts(task_state):
-        return (
-            {"1": {"ENV_A": 5}, "2": {"ENV_A": 2}},
-            {"1": {"ENV_A": 0.42}, "2": {"ENV_A": 0.10}},
-        )
+    """When the per-miner display map has live entries, those drive
+    ``sample_counts`` / ``sample_averages``; the helper flags any
+    battle subject whose live count hasn't reached the env's sampling
+    target."""
+
+    class _MinersDAOWith:
+        async def get_valid_miners(self):
+            return [
+                {"uid": 1, "hotkey": "A", "revision": "r1"},
+                {"uid": 2, "hotkey": "B", "revision": "r2"},
+            ]
+
+        async def get_all_miners(self):
+            return await self.get_valid_miners()
+
+    class _StatsDAOWith:
+        async def build_display_scores_map(self, miners, *, current_refresh_block=None):
+            return {
+                "1": {"scores": {"ENV_A": {"count": 5, "avg": 0.42}}, "frozen": False},
+                "2": {"scores": {"ENV_A": {"count": 2, "avg": 0.10}}, "frozen": False},
+            }
 
     kv = InMemoryConfigStore()
     kv.data["environments"] = {
@@ -122,8 +150,9 @@ async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(mon
         task_ids={"ENV_A": [1, 2, 3, 4, 5, 6]}, refreshed_at_block=42,
     ))
     monkeypatch.setattr(rank_state, "_state_store", lambda: store)
-    monkeypatch.setattr(rank_state, "_sample_counts_and_averages", _counts)
     monkeypatch.setattr(rank_state, "_infer_champion_from_scores", _no_inferred_champion)
+    monkeypatch.setattr(rank_state, "MinersDAO", _MinersDAOWith)
+    monkeypatch.setattr(rank_state, "MinerStatsDAO", _StatsDAOWith)
 
     resp = await rank_state.get_current_state()
 
@@ -174,6 +203,52 @@ class _FakeMinerStatsDAO:
                 "termination_reason": "",
             },
         }
+
+
+@pytest.mark.asyncio
+async def test_frozen_scores_survive_post_termination_invalidation(monkeypatch):
+    """Terminated miner that later flipped to ``is_valid=false`` must
+    still surface its frozen ``terminal_scores`` in /rank/current —
+    otherwise the comparator's decide-time view disappears the moment
+    monitor invalidates a hotkey."""
+
+    class _MinersDAOMixed:
+        async def get_valid_miners(self):
+            return [{"uid": 9, "hotkey": "still_valid", "revision": "rv"}]
+
+        async def get_all_miners(self):
+            # uid=1 is the dropped invalid; only ``get_all_miners`` sees it.
+            return [
+                {"uid": 1, "hotkey": "dropped", "revision": "r0"},
+                {"uid": 9, "hotkey": "still_valid", "revision": "rv"},
+            ]
+
+    seen_input = []
+
+    class _StatsDAOSnapshot:
+        async def build_display_scores_map(self, miners, *, current_refresh_block=None):
+            seen_input.append([m["hotkey"] for m in miners])
+            return {
+                "1": {
+                    "scores": {"ENV_A": {"count": 200, "avg": 0.5,
+                                          "champion_overlap_avg": 0.52}},
+                    "frozen": True,
+                },
+            }
+
+    monkeypatch.setattr(rank_state, "_state_store", lambda: StateStore(InMemoryConfigStore()))
+    monkeypatch.setattr(rank_state, "_infer_champion_from_scores", _no_inferred_champion)
+    monkeypatch.setattr(rank_state, "MinersDAO", _MinersDAOMixed)
+    monkeypatch.setattr(rank_state, "MinerStatsDAO", _StatsDAOSnapshot)
+
+    resp = await rank_state.get_current_state()
+
+    # DAO was driven off get_all_miners (sees ``dropped``), not valid only.
+    assert "dropped" in seen_input[0]
+    # Frozen entry made it through to the payload.
+    assert resp["terminal_scores"] == {
+        "1": {"ENV_A": {"count": 200, "avg": 0.5, "champion_overlap_avg": 0.52}},
+    }
 
 
 @pytest.mark.asyncio

@@ -286,27 +286,164 @@ class MinerStatsDAO(BaseDAO):
         revision: str,
         status: str,
         termination_reason: str = "",
+        scores_by_env: Optional[Dict[str, Dict[str, float]]] = None,
+        scores_refresh_block: Optional[int] = None,
+        terminated_at_block: Optional[int] = None,
     ) -> None:
+        """Flip lifecycle state. When called at termination with score
+        data, also freezes the comparator's decide-time view onto the
+        row in the SAME atomic write: ``scores_by_env`` carries the
+        ``{env: {count, avg, champion_overlap_avg?}}`` view and
+        ``terminated_at_block`` marks the row immutable (live writes
+        from :class:`LiveScoresMonitor` skip rows where this attribute
+        is set).
+        """
         from affine.database.client import get_client
 
         now = int(time.time())
+        values: Dict[str, Any] = {
+            ":status": {"S": status},
+            ":reason": {"S": termination_reason},
+            ":now": {"N": str(now)},
+            ":hotkey": {"S": hotkey},
+            ":revision": {"S": revision},
+        }
+        update_parts = [
+            "challenge_status = :status",
+            "termination_reason = :reason",
+            "last_updated_at = :now",
+            "hotkey = if_not_exists(hotkey, :hotkey)",
+            "revision = if_not_exists(revision, :revision)",
+            "first_seen_at = if_not_exists(first_seen_at, :now)",
+        ]
+        if scores_by_env is not None:
+            values[":sc"] = self._serialize({"_v": scores_by_env})["_v"]
+            update_parts.append("scores_by_env = :sc")
+        if scores_refresh_block is not None:
+            values[":srb"] = {"N": str(int(scores_refresh_block))}
+            update_parts.append("scores_refresh_block = :srb")
+        if terminated_at_block is not None:
+            values[":tb"] = {"N": str(int(terminated_at_block))}
+            update_parts.append("terminated_at_block = :tb")
         await get_client().update_item(
             TableName=self.table_name,
             Key={
                 "pk": {"S": self._make_pk(hotkey)},
                 "sk": {"S": self._make_sk(revision)},
             },
-            UpdateExpression=(
-                "SET challenge_status = :status, termination_reason = :reason, "
-                "last_updated_at = :now, hotkey = if_not_exists(hotkey, :hotkey), "
-                "revision = if_not_exists(revision, :revision), "
-                "first_seen_at = if_not_exists(first_seen_at, :now)"
-            ),
-            ExpressionAttributeValues={
-                ":status": {"S": status},
-                ":reason": {"S": termination_reason},
-                ":now": {"N": str(now)},
-                ":hotkey": {"S": hotkey},
-                ":revision": {"S": revision},
-            },
+            UpdateExpression="SET " + ", ".join(update_parts),
+            ExpressionAttributeValues=values,
         )
+
+    async def update_live_scores(
+        self, *,
+        hotkey: str,
+        revision: str,
+        scores_by_env: Dict[str, Dict[str, float]],
+        scores_refresh_block: int,
+    ) -> None:
+        """Overwrite the per-miner score snapshot for the current
+        refresh_block. Called by :class:`LiveScoresMonitor` every cycle.
+
+        Same ``scores_by_env`` attribute as
+        :meth:`update_challenge_status` — the row stores ONE per-env
+        snapshot, with ``terminated_at_block`` (if present) marking it
+        as frozen-by-the-decision. The conditional write below skips
+        any row that has already been frozen so a live refresh can't
+        clobber the comparator's decide-time view.
+        """
+        from affine.database.client import get_client
+
+        now = int(time.time())
+        try:
+            await get_client().update_item(
+                TableName=self.table_name,
+                Key={
+                    "pk": {"S": self._make_pk(hotkey)},
+                    "sk": {"S": self._make_sk(revision)},
+                },
+                UpdateExpression=(
+                    "SET scores_by_env = :sc, "
+                    "scores_refresh_block = :srb, "
+                    "last_updated_at = :now, "
+                    "hotkey = if_not_exists(hotkey, :hotkey), "
+                    "revision = if_not_exists(revision, :revision), "
+                    "first_seen_at = if_not_exists(first_seen_at, :now)"
+                ),
+                ConditionExpression="attribute_not_exists(terminated_at_block)",
+                ExpressionAttributeValues={
+                    ":sc": self._serialize({"_v": scores_by_env})["_v"],
+                    ":srb": {"N": str(int(scores_refresh_block))},
+                    ":now": {"N": str(now)},
+                    ":hotkey": {"S": hotkey},
+                    ":revision": {"S": revision},
+                },
+            )
+        except ClientError as e:
+            # Frozen rows (terminated_at_block already set) reject the
+            # write — expected; the comparator's decision-time view is
+            # the canonical record for those miners. Other errors
+            # bubble up so the caller's retry/log path sees them.
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                raise
+
+    async def build_display_scores_map(
+        self,
+        miners: Iterable[Dict[str, Any]],
+        *,
+        current_refresh_block: Optional[int] = None,
+        concurrency: int = 32,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return ``{uid_str: {"scores": {env: ...}, "frozen": bool}}``
+        for the rank API. One read per miner — parallelized so the
+        /rank/current endpoint isn't gated by 256 sequential DDB gets.
+
+        A row contributes when EITHER:
+          * ``terminated_at_block`` is set → ``frozen=True``: always
+            surfaced, regardless of ``current_refresh_block``.
+          * ``scores_refresh_block`` matches ``current_refresh_block``
+            → ``frozen=False``: fresh live aggregate.
+
+        Stale-and-not-frozen rows are dropped — they were live snapshots
+        from a previous task pool and the CLI must not show those numbers.
+
+        Pass the full ``get_all_miners`` set, not just valid ones: a
+        terminated miner that later turned invalid must still surface
+        its frozen scores.
+        """
+        import asyncio
+
+        miners_list = [
+            m for m in miners
+            if m.get("hotkey") and m.get("revision") and m.get("uid") is not None
+        ]
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+        async def _one(miner):
+            async with sem:
+                row = await self.get_miner_stats(
+                    str(miner["hotkey"]), str(miner["revision"]),
+                )
+            return int(miner["uid"]), row
+
+        results = await asyncio.gather(*(_one(m) for m in miners_list))
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for uid, row in results:
+            if not row:
+                continue
+            scores = row.get("scores_by_env")
+            if not isinstance(scores, dict) or not scores:
+                continue
+            terminated = row.get("terminated_at_block")
+            if terminated is not None:
+                out[str(uid)] = {"scores": scores, "frozen": True}
+                continue
+            refresh = row.get("scores_refresh_block")
+            if (
+                current_refresh_block is not None
+                and refresh is not None
+                and int(refresh) == int(current_refresh_block)
+            ):
+                out[str(uid)] = {"scores": scores, "frozen": False}
+        return out
