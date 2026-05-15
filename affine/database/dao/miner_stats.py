@@ -406,6 +406,10 @@ class MinerStatsDAO(BaseDAO):
 
         Stale-and-not-frozen rows are dropped — they were live snapshots
         from a previous task pool and the CLI must not show those numbers.
+
+        Pass the full ``get_all_miners`` set, not just valid ones: a
+        terminated miner that later turned invalid must still surface
+        its frozen scores.
         """
         import asyncio
 

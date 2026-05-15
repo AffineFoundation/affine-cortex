@@ -188,17 +188,19 @@ async def get_current_state() -> Dict[str, Any]:
     battle = await store.get_battle()
     task_state = await store.get_task_state()
     envs = await store.get_environments()
-    # Single per-miner read pulls both live (precomputed by
-    # LiveScoresMonitor) and final (frozen at termination) scores from
-    # miner_stats. The DAO drops live entries whose stored
-    # refresh_block doesn't match the current one so the UI never
-    # shows numbers from a previous task pool.
-    valid_miners = await MinersDAO().get_valid_miners()
+    # One read per miner pulls both live (LiveScoresMonitor) and frozen
+    # (decide-time) scores from miner_stats; the DAO drops live entries
+    # not matching ``current_refresh_block``.
+    #
+    # Uses ``get_all_miners`` (not valid only) so a miner that was
+    # terminated and later turned invalid keeps its frozen scores in
+    # the rank table.
+    all_miners = await MinersDAO().get_all_miners()
     current_refresh = (
         int(task_state.refreshed_at_block) if task_state else None
     )
     display_map = await MinerStatsDAO().build_display_scores_map(
-        valid_miners, current_refresh_block=current_refresh,
+        all_miners, current_refresh_block=current_refresh,
     )
     sample_counts, sample_averages, champion_overlap_avgs, terminal_scores = (
         _split_display_scores(display_map)

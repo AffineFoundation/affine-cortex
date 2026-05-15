@@ -465,7 +465,8 @@ class FlowScheduler:
                 f"{type(e).__name__}: {e}"
             )
             # Used their one shot — mark FAILED so the queue doesn't keep
-            # retrying a model the platform can't host.
+            # retrying a model the platform can't host. No frozen scores
+            # to pass: this miner never sampled anything.
             from affine.src.scorer.challenger_queue import OUTCOME_FAILED
             await self.queue.mark_terminated(
                 candidate.uid,
@@ -564,6 +565,9 @@ class FlowScheduler:
                 and prev.revision
             )
             if prev_ready:
+                # No frozen scores: comparator ``result`` was lost in
+                # the crash. Pre-crash freeze (if any) survives — DAO
+                # SET is field-additive.
                 await self.queue.mark_terminated(
                     prev.uid,
                     OUTCOME_LOST,
@@ -614,6 +618,7 @@ class FlowScheduler:
                 f"invalidated mid-battle; forcing LOST regardless of scores"
             )
             await self._teardown_record(battle)
+            # No frozen scores: kicked for being invalid, not on score.
             await self.queue.mark_terminated(
                 battle.challenger.uid,
                 OUTCOME_LOST,
