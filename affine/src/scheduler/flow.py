@@ -534,11 +534,19 @@ class FlowScheduler:
             # sufficient evidence; the others, regression or not, are
             # recorded into per_env_data anyway so the rank table shows
             # the full picture at decide-time.
+            #
+            # The ``- 1e-9`` slack mirrors the comparator's ENV_WORSE
+            # branch (see ``comparator.py``) so the early verdict is
+            # bit-identical to what the full pass would emit; without
+            # it a ``chal_avg`` sitting exactly on the threshold would
+            # tip WORSE here but NOT_WORSE later.
+            not_worse_threshold = (
+                champ_overlap_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
+            )
             if (
                 regression_env is None
                 and len(overlap) >= int(env_cfg.sampling_count)
-                and chal_overlap_avg
-                < champ_overlap_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
+                and chal_overlap_avg < not_worse_threshold - 1e-9
             ):
                 regression_env = env
 
