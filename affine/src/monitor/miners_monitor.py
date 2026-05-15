@@ -242,43 +242,54 @@ class MinersMonitor:
     async def _prune_stale_anticopy_jobs(
         self, current_miners: list[MinerInfo],
     ) -> None:
-        """Delete ``anticopy_jobs`` rows whose ``(hotkey, revision)``
-        pair is no longer present in the current metagraph snapshot.
+        """Delete pending ``anticopy_jobs`` whose candidate is no longer
+        worth evaluating. Two cases:
 
-        Match on the EXACT pair so a hotkey that re-committed to a new
-        revision drops its old job (the old revision will never run
-        again — the next monitor tick enqueues the new revision).
+          (a) the ``(hotkey, revision)`` pair is not in the current
+              metagraph snapshot at all (hotkey terminated, re-registered
+              to a new owner, or the miner re-committed to a different
+              revision);
+          (b) the pair IS in the snapshot but ``miner_stats.challenge_status``
+              has reached ``terminated`` — scheduler / scorer has
+              already decided this candidate is out of the running, so
+              an anticopy score has no consumer.
+
+        Running rows are left alone to avoid racing with ``claim_next``;
+        they'll be pruned on the next tick once the worker releases them.
         """
         live_pairs = {(m.hotkey, m.revision) for m in current_miners}
-        # Pull every pending/running job (failed/done are terminal and
-        # safe to keep as history).
-        for state in (
-            self.anticopy_jobs_dao.STATE_PENDING,
-            self.anticopy_jobs_dao.STATE_RUNNING,
-        ):
-            rows = await self.anticopy_jobs_dao.peek_pending(
-                limit=10000,
-            ) if state == self.anticopy_jobs_dao.STATE_PENDING else []
-            # ``peek_pending`` only returns ``pending`` — for running we'd
-            # need a full scan, but worker hold-times are short (a single
-            # ckpt load) so a running-row that becomes stale will be
-            # pruned on the *next* monitor tick anyway. Skip it here to
-            # avoid racing with claim_next.
-            for row in rows:
-                hk = row.get("hotkey", "")
-                rev = row.get("revision", "")
-                if (hk, rev) in live_pairs:
-                    continue
+        rows = await self.anticopy_jobs_dao.peek_pending(limit=10000)
+        for row in rows:
+            hk = row.get("hotkey", "")
+            rev = row.get("revision", "")
+            reason = None
+            if (hk, rev) not in live_pairs:
+                reason = "off-metagraph"
+            else:
                 try:
-                    await self.anticopy_jobs_dao.delete(row["pk"])
-                    logger.info(
-                        f"[MinersMonitor] pruned stale anticopy job "
-                        f"{hk[:10]}#{rev[:8]} (no longer on metagraph)"
-                    )
+                    stats_row = await self.stats_dao.get_miner_stats(hk, rev)
                 except Exception as e:
                     logger.debug(
-                        f"[MinersMonitor] prune {hk[:10]}: {e}"
+                        f"[MinersMonitor] stats lookup failed "
+                        f"{hk[:10]}#{rev[:8]}: {e}"
                     )
+                    stats_row = None
+                if (
+                    stats_row
+                    and stats_row.get("challenge_status")
+                    == MinerStatsDAO.STATUS_TERMINATED
+                ):
+                    reason = "terminated"
+            if reason is None:
+                continue
+            try:
+                await self.anticopy_jobs_dao.delete(row["pk"])
+                logger.info(
+                    f"[MinersMonitor] pruned stale anticopy job "
+                    f"{hk[:10]}#{rev[:8]} ({reason})"
+                )
+            except Exception as e:
+                logger.debug(f"[MinersMonitor] prune {hk[:10]}: {e}")
 
     # ---- validation -----------------------------------------------------
 

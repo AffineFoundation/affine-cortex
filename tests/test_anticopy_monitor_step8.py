@@ -243,26 +243,46 @@ class _FakeJobsDAOWithPrune:
         self.deleted.append(pk)
 
 
+class _FakeStatsDAO:
+    """Returns a fixed challenge_status keyed by ``(hotkey, revision)``
+    so the prune test can simulate ``terminated`` miners."""
+    def __init__(self, statuses):
+        self._statuses = statuses        # (hk, rev) -> status
+
+    async def get_miner_stats(self, hotkey, revision):
+        st = self._statuses.get((hotkey, revision))
+        return {"challenge_status": st} if st else None
+
+
 @pytest.mark.asyncio
-async def test_prune_stale_anticopy_jobs_removes_terminated():
-    """Hotkey/revision pairs that aren't in the current metagraph
-    snapshot must be deleted from the pending queue; live ones stay."""
+async def test_prune_stale_anticopy_jobs_removes_off_metagraph_and_terminated():
+    """Three prune sources: (a) hotkey gone from metagraph,
+    (b) hotkey present but with a different revision now committed,
+    (c) hotkey + revision still on metagraph but miner_stats marks the
+    challenge ``terminated``."""
     from affine.src.monitor.miners_monitor import MinersMonitor, MinerInfo
+    from affine.database.dao.miner_stats import MinerStatsDAO
 
     monitor = MinersMonitor()
     monitor.anticopy_jobs_dao = _FakeJobsDAOWithPrune([
-        # live (will stay)
+        # live + sampling — keep
         {"pk": "JOB#live_hk#rev1", "hotkey": "live_hk", "revision": "rev1"},
-        # stale (will be deleted)
+        # off-metagraph — drop
         {"pk": "JOB#dead_hk#rev2", "hotkey": "dead_hk", "revision": "rev2"},
-        # live hotkey but stale revision — also deleted because the
-        # hotkey re-committed to a new revision
+        # live hotkey, stale revision — drop
         {"pk": "JOB#live_hk#oldrev", "hotkey": "live_hk", "revision": "oldrev"},
+        # live + terminated — drop
+        {"pk": "JOB#term_hk#rev3", "hotkey": "term_hk", "revision": "rev3"},
     ])
+    monitor.stats_dao = _FakeStatsDAO({
+        ("live_hk", "rev1"): MinerStatsDAO.STATUS_SAMPLING,
+        ("term_hk", "rev3"): MinerStatsDAO.STATUS_TERMINATED,
+    })
 
     current = [
         MinerInfo(uid=1, hotkey="live_hk", model="m1", revision="rev1"),
-        MinerInfo(uid=2, hotkey="other_hk", model="m2", revision="rev_other"),
+        MinerInfo(uid=2, hotkey="term_hk", model="m3", revision="rev3"),
+        MinerInfo(uid=3, hotkey="other_hk", model="m2", revision="rev_other"),
     ]
 
     await monitor._prune_stale_anticopy_jobs(current)
@@ -270,4 +290,5 @@ async def test_prune_stale_anticopy_jobs_removes_terminated():
     assert sorted(monitor.anticopy_jobs_dao.deleted) == sorted([
         "JOB#dead_hk#rev2",
         "JOB#live_hk#oldrev",
+        "JOB#term_hk#rev3",
     ])
