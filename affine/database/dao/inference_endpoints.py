@@ -32,6 +32,14 @@ class Endpoint:
     public_inference_url: Optional[str] = None
     notes: Optional[str] = None
 
+    # Static endpoint purpose. ``"scoring"`` (default) means the
+    # scheduler may pick this endpoint to host the champion / a
+    # challenger; ``"anticopy"`` means the endpoint is dedicated to the
+    # CEAC forward worker and the scheduler must skip it. Older rows
+    # without this attribute deserialize to None — treat None as
+    # ``"scoring"`` for backwards compat.
+    role: Optional[str] = None
+
     # Runtime assignment. Provider-agnostic: one endpoint/machine may be
     # serving one miner model at a time. Scheduler writes these fields after
     # deploy/adopt and clears them on teardown.

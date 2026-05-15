@@ -11,6 +11,8 @@ Server Services (af servers):
 - af servers executor  : Start per-env executor manager (subprocess per env)
 - af servers teacher   : Start teacher rollout worker + R2 mover (DISTILL)
 - af servers validator : Start validator service
+- af servers anticopy-refresh : Start CEAC daily rollout pool refresh
+- af servers anticopy-worker  : Start CEAC GPU forward worker (single-instance)
 
 Miner Commands:
 - af miner-deploy: One-command deployment (HF push → on-chain commit)
@@ -137,6 +139,32 @@ def validator(ctx):
 
     sys.argv = ["validator"] + ctx.args
     validator_main.main(standalone_mode=False)
+
+
+@servers.command(
+    "anticopy-refresh",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.pass_context
+def anticopy_refresh(ctx):
+    """Daily CEAC rollout pool refresh service."""
+    from affine.src.anticopy.main import refresh_main
+
+    sys.argv = ["anticopy-refresh"] + ctx.args
+    refresh_main.main(standalone_mode=False)
+
+
+@servers.command(
+    "anticopy-worker",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.pass_context
+def anticopy_worker(ctx):
+    """CEAC forward worker (GPU host)."""
+    from affine.src.anticopy.main import worker_main
+
+    sys.argv = ["anticopy-worker"] + ctx.args
+    worker_main.main(standalone_mode=False)
 
 
 @cli.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
@@ -307,9 +335,9 @@ cli.add_command(db)
 @click.option("--restart", is_flag=True, help="Restart containers without recreating")
 def deploy(service, local, recreate, restart):
     """Deploy docker containers for validator, backend, or api services.
-    
+
     SERVICE: Either 'validator', 'backend', or 'api'
-    
+
     Examples:
         af deploy validator --recreate --local
         af deploy backend --local
@@ -323,7 +351,7 @@ def deploy(service, local, recreate, restart):
         sys.exit(1)
     # Get the affine directory (where docker-compose files are located)
     affine_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    
+
     # Build docker-compose command based on service type
     if service == "validator":
         compose_files = ["-f", "docker-compose.yml"]
@@ -337,17 +365,17 @@ def deploy(service, local, recreate, restart):
         compose_files = ["-f", "compose/docker-compose.backend.yml"]
         if local:
             compose_files.extend(["-f", "compose/docker-compose.backend.local.yml"])
-    
+
     # Build the command with project directory
     if restart:
         # Use restart command instead of up
         cmd = ["docker", "compose", "--project-directory", affine_dir] + compose_files + ["restart"]
     else:
         cmd = ["docker", "compose", "--project-directory", affine_dir] + compose_files + ["up", "-d"]
-        
+
         if recreate:
             cmd.append("--force-recreate")
-        
+
         if local:
             cmd.append("--build")
     
@@ -377,9 +405,9 @@ def deploy(service, local, recreate, restart):
 @click.option("--volumes", "-v", is_flag=True, help="Remove volumes as well")
 def down(service, local, volumes):
     """Stop and remove docker containers for validator, backend, or api services.
-    
+
     SERVICE: Either 'validator', 'backend', or 'api'
-    
+
     Examples:
         af down validator --local
         af down backend --local --volumes
@@ -388,7 +416,7 @@ def down(service, local, volumes):
     """
     # Get the affine directory (where docker-compose files are located)
     affine_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    
+
     # Build docker-compose command based on service type
     if service == "validator":
         compose_files = ["-f", "docker-compose.yml"]
@@ -402,10 +430,10 @@ def down(service, local, volumes):
         compose_files = ["-f", "compose/docker-compose.backend.yml"]
         if local:
             compose_files.extend(["-f", "compose/docker-compose.backend.local.yml"])
-    
+
     # Build the command with project directory
     cmd = ["docker", "compose", "--project-directory", affine_dir] + compose_files + ["down"]
-    
+
     if volumes:
         cmd.append("--volumes")
     
