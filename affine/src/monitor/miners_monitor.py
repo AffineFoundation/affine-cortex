@@ -220,6 +220,17 @@ class MinersMonitor:
         # in miner_stats, keyed by (hotkey, revision).
         await self._persist_miners(miners, current_block=current_block)
 
+        # Drop CEAC jobs for hotkey/revision pairs that no longer appear
+        # in the current metagraph snapshot. Terminated / re-registered
+        # miners would otherwise sit in ``anticopy_jobs`` forever, and a
+        # worker that claims one wastes a sglang reload + teacher-force
+        # pass on a hotkey that won't influence any scoring decision
+        # anymore.
+        try:
+            await self._prune_stale_anticopy_jobs(miners)
+        except Exception as e:
+            logger.debug(f"[MinersMonitor] anticopy queue prune failed: {e}")
+
         self.last_update = int(time.time())
         valid = {m.key(): m for m in miners if m.is_valid}
         logger.info(
@@ -227,6 +238,47 @@ class MinersMonitor:
             f"({len(valid)} valid, {len(miners) - len(valid)} invalid)"
         )
         return valid
+
+    async def _prune_stale_anticopy_jobs(
+        self, current_miners: list[MinerInfo],
+    ) -> None:
+        """Delete ``anticopy_jobs`` rows whose ``(hotkey, revision)``
+        pair is no longer present in the current metagraph snapshot.
+
+        Match on the EXACT pair so a hotkey that re-committed to a new
+        revision drops its old job (the old revision will never run
+        again — the next monitor tick enqueues the new revision).
+        """
+        live_pairs = {(m.hotkey, m.revision) for m in current_miners}
+        # Pull every pending/running job (failed/done are terminal and
+        # safe to keep as history).
+        for state in (
+            self.anticopy_jobs_dao.STATE_PENDING,
+            self.anticopy_jobs_dao.STATE_RUNNING,
+        ):
+            rows = await self.anticopy_jobs_dao.peek_pending(
+                limit=10000,
+            ) if state == self.anticopy_jobs_dao.STATE_PENDING else []
+            # ``peek_pending`` only returns ``pending`` — for running we'd
+            # need a full scan, but worker hold-times are short (a single
+            # ckpt load) so a running-row that becomes stale will be
+            # pruned on the *next* monitor tick anyway. Skip it here to
+            # avoid racing with claim_next.
+            for row in rows:
+                hk = row.get("hotkey", "")
+                rev = row.get("revision", "")
+                if (hk, rev) in live_pairs:
+                    continue
+                try:
+                    await self.anticopy_jobs_dao.delete(row["pk"])
+                    logger.info(
+                        f"[MinersMonitor] pruned stale anticopy job "
+                        f"{hk[:10]}#{rev[:8]} (no longer on metagraph)"
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"[MinersMonitor] prune {hk[:10]}: {e}"
+                    )
 
     # ---- validation -----------------------------------------------------
 

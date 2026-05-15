@@ -221,3 +221,53 @@ async def _async_pass_size(*_args, **_kw):
 
 async def _async_safe(*_args, **_kw):
     return {"safe": True, "reason": ""}
+
+
+# ---- stale-job prune --------------------------------------------------------
+
+
+class _FakeJobsDAOWithPrune:
+    """Fake jobs DAO that supports the prune contract: peek_pending +
+    delete + STATE_PENDING/STATE_RUNNING constants."""
+    STATE_PENDING = "pending"
+    STATE_RUNNING = "running"
+
+    def __init__(self, pending_rows):
+        self._pending = pending_rows
+        self.deleted = []
+
+    async def peek_pending(self, *, limit=5, exclude_pk=None):
+        return list(self._pending)
+
+    async def delete(self, pk):
+        self.deleted.append(pk)
+
+
+@pytest.mark.asyncio
+async def test_prune_stale_anticopy_jobs_removes_terminated():
+    """Hotkey/revision pairs that aren't in the current metagraph
+    snapshot must be deleted from the pending queue; live ones stay."""
+    from affine.src.monitor.miners_monitor import MinersMonitor, MinerInfo
+
+    monitor = MinersMonitor()
+    monitor.anticopy_jobs_dao = _FakeJobsDAOWithPrune([
+        # live (will stay)
+        {"pk": "JOB#live_hk#rev1", "hotkey": "live_hk", "revision": "rev1"},
+        # stale (will be deleted)
+        {"pk": "JOB#dead_hk#rev2", "hotkey": "dead_hk", "revision": "rev2"},
+        # live hotkey but stale revision — also deleted because the
+        # hotkey re-committed to a new revision
+        {"pk": "JOB#live_hk#oldrev", "hotkey": "live_hk", "revision": "oldrev"},
+    ])
+
+    current = [
+        MinerInfo(uid=1, hotkey="live_hk", model="m1", revision="rev1"),
+        MinerInfo(uid=2, hotkey="other_hk", model="m2", revision="rev_other"),
+    ]
+
+    await monitor._prune_stale_anticopy_jobs(current)
+
+    assert sorted(monitor.anticopy_jobs_dao.deleted) == sorted([
+        "JOB#dead_hk#rev2",
+        "JOB#live_hk#oldrev",
+    ])
