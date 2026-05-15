@@ -13,6 +13,10 @@ One block tick:
   6. Champion samples for the current task_ids not yet full → return
      (executors are filling them).
   7. No in-flight battle → pick next challenger, deploy, record battle.
+  7.5. Any scoring env reached ``sampling_count`` overlap AND the
+       challenger is already worse on it under the not_worse rule →
+       short-circuit LOST, freeing the host without waiting for slower
+       envs to finish buffering.
   8. Battle challenger samples not yet full → return.
   9. Both subjects done → run comparator, transition champion (or drop
      challenger), write weights when the champion changes, clear battle.
@@ -24,7 +28,7 @@ record shape itself tells us where we are.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from affine.core.setup import logger
 
@@ -220,6 +224,31 @@ class FlowScheduler:
             await self._start_battle(champion, current_block)
             return
 
+        # The comparator sees only envs whose ``enabled_for_scoring`` is
+        # true; sampling-only envs accumulate data without affecting any
+        # DECIDE path. Read once and share between the 7.5 short-circuit
+        # and the step-9 full comparator.
+        scoring_envs = await self.state.get_scoring_environments()
+
+        # 7.5. Early-regression short-circuit. Under partial-Pareto a
+        # single env that's both fully sampled AND showing a definitive
+        # regression is enough to lose — no need to wait for the slower
+        # envs to buffer their last samples.
+        early = await self._check_early_regression(
+            champion, battle.challenger,
+            scoring_envs=scoring_envs, task_state=task_state,
+        )
+        if early is not None:
+            regression_env, per_env_data = early
+            await self._decide_early_lost(
+                champion, battle,
+                regression_env=regression_env,
+                per_env_data=per_env_data,
+                task_state=task_state,
+                current_block=current_block,
+            )
+            return
+
         # 8. Battle overlap not yet sufficient — wait for both miners to
         # have ≥ sampling_count current-refresh task_ids in common per env.
         if not await self._battle_overlap_ready(
@@ -228,11 +257,6 @@ class FlowScheduler:
             return
 
         # 9. Sufficient overlap — run the contest on overlap task_ids only.
-        # The comparator sees only envs whose ``enabled_for_scoring`` is
-        # true; sampling-only envs accumulate data without affecting
-        # DECIDE. Same ``envs`` dict object stays in use for any tick
-        # paths that need the full sampling set.
-        scoring_envs = await self.state.get_scoring_environments()
         await self._decide(
             champion, battle, scoring_envs, task_state, current_block,
         )
@@ -442,6 +466,141 @@ class FlowScheduler:
             if len(overlap) < env_cfg.sampling_count:
                 return False
         return True
+
+    async def _check_early_regression(
+        self,
+        champion: ChampionRecord,
+        challenger: MinerSnapshot,
+        *,
+        scoring_envs: Mapping[str, EnvConfig],
+        task_state: TaskIdState,
+    ) -> Optional[Tuple[str, Dict[str, Dict[str, float]]]]:
+        """Detect a battle the challenger has already lost on one env
+        before all envs finish buffering.
+
+        Under partial-Pareto (``WIN_MIN_DOMINANT_ENVS=1`` + every env
+        must be not_worse) a single env where the challenger sits below
+        ``champion_avg * (1 - DEFAULT_NOT_WORSE_TOLERANCE)`` is a
+        terminal verdict — no later env can rescue it. Once that env
+        has the same overlap depth ``_decide`` would require
+        (``cfg.sampling_count``), waiting for slower envs only burns
+        GPU time.
+
+        Sampling thresholds match ``_decide`` exactly (no looser early
+        rule), so the short-circuit verdict is identical to what the
+        full comparator pass would emit moments later — just earlier.
+
+        Returns:
+            * ``(env, per_env_data)`` when one env qualifies. ``env`` is
+              the trigger env; ``per_env_data`` is the comparator-style
+              view ``{env: {count, avg, champion_overlap_avg}}`` for
+              every scoring env that already has at least one overlap
+              sample, so the rank UI can show as much context as it
+              would after a full decide.
+            * ``None`` when no env has both enough overlap AND a
+              regression.
+        """
+        per_env_data: Dict[str, Dict[str, float]] = {}
+        regression_env: Optional[str] = None
+
+        for env, env_cfg in scoring_envs.items():
+            tasks = task_state.task_ids.get(env, [])
+            if not tasks:
+                continue
+            champ_scores = await self._scores_reader(
+                champion.hotkey, champion.revision, env, tasks,
+                task_state.refreshed_at_block,
+            )
+            chal_scores = await self._scores_reader(
+                challenger.hotkey, challenger.revision, env, tasks,
+                task_state.refreshed_at_block,
+            )
+            overlap = set(champ_scores) & set(chal_scores)
+            if not overlap:
+                continue
+            champ_overlap_avg = (
+                sum(champ_scores[t] for t in overlap) / len(overlap)
+            )
+            chal_overlap_avg = (
+                sum(chal_scores[t] for t in overlap) / len(overlap)
+            )
+            per_env_data[env] = {
+                "count": len(overlap),
+                "avg": chal_overlap_avg,
+                "champion_overlap_avg": champ_overlap_avg,
+            }
+            # ``regression_env`` keeps the FIRST trigger env (iteration
+            # order is the scoring_envs config order). Any one is
+            # sufficient evidence; the others, regression or not, are
+            # recorded into per_env_data anyway so the rank table shows
+            # the full picture at decide-time.
+            if (
+                regression_env is None
+                and len(overlap) >= int(env_cfg.sampling_count)
+                and chal_overlap_avg
+                < champ_overlap_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
+            ):
+                regression_env = env
+
+        if regression_env is None:
+            return None
+        return regression_env, per_env_data
+
+    async def _decide_early_lost(
+        self,
+        champion: ChampionRecord,
+        battle: BattleRecord,
+        *,
+        regression_env: str,
+        per_env_data: Dict[str, Dict[str, float]],
+        task_state: TaskIdState,
+        current_block: int,
+    ) -> None:
+        """LOST handler for the 7.5 short-circuit.
+
+        Mirrors :meth:`_decide`'s challenger-loses branch — teardown,
+        ``mark_terminated`` with frozen scores + freeze marker,
+        single-instance host cleanup, ``clear_battle`` — but skips the
+        full comparator pass because the single regressed env is
+        already definitive under partial-Pareto.
+
+        ``per_env_data`` already carries the same
+        ``{env: {count, avg, champion_overlap_avg}}`` shape
+        ``_final_scores_from_result(role="challenger")`` would produce,
+        so the rank UI renders these rows identically to a
+        normal-path LOST.
+        """
+        await self._teardown_record(battle)
+        await self.queue.mark_terminated(
+            battle.challenger.uid,
+            OUTCOME_LOST,
+            reason=(
+                f"lost_to_champion:{champion.hotkey[:10]}:"
+                f"early_regression_in_{regression_env}"
+            ),
+            hotkey=battle.challenger.hotkey,
+            revision=battle.challenger.revision,
+            model=battle.challenger.model,
+            scores_by_env=per_env_data,
+            scores_refresh_block=task_state.refreshed_at_block,
+            terminated_at_block=current_block,
+        )
+        # Single-instance provider: the teardown just emptied the
+        # inference host (challenger and champion share the same
+        # container under sglang). Champion's deployment_id is now
+        # stale — clear it so step 5 re-deploys champion next tick.
+        # Symmetric to the ``_decide`` LOST branch.
+        if self.cfg.single_instance_provider:
+            champion.deployment_id = None
+            champion.base_url = None
+            champion.deployments = []
+            await self.state.set_champion(champion)
+        await self.state.clear_battle()
+        logger.info(
+            f"FlowScheduler: challenger uid={battle.challenger.uid} "
+            f"early-LOST on {regression_env} regression vs champion "
+            f"uid={champion.uid} — saved waiting on remaining envs"
+        )
 
     async def _start_battle(
         self, champion: ChampionRecord, current_block: int,
