@@ -95,8 +95,10 @@ def test_verdict_above_threshold_independent():
     assert not is_copy_verdict(res, nll_threshold=0.004, agreement_ratio=0.5)
 
 
-def test_verdict_requires_majority_agreement():
-    """Two envs, one below, one above → ceil(2*0.5)=1 needed → copy."""
+def test_verdict_combined_median_pools_across_envs():
+    """Combined-median rule: two envs are pooled into one median. A
+    low-signal env can't single-handedly flip the verdict the way it
+    could under per-env voting."""
     res = compare_scores(
         _score(
             "A",
@@ -113,10 +115,12 @@ def test_verdict_requires_majority_agreement():
             ],
         ),
     )
-    # 1 of 2 envs is "copy" → ceil(0.5*2)=1 → verdict copy
-    assert is_copy_verdict(res, nll_threshold=0.004, agreement_ratio=0.5)
-    # but require *both* envs and it flips
-    assert not is_copy_verdict(res, nll_threshold=0.004, agreement_ratio=1.0)
+    # Decision-position gaps pooled across envs: [0, 0, 0.8, 0.8]
+    # → combined median = 0.4. agreement_ratio is now ignored.
+    assert abs(res.decision_median_combined - 0.4) < 1e-9
+    assert not is_copy_verdict(res, nll_threshold=0.04)
+    # When the threshold is moved above the combined, verdict flips.
+    assert is_copy_verdict(res, nll_threshold=0.5)
 
 
 # ------------------------------------------------------------ detect_copies

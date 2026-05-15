@@ -16,13 +16,15 @@ from affine.database.dao.system_config import SystemConfigDAO
 
 # ----- defaults -------------------------------------------------------
 
-# Decision-position |Δlogp| median below which two miners are flagged
-# as the same model (potentially with light noise injection). Applied
-# to :attr:`EnvCompare.decision_median` — the median of |Δlogp| over
-# positions where the reference model was uncertain, NOT the
-# all-positions median (which pins to ~0 even for clearly different
-# fine-tunes).
-DEFAULT_NLL_THRESHOLD = 0.05
+# Combined decision-position |Δlogp| median below which two miners
+# are flagged as the same model (potentially with light noise
+# injection). Applied to :attr:`PairResult.decision_median_combined`
+# — the median over the union of every env's "uncertain" positions
+# (where the reference model's top-1 logprob was below
+# ``_DECISION_LOGP_CUTOFF``). Not the all-positions median, which
+# pins to ~0 for every Qwen3 fine-tune because trivial-prediction
+# tokens dominate.
+DEFAULT_NLL_THRESHOLD = 0.04
 
 # Minimum token-position overlap a pair must share before we issue a
 # verdict either way. Below this we say "pending: insufficient data"

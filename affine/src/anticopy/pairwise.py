@@ -49,6 +49,13 @@ class PairResult:
     n_overlap_rollouts: int
     n_overlap_tokens: int
     per_env: Dict[str, EnvCompare]
+    # Median |Δlogp| over the union of every env's decision positions
+    # (positions where the reference model's top-1 logprob fell below
+    # ``_DECISION_LOGP_CUTOFF``). ``-1.0`` sentinel means "no env had
+    # any uncertain positions" — the pair carries no usable signal.
+    # This is the single number the verdict rule compares against
+    # ``nll_threshold`` directly.
+    decision_median_combined: float = -1.0
 
 
 # Reference logprob below this threshold marks a "decision" position —
@@ -138,6 +145,7 @@ def compare_scores(
         per_env_decision[env].extend(decision)
 
     per_env: Dict[str, EnvCompare] = {}
+    all_decision_gaps: List[float] = []
     for env, gaps in per_env_gaps.items():
         top1 = per_env_top1.get(env, [])
         decision = per_env_decision.get(env, [])
@@ -150,40 +158,48 @@ def compare_scores(
             decision_n=len(decision),
             decision_median=float(median(decision)) if decision else 0.0,
         )
+        all_decision_gaps.extend(decision)
+
+    decision_median_combined = (
+        float(median(all_decision_gaps)) if all_decision_gaps else -1.0
+    )
 
     return PairResult(
         n_overlap_rollouts=n_overlap_rollouts,
         n_overlap_tokens=n_overlap_tokens,
         per_env=per_env,
+        decision_median_combined=decision_median_combined,
     )
 
 
 def is_copy_verdict(
-    pair: PairResult, *, nll_threshold: float, agreement_ratio: float
+    pair: PairResult,
+    *,
+    nll_threshold: float,
+    agreement_ratio: float = 1.0,  # noqa: ARG001 — accepted for back-compat
 ) -> bool:
-    """Final verdict: ``copy`` iff at least
-    ``ceil(n_envs * agreement_ratio)`` envs land below ``nll_threshold``
-    on the decision-position metric.
+    """Final verdict: ``copy`` iff the combined decision-position
+    median (every env's "uncertain" positions pooled into one bag)
+    lands below ``nll_threshold``.
+
+    Pooling across envs lets the high-signal ones (NAVWORLD / TERMINAL
+    with thousands of decision tokens) anchor the verdict while low-
+    signal envs (MEMORY) blend in by their share of the union — they
+    can't single-handedly veto a copy call the way per-env voting did.
 
     The threshold is applied to ``decision_median`` (|Δlogp| over
     positions where the reference model was uncertain), not the
-    all-positions median. Calibration runs show that fine-tunes
-    overlap at lp≈0 on the bulk of "trivial" tokens, so the
-    all-positions median pins to ~0 even for clearly different models
-    — it is kept for diagnostics but not used here.
+    all-positions median: trivial-prediction tokens agree across
+    every Qwen3 fine-tune and would otherwise drag the median to ~0.
+
+    ``agreement_ratio`` is accepted for backward-compat with callers
+    that still pass it; the verdict now comes from a single number,
+    not a per-env vote, so the ratio has no effect.
     """
-    # Only count envs where we actually observed decision-position
-    # tokens; an env with zero "uncertain" positions carries no signal
-    # — its trivially-empty ``decision_median`` would otherwise vote
-    # "copy" by default, which is the wrong direction for evidence.
-    envs_with_signal = [ec for ec in pair.per_env.values() if ec.decision_n > 0]
-    if not envs_with_signal:
-        return False
-    n_copy = sum(
-        1 for ec in envs_with_signal if ec.decision_median < nll_threshold
+    return (
+        pair.decision_median_combined >= 0
+        and pair.decision_median_combined < nll_threshold
     )
-    needed = max(1, math.ceil(len(envs_with_signal) * agreement_ratio))
-    return n_copy >= needed
 
 
 # --------------------------------------------------------------- detect_copies
@@ -214,16 +230,12 @@ def _per_env_decision_medians(pair: PairResult) -> Dict[str, float]:
 
 
 def _aggregate_decision_median(pair: PairResult) -> float:
-    """Best (smallest) ``decision_median`` across envs of a pair.
-
-    We take the MIN per env rather than the mean because a single env
-    landing under the threshold is what flips ``is_copy_verdict`` when
-    ``agreement_ratio`` is low; reporting that env's median makes the
-    stored number consistent with the verdict reason."""
-    vals = list(_per_env_decision_medians(pair).values())
-    if not vals:
-        return -1.0
-    return float(min(vals))
+    """Combined ``decision_median`` for a pair — the median over the
+    union of every env's decision positions (i.e. one big bag rather
+    than a per-env vote). This is the number ``is_copy_verdict``
+    compares against ``nll_threshold`` and the number we persist on
+    the score row."""
+    return float(pair.decision_median_combined)
 
 
 def detect_copies(
