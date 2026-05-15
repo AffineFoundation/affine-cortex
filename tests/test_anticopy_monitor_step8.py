@@ -223,6 +223,59 @@ async def _async_safe(*_args, **_kw):
     return {"safe": True, "reason": ""}
 
 
+# ---- terminated miners are not enqueued -----------------------------------
+
+
+class _FakeStatsDAOEnqueue:
+    """Stats DAO that returns ``challenge_status=terminated`` for a
+    specific (hotkey, revision) pair. Used by the enqueue-gate test."""
+    def __init__(self, terminated_pair):
+        self._terminated = terminated_pair
+
+    async def get_miner_stats(self, hotkey, revision):
+        if (hotkey, revision) == self._terminated:
+            from affine.database.dao.miner_stats import MinerStatsDAO
+            return {"challenge_status": MinerStatsDAO.STATUS_TERMINATED}
+        return None
+
+
+@pytest.mark.asyncio
+async def test_terminated_miner_not_enqueued(monkeypatch):
+    """A miner that has reached challenge_status=terminated must NOT
+    be enqueued by step 8 — even if it would otherwise pass every
+    validity check. This avoids a wasted GPU pass and saves the
+    prune-pass an extra round trip."""
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(
+        champion_sig="S" * 64, cand_sig="S" * 64, cfg_enabled=True,
+    )
+    # Use the same hotkey as the validate call below to simulate the
+    # scheduler-side termination.
+    monitor.stats_dao = _FakeStatsDAOEnqueue(
+        terminated_pair=("hk_term_xyz", "rev")
+    )
+    monitor._get_model_info = _hot_get_model_info
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_model_size",
+        _async_pass_size,
+    )
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_template_safety",
+        _async_safe,
+    )
+
+    info = await monitor._validate_miner(
+        uid=42, hotkey="hk_term_xyz",
+        model="org/affine-model-hk_term_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+    # Validity unaffected — only the enqueue is skipped.
+    assert info.is_valid is True
+    assert monitor.anticopy_jobs_dao.enqueued == []
+
+
 # ---- stale-job prune --------------------------------------------------------
 
 

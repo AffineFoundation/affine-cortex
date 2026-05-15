@@ -432,6 +432,25 @@ class MinersMonitor:
             and anticopy_cfg.enabled
             and info.tokenizer_sig
         ):
+            # Skip miners the scheduler has already TERMINATED — they
+            # won't influence any future scoring decision, so a CEAC
+            # score on them is wasted GPU time. Pair the enqueue-side
+            # filter with ``_prune_stale_anticopy_jobs`` (which sweeps
+            # the queue once per tick) so the two together keep
+            # terminated revisions out of the queue end-to-end.
+            try:
+                stats_row = await self.stats_dao.get_miner_stats(hotkey, revision)
+            except Exception as e:
+                logger.debug(
+                    f"[MinersMonitor] stats lookup for enqueue gate failed: {e}"
+                )
+                stats_row = None
+            if (
+                stats_row
+                and stats_row.get("challenge_status")
+                == MinerStatsDAO.STATUS_TERMINATED
+            ):
+                return info
             try:
                 score_row = await self.anticopy_scores_dao.get_score(hotkey, revision)
             except Exception as e:
