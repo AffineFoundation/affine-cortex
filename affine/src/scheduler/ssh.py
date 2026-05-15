@@ -64,6 +64,19 @@ DEFAULT_POLL_INTERVAL_SEC = 15.0
 # ``docker rm -f`` is idempotent so start() always kicks off a fresh state.
 CONTAINER_NAME = "affine-sglang-current"
 
+# HuggingFace snapshot cache layout: model "<owner>/<name>" lives at
+# ``<cache>/models--<owner>--<name>/``. Both the prefix and the org/name
+# separator are HF conventions — centralize so the cleanup glob, the
+# Python-side dir name builder, and any future code stay in sync.
+#
+# ``HF_SNAPSHOT_PREFIX`` MUST be non-empty: the cleanup loop globs
+# ``<cache>/<prefix>*/`` to scope deletion, and an empty prefix would
+# match every directory under ``<cache>``. Assertion below makes that
+# class of mistake impossible at module-load time rather than at deploy.
+HF_SNAPSHOT_PREFIX = "models--"
+HF_ORG_SEPARATOR = "--"
+assert HF_SNAPSHOT_PREFIX, "HF_SNAPSHOT_PREFIX must be non-empty"
+
 
 @dataclass(frozen=True)
 class SSHConfig:
@@ -271,6 +284,96 @@ def _expected_labels(config: SSHConfig, target: DeployTarget) -> Dict[str, str]:
     }
 
 
+def _hf_cache_dir_name(model: str) -> str:
+    """HuggingFace's snapshot dir convention: ``<prefix><owner><sep><name>``
+    (the org separator ``/`` is flattened to ``--``)."""
+    return f"{HF_SNAPSHOT_PREFIX}{model.replace('/', HF_ORG_SEPARATOR)}"
+
+
+# Shell snippet that nukes every ``<cache>/<prefix>*`` directory
+# *except* the new target's. Run pre-deploy so b300 doesn't fill its
+# disk with stale weights from every past challenger. Single-instance
+# mode hosts one model at a time, so a single keep dir is all we ever
+# need on disk.
+_CLEANUP_SCRIPT = r"""
+TARGET_DIR={target_dir_q}
+CACHE_DIR={cache_dir_q}
+PREFIX={prefix_q}
+for d in "$CACHE_DIR"/"$PREFIX"*/; do
+    [ -d "$d" ] || continue
+    name=$(basename "$d")
+    [ "$name" = "$TARGET_DIR" ] && continue
+    echo "removed: $name"
+    rm -rf "$d"
+done
+"""
+
+
+def _build_cache_cleanup_cmd(target: DeployTarget, config: SSHConfig) -> str:
+    """Return the shell snippet that purges stale HF caches before a deploy."""
+    return _CLEANUP_SCRIPT.format(
+        target_dir_q=shlex.quote(_hf_cache_dir_name(target.model)),
+        cache_dir_q=shlex.quote(config.sglang_cache_dir),
+        prefix_q=shlex.quote(HF_SNAPSHOT_PREFIX),
+    )
+
+
+def _is_valid_hf_model_id(model: str) -> bool:
+    """A valid HuggingFace model id is ``<owner>/<name>`` with both
+    parts non-empty. The cleanup loop's keep-check is by exact dir
+    name match — a malformed id would translate to a target dir name
+    that matches *zero* dirs on disk, and the loop would then delete
+    every other ``models--*`` dir (including the currently-serving
+    model). Guard against that by refusing to run cleanup when the
+    id doesn't look like a real HF model."""
+    if not isinstance(model, str) or not model:
+        return False
+    parts = model.split("/")
+    if len(parts) != 2:
+        return False
+    owner, name = parts
+    return bool(owner) and bool(name)
+
+
+async def _cleanup_stale_caches(
+    config: SSHConfig, target: DeployTarget,
+) -> None:
+    """Delete stale ``<prefix>*`` dirs on the remote host.
+
+    Idempotent. Failures are logged but non-fatal — the deploy will
+    still try to ``docker run``; sglang itself will surface
+    out-of-disk later if the cleanup didn't free enough.
+
+    Refuses to run when ``target.model`` is not a valid HuggingFace
+    id (``<owner>/<name>``). A bogus id would produce a keep-dir name
+    that matches no real cache entry, which would cause every other
+    model dir — including the currently-serving model — to be wiped.
+    Better to leave the cache alone and let the upstream HF download
+    fail loudly than to silently nuke disk on a malformed commit."""
+    if not _is_valid_hf_model_id(target.model):
+        logger.warning(
+            f"ssh-provider: skipping cache cleanup; "
+            f"target.model={target.model!r} is not a valid HF id"
+        )
+        return
+    cmd = _build_cache_cleanup_cmd(target, config)
+    try:
+        rc, out, err = await _ssh_exec(config, cmd)
+    except Exception as e:
+        logger.warning(
+            f"ssh-provider: cache cleanup raised {type(e).__name__}: {e}"
+        )
+        return
+    if rc != 0:
+        logger.warning(
+            f"ssh-provider: cache cleanup rc={rc} stderr={err!r}"
+        )
+        return
+    for line in (out or "").splitlines():
+        if line.startswith("removed:"):
+            logger.info(f"ssh-provider: stale cache {line}")
+
+
 async def _existing_container_matches(
     config: SSHConfig, target: DeployTarget,
 ) -> bool:
@@ -374,6 +477,12 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
                 )
             ],
         )
+
+    # Purge stale HF caches before the new container starts. The previous
+    # container's open files keep its own model dir alive against the
+    # ``rm -rf`` (Linux unlink semantics), so this is safe to do while
+    # the old sglang is still running.
+    await _cleanup_stale_caches(config, target)
 
     cmd = _build_docker_run_cmd(target, config)
     logger.info(
