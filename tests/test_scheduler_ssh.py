@@ -16,9 +16,15 @@ from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.main import _select_ssh_endpoints
 from affine.src.scheduler.ssh import (
     CONTAINER_NAME,
+    HF_ORG_SEPARATOR,
+    HF_SNAPSHOT_PREFIX,
     SSHConfig,
+    _build_cache_cleanup_cmd,
     _build_docker_run_cmd,
     _build_sglang_args,
+    _cleanup_stale_caches,
+    _hf_cache_dir_name,
+    _is_valid_hf_model_id,
     deploy,
 )
 from affine.src.scheduler.targon import DeployTarget
@@ -166,6 +172,89 @@ def test_sglang_args_include_required_perf_flags():
     assert "--trust-remote-code" in args
 
 
+def test_hf_cache_dir_name_flattens_org_separator():
+    """HuggingFace snapshots live in ``<prefix><owner><sep><name>``."""
+    qwen = _hf_cache_dir_name("Qwen/Qwen3-30B-A22B")
+    assert qwen.startswith(HF_SNAPSHOT_PREFIX)
+    assert qwen == f"{HF_SNAPSHOT_PREFIX}Qwen{HF_ORG_SEPARATOR}Qwen3-30B-A22B"
+    assert _hf_cache_dir_name("prexpert/affine-138-5CqkEFMX") == \
+        f"{HF_SNAPSHOT_PREFIX}prexpert{HF_ORG_SEPARATOR}affine-138-5CqkEFMX"
+
+
+def test_hf_snapshot_prefix_is_non_empty():
+    """The cleanup glob ``<cache>/<prefix>*/`` would match every
+    directory under ``<cache>`` if the prefix were empty, blowing
+    away all caches. The module-level assert prevents that class of
+    mistake from compiling."""
+    assert HF_SNAPSHOT_PREFIX, "prefix MUST be non-empty"
+    assert HF_SNAPSHOT_PREFIX.endswith(HF_ORG_SEPARATOR), (
+        "HF cache convention puts the org separator right after the prefix"
+    )
+
+
+def test_is_valid_hf_model_id_accepts_owner_slash_name():
+    assert _is_valid_hf_model_id("Qwen/Qwen3-30B-A22B")
+    assert _is_valid_hf_model_id("prexpert/affine-138")
+
+
+def test_is_valid_hf_model_id_rejects_malformed_ids():
+    """Malformed ids would produce a keep-dir name that matches NO
+    real cache entry — the cleanup would then delete every other
+    model dir, including the currently-serving one. Reject early."""
+    assert not _is_valid_hf_model_id("")           # empty
+    assert not _is_valid_hf_model_id("foo")         # no slash
+    assert not _is_valid_hf_model_id("/foo")        # empty owner
+    assert not _is_valid_hf_model_id("foo/")        # empty name
+    assert not _is_valid_hf_model_id("foo/bar/baz") # extra slash
+    assert not _is_valid_hf_model_id(None)          # not a string
+
+
+@pytest.mark.asyncio
+async def test_cleanup_skipped_for_invalid_model_id(monkeypatch):
+    """When ``target.model`` isn't a valid HF id (no slash, empty,
+    etc.) the cleanup must NOT run — the keep-dir name would match
+    nothing, causing the loop to wipe every cache including the live
+    one. The function should early-return without any SSH call."""
+    calls = []
+
+    async def fake_ssh_exec(config, command):
+        calls.append(command)
+        return 0, "", ""
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+
+    bad_target = DeployTarget(uid=1, hotkey="hk", model="", revision="r")
+    await _cleanup_stale_caches(_config(), bad_target)
+    assert calls == [], "cleanup must not SSH when model id is invalid"
+
+    bad_target2 = DeployTarget(uid=1, hotkey="hk", model="just-a-name", revision="r")
+    await _cleanup_stale_caches(_config(), bad_target2)
+    assert calls == [], "cleanup must not SSH when model id lacks '/'"
+
+
+def test_cache_cleanup_cmd_keeps_only_target():
+    """The cleanup snippet declares the new target's HF dir as the
+    sole keep entry. Single-instance mode hosts one model at a time;
+    keeping anything beyond the new target wastes disk for no
+    operational gain (a loss-path redeploy just re-downloads the
+    champion, which is no worse than the original deploy)."""
+    cmd = _build_cache_cleanup_cmd(_target(), _config())
+    # Target dir name is computed and quoted into the script.
+    expected_dir = _hf_cache_dir_name(_target().model)
+    assert expected_dir in cmd, f"target dir {expected_dir!r} missing"
+    # Cache dir from config is quoted into the script.
+    assert _config().sglang_cache_dir in cmd
+    # The cleanup uses ``rm -rf`` only inside the keep-filter loop.
+    assert "rm -rf" in cmd
+    # The keep-check must precede the rm so we don't delete the target.
+    rm_idx = cmd.find("rm -rf")
+    target_check_idx = cmd.find("$TARGET_DIR")
+    assert target_check_idx < rm_idx, "target keep-check must come before rm"
+    # No previous-model lookup — single keep dir.
+    assert "docker inspect" not in cmd
+    assert "PREV" not in cmd
+
+
 def test_docker_cmd_rms_existing_container_first():
     cmd = _build_docker_run_cmd(_target(), _config())
     # The rm-then-run order matters — it kicks off a fresh state on every
@@ -311,7 +400,10 @@ async def test_deploy_restarts_when_existing_container_is_wrong(monkeypatch):
 
     async def fake_ssh_exec(config, command):
         calls.append(command)
-        if command.startswith("docker inspect"):
+        # Existing-container label probe (first call from deploy()).
+        if command.startswith(
+            "docker inspect --format '{{range $k,$v"
+        ):
             return 0, "\n".join([
                 "io.affine.endpoint = ssh_b300",
                 "io.affine.uid = 99",
@@ -319,6 +411,9 @@ async def test_deploy_restarts_when_existing_container_is_wrong(monkeypatch):
                 "io.affine.model = other/model",
                 "io.affine.revision = otherrev",
             ]), ""
+        # Cache cleanup script: keep-only-target shell loop.
+        if "for d in" in command and "rm -rf" in command:
+            return 0, "", ""
         if command.startswith(f"docker rm -f {CONTAINER_NAME}"):
             return 0, "container1234567890", ""
         raise AssertionError(f"unexpected command: {command}")
@@ -333,6 +428,8 @@ async def test_deploy_restarts_when_existing_container_is_wrong(monkeypatch):
     result = await deploy(cfg, _target())
 
     assert result.deployment_id == f"ssh:ssh_b300:{CONTAINER_NAME}"
-    assert len(calls) == 2
+    # 3 SSH round-trips: labels probe → cache cleanup script → docker run.
+    assert len(calls) == 3
     assert calls[0].startswith("docker inspect")
-    assert calls[1].startswith(f"docker rm -f {CONTAINER_NAME}")
+    assert "for d in" in calls[1] and "rm -rf" in calls[1]
+    assert calls[2].startswith(f"docker rm -f {CONTAINER_NAME}")
