@@ -34,31 +34,24 @@ class _FakeStatsDAO:
 
 
 class _FakeScoresDAO:
-    """``scored`` = verdict fully written (row + ``verdict_at``).
-    ``half_done`` = score blob persisted but ``update_verdict`` never
-    ran (older-worker crash). Half-done rows must still surface as
-    candidates so the worker can re-run verdict against the current
-    peer set."""
+    """``scored`` = a row already exists. The worker stops at "score
+    persisted"; verdict math runs in the anticopy-refresh container's
+    backfill service, so any row in scores_index is the "done" marker
+    here regardless of whether verdict_at is populated."""
 
-    def __init__(self, scored_pairs=None, half_done_pairs=None):
+    def __init__(self, scored_pairs=None):
         self._scored = scored_pairs or set()
-        self._half_done = half_done_pairs or set()
 
     async def get_score(self, hotkey, revision):
         if (hotkey, revision) in self._scored:
-            return {
-                "hotkey": hotkey, "revision": revision,
-                "verdict_at": 1234567890,
-            }
-        if (hotkey, revision) in self._half_done:
             return {"hotkey": hotkey, "revision": revision}
         return None
 
 
-def _build_worker(*, miners, terminated=None, scored=None, half_done=None):
+def _build_worker(*, miners, terminated=None, scored=None):
     return ForwardWorker(
         rollouts_dao=object(),
-        scores_dao=_FakeScoresDAO(scored or set(), half_done or set()),
+        scores_dao=_FakeScoresDAO(scored or set()),
         miners_dao=_FakeMinersDAO(miners),
         miner_stats_dao=_FakeStatsDAO(terminated or set()),
         config_dao=object(),
@@ -112,24 +105,6 @@ async def test_skips_already_scored_miners():
     )
     rows = await worker._get_next_candidates(limit=3)
     assert [r["uid"] for r in rows] == [2]
-
-
-@pytest.mark.asyncio
-async def test_half_done_rows_resurface_for_verdict_only():
-    """Score blob persisted but ``verdict_at`` empty (older-worker
-    crash between upsert and update_verdict). Such rows must come back
-    so ``_run_job`` can take the verdict-only fast path."""
-    worker = _build_worker(
-        miners=[
-            _miner(uid=1, hk="hk_full",  rev="r_full",  first_block=8000),
-            _miner(uid=2, hk="hk_half",  rev="r_half",  first_block=8200),
-            _miner(uid=3, hk="hk_fresh", rev="r_fresh", first_block=8400),
-        ],
-        scored={("hk_full", "r_full")},
-        half_done={("hk_half", "r_half")},
-    )
-    rows = await worker._get_next_candidates(limit=3)
-    assert [r["uid"] for r in rows] == [2, 3]
 
 
 @pytest.mark.asyncio

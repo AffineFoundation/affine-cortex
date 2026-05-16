@@ -31,8 +31,17 @@ def _verbosity_opt(f):
 
 
 async def _bootstrap_run(coro_factory):
+    """Boot one or several services in a single asyncio process.
+
+    ``coro_factory`` may return either a single service instance
+    (back-compat with worker_main) or a list/tuple of them
+    (refresh_main runs RolloutRefreshService + VerdictBackfillService
+    side by side). Stop signal cancels all runners.
+    """
     await init_client()
-    service = coro_factory()
+    produced = coro_factory()
+    services = list(produced) if isinstance(produced, (list, tuple)) else [produced]
+
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -41,19 +50,25 @@ async def _bootstrap_run(coro_factory):
         except NotImplementedError:                # Windows / non-main thread
             pass
 
-    runner = asyncio.create_task(service.run())
+    runners = [asyncio.create_task(s.run()) for s in services]
     waiter = asyncio.create_task(stop_event.wait())
     try:
         await asyncio.wait(
-            {runner, waiter}, return_when=asyncio.FIRST_COMPLETED,
+            set(runners) | {waiter}, return_when=asyncio.FIRST_COMPLETED,
         )
     finally:
-        service.stop()
-        runner.cancel()
-        try:
-            await runner
-        except (asyncio.CancelledError, Exception):
-            pass
+        for s in services:
+            try:
+                s.stop()
+            except Exception:
+                pass
+        for r in runners:
+            r.cancel()
+        for r in runners:
+            try:
+                await r
+            except (asyncio.CancelledError, Exception):
+                pass
         await close_client()
 
 
@@ -62,12 +77,14 @@ async def _bootstrap_run(coro_factory):
 @click.command("anticopy-refresh")
 @_verbosity_opt
 def refresh_main(verbose: int):
-    """Daily rollout pool refresh (CEAC)."""
+    """CEAC refresh container: daily rollout pool refresh + per-minute
+    verdict backfill side by side."""
     setup_logging(verbose, component="anticopy_refresh")
     from affine.src.anticopy.refresh import RolloutRefreshService
+    from affine.src.anticopy.verdict import VerdictBackfillService
 
     def _factory():
-        return RolloutRefreshService()
+        return [RolloutRefreshService(), VerdictBackfillService()]
 
     try:
         asyncio.run(_bootstrap_run(_factory))

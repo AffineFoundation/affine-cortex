@@ -53,17 +53,11 @@ from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 
-from affine.src.anticopy.pairwise import (
-    CopyDecision,
-    PairResult,
-    _per_env_decision_medians,
-    compare_scores,
-    is_copy_verdict,
-)
+# Worker no longer runs verdict — VerdictBackfillService in the
+# anticopy-refresh container owns that pipeline now.
 from affine.src.anticopy.r2 import AntiCopyR2
 from affine.src.anticopy.threshold import (
     AntiCopyConfig,
-    BLOCKS_PER_DAY,
     load_anticopy_config,
 )
 from affine.src.anticopy.tokenizer_sig import compute_tokenizer_signature
@@ -302,18 +296,16 @@ class ForwardWorker:
                 stats = None
             if stats and stats.get("challenge_status") == "terminated":
                 continue
-            # A row is the "done" marker ONLY if verdict has actually
-            # run (``verdict_at`` populated). Rows from an older worker
-            # build that wrote the score blob but crashed before
-            # ``update_verdict`` are stuck at ``verdict_at=None`` /
-            # ``decision_median=-1`` and need a verdict-only re-run —
-            # ``_run_job`` detects that and skips teacher-forcing.
+            # Worker is "done" once the score row is in DDB and the R2
+            # blob is uploaded — verdict math is the backfill service's
+            # job (anticopy-refresh container). Rows with verdict_at
+            # still pending are NOT re-scored.
             try:
                 score_row = await self.scores_dao.get_score(hk, rev)
             except Exception as e:
                 logger.debug(f"[anticopy.worker] score lookup {hk[:10]}: {e}")
                 score_row = None
-            if score_row is not None and score_row.get("verdict_at"):
+            if score_row is not None:
                 continue
             candidates.append(row)
         candidates.sort(
@@ -348,20 +340,6 @@ class ForwardWorker:
             if not cfg.enabled:
                 logger.info("[anticopy.worker] anticopy disabled — sleeping")
                 await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
-                return
-
-            # Verdict-only fast path: row already exists with score blob
-            # in R2 but ``verdict_at`` is empty (older worker crashed
-            # before update_verdict). Re-run verdict against the current
-            # peer set without touching sglang or re-doing the ~3-min
-            # teacher-force.
-            existing_row = None
-            try:
-                existing_row = await self.scores_dao.get_score(hotkey, revision)
-            except Exception as e:
-                logger.debug(f"[anticopy.worker] existing-row lookup {hotkey[:10]}: {e}")
-            if existing_row is not None and not existing_row.get("verdict_at"):
-                await self._run_verdict_only(cfg, job, existing_row)
                 return
 
             # 1) Compute the candidate's tokenizer signature once so we
@@ -436,48 +414,17 @@ class ForwardWorker:
                 first_block=first_block,
             )
 
-            # 5) Pairwise vs every existing score; flag copy if found.
-            (
-                verdict_hotkey,
-                decision_med,
-                decision_per_env,
-                closest_peer_model,
-            ) = await self._run_verdict(
-                cfg=cfg,
-                new_score=score_payload,
-                new_first_block=first_block,
-            )
-            await self.scores_dao.update_verdict(
-                hotkey, revision,
-                copy_of=verdict_hotkey,
-                decision_median=decision_med,
-                decision_per_env=decision_per_env,
-                closest_peer_model=closest_peer_model,
-            )
-            per_env_str = " ".join(
-                f"{env}={med:.4f}" for env, med in sorted(decision_per_env.items())
-            ) or "(no peers)"
-            if verdict_hotkey:
-                logger.info(
-                    f"[anticopy.worker] {hotkey[:10]} verdict "
-                    f"copy_of={verdict_hotkey[:10]} dec_med={decision_med:.4f} "
-                    f"per_env={{{per_env_str}}} recorded in scores_index"
-                )
-            elif closest_peer_model:
-                logger.info(
-                    f"[anticopy.worker] {hotkey[:10]} independent — "
-                    f"closest peer {closest_peer_model[:40]} "
-                    f"dec_med={decision_med:.4f}"
-                )
-
-            # Done — ``scores_index`` row above is the durable marker
-            # next iteration uses to skip this miner. No separate
-            # ``mark_done`` call needed.
+            # Verdict math is the verdict-backfill service's job (lives
+            # in the anticopy-refresh container). Worker just persists
+            # the score blob and moves on — no R2 peer fetch, no compare,
+            # no DDB update_verdict here. Decoupling that work freed the
+            # GPU-side worker from the 4 GB cgroup OOM that the bulk
+            # peer load caused, and lets the backfill amortise one
+            # all-peer R2 fetch across every pending candidate per tick.
             logger.info(
                 f"[anticopy.worker] {hotkey[:10]} done "
-                f"rollouts={len(per_rollout)} dec_med={decision_med:.4f} "
-                f"per_env={{{per_env_str}}} "
-                f"verdict={verdict_hotkey or 'independent'}"
+                f"rollouts={len(per_rollout)} "
+                f"(verdict deferred to anticopy-refresh backfill)"
             )
         except Exception as e:
             # No retry counter to bump — the loop will pick this same
@@ -1019,330 +966,6 @@ class ForwardWorker:
                 if attempt < 3:
                     await asyncio.sleep(2 * attempt)
         raise last_err or _SglangError("teacher_force exhausted retries")
-
-    # ---- verdict + invalid mark -------------------------------------
-
-    async def _run_verdict_only(
-        self,
-        cfg: AntiCopyConfig,
-        job: Dict[str, Any],
-        existing_row: Dict[str, Any],
-    ) -> None:
-        """Verdict re-run for a row whose score blob is already in R2
-        but whose ``verdict_at`` was never written (older-worker crash
-        between ``upsert`` and ``update_verdict``)."""
-        hotkey = str(job.get("hotkey", ""))
-        revision = str(job.get("revision", ""))
-        uid = int(job.get("uid", 0) or 0)
-        r2_key = existing_row.get("r2_key")
-        if not r2_key:
-            logger.warning(
-                f"[anticopy.worker] {hotkey[:10]} verdict-only skipped: "
-                f"row has no r2_key"
-            )
-            return
-        try:
-            blob = await asyncio.to_thread(self.r2.get_score_by_key, r2_key)
-        except Exception as e:
-            logger.warning(
-                f"[anticopy.worker] {hotkey[:10]} verdict-only R2 fetch failed: {e}"
-            )
-            return
-        if not blob:
-            logger.warning(
-                f"[anticopy.worker] {hotkey[:10]} verdict-only skipped: "
-                f"R2 blob {r2_key} missing"
-            )
-            return
-        first_block = int(existing_row.get("first_block") or 0)
-        if not first_block:
-            first_block = await self._lookup_first_block(uid, hotkey, revision)
-        logger.info(
-            f"[anticopy.worker] {hotkey[:10]} verdict-only "
-            f"(R2 score blob, first_block={first_block})"
-        )
-        (
-            verdict_hotkey,
-            decision_med,
-            decision_per_env,
-            closest_peer_model,
-        ) = await self._run_verdict(
-            cfg=cfg, new_score=blob, new_first_block=first_block,
-        )
-        await self.scores_dao.update_verdict(
-            hotkey, revision,
-            copy_of=verdict_hotkey,
-            decision_median=decision_med,
-            decision_per_env=decision_per_env,
-            closest_peer_model=closest_peer_model,
-        )
-        per_env_str = " ".join(
-            f"{env}={med:.4f}" for env, med in sorted(decision_per_env.items())
-        ) or "(no peers)"
-        if verdict_hotkey:
-            logger.info(
-                f"[anticopy.worker] {hotkey[:10]} verdict-only done "
-                f"copy_of={verdict_hotkey[:10]} dec_med={decision_med:.4f} "
-                f"per_env={{{per_env_str}}}"
-            )
-        else:
-            logger.info(
-                f"[anticopy.worker] {hotkey[:10]} verdict-only done "
-                f"dec_med={decision_med:.4f} verdict=independent "
-                f"closest_peer={(closest_peer_model or '-')[:40]}"
-            )
-
-    async def _fetch_peer_blob(
-        self, row: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        """Fetch a peer's score blob from R2 and strip the diagnostic
-        ``resp_top`` field (which alone is ~10× the resp_lp footprint
-        and isn't consulted by the verdict rule). Returns ``None`` on
-        fetch failure or missing key/blob."""
-        r2_key = row.get("r2_key")
-        if not r2_key:
-            return None
-        try:
-            blob = await asyncio.to_thread(self.r2.get_score_by_key, r2_key)
-        except Exception as e:
-            logger.debug(
-                f"[anticopy.worker] peer score fetch failed {r2_key}: {e}"
-            )
-            return None
-        if not blob:
-            return None
-        for ro in (blob.get("per_rollout") or []):
-            ro.pop("resp_top", None)
-        blob["first_block"] = int(row.get("first_block", 0) or 0)
-        return blob
-
-    async def _stream_pick_origin(
-        self,
-        *,
-        cfg: AntiCopyConfig,
-        ref_score: Dict[str, Any],
-        ref_first_block: int,
-        candidate_rows: List[Dict[str, Any]],
-        extra_loaded_peers: Optional[List[Dict[str, Any]]] = None,
-    ) -> CopyDecision:
-        """Memory-bounded ``detect_copies`` equivalent.
-
-        Iterates ``candidate_rows`` (DDB index rows, lazy-fetched) plus
-        any ``extra_loaded_peers`` (already-resident blobs, used to
-        thread the freshly-scored ``new_score`` into a retroactive
-        re-evaluation). Holds at most one peer blob alive at a time;
-        early-exits on the first row whose pair crosses
-        ``nll_threshold`` and has ``n_overlap_tokens >= min_overlap``
-        — the (first_block, hotkey)-ordered iteration guarantees that
-        first hit is the earliest committer (i.e. the winner).
-        """
-        lookback_blocks = cfg.verdict_lookback_days * BLOCKS_PER_DAY
-        ref_hk = ref_score.get("hotkey", "")
-        ref_rev = ref_score.get("revision", "")
-
-        # Merge rows + extra blobs into one sequence tagged by source.
-        items: List[tuple] = []
-        for row in candidate_rows:
-            fb = int(row.get("first_block", 0) or 0)
-            hk = row.get("hotkey", "")
-            items.append(("row", fb, hk, row))
-        for peer in (extra_loaded_peers or []):
-            fb = int(peer.get("first_block", 0) or 0)
-            hk = peer.get("hotkey", "")
-            items.append(("blob", fb, hk, peer))
-        items.sort(key=lambda x: (x[1], x[2]))
-
-        closest_median: float = -1.0
-        closest_per_env: Dict[str, float] = {}
-        closest_peer_model: str = ""
-        winning_pair: Optional[PairResult] = None
-        winning_hk: str = ""
-        winning_model: str = ""
-
-        for kind, fb, hk, payload in items:
-            if not hk or hk == ref_hk:
-                continue
-            if (fb, hk) >= (ref_first_block, ref_hk):
-                continue
-            if (
-                lookback_blocks > 0 and fb > 0
-                and (ref_first_block - fb) > lookback_blocks
-            ):
-                continue
-            if kind == "row":
-                if (
-                    payload.get("hotkey") == ref_hk
-                    and payload.get("revision") == ref_rev
-                ):
-                    continue
-                blob = await self._fetch_peer_blob(payload)
-                if blob is None:
-                    continue
-            else:
-                blob = payload
-
-            pair = compare_scores(ref_score, blob)
-            pair_med = pair.decision_median_combined
-            peer_model = str(blob.get("model", ""))
-            if pair_med >= 0 and (closest_median < 0 or pair_med < closest_median):
-                closest_median = pair_med
-                closest_per_env = _per_env_decision_medians(pair)
-                closest_peer_model = peer_model
-            if (
-                pair.n_overlap_tokens >= cfg.min_overlap
-                and is_copy_verdict(
-                    pair,
-                    nll_threshold=cfg.nll_threshold,
-                    agreement_ratio=cfg.agreement_ratio,
-                )
-            ):
-                winning_pair = pair
-                winning_hk = hk
-                winning_model = peer_model
-                if kind == "row":
-                    del blob
-                break
-            if kind == "row":
-                del blob
-
-        decision = CopyDecision()
-        if winning_pair is not None:
-            decision.copy_of_hotkey = winning_hk
-            decision.decision_median = float(winning_pair.decision_median_combined)
-            decision.decision_per_env = _per_env_decision_medians(winning_pair)
-            decision.closest_peer_model = winning_model
-        else:
-            decision.decision_median = closest_median
-            decision.decision_per_env = dict(closest_per_env)
-            decision.closest_peer_model = closest_peer_model
-        return decision
-
-    async def _run_verdict(
-        self,
-        *,
-        cfg: AntiCopyConfig,
-        new_score: Dict[str, Any],
-        new_first_block: int,
-    ) -> tuple:
-        """Compute the verdict for ``new_score`` AND retroactively refresh
-        the verdicts of any later-committed peer that turns out to be a
-        copy of it.
-
-        Streaming implementation: at most one peer blob is held in
-        memory at a time. With ~90 peers each carrying ~4 MB of float
-        logprobs this previously OOM'd the worker's 4 GB cgroup; the
-        per-peer fetch+compare+release pattern keeps the resident set
-        bounded regardless of how many peers exist.
-
-        Why the retroactive pass: candidates are not necessarily scored
-        in commit order (priority overrides, retries, parallel workers).
-        Without this pass, an earlier-committed candidate that arrives
-        in the queue late would be flagged ``independent`` correctly,
-        but the already-scored later peers that copied it would keep a
-        stale ``verdict_copy_of`` pointing at whichever earlier peer
-        was visible when they were scored — or at nothing.
-        """
-        index_rows = await self.scores_dao.list_all()
-        decision = await self._stream_pick_origin(
-            cfg=cfg,
-            ref_score=new_score,
-            ref_first_block=new_first_block,
-            candidate_rows=index_rows,
-        )
-        await self._refresh_later_peer_verdicts(
-            cfg=cfg,
-            new_score=new_score,
-            new_first_block=new_first_block,
-            all_rows=index_rows,
-        )
-        return (
-            decision.copy_of_hotkey,
-            decision.decision_median,
-            dict(decision.decision_per_env),
-            decision.closest_peer_model,
-        )
-
-    async def _refresh_later_peer_verdicts(
-        self,
-        *,
-        cfg: AntiCopyConfig,
-        new_score: Dict[str, Any],
-        new_first_block: int,
-        all_rows: List[Dict[str, Any]],
-    ) -> None:
-        """For each peer committed strictly later than ``new_score`` and
-        pairwise-similar to it, recompute the peer's verdict (with
-        ``new_score`` now included as a candidate origin) and write the
-        refreshed result back to ``anticopy_scores_index``.
-
-        Streaming: holds at most 2 peer blobs concurrently (the later
-        peer being checked + whichever earlier peer ``_stream_pick_origin``
-        is currently fetching). Only peers that are *copies of*
-        ``new_score`` trigger the inner re-evaluation, so the work
-        stays O(n_overlapping_copies).
-        """
-        new_hk = new_score.get("hotkey", "")
-        new_rev = new_score.get("revision", "")
-        new_first_block = int(new_first_block)
-        # Make sure new_score itself participates in re-evaluations as
-        # an inline peer (it's the freshly-computed candidate that
-        # hasn't been written to peers' R2 yet from the peer's POV).
-        if "first_block" not in new_score:
-            new_score["first_block"] = new_first_block
-        for row in all_rows:
-            peer_hk = row.get("hotkey", "")
-            peer_rev = row.get("revision", "")
-            peer_first = int(row.get("first_block", 0) or 0)
-            if peer_hk == new_hk and peer_rev == new_rev:
-                continue
-            # Strict later-committer check.
-            if (peer_first, peer_hk) <= (new_first_block, new_hk):
-                continue
-            # Fetch + quick prune: is peer a copy of new_score at all?
-            peer = await self._fetch_peer_blob(row)
-            if peer is None:
-                continue
-            pair = compare_scores(peer, new_score)
-            if (
-                pair.n_overlap_tokens < cfg.min_overlap
-                or not is_copy_verdict(
-                    pair,
-                    nll_threshold=cfg.nll_threshold,
-                    agreement_ratio=cfg.agreement_ratio,
-                )
-            ):
-                del peer
-                continue
-            # Drop pre-evaluated peer blob; _stream_pick_origin re-fetches
-            # it via the row-list mechanism if needed... wait, peer IS the
-            # target here. Keep it as the ref_score.
-            refreshed = await self._stream_pick_origin(
-                cfg=cfg,
-                ref_score=peer,
-                ref_first_block=peer_first,
-                candidate_rows=all_rows,
-                extra_loaded_peers=[new_score],
-            )
-            try:
-                await self.scores_dao.update_verdict(
-                    peer_hk, peer_rev,
-                    copy_of=refreshed.copy_of_hotkey,
-                    decision_median=refreshed.decision_median,
-                    decision_per_env=dict(refreshed.decision_per_env),
-                    closest_peer_model=refreshed.closest_peer_model,
-                )
-                logger.info(
-                    f"[anticopy.worker] retroactive verdict {peer_hk[:10]} "
-                    f"copy_of={(refreshed.copy_of_hotkey or 'independent')[:14]} "
-                    f"dec_med={refreshed.decision_median:.4f} "
-                    f"(after {new_hk[:10]} arrived)"
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[anticopy.worker] retroactive verdict update "
-                    f"failed for {peer_hk[:10]}: {e}"
-                )
-            del peer
 
 
     async def _lookup_first_block(
