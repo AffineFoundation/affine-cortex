@@ -19,7 +19,7 @@ import asyncio
 import math
 import multiprocessing
 import signal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import click
 
@@ -308,6 +308,10 @@ class ExecutorManager:
             env_stats,
             {env: int(v.value) for env, v in self.env_cap_values.items()},
             global_budget=GLOBAL_DISPATCH_BUDGET,
+            priorities={
+                env: _sampling_priority_for_env(envs_raw, env)
+                for env in self.envs
+            },
         )
         for env, cap in new_caps.items():
             self.env_cap_values[env].value = cap
@@ -384,6 +388,7 @@ def _compute_adaptive_env_caps(
     previous_caps: Dict[str, int],
     *,
     global_budget: int,
+    priorities: Optional[Mapping[str, int]] = None,
 ) -> Dict[str, int]:
     """Adapt per-env in-flight caps from live progress.
 
@@ -394,6 +399,84 @@ def _compute_adaptive_env_caps(
     taking the whole global budget. Slow envs with no recent completions
     still ramp while they are saturated so long-running environments
     cannot starve behind short-window ``delta=0`` readings.
+
+    ``priorities`` tiers allocation: envs sharing the highest priority
+    claim the bulk of ``global_budget`` first, the residue cascades down
+    to the next tier, etc. Every backlogged env still keeps a probe
+    floor regardless of tier so a lower-tier env cannot starve
+    completely. ``priorities`` is ``None`` or all envs sharing one
+    priority value is the single-tier case: one loop iteration runs
+    with ``tier_budget == global_budget``, equivalent to a direct
+    un-tiered pool call.
+    """
+    priorities_map = priorities or {}
+    by_tier: Dict[int, List[str]] = {}
+    for env in envs:
+        by_tier.setdefault(int(priorities_map.get(env, 0)), []).append(env)
+    tiers_desc = sorted(by_tier.keys(), reverse=True)
+
+    def is_active(env: str) -> bool:
+        row = stats.get(env, {})
+        return (
+            int(row.get("target", 0) or 0) - int(row.get("done", 0) or 0) > 0
+            or int(row.get("running", 0) or 0) > 0
+        )
+
+    # ``reserve_floor`` is the probe size held back per downstream-tier
+    # active env so a higher-priority tier cannot starve a backlogged
+    # lower-priority env. Sized like the un-tiered allocator's internal
+    # floor (``fair // 8``) so a lower-priority env keeps the same probe
+    # size it would have received in a flat allocation. With one tier
+    # the reservation is naturally zero (no downstream) and
+    # ``tier_budget`` collapses to ``global_budget`` — a single loop
+    # iteration that delegates to the pool, bit-identical to a direct
+    # un-tiered call. With zero active envs anywhere the reservation
+    # is also zero — nothing to keep alive — and each tier pool returns
+    # placeholder caps from its own budget split.
+    n_active = sum(1 for env in envs if is_active(env))
+    reserve_floor = (
+        max(1, math.ceil(global_budget / n_active) // 8) if n_active else 0
+    )
+
+    caps: Dict[str, int] = {}
+    remaining_budget = global_budget
+    for tier_idx, tier in enumerate(tiers_desc):
+        tier_envs = by_tier[tier]
+        lower_active = sum(
+            1 for t in tiers_desc[tier_idx + 1:]
+            for e in by_tier[t] if is_active(e)
+        )
+        tier_budget = max(1, remaining_budget - lower_active * reserve_floor)
+        tier_caps = _allocate_within_pool(
+            tier_envs, stats, previous_caps, pool_budget=tier_budget,
+        )
+        caps.update(tier_caps)
+        # Only active envs consume from the cascading budget. Inactive
+        # envs hold their previous-cap legacy value (so a new battle can
+        # ramp without re-deriving a fair share from scratch) but they
+        # are not running anything, so they do not subtract from what
+        # lower tiers receive.
+        consumed = sum(
+            tier_caps.get(env, 0) for env in tier_envs if is_active(env)
+        )
+        remaining_budget = max(0, remaining_budget - consumed)
+
+    return caps
+
+
+def _allocate_within_pool(
+    envs: List[str],
+    stats: Dict[str, Dict[str, int]],
+    previous_caps: Dict[str, int],
+    *,
+    pool_budget: int,
+) -> Dict[str, int]:
+    """Pressure-weighted cap allocation for a single pool of envs.
+
+    Extracted from ``_compute_adaptive_env_caps`` so the tiered
+    orchestrator can call it once per priority tier. Behavior for a
+    single pool (``pool_budget == global_budget``, ``envs == all envs``)
+    is identical to the historical un-tiered allocator.
     """
     active = [
         env for env in envs
@@ -401,9 +484,9 @@ def _compute_adaptive_env_caps(
         or stats.get(env, {}).get("running", 0) > 0
     ]
     if not active:
-        initial = _initial_env_cap(envs, global_budget)
+        initial = _initial_env_cap(envs, pool_budget)
         return {env: initial for env in envs}
-    fair = _initial_env_cap(active, global_budget)
+    fair = _initial_env_cap(active, pool_budget)
     floor = max(1, fair // 8)
     ramp = max(floor, fair // 4)
     # Envs with no current work keep their previous cap so a new battle
@@ -474,17 +557,17 @@ def _compute_adaptive_env_caps(
             caps[env] = max(floor, min(remaining, running + ramp))
 
     total = sum(caps[env] for env in active)
-    if total > global_budget:
+    if total > pool_budget:
         caps.update(
             _trim_caps(
                 {env: caps[env] for env in active},
-                global_budget=global_budget,
+                global_budget=pool_budget,
                 floor=1,
             )
         )
         return caps
 
-    extra = global_budget - total
+    extra = pool_budget - total
     if extra <= 0 or (not weights and not opportunistic_weights):
         return caps
 
@@ -500,7 +583,7 @@ def _compute_adaptive_env_caps(
     caps.update(
         _trim_caps(
             {env: caps[env] for env in active},
-            global_budget=global_budget,
+            global_budget=pool_budget,
             floor=1,
         )
     )
@@ -533,7 +616,14 @@ def _allocate_weighted_extra(
         allocated[env] += 1
 
 
-def _sampling_count_for_env(envs_raw: Any, env: str, default: int) -> int:
+def _sampling_field(envs_raw: Any, env: str, key: str, default: Any) -> Any:
+    """Walk ``environments[env].(sampling|window_config)[key]`` defensively.
+
+    The DDB-backed config can return non-dict values during partial
+    migrations or hand edits, so every nesting step short-circuits to
+    ``default``. Returns the raw value (or ``default``); callers cast +
+    clamp as the field demands.
+    """
     if not isinstance(envs_raw, dict):
         return default
     cfg = envs_raw.get(env) or {}
@@ -542,14 +632,30 @@ def _sampling_count_for_env(envs_raw: Any, env: str, default: int) -> int:
     sampling = cfg.get("sampling") or cfg.get("window_config") or {}
     if not isinstance(sampling, dict):
         return default
-    raw = sampling.get("sampling_count", default)
-    if raw is None:
-        return default
+    raw = sampling.get(key, default)
+    return default if raw is None else raw
+
+
+def _sampling_count_for_env(envs_raw: Any, env: str, default: int) -> int:
+    raw = _sampling_field(envs_raw, env, "sampling_count", default)
     try:
-        count = int(raw)
+        return max(0, int(raw))
     except (TypeError, ValueError):
         return default
-    return max(0, count)
+
+
+def _sampling_priority_for_env(envs_raw: Any, env: str, default: int = 0) -> int:
+    """Read ``environments[env].sampling.priority`` from the live config.
+
+    Higher integer = scheduled before lower-priority envs by
+    ``_compute_adaptive_env_caps``. Missing / non-dict / non-numeric
+    values fall through to ``default`` so untouched configs preserve
+    flat (single-tier) allocation."""
+    raw = _sampling_field(envs_raw, env, "priority", default)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
 
 
 def _trim_caps(caps: Dict[str, int], *, global_budget: int, floor: int) -> Dict[str, int]:
