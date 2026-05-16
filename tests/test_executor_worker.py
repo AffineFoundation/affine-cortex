@@ -1525,7 +1525,7 @@ def test_predeployed_challenger_dispatches_to_its_own_url():
     samples between miners.
     """
     from affine.src.scorer.window_state import (
-        DeploymentRecord, MinerSnapshot, PreDeployedChallenger,
+        DeploymentRecord, MinerSnapshot, BattleRecord,
     )
 
     fx = _make_overlap_worker()
@@ -1537,7 +1537,7 @@ def test_predeployed_challenger_dispatches_to_its_own_url():
     fx.champ_scores = {t: 0.5 for t in range(5)}
     fx.chal_scores = {}
 
-    pre_miner = PreDeployedChallenger(
+    pre_miner = BattleRecord(
         challenger=MinerSnapshot(
             uid=42, hotkey="pre_hk", revision="pre_rev", model="org/p",
         ),
@@ -1591,7 +1591,7 @@ def test_predeployed_challenger_gated_on_champion_done():
     champion is mid-baseline, other machines stay idle automatically
     (the user's '冠军采样时其他机器空闲' invariant)."""
     from affine.src.scorer.window_state import (
-        DeploymentRecord, MinerSnapshot, PreDeployedChallenger,
+        DeploymentRecord, MinerSnapshot, BattleRecord,
     )
 
     fx = _make_overlap_worker()
@@ -1601,7 +1601,7 @@ def test_predeployed_challenger_gated_on_champion_done():
     fx.champ_scores = {0: 0.5, 1: 0.5, 2: 0.5}
     fx.chal_scores = {}
 
-    pre_miner = PreDeployedChallenger(
+    pre_miner = BattleRecord(
         challenger=MinerSnapshot(
             uid=42, hotkey="pre_hk", revision="pre_rev", model="org/p",
         ),

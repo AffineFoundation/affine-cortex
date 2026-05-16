@@ -65,43 +65,34 @@ class ChampionRecord:
 
 @dataclass
 class BattleRecord:
-    """An in-flight contest. The challenger's Targon workload only lives
-    as long as this record does.
+    """A deployed challenger.
 
-    ``previous_champion`` captures the champion's identity at the moment
-    ``_start_battle`` ran. We need this for recovery: if the scheduler
-    crashes between ``set_champion(new)`` and ``clear_battle()``, the
-    canonical champion record has already been overwritten with the
-    challenger, so we'd lose the old champion's UID/hotkey — and miss
-    marking them ``terminated`` and re-emitting weights. Optional only
-    for backward compat with battle rows written before this field
-    existed.
-    """
+    Two lifecycle states share this shape:
+
+    * **Active battle** (``current_battle``) — the challenger the
+      comparator is currently deciding on. Deployed on the primary
+      endpoint under single-instance semantics. ``previous_champion``
+      is set so crash recovery can still terminate the displaced
+      champion and re-emit weights if a tick crashes between
+      ``set_champion(new)`` and ``clear_battle()``.
+    * **Pre-deployed** (``predeployed_challengers``) — a queued miner
+      deployed onto a spare non-primary endpoint so it can accumulate
+      baseline samples in parallel with the active battle. Promotion
+      to active battle is a teardown-then-deploy on the primary;
+      sample_results survives because rows are keyed by
+      ``(hotkey, revision, env, task_id, refresh_block)``, not by host
+      or deployment id. ``previous_champion`` is ``None`` for these.
+
+    The structural identity is intentional: every dispatch / drift-check
+    / invalidation / early-loss code path treats both states identically
+    on the data side. The only divergence is bookkeeping at promotion
+    and decide time, both of which live in the scheduler."""
     challenger: MinerSnapshot
     deployment_id: str
     base_url: str
     started_at_block: int
     deployments: List[DeploymentRecord] = field(default_factory=list)
     previous_champion: Optional[MinerSnapshot] = None
-
-
-@dataclass
-class PreDeployedChallenger:
-    """A queued miner deployed onto a spare endpoint so it can accumulate
-    baseline samples while the active battle proceeds on another host.
-
-    When ``pick_next`` later claims this miner, its deployment is adopted
-    into ``current_battle`` with no re-deploy — sample_results is keyed
-    by ``(hotkey, revision, env, task_id, refresh_block)`` so any rows
-    collected pre-battle stay usable once the role flips. The record
-    holds the same deployment fields a ``BattleRecord`` does (minus
-    ``previous_champion``, which is meaningless before promotion).
-    """
-    challenger: MinerSnapshot
-    deployment_id: str
-    base_url: str
-    started_at_block: int
-    deployments: List[DeploymentRecord] = field(default_factory=list)
 
 
 @dataclass
@@ -197,26 +188,29 @@ class StateStore:
 
     # -- pre-deployed challengers ------------------------------------------
 
-    async def get_predeployed_challengers(self) -> List[PreDeployedChallenger]:
+    async def get_predeployed_challengers(self) -> List[BattleRecord]:
         """Pre-deployed challengers — queued miners loaded onto spare ssh
         endpoints so they accumulate baseline samples in parallel with
         the active battle. Empty list when no spare endpoints exist
-        (single-machine) or no eligible queued miners remain."""
+        (single-machine) or no eligible queued miners remain. Uses the
+        same :class:`BattleRecord` shape as ``current_battle`` —
+        ``previous_champion`` is ``None`` for these entries (it only
+        becomes meaningful at promotion)."""
         raw = await self._kv.get(self.KEY_PREDEPLOYED, default=[]) or []
         if not isinstance(raw, list):
             return []
         return [
-            _predeployed_from_dict(item)
+            _battle_from_dict(item)
             for item in raw
             if isinstance(item, dict)
         ]
 
     async def set_predeployed_challengers(
-        self, items: List[PreDeployedChallenger],
+        self, items: List[BattleRecord],
     ) -> None:
         await self._kv.set(
             self.KEY_PREDEPLOYED,
-            [_predeployed_to_dict(p) for p in items],
+            [_battle_to_dict(p) for p in items],
         )
 
     async def clear_predeployed_challengers(self) -> None:
@@ -428,37 +422,6 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
         started_at_block=int(raw.get("started_at_block", 0)),
         deployments=deployments,
         previous_champion=previous_champion,
-    )
-
-
-def _predeployed_to_dict(p: PreDeployedChallenger) -> Dict[str, Any]:
-    return {
-        "challenger": asdict(p.challenger),
-        "deployment_id": p.deployment_id,
-        "base_url": p.base_url,
-        "started_at_block": p.started_at_block,
-        "deployments": [asdict(d) for d in p.deployments],
-    }
-
-
-def _predeployed_from_dict(raw: Dict[str, Any]) -> PreDeployedChallenger:
-    chal_raw = raw.get("challenger") or {}
-    deployments = _deployment_list(raw)
-    deployment_id = str(raw.get("deployment_id") or "")
-    base_url = str(raw.get("base_url") or "")
-    if deployments and (not deployment_id or not base_url):
-        primary_id, primary_url = _primary_deployment(deployments)
-        deployment_id = primary_id or ""
-        base_url = primary_url or ""
-    return PreDeployedChallenger(
-        challenger=MinerSnapshot(**{
-            k: chal_raw[k] for k in ("uid", "hotkey", "revision", "model")
-            if k in chal_raw
-        }),
-        deployment_id=deployment_id,
-        base_url=base_url,
-        started_at_block=int(raw.get("started_at_block", 0)),
-        deployments=deployments,
     )
 
 

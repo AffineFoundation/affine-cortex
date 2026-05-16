@@ -57,7 +57,6 @@ from affine.src.scorer.window_state import (
     DeploymentRecord,
     EnvConfig,
     MinerSnapshot,
-    PreDeployedChallenger,
     StateStore,
     TaskIdState,
 )
@@ -744,7 +743,7 @@ class FlowScheduler:
         valid_uids = {
             int(r.get("uid", -1)) for r in await self._list_valid_miners()
         }
-        kept: List[PreDeployedChallenger] = []
+        kept: List[BattleRecord] = []
         for record in records:
             if record.challenger.uid in valid_uids:
                 kept.append(record)
@@ -769,7 +768,7 @@ class FlowScheduler:
         if not records:
             return
         scoring_envs = await self.state.get_scoring_environments()
-        kept: List[PreDeployedChallenger] = []
+        kept: List[BattleRecord] = []
         for record in records:
             early = await self._check_early_regression(
                 champion, record.challenger,
@@ -792,7 +791,7 @@ class FlowScheduler:
     async def _decide_predeployed_early_lost(
         self,
         champion: ChampionRecord,
-        record: PreDeployedChallenger,
+        record: BattleRecord,
         *,
         regression_env: str,
         per_env_data: Dict[str, Dict[str, float]],
@@ -872,7 +871,7 @@ class FlowScheduler:
                 )
                 return
             deployments = _deployments_from_result(result)
-            records.append(PreDeployedChallenger(
+            records.append(BattleRecord(
                 challenger=MinerSnapshot(
                     uid=cand.uid, hotkey=cand.hotkey,
                     revision=cand.revision, model=cand.model,
@@ -1206,8 +1205,8 @@ class FlowScheduler:
         records = await self.state.get_predeployed_challengers()
         if not records:
             return
-        remaining: List[PreDeployedChallenger] = []
-        adopted: Optional[PreDeployedChallenger] = None
+        remaining: List[BattleRecord] = []
+        adopted: Optional[BattleRecord] = None
         for record in records:
             if adopted is None and record.challenger.uid == uid:
                 adopted = record
