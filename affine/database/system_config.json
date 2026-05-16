@@ -7,6 +7,7 @@
       "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 200,
+        "priority": 1,
         "dataset_range": [[0, 5000]],
         "sampling_mode": "latest",
         "dataset_range_source": {
@@ -67,6 +68,7 @@
       "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 100,
+        "priority": 1,
         "dataset_range": [[0, 1000000000]],
         "sampling_mode": "random"
       }
