@@ -169,7 +169,11 @@ class VerdictBackfillService:
     ``verdict_at`` is still empty.
     """
 
-    POLL_INTERVAL_SEC = 60
+    # Verdict is advisory (it doesn't gate anything live), so a long
+    # interval is fine. Steady state is "0 pending" most ticks anyway,
+    # and the cost of one full pass — list_all + ~N R2 fetches — is
+    # several minutes; running it every minute would just churn DDB.
+    POLL_INTERVAL_SEC = 4 * 60 * 60
 
     def __init__(
         self,
