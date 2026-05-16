@@ -411,6 +411,48 @@ class ExecutorWorker:
                         (key, battle.challenger, tid, url, dep_id)
                     )
 
+        # Pre-deployed challengers: same gating as ``battle.challenger``
+        # but each one runs on its own non-primary endpoint. The
+        # ``champion hasn't sampled yet`` guard naturally pauses their
+        # dispatch while champion is still doing its baseline pass —
+        # which is what makes "其他机器空闲等冠军" automatic without
+        # any explicit wait logic. Their samples flow into
+        # ``sample_results`` keyed by their own hotkey/revision, so
+        # the scheduler's early-loss sweep and (eventually) the
+        # comparator can read them just like a normal challenger's.
+        for record in await self._state.get_predeployed_challengers():
+            pre_urls = _base_urls(
+                record.deployments, record.base_url,
+            )
+            if not pre_urls:
+                continue
+            pre_done = await self._samples.read_scores_for_tasks(
+                record.challenger.hotkey, record.challenger.revision,
+                self.env, task_ids, refresh_block=refresh_block,
+            )
+            if len(champ_done.keys() & pre_done.keys()) >= sampling_count:
+                continue                  # enough overlap; let scheduler decide
+            for idx, tid in enumerate(task_ids):
+                tid_int = int(tid)
+                if tid_int not in champ_done:
+                    continue              # champion hasn't sampled yet
+                if tid_int in pre_done:
+                    continue              # this pre-challenger already done
+                key = (
+                    record.challenger.hotkey,
+                    record.challenger.revision,
+                    tid_int,
+                )
+                if key in in_flight_keys:
+                    continue
+                url = _pick_url(pre_urls, tid, idx)
+                dep_id = _resolve_deployment_id(
+                    url, record.deployments, record.deployment_id,
+                )
+                candidates.append(
+                    (key, record.challenger, tid, url, dep_id)
+                )
+
         if not candidates:
             return 0
 
@@ -559,6 +601,24 @@ class ExecutorWorker:
             if any(
                 d.deployment_id == expected_deployment_id
                 for d in battle.deployments
+            ):
+                return True
+        # Pre-deployed miners — same hotkey/revision identity check,
+        # any deployment they currently hold counts as current. This
+        # path is what keeps multi-host pre-sample dispatches from
+        # being dropped as 'drift' even though they're attached to a
+        # different (non-primary) endpoint than the active battle's.
+        for record in await self._state.get_predeployed_challengers():
+            if (
+                record.challenger.hotkey != miner.hotkey
+                or record.challenger.revision != miner.revision
+            ):
+                continue
+            if record.deployment_id == expected_deployment_id:
+                return True
+            if any(
+                d.deployment_id == expected_deployment_id
+                for d in record.deployments
             ):
                 return True
         return False

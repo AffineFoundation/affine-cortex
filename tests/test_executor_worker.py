@@ -772,6 +772,9 @@ def test_dispatch_proceeds_when_only_battle_has_url():
                 ],
             )
 
+        async def get_predeployed_challengers(self):
+            return []
+
     class _SamplesStub:
         # Champion has already sampled all 3 task_ids — without that the
         # new challenger-overlap rule (challenger only attempts task_ids
@@ -848,6 +851,9 @@ def test_dispatch_skips_when_neither_has_url():
 
         async def get_battle(self):
             return None
+
+        async def get_predeployed_challengers(self):
+            return []
 
     class _SamplesStub:
         async def has_sample(self, *a, **kw):
@@ -929,6 +935,9 @@ class _DeploymentDriftFixture:
 
             async def get_battle(self):
                 return fixture.battle
+
+            async def get_predeployed_challengers(self):
+                return list(getattr(fixture, "predeployed", []))
 
         class _SamplesStub:
             async def persist(self, **kwargs):
@@ -1161,6 +1170,9 @@ def _make_overlap_worker(env="ENV_A"):
                 ],
             )
 
+        async def get_predeployed_challengers(self):
+            return list(getattr(fx, "predeployed", []))
+
     class _SamplesStub:
         async def read_scores_for_tasks(
             self, hotkey, revision, _env, task_ids, *, refresh_block,
@@ -1170,6 +1182,10 @@ def _make_overlap_worker(env="ENV_A"):
                 return {t: s for t, s in fx.champ_scores.items() if t in wanted}
             if hotkey == "chal_hk":
                 return {t: s for t, s in fx.chal_scores.items() if t in wanted}
+            for record in getattr(fx, "predeployed", []):
+                if hotkey == record.challenger.hotkey:
+                    pre_scores = getattr(fx, "pre_scores", {}).get(hotkey, {})
+                    return {t: s for t, s in pre_scores.items() if t in wanted}
             return {}
 
     fx.state = _StateStub()
@@ -1300,3 +1316,117 @@ def test_challenger_ignores_existing_samples_outside_champion_set():
     # dispatches all 210 of champion's set fresh.
     assert len(challenger_dispatches) == 210
     assert all(tid in range(210) for tid in challenger_dispatches)
+
+
+# ---- pre-deployed challengers dispatch -----------------------------------
+
+
+def test_predeployed_challenger_dispatches_to_its_own_url():
+    """Pre-deployed miners run on a non-primary endpoint, so their
+    dispatches must hit that endpoint's base_url — not the
+    primary/battle URL. Ensures the multi-host mode doesn't cross-fire
+    samples between miners.
+    """
+    from affine.src.scorer.window_state import (
+        DeploymentRecord, MinerSnapshot, PreDeployedChallenger,
+    )
+
+    fx = _make_overlap_worker()
+    # Champion has sampled 5 task_ids on the primary; battle is None
+    # (no active battle) so the only candidates beyond champion are
+    # pre-deployed miners. Use a small task pool for arithmetic ease.
+    fx.task_ids = list(range(5))
+    fx.sampling_count = 5
+    fx.champ_scores = {t: 0.5 for t in range(5)}
+    fx.chal_scores = {}
+
+    pre_miner = PreDeployedChallenger(
+        challenger=MinerSnapshot(
+            uid=42, hotkey="pre_hk", revision="pre_rev", model="org/p",
+        ),
+        deployment_id="wrk-pre",
+        base_url="https://host-b/wrk-pre",
+        started_at_block=0,
+        deployments=[DeploymentRecord(
+            endpoint_name="host-b",
+            deployment_id="wrk-pre",
+            base_url="https://host-b/wrk-pre",
+        )],
+    )
+    fx.predeployed = [pre_miner]
+    fx.pre_scores = {"pre_hk": {}}
+
+    # Force battle to None to isolate pre-deployed dispatch.
+    async def _no_battle(self):
+        return None
+    fx.state.get_battle = _no_battle.__get__(fx.state)
+
+    fx.drive()
+
+    pre_dispatches = [
+        (tid, url) for uid, tid in fx.dispatched
+        for url in [None]  # placeholder; we'll re-fetch with base_url
+    ]
+    # The fixture's _capture only stored (uid, tid). To check URL we
+    # need a richer capture — replace and re-run.
+    fx.dispatched = []
+    captured = []
+
+    async def _capture_full(*, miner, task_id, base_url, **_kwargs):
+        captured.append((miner.uid, int(task_id), base_url))
+
+    fx.worker._dispatch_one = _capture_full
+    fx.drive()
+
+    pre_rows = [row for row in captured if row[0] == 42]
+    assert len(pre_rows) == 5, (
+        f"pre-deployed should dispatch 5 task_ids (all champion-done), "
+        f"got {len(pre_rows)}"
+    )
+    assert all(
+        url == "https://host-b/wrk-pre" for _, _, url in pre_rows
+    ), "pre-deployed dispatches must hit its own endpoint URL"
+
+
+def test_predeployed_challenger_gated_on_champion_done():
+    """Pre-deployed miner only dispatches for task_ids the champion has
+    already sampled — same gating as ``battle.challenger``. While
+    champion is mid-baseline, other machines stay idle automatically
+    (the user's '冠军采样时其他机器空闲' invariant)."""
+    from affine.src.scorer.window_state import (
+        DeploymentRecord, MinerSnapshot, PreDeployedChallenger,
+    )
+
+    fx = _make_overlap_worker()
+    fx.task_ids = list(range(10))
+    fx.sampling_count = 10
+    # Champion has only done 3 of 10 so far.
+    fx.champ_scores = {0: 0.5, 1: 0.5, 2: 0.5}
+    fx.chal_scores = {}
+
+    pre_miner = PreDeployedChallenger(
+        challenger=MinerSnapshot(
+            uid=42, hotkey="pre_hk", revision="pre_rev", model="org/p",
+        ),
+        deployment_id="wrk-pre",
+        base_url="https://host-b/wrk-pre",
+        started_at_block=0,
+        deployments=[DeploymentRecord(
+            endpoint_name="host-b",
+            deployment_id="wrk-pre",
+            base_url="https://host-b/wrk-pre",
+        )],
+    )
+    fx.predeployed = [pre_miner]
+    fx.pre_scores = {"pre_hk": {}}
+
+    async def _no_battle(self):
+        return None
+    fx.state.get_battle = _no_battle.__get__(fx.state)
+
+    fx.drive()
+
+    pre_tids = {tid for uid, tid in fx.dispatched if uid == 42}
+    assert pre_tids == {0, 1, 2}, (
+        f"pre-deployed must gate on champion-done set {{0,1,2}}, got {pre_tids}"
+    )
