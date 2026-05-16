@@ -765,6 +765,9 @@ def test_adaptive_caps_priority_inactive_top_tier_does_not_block_cascade():
 
 
 def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
+    """Champion's per-env target is the full oversampled pool;
+    challenger's target is clipped to ``sampling_count`` (overlap
+    threshold). Verified via per-subject ``_last_done`` entries."""
     import asyncio as _asyncio
 
     manager = ExecutorManager(["ENV_A"])
@@ -777,11 +780,14 @@ def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
                     "task_ids": {"ENV_A": ids},
                     "refreshed_at_block": 123,
                 },
-                "champion": {"hotkey": "champ_hk", "revision": "champ_rev"},
+                "champion": {
+                    "uid": 213,
+                    "hotkey": "champ_hk", "revision": "champ_rev",
+                },
                 "current_battle": {
                     "challenger": {
-                        "hotkey": "chal_hk",
-                        "revision": "chal_rev",
+                        "uid": 228,
+                        "hotkey": "chal_hk", "revision": "chal_rev",
                     },
                 },
                 "environments": {
@@ -802,14 +808,23 @@ def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
 
     _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
 
-    assert manager._last_done["ENV_A"] == 400
+    # Per-subject done counts, keyed by (uid, env). Champion sees full
+    # pool (441 clipped to target=441). Challenger sees sampling_count
+    # (400 clipped to target=400).
+    assert manager._last_done[(213, "ENV_A")] == 441
+    assert manager._last_done[(228, "ENV_A")] == 400
+    # No work remaining → planner falls back to initial fair share (the
+    # whole budget when there's exactly one env).
     assert manager.env_cap_values["ENV_A"].value == 600
 
 
-def test_status_label_includes_uid_for_each_role(caplog):
-    """STATUS label must carry the UID so operators don't read role as
-    identity. ``[champion U213]`` / ``[challenger U228]`` instead of
-    ambiguous ``[champion]`` / ``[challenger]``."""
+def test_status_label_includes_uid_for_each_subject(caplog):
+    """STATUS line must report EVERY active subject — champion,
+    current-battle challenger, and pre-deployed challengers — each
+    tagged with its uid. Operators were misreading the legacy single-
+    role label as identity even before pre-deploys; now that multiple
+    miners actually run in parallel, single-subject reporting would
+    hide where the in-flight slots are going."""
     import asyncio as _asyncio
     import logging
 
@@ -819,96 +834,203 @@ def test_status_label_includes_uid_for_each_role(caplog):
     class _SC:
         async def get_param_value(self, name, default=None):
             return {
-                "current_task_ids": {"task_ids": {"ENV_A": ids}, "refreshed_at_block": 1},
-                "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
+                "current_task_ids": {
+                    "task_ids": {"ENV_A": ids}, "refreshed_at_block": 1,
+                },
+                "champion": {
+                    "uid": 213, "hotkey": "champ_hk", "revision": "champ_rev",
+                },
                 "current_battle": {"challenger": {
                     "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
                 }},
+                "predeployed_challengers": [
+                    {"challenger": {
+                        "uid": 305, "hotkey": "pre_hk", "revision": "pre_rev",
+                    }},
+                ],
                 "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
             }.get(name, default)
 
     class _Samples:
-        async def count_samples_for_tasks(self, hotkey, revision, env, task_ids, *, refresh_block):
+        async def count_samples_for_tasks(
+            self, hotkey, revision, env, task_ids, *, refresh_block,
+        ):
             return 5
 
     with caplog.at_level(logging.INFO, logger="affine"):
         _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
 
-    assert any("[challenger U228]" in r.message for r in caplog.records), (
-        "active subject is the challenger in a live battle — STATUS label must say [challenger U228]"
+    log_text = " ".join(r.message for r in caplog.records)
+    assert "champ U213" in log_text, (
+        f"champion segment missing in: {log_text!r}"
     )
-
-    # Now clear the battle: label flips to [champion U213].
-    caplog.clear()
-
-    class _SC2:
-        async def get_param_value(self, name, default=None):
-            return {
-                "current_task_ids": {"task_ids": {"ENV_A": ids}, "refreshed_at_block": 1},
-                "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
-                "current_battle": {},
-                "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
-            }.get(name, default)
-
-    with caplog.at_level(logging.INFO, logger="affine"):
-        _asyncio.run(manager._emit_status_line(_SC2(), _Samples()))
-
-    assert any("[champion U213]" in r.message for r in caplog.records), (
-        "no battle in flight — STATUS label must say [champion U213]"
+    assert "chal U228" in log_text, (
+        f"challenger segment missing in: {log_text!r}"
+    )
+    assert "pre U305" in log_text, (
+        f"pre-deployed segment missing in: {log_text!r}"
     )
 
 
-def test_status_delta_zeroes_on_subject_change(caplog):
-    """Between two STATUS prints the active subject can change (battle
-    decided → role flips). The per-env delta is otherwise computed as
-    ``current_subject_count - previous_subject_count`` — a meaningless
-    cross-miner subtraction. The first frame after a subject change
-    must report ``+0`` instead of that phantom delta."""
+def test_status_delta_zeroes_for_newly_appearing_subject(caplog):
+    """A subject newly visible this frame (just-promoted challenger,
+    just-pre-deployed miner) has no baseline to subtract from. Its
+    per-env delta must be ``0`` for the first frame so we don't display
+    a phantom ``+done`` against a non-existent prior. Subjects that
+    were present last frame keep computing real deltas."""
     import asyncio as _asyncio
     import logging
 
     manager = ExecutorManager(["ENV_A"])
     ids = list(range(10))
 
-    sample_counts = {("chal_hk", "chal_rev"): 7, ("champ_hk", "champ_rev"): 9}
+    sample_counts = {
+        ("chal_hk", "chal_rev"): 7,
+        ("champ_hk", "champ_rev"): 9,
+        ("pre_hk", "pre_rev"): 4,
+    }
 
-    def _make_sc(battle):
+    def _make_sc(battle, *, predeployed=()):
         class _SC:
             async def get_param_value(_self, name, default=None):
                 return {
-                    "current_task_ids": {"task_ids": {"ENV_A": ids},
-                                         "refreshed_at_block": 1},
-                    "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
+                    "current_task_ids": {
+                        "task_ids": {"ENV_A": ids}, "refreshed_at_block": 1,
+                    },
+                    "champion": {
+                        "uid": 213,
+                        "hotkey": "champ_hk", "revision": "champ_rev",
+                    },
                     "current_battle": battle,
-                    "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
+                    "predeployed_challengers": list(predeployed),
+                    "environments": {
+                        "ENV_A": {"sampling": {"sampling_count": 10}},
+                    },
                 }.get(name, default)
         return _SC()
 
     class _Samples:
-        async def count_samples_for_tasks(self, hotkey, revision, env, task_ids, *, refresh_block):
+        async def count_samples_for_tasks(
+            self, hotkey, revision, env, task_ids, *, refresh_block,
+        ):
             return sample_counts.get((hotkey, revision), 0)
 
-    # First print: challenger active, done=7. Baseline (no delta shown).
+    # Frame 1 (baseline): champion + challenger visible. No deltas.
     _asyncio.run(manager._emit_status_line(
-        _make_sc({"challenger": {"uid": 228, "hotkey": "chal_hk", "revision": "chal_rev"}}),
+        _make_sc({"challenger": {
+            "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
+        }}),
         _Samples(),
     ))
-    assert manager._last_subject_key == ("challenger", "chal_hk", "chal_rev")
-    assert manager._last_done["ENV_A"] == 7
+    assert manager._last_subject_set == frozenset({
+        ("champion", 213), ("challenger", 228),
+    })
+    assert manager._last_done[(213, "ENV_A")] == 9
+    assert manager._last_done[(228, "ENV_A")] == 7
 
-    # Second print: battle cleared, champion is now the active subject.
-    # Done count flips to 9 (champion's count). Without the guard, delta
-    # would be 9-7=+2 (false). With the guard, delta=0.
+    # Frame 2: pre-deployed U305 newly appears. Its done=4 is real but
+    # since it wasn't tracked last frame, its delta must be 0 (not +4).
+    # Champion / challenger keep accumulating with real deltas (here
+    # 9-9=0 and 7-7=0 because counts didn't move).
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="affine"):
-        _asyncio.run(manager._emit_status_line(_make_sc({}), _Samples()))
+        _asyncio.run(manager._emit_status_line(
+            _make_sc(
+                {"challenger": {
+                    "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
+                }},
+                predeployed=[{"challenger": {
+                    "uid": 305, "hotkey": "pre_hk", "revision": "pre_rev",
+                }}],
+            ),
+            _Samples(),
+        ))
 
     log_text = " ".join(r.message for r in caplog.records)
-    assert "[champion U213]" in log_text, "subject flipped to champion"
-    assert "+0 " in log_text or "+0\n" in log_text or log_text.endswith("+0"), (
-        f"delta on subject change must be 0, got: {log_text!r}"
+    assert "pre U305:4/10" in log_text, (
+        f"pre-deployed should print 4/10 without a +delta, got: {log_text!r}"
     )
-    assert "+2" not in log_text, "phantom cross-subject delta must be suppressed"
+    # The exact substring `+4` must NOT appear for U305 — that would be
+    # the phantom delta against an empty baseline.
+    assert "U305:4/10+4" not in log_text
+    # Frame 3: pre-deployed U305 advanced from 4 to 7. Now its delta
+    # SHOULD be +3 (it was tracked in frame 2).
+    sample_counts[("pre_hk", "pre_rev")] = 7
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="affine"):
+        _asyncio.run(manager._emit_status_line(
+            _make_sc(
+                {"challenger": {
+                    "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
+                }},
+                predeployed=[{"challenger": {
+                    "uid": 305, "hotkey": "pre_hk", "revision": "pre_rev",
+                }}],
+            ),
+            _Samples(),
+        ))
+    log_text = " ".join(r.message for r in caplog.records)
+    # Head segment uses ``done/target +delta (rate/h)``; per-env
+    # segment is more compact: ``Uxxx:done/target+delta``. Verify both
+    # — the head shows the rate, the per-env shows the per-env delta.
+    assert "pre U305:7/10 +3" in log_text, (
+        f"head segment should show +3 for pre-deployed, got: {log_text!r}"
+    )
+    assert "U305:7/10+3" in log_text, (
+        f"per-env segment should show +3 for pre-deployed, got: {log_text!r}"
+    )
+
+
+def test_status_marks_throttling_when_inflight_exceeds_cap(caplog):
+    """When ``_compute_adaptive_env_caps`` lowers an env cap, in-flight
+    tasks that started under the old cap keep draining. During that
+    transient, ``running > cap`` is normal — not a bug. The STATUS
+    line flags it with ``*`` so operators don't read it as runaway
+    dispatch."""
+    import asyncio as _asyncio
+    import logging
+
+    manager = ExecutorManager(["ENV_A"])
+    # Force the cap down to 100 while in-flight is 111 (the exact
+    # scenario operators reported).
+    manager.env_cap_values["ENV_A"].value = 100
+    manager.in_flight_values["ENV_A"].value = 111
+
+    class _SC:
+        async def get_param_value(self, name, default=None):
+            return {
+                "current_task_ids": {
+                    "task_ids": {"ENV_A": list(range(10))},
+                    "refreshed_at_block": 1,
+                },
+                "champion": {
+                    "uid": 42, "hotkey": "champ", "revision": "r1",
+                },
+                "current_battle": {},
+                "environments": {
+                    "ENV_A": {"sampling": {"sampling_count": 10}},
+                },
+            }.get(name, default)
+
+    class _Samples:
+        async def count_samples_for_tasks(self, *a, **kw):
+            return 0
+
+    with caplog.at_level(logging.INFO, logger="affine"):
+        _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
+
+    log_text = " ".join(r.message for r in caplog.records)
+    # Allow the planner to revise the cap; check for the throttling
+    # marker against whatever it landed at.
+    final_cap = manager.env_cap_values["ENV_A"].value
+    if 111 > final_cap:
+        assert f"r:111/{final_cap}*" in log_text, (
+            f"expected throttling marker for r:111/{final_cap}*, got: {log_text!r}"
+        )
+    else:
+        # Planner may have raised the cap back; nothing to assert in
+        # that case beyond the line printing.
+        assert "[STATUS]" in log_text
 
 
 def test_dispatch_proceeds_when_only_battle_has_url():

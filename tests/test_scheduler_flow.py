@@ -95,17 +95,29 @@ class _DeployTracker:
     fail_on_deploy: bool = False
     # Default: simulate a single-endpoint deployment — no spare for
     # pre-sampling. ``_predeploy_fill_spare`` stops cleanly on this
-    # ``RuntimeError`` exactly like ``_select_ssh_endpoints`` would
+    # ``NoSpareEndpoint`` exactly like ``_select_ssh_endpoints`` would
     # report under one endpoint. Tests that want pre-sample slots set
     # ``pre_challenger_slots`` to allow that many extra deploys.
     pre_challenger_slots: int = 0
     next_deployment_id: int = 0
     predeploys: List[DeployTarget] = field(default_factory=list)
+    # uids that should raise a non-NoSpareEndpoint error on pre-deploy
+    # (simulates a real ssh / docker failure). The fill loop must
+    # ``mark_terminated(FAILED)`` and advance to the next candidate.
+    predeploy_failures: set = field(default_factory=set)
 
     async def deploy(self, target: DeployTarget, role: str = "active") -> DeployResult:
         if role == "pre_challenger":
-            if len(self.predeploys) >= self.pre_challenger_slots:
+            if target.uid in self.predeploy_failures:
+                # Real deploy failure — distinct from 'no spare'. ssh.py's
+                # ``deploy`` raises generic ``RuntimeError`` on docker
+                # errors; we use that exact shape here.
                 raise RuntimeError(
+                    f"simulated ssh deploy failure for uid={target.uid}"
+                )
+            if len(self.predeploys) >= self.pre_challenger_slots:
+                from affine.src.scheduler.flow import NoSpareEndpoint
+                raise NoSpareEndpoint(
                     "no free non-primary ssh endpoint for pre_challenger"
                 )
             self.predeploys.append(target)
@@ -2448,3 +2460,73 @@ async def test_predeploy_excludes_active_battle_challenger():
     pre_uids = {p.challenger.uid for p in await state.get_predeployed_challengers()}
     assert 2 not in pre_uids
     assert pre_uids == {3}
+
+
+@pytest.mark.asyncio
+async def test_predeploy_deploy_failure_marks_failed_and_advances():
+    """A real ssh / docker deploy error during pre-deploy (distinct
+    from ``NoSpareEndpoint``) must:
+
+    1. mark the failing miner ``FAILED`` so the queue advances (mirror
+       of :meth:`_start_battle`'s deploy-failure handling), and
+    2. continue filling the remaining spare slots with the next
+       candidates — without the failure path the head-of-queue miner
+       would starve every pre-sample slot forever, since
+       ``peek_next`` re-picks the same uid each tick.
+    """
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(5, "broken", 50, revision="r5"),    # earliest, will fail
+        _make_miner(7, "fine", 200, revision="r7"),
+        _make_miner(9, "alsofine", 300, revision="r9"),
+    ])
+    deployer = _DeployTracker(
+        pre_challenger_slots=3,
+        predeploy_failures={5},  # uid=5 fails to deploy
+    )
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+
+    # uid=5 marked FAILED and out of the queue; uid=7 and uid=9 took
+    # the remaining slots.
+    assert miner_store.rows[5]["challenge_status"] == STATUS_TERMINATED
+    reason = miner_store.rows[5].get("termination_reason") or ""
+    assert "deployment_failed_predeploy" in reason
+
+    pre_uids = [p.challenger.uid for p in await state.get_predeployed_challengers()]
+    assert pre_uids == [7, 9], (
+        f"expected uid=5 failure not to starve later candidates, got {pre_uids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_predeploy_no_spare_does_not_mark_failed():
+    """``NoSpareEndpoint`` is a clean termination signal — the
+    candidate miner must NOT be marked FAILED (they're a valid
+    candidate, just no host for them right now). This is the
+    asymmetry between 'no spare' and 'real deploy error' that
+    motivated introducing ``NoSpareEndpoint`` as a distinct
+    exception class."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "queued", 50, revision="r2"),
+    ])
+    deployer = _DeployTracker()  # 0 pre-sample slots → NoSpareEndpoint
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+
+    # uid=2 was eligible but had no host. Status must stay SAMPLING.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert (await state.get_predeployed_challengers()) == []

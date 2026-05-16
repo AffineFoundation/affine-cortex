@@ -38,6 +38,7 @@ from affine.core.setup import logger
 
 from affine.src.scorer.challenger_queue import (
     ChallengerQueue,
+    OUTCOME_FAILED,
     OUTCOME_LOST,
     OUTCOME_WON,
 )
@@ -64,6 +65,22 @@ from affine.src.scorer.window_state import (
 from . import targon as targon_lifecycle
 
 
+# ---- deploy_fn contract: signaling exception -------------------------------
+
+
+class NoSpareEndpoint(RuntimeError):
+    """``deploy_fn`` raises this when the requested role has no host to
+    land on. The pre-deploy fill loop treats it as a clean termination
+    signal (stop filling); any other exception out of ``deploy_fn`` is
+    a real deploy failure and the loop marks the miner FAILED so the
+    queue can advance (symmetric with ``_start_battle``'s deploy
+    failure path).
+
+    Subclassing ``RuntimeError`` keeps backward compatibility with any
+    caller catching ``RuntimeError`` while letting the fill loop pick
+    out the structured 'no spare' case explicitly."""
+
+
 # ---- constants (no longer in system_config) --------------------------------
 
 
@@ -80,6 +97,13 @@ DEFAULT_NOT_WORSE_TOLERANCE = 0.02
 
 WIN_MIN_DOMINANT_ENVS = 1
 """Partial Pareto: at least one env must be dominant; the rest must not regress."""
+
+_PREDEPLOY_PEEK_LIMIT = 32
+"""Upper bound on candidates pulled per ``_predeploy_fill_spare`` tick.
+Sized to comfortably exceed any plausible SSH endpoint count; the real
+terminator is :exc:`NoSpareEndpoint` from ``deploy_fn``. Bounding it
+keeps a pathological queue from materialising thousands of candidates
+per tick when the host runs out of space."""
 
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
@@ -835,31 +859,44 @@ class FlowScheduler:
     ) -> None:
         """Deploy queued miners on free non-primary endpoints, FIFO.
 
-        Loop one miner at a time so each deploy gets its own
-        ``set_predeployed_challengers`` write — if any single deploy
-        fails (selector RuntimeError = no spare; ssh deploy error =
-        host issue), we keep the work already done and stop. ``RuntimeError``
-        from the selector is the natural termination signal.
+        One batch peek per tick (bounded by ``_PREDEPLOY_PEEK_LIMIT``)
+        rather than re-running ``list_valid_pending`` per attempt. Then:
+
+        * :exc:`NoSpareEndpoint` from ``deploy_fn`` (selector reports
+          no host) — stop filling; we're done for this tick.
+        * any other exception — this miner's model can't be served.
+          Mark them ``FAILED`` (symmetric with :meth:`_start_battle`'s
+          deploy-failure handling) so the queue advances, then move on
+          to the next candidate. Without this, a single broken miner
+          at the head of the queue starves every pre-sample slot
+          forever — the peek-then-deploy loop would re-pick the same
+          uid every tick.
+
+        Per-success ``set_predeployed_challengers`` writes are kept so
+        a mid-batch crash leaves consistent state for the next tick.
         """
-        while True:
-            battle = await self.state.get_battle()
-            records = await self.state.get_predeployed_challengers()
-            exclude = {p.challenger.uid for p in records}
-            if battle is not None:
-                exclude.add(battle.challenger.uid)
-            next_up = await self.queue.peek_next(
-                n=1, champion_uid=champion.uid, exclude_uids=exclude,
-            )
-            if not next_up:
-                return
-            cand = next_up[0]
+        battle = await self.state.get_battle()
+        records = await self.state.get_predeployed_challengers()
+        exclude = {p.challenger.uid for p in records}
+        if battle is not None:
+            exclude.add(battle.challenger.uid)
+        # Single batch peek. Limit is sized well above any plausible
+        # endpoint count; ``NoSpareEndpoint`` from ``deploy_fn`` is the
+        # real terminator. Each FAILED-then-continue consumes one slot
+        # from this batch — sufficient headroom for catastrophic days.
+        candidates = await self.queue.peek_next(
+            n=_PREDEPLOY_PEEK_LIMIT,
+            champion_uid=champion.uid,
+            exclude_uids=exclude,
+        )
+        for cand in candidates:
             target = targon_lifecycle.DeployTarget(
                 uid=cand.uid, hotkey=cand.hotkey,
                 model=cand.model, revision=cand.revision,
             )
             try:
                 result = await self._deploy(target, "pre_challenger")
-            except RuntimeError as e:
+            except NoSpareEndpoint as e:
                 logger.debug(
                     f"FlowScheduler: predeploy fill stopped: {e}"
                 )
@@ -867,9 +904,20 @@ class FlowScheduler:
             except Exception as e:
                 logger.error(
                     f"FlowScheduler: pre-deploy failed uid={cand.uid}: "
-                    f"{type(e).__name__}: {e}"
+                    f"{type(e).__name__}: {e} — marking FAILED so the "
+                    f"queue advances (symmetric with _start_battle)"
                 )
-                return
+                await self.queue.mark_terminated(
+                    cand.uid,
+                    OUTCOME_FAILED,
+                    reason=(
+                        f"deployment_failed_predeploy:{type(e).__name__}"
+                    ),
+                    hotkey=cand.hotkey,
+                    revision=cand.revision,
+                    model=cand.model,
+                )
+                continue
             deployments = _deployments_from_result(result)
             records.append(BattleRecord(
                 challenger=MinerSnapshot(
@@ -920,7 +968,6 @@ class FlowScheduler:
             # Used their one shot — mark FAILED so the queue doesn't keep
             # retrying a model the platform can't host. No frozen scores
             # to pass: this miner never sampled anything.
-            from affine.src.scorer.challenger_queue import OUTCOME_FAILED
             await self.queue.mark_terminated(
                 candidate.uid,
                 OUTCOME_FAILED,

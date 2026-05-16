@@ -46,7 +46,7 @@ from affine.src.scorer.window_state import (
 
 from . import ssh as ssh_lifecycle
 from . import targon as targon_lifecycle
-from .flow import FlowConfig, FlowScheduler
+from .flow import FlowConfig, FlowScheduler, NoSpareEndpoint
 
 
 NETUID = int(os.getenv("NETUID", "120"))
@@ -123,12 +123,17 @@ def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List
     if role == "pre_challenger":
         # Free non-primary endpoint. The pre-sample slot intentionally
         # cannot land on the primary — that's reserved for the active
-        # battle's champion/challenger time-share.
+        # battle's champion/challenger time-share. The structured
+        # ``NoSpareEndpoint`` (vs a generic ``RuntimeError``) lets the
+        # fill loop in ``FlowScheduler._predeploy_fill_spare`` tell
+        # 'no spare' apart from real deploy failures (e.g. ssh /
+        # docker errors that ssh_lifecycle.deploy itself raises as
+        # ``RuntimeError``).
         candidates = [
             ep for ep in endpoints[1:] if ep.assigned_uid is None
         ]
         if not candidates:
-            raise RuntimeError(
+            raise NoSpareEndpoint(
                 f"no free non-primary ssh endpoint for pre_challenger "
                 f"target_uid={target.uid}"
             )
@@ -254,6 +259,19 @@ async def _run() -> None:
         # machines exist only to pre-sample queued miners on free
         # non-primary endpoints — they never host an active battle. So
         # the flag is True for ssh under all ``len(active)`` values.
+        #
+        # Trade-off vs the pre-PR multi-endpoint policy (champion on
+        # N-1 hosts, challenger on 1 host, no pre-sampling): the new
+        # policy gives up "champion never redeploys" — under
+        # single-instance the primary is torn down at every battle
+        # start, so champion pays a ~2-minute redeploy cost per
+        # battle. In exchange the other N-1 hosts run pre-samples in
+        # parallel and the next battle can decide on tick-after-promotion
+        # without waiting for samples. Net win when the queue is
+        # steadily non-empty; baseline cost when it's not. The fix for
+        # 'pre-sampled miner adopted into battle still has to redeploy
+        # on primary' is to swap primary identity at adoption time —
+        # not implemented here, a known follow-up.
         flow_config = FlowConfig(single_instance_provider=True)
         targon_client = None
         logger.info(

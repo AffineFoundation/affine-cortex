@@ -45,6 +45,21 @@ def _as_uid(raw: Any) -> Optional[int]:
         return None
 
 
+def _make_subject(
+    kind: str, raw: Any,
+) -> Optional[tuple]:
+    """Identity tuple for a STATUS-tracked miner, or ``None`` when the
+    state row is missing/malformed. Shape:
+    ``(kind, uid_or_None, hotkey, revision)``."""
+    if not isinstance(raw, dict):
+        return None
+    hk = raw.get("hotkey")
+    rev = raw.get("revision")
+    if not hk or not rev:
+        return None
+    return (kind, _as_uid(raw.get("uid")), str(hk), str(rev))
+
+
 class ExecutorManager:
     def __init__(
         self,
@@ -73,17 +88,18 @@ class ExecutorManager:
             env: self.mp_ctx.Value("i", initial_cap, lock=False) for env in envs
         }
         self.workers: List[WorkerProcess] = []
-        # Per-env running totals from the prior status print, used to
-        # compute "finished in last interval" + rate/h.
+        # Per-(uid, env) done counters from the prior status print, used
+        # to compute "finished in last interval" + rate/h. Keyed by uid
+        # (not by role) so promotion/demotion doesn't reset the delta —
+        # the same model keeps accumulating, only its label flips.
         self._last_status_at: float = 0.0
-        self._last_done: Dict[str, int] = {env: 0 for env in envs}
-        # (kind, hotkey, revision) of the subject the previous status was
-        # reporting. When it changes between two ticks (challenger lost →
-        # role flips to champion, or new challenger picked), the per-env
-        # delta would otherwise be `current_subject_count - prior_subject_count`
-        # — a meaningless cross-miner subtraction — so we zero deltas for
-        # one frame.
-        self._last_subject_key: Optional[tuple] = None
+        self._last_done: Dict[tuple, int] = {}
+        # Set of (kind, uid) pairs visible in the previous frame. A
+        # subject newly appearing this frame gets its per-env delta
+        # zeroed for one tick — otherwise we'd subtract its current
+        # done from a non-existent baseline. Removed subjects get their
+        # ``_last_done`` keys garbage-collected to keep the dict bounded.
+        self._last_subject_set: frozenset = frozenset()
         self.running = False
         logger.info(
             f"ExecutorManager init: envs={envs}, "
@@ -149,14 +165,17 @@ class ExecutorManager:
         value.value = 0
 
     async def _status_printer(self) -> None:
-        """Periodic ``[STATUS]`` line in the legacy executor's format.
+        """Periodic ``[STATUS]`` line — one row per active uid.
 
-        Reads done counts from ``sample_results`` for the champion and,
-        during battles, the challenger. Per-env in-flight comes from the
-        shared ``in_flight_values`` Values. Format:
-
-            [STATUS] running=N/GLOBAL_DISPATCH_BUDGET | env@done/target +delta in Xs rate:Y/h
-                run:R | env2@... | total +D in Xs rate:Y/h
+        With the pre-deployed-challenger feature, multiple miners can be
+        accumulating samples concurrently (champion on primary, current
+        battle's challenger on primary time-share, and one queued miner
+        per non-primary endpoint). Reporting only the "active" subject
+        like the legacy single-uid format did was misleading — operators
+        couldn't tell which model produced which slice of the 365
+        in-flight slots. We now emit a per-subject head segment plus a
+        per-env breakdown with each subject's done/target/+delta tagged
+        by uid.
 
         First print after start is the baseline (delta+rate omitted).
         """
@@ -182,126 +201,118 @@ class ExecutorManager:
         tids = await sc.get_param_value("current_task_ids") or {}
         champion = await sc.get_param_value("champion") or {}
         battle = await sc.get_param_value("current_battle") or {}
-        envs_raw = await sc.get_param_value("environments", default={}) or {}
-        task_ids_by_env: Dict[str, List[int]] = tids.get("task_ids", {}) or {}
+        predeployed = await sc.get_param_value("predeployed_challengers") or []
+        envs_raw = await sc.get_param_value("environments") or {}
+        task_ids_by_env: Dict[str, List[int]] = tids.get("task_ids") or {}
         refresh_block = int(tids.get("refreshed_at_block", 0) or 0)
-        # subjects: (kind, uid, hotkey, revision). uid is carried so the
-        # STATUS label can disambiguate "[champion U213]" vs the new
-        # challenger UID — operators were misreading the role-only label
-        # as identity.
-        subjects: List[tuple[str, Optional[int], str, str]] = []
-        if champion.get("hotkey") and champion.get("revision"):
-            subjects.append((
-                "champion",
-                _as_uid(champion.get("uid")),
-                str(champion["hotkey"]),
-                str(champion["revision"]),
-            ))
-        challenger = battle.get("challenger") if isinstance(battle, dict) else None
-        if (
-            isinstance(challenger, dict)
-            and challenger.get("hotkey")
-            and challenger.get("revision")
-        ):
-            pair = (
-                "challenger",
-                _as_uid(challenger.get("uid")),
-                str(challenger["hotkey"]),
-                str(challenger["revision"]),
-            )
-            if pair not in subjects:
-                subjects.append(pair)
+
+        # Subjects in display order: champion → battle challenger →
+        # pre-deployed (FIFO). ``_make_subject`` drops malformed rows.
+        subjects: List[tuple] = []
+        battle_chal = battle.get("challenger") if isinstance(battle, dict) else None
+        candidate_rows = [
+            ("champion", champion),
+            ("challenger", battle_chal),
+        ] + [
+            ("pre_challenger", r.get("challenger") if isinstance(r, dict) else None)
+            for r in predeployed
+        ]
+        for kind, raw in candidate_rows:
+            subj = _make_subject(kind, raw)
+            if subj is not None and subj not in subjects:
+                subjects.append(subj)
 
         now = _t.time()
-        elapsed_s = max(1, int(now - self._last_status_at)) if self._last_status_at else 0
-        in_flight_total = 0
-        total_done = 0
-        total_target = 0
-        total_delta = 0
-        env_stats: Dict[str, Dict[str, int]] = {}
-        rows: Dict[str, Dict[str, Any]] = {}
-
-        # Display the currently-sampling miner's progress only:
-        #   no battle → champion (still ramping samples)
-        #   battle in flight → challenger (champion already done by definition)
-        # Cumulative champion+challenger numbers are misleading once
-        # champion is finished — operators want to see how close the
-        # challenger is to ``sampling_count`` so they can predict decide.
-        active_kind: Optional[str] = None
-        active_uid: Optional[int] = None
-        active_subject_key: Optional[tuple] = None
-        for kind, uid, hk, rev in subjects:
-            if kind == "challenger":
-                active_kind = "challenger"
-                active_uid = uid
-                active_subject_key = (kind, hk, rev)
-                break
-        if active_kind is None and subjects:
-            kind, uid, hk, rev = subjects[0]  # champion phase
-            active_kind = kind
-            active_uid = uid
-            active_subject_key = (kind, hk, rev)
-
-        # The subject changed when the role+identity tuple differs from the
-        # previous status print. On the first frame after a change, zero
-        # deltas so we don't subtract one miner's count from another's.
-        subject_changed = (
-            self._last_subject_key is not None
-            and active_subject_key is not None
-            and active_subject_key != self._last_subject_key
+        elapsed_s = (
+            max(1, int(now - self._last_status_at))
+            if self._last_status_at else 0
         )
+
+        # Track which (kind, uid) pairs are visible this frame so we can
+        # zero deltas for newcomers and GC ``_last_done`` for departures.
+        current_subject_set = frozenset(
+            (kind, uid) for kind, uid, _hk, _rev in subjects
+        )
+        newcomer_set = current_subject_set - self._last_subject_set
+
+        in_flight_total = 0
+        env_stats: Dict[str, Dict[str, int]] = {}
+        # Per-env, per-subject snapshot used by both the cap planner
+        # (combined) and the displayed per-env breakdown.
+        per_env_subject: Dict[str, Dict[tuple, Dict[str, int]]] = {}
+        # Per-subject aggregate across envs for the head segment.
+        subject_totals: Dict[tuple, Dict[str, int]] = {
+            (kind, uid): {"done": 0, "target": 0, "delta": 0}
+            for kind, uid, _hk, _rev in subjects
+        }
 
         for env in sorted(self.envs):
             ids = task_ids_by_env.get(env, []) or []
             sampling_count = _sampling_count_for_env(envs_raw, env, len(ids))
-            subject_targets = {
+            # Per-role target. Champion samples the full oversampled
+            # pool; current challenger and pre-deployed both gate on
+            # ``sampling_count`` (the overlap threshold the comparator
+            # needs).
+            subject_target = {
                 "champion": len(ids),
                 "challenger": min(len(ids), sampling_count),
+                "pre_challenger": min(len(ids), sampling_count),
             }
-            # Per-subject done (used for adaptive cap math + the displayed
-            # active-subject row).
-            per_done: Dict[str, int] = {}
+            running = int(self.in_flight_values[env].value)
+            in_flight_total += running
+            per_subject_row: Dict[tuple, Dict[str, int]] = {}
+            combined_done = 0
+            combined_target = 0
+            combined_delta = 0
             if ids and subjects and refresh_block:
-                for kind, _uid, hk, rev in subjects:
+                for kind, uid, hk, rev in subjects:
+                    target = subject_target.get(kind, 0)
                     try:
-                        count = await samples.count_samples_for_tasks(
+                        raw = await samples.count_samples_for_tasks(
                             hk, rev, env, ids, refresh_block=refresh_block,
                         )
-                        per_done[kind] = min(count, subject_targets[kind])
                     except Exception as e:
-                        logger.debug(f"status count failed for {env}: {e}")
-                        per_done[kind] = 0
-            target = subject_targets.get(active_kind, 0) if active_kind else 0
-            done = per_done.get(active_kind, 0) if active_kind else 0
-            running = int(self.in_flight_values[env].value)
-            if subject_changed:
-                delta = 0
-            else:
-                prev = self._last_done.get(env, 0)
-                delta = max(0, done - prev) if self._last_status_at else 0
-            # Adaptive cap math still uses the combined (champ + chal) target
-            # and per-cycle delta so an env that finished one subject doesn't
-            # look "complete" from the cap planner's POV while the other
-            # subject still has work.
-            combined_target = sum(subject_targets[k] for k, _uid, _hk, _rev in subjects)
-            combined_done = sum(per_done.get(k, 0) for k, _uid, _hk, _rev in subjects)
+                        logger.debug(
+                            f"status count failed for {env} U{uid}: {e}"
+                        )
+                        raw = 0
+                    done = min(int(raw), target)
+                    key = (kind, uid)
+                    prev = self._last_done.get((uid, env), 0)
+                    if (
+                        not self._last_status_at
+                        or key in newcomer_set
+                    ):
+                        delta = 0
+                    else:
+                        delta = max(0, done - prev)
+                    per_subject_row[key] = {
+                        "done": done,
+                        "target": target,
+                        "delta": delta,
+                    }
+                    self._last_done[(uid, env)] = done
+                    combined_done += done
+                    combined_target += target
+                    combined_delta += delta
+                    tot = subject_totals[key]
+                    tot["done"] += done
+                    tot["target"] += target
+                    tot["delta"] += delta
+            per_env_subject[env] = per_subject_row
             env_stats[env] = {
                 "target": combined_target,
                 "done": combined_done,
                 "running": running,
-                "delta": delta,
+                "delta": combined_delta,
             }
-            rows[env] = {
-                "target": target,
-                "done": done,
-                "running": running,
-                "delta": delta,
-            }
-            self._last_done[env] = done
-            in_flight_total += running
-            total_done += done
-            total_target += target
-            total_delta += delta
+
+        # GC ``_last_done`` entries for uids that left this frame, so the
+        # dict stays bounded across many battles / pre-deploy churn.
+        live_uids = {uid for _kind, uid in current_subject_set}
+        self._last_done = {
+            k: v for k, v in self._last_done.items() if k[0] in live_uids
+        }
 
         new_caps = _compute_adaptive_env_caps(
             self.envs,
@@ -316,47 +327,80 @@ class ExecutorManager:
         for env, cap in new_caps.items():
             self.env_cap_values[env].value = cap
 
-        per_env_parts: List[str] = []
-        for env in sorted(self.envs):
-            row = rows[env]
-            done = int(row["done"])
-            target = int(row["target"])
-            running = int(row["running"])
-            delta = int(row["delta"])
-            rate_per_h = (delta / elapsed_s * 3600) if (elapsed_s and delta) else 0
-            short = env.split(":")[-1].split("-")[0].lower()
-            cap = int(self.env_cap_values[env].value)
-            if self._last_status_at:
-                per_env_parts.append(
-                    f"{short}@{done}/{target} +{delta} "
-                    f"rate:{rate_per_h:.0f}/h run:{running}/{cap}"
+        # ---- assemble output --------------------------------------
+        head_parts: List[str] = []
+        for kind, uid, _hk, _rev in subjects:
+            tot = subject_totals[(kind, uid)]
+            kc = _kind_short(kind)
+            done = tot["done"]
+            target = tot["target"]
+            delta = tot["delta"]
+            rate = (
+                int(delta / elapsed_s * 3600)
+                if (elapsed_s and delta) else 0
+            )
+            uid_str = f"U{uid}" if uid is not None else "U?"
+            if self._last_status_at and (delta or rate):
+                head_parts.append(
+                    f"{kc} {uid_str}:{done}/{target} +{delta} ({rate}/h)"
                 )
             else:
-                per_env_parts.append(f"{short}@{done}/{target} run:{running}/{cap}")
+                head_parts.append(f"{kc} {uid_str}:{done}/{target}")
 
-        total_rate = (total_delta / elapsed_s * 3600) if (elapsed_s and total_delta) else 0
-        if active_kind and active_uid is not None:
-            kind_label = f"[{active_kind} U{active_uid}]"
-        elif active_kind:
-            kind_label = f"[{active_kind}]"
-        else:
-            kind_label = ""
-        if self._last_status_at:
-            head = (
-                f"[STATUS] {kind_label} "
-                f"running={in_flight_total}/{GLOBAL_DISPATCH_BUDGET} | "
-                f"done={total_done}/{total_target} +{total_delta} in {elapsed_s}s "
-                f"rate:{total_rate:.0f}/h"
-            )
-        else:
-            head = (
-                f"[STATUS] {kind_label} "
-                f"running={in_flight_total}/{GLOBAL_DISPATCH_BUDGET} | "
-                f"done={total_done}/{total_target} (baseline)"
-            )
-        logger.info(f"{head} | " + " | ".join(per_env_parts))
+        per_env_parts: List[str] = []
+        for env in sorted(self.envs):
+            running = env_stats[env]["running"]
+            cap = int(self.env_cap_values[env].value)
+            short = env.split(":")[-1].split("-")[0].lower()
+            # ``*`` flags adaptive-cap throttling — in-flight exceeds the
+            # current cap because the cap was lowered after dispatch.
+            # Existing calls drain naturally; no new dispatch is admitted
+            # until in_flight < cap. Not a bug.
+            cap_mark = "*" if running > cap else ""
+            row_parts = [f"{short} r:{running}/{cap}{cap_mark}"]
+            row = per_env_subject.get(env, {})
+            for kind, uid, _hk, _rev in subjects:
+                cell = row.get((kind, uid))
+                if cell is None:
+                    continue
+                uid_str = f"U{uid}" if uid is not None else "U?"
+                done = cell["done"]
+                target = cell["target"]
+                delta = cell["delta"]
+                if delta > 0:
+                    row_parts.append(
+                        f"{uid_str}:{done}/{target}+{delta}"
+                    )
+                else:
+                    row_parts.append(f"{uid_str}:{done}/{target}")
+            per_env_parts.append(" ".join(row_parts))
+
+        suffix = f" in {elapsed_s}s" if self._last_status_at else " (baseline)"
+        head_main = (
+            f"[STATUS] running={in_flight_total}/"
+            f"{GLOBAL_DISPATCH_BUDGET}{suffix}"
+        )
+        logger.info(" | ".join([head_main, *head_parts, *per_env_parts]))
+
         self._last_status_at = now
-        self._last_subject_key = active_subject_key
+        self._last_subject_set = current_subject_set
+
+
+def _kind_short(kind: str) -> str:
+    """Short label for STATUS rows. Full-word abbreviations rather than
+    single letters — single-letter labels (esp. ``H`` for challenger)
+    weren't readable at a glance.
+
+    * ``champ`` — the current crown holder.
+    * ``chal``  — the current battle's challenger, time-sharing the
+      primary endpoint with the champion.
+    * ``pre``   — a pre-deployed challenger: queued miner accumulating
+      baseline samples on a spare non-primary endpoint."""
+    return {
+        "champion": "champ",
+        "challenger": "chal",
+        "pre_challenger": "pre",
+    }.get(kind, "?")
 
 
 async def _enabled_envs() -> List[str]:
