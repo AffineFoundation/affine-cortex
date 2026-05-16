@@ -1142,6 +1142,13 @@ class ForwardWorker:
                 continue
             if not blob:
                 continue
+            # Strip the resp_top matrix (~10× the resp_lp footprint —
+            # 137k positions × top-K × 2 ints per rollout) before the
+            # blob enters peer_scores. resp_top only feeds the
+            # ``top1_match`` diagnostic, which the verdict rule doesn't
+            # consult; keeping it would OOM the worker for ~90 peers.
+            for ro in (blob.get("per_rollout") or []):
+                ro.pop("resp_top", None)
             blob["first_block"] = row_first_block
             peer_scores.append(blob)
 
