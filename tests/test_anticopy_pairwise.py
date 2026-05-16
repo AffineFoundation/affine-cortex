@@ -6,6 +6,7 @@ from affine.src.anticopy.pairwise import (
     compare_scores,
     detect_copies,
     is_copy_verdict,
+    sparsify_rollout,
 )
 
 
@@ -41,33 +42,30 @@ def test_pairwise_matches_only_shared_rollout_keys():
     assert res.per_env == {}
 
 
-def test_pairwise_identical_scores_yield_zero_nll():
+def test_pairwise_identical_scores_yield_zero_decision_median():
+    """Sparse format: only positions below the decision cutoff (lp < -0.5)
+    contribute. Position 1 (-0.7) is the only decision position; A and B
+    agree there → gap 0."""
     a = _score("A", [_rollout("k1", "CDE", [-0.5, -0.7, -0.1])])
     b = _score("B", [_rollout("k1", "CDE", [-0.5, -0.7, -0.1])])
     res = compare_scores(a, b)
     assert res.n_overlap_rollouts == 1
-    assert res.n_overlap_tokens == 3
-    assert res.per_env["CDE"].nll_median == 0.0
-    assert res.per_env["CDE"].nll_mean == 0.0
+    assert res.n_overlap_tokens == 1          # only the decision pos counts
+    assert res.per_env["CDE"].decision_median == 0.0
+    assert res.per_env["CDE"].decision_n == 1
 
 
-def test_pairwise_skips_none_positions():
-    """``None`` logprobs (e.g. masked-out tokens) drop from the diff."""
-    a = _score("A", [_rollout("k1", "CDE", [-0.5, None, -0.1])])
-    b = _score("B", [_rollout("k1", "CDE", [-0.5, -0.7, -0.1])])
+def test_pairwise_union_of_decision_positions():
+    """Decision positions = union of both sides' uncertain spots; the
+    missing side's lp is approximated as 0 (the model was confident
+    there)."""
+    # A's decision pos: idx 1 (-0.7). B's decision pos: idx 2 (-0.8).
+    a = _score("A", [_rollout("k", "CDE", [-0.1, -0.7, -0.1])])
+    b = _score("B", [_rollout("k", "CDE", [-0.1, -0.1, -0.8])])
     res = compare_scores(a, b)
-    assert res.n_overlap_tokens == 2          # the None pos was dropped
-
-
-def test_pairwise_top1_match_rate():
-    a_top = [[[-0.3, 1]], [[-0.4, 2]]]
-    b_top_same = [[[-0.3, 1]], [[-0.4, 2]]]
-    b_top_one_diff = [[[-0.3, 1]], [[-0.4, 99]]]
-    a = _score("A", [_rollout("k", "CDE", [0.0, 0.0], top=a_top)])
-    b1 = _score("B", [_rollout("k", "CDE", [0.0, 0.0], top=b_top_same)])
-    b2 = _score("C", [_rollout("k", "CDE", [0.0, 0.0], top=b_top_one_diff)])
-    assert compare_scores(a, b1).per_env["CDE"].top1_match == 1.0
-    assert compare_scores(a, b2).per_env["CDE"].top1_match == 0.5
+    # Union = {1, 2}. At 1: A=-0.7, B≈0 → gap=0.7. At 2: A≈0, B=-0.8 → gap=0.8
+    assert res.per_env["CDE"].decision_n == 2
+    assert abs(res.per_env["CDE"].decision_median - 0.75) < 1e-6   # median(0.7,0.8)
 
 
 # ------------------------------------------------------------ verdict
@@ -117,7 +115,7 @@ def test_verdict_combined_median_pools_across_envs():
     )
     # Decision-position gaps pooled across envs: [0, 0, 0.8, 0.8]
     # → combined median = 0.4. agreement_ratio is now ignored.
-    assert abs(res.decision_median_combined - 0.4) < 1e-9
+    assert abs(res.decision_median_combined - 0.4) < 1e-6
     assert not is_copy_verdict(res, nll_threshold=0.04)
     # When the threshold is moved above the combined, verdict flips.
     assert is_copy_verdict(res, nll_threshold=0.5)
@@ -274,11 +272,10 @@ def test_decision_median_ignores_trivial_positions():
         _score("B", [_rollout("k", "CDE", b_lp)]),
     )
     ec = res.per_env["CDE"]
-    # All-positions median is dragged to 0 by the 9 identical trivial tokens
-    assert ec.nll_median == 0.0
-    # But the decision-position metric isolates the diverging token
+    # Trivial positions never enter the decision metric in the first
+    # place — sparse format only stores positions where lp < CUTOFF.
     assert ec.decision_n == 1
-    assert abs(ec.decision_median - 1.5) < 1e-9
+    assert abs(ec.decision_median - 1.5) < 1e-6
     # → not a copy under the new metric (1.5 ≫ 0.05)
     assert not is_copy_verdict(res, nll_threshold=0.05, agreement_ratio=0.5)
 
@@ -291,7 +288,11 @@ def test_decision_metric_no_uncertain_positions_means_no_copy():
         _score("A", [_rollout("k", "CDE", [-0.01, -0.02, -0.03])]),
         _score("B", [_rollout("k", "CDE", [-0.01, -0.02, -0.03])]),
     )
-    assert res.per_env["CDE"].decision_n == 0
+    # Neither side has decision positions; the rollout contributes no
+    # gaps, so per_env stays empty and the combined median is the
+    # "no evidence" sentinel.
+    assert res.per_env == {}
+    assert res.decision_median_combined == -1.0
     assert not is_copy_verdict(res, nll_threshold=0.05, agreement_ratio=0.5)
 
 
@@ -347,3 +348,46 @@ def test_detect_copies_per_env_from_closest_when_no_winner():
     assert dec.copy_of_hotkey == ""
     # Closest-pair's per-env survived even without a winner.
     assert dec.decision_per_env.get("CDE", -1) > 0.05
+
+
+# ------------------------------------------------------------ sparse v3 format
+
+
+def test_compare_scores_accepts_v3_sparse_rollout_directly():
+    """A v3 rollout (``decision_positions`` + ``decision_lps``) compares
+    bit-for-bit identically to the v2 dense form it was derived from."""
+    dense_a = _rollout("k", "CDE", [-0.1, -0.7, -0.1, -1.2, -0.2])
+    dense_b = _rollout("k", "CDE", [-0.1, -0.7, -0.1, -1.5, -0.2])
+    sparse_a = sparsify_rollout(dense_a)
+    sparse_b = sparsify_rollout(dense_b)
+    # v3 carries ONLY decision_positions / decision_lps for the per-rollout
+    # payload — resp_lp / resp_top must be absent so the on-disk blob shrinks.
+    assert "resp_lp" not in sparse_a
+    assert "resp_top" not in sparse_a
+    assert sparse_a["decision_positions"] == [1, 3]
+    # float32 round-trip, exact equality unsafe — compare with tolerance
+    assert all(
+        abs(got - exp) < 1e-5
+        for got, exp in zip(sparse_a["decision_lps"], [-0.7, -1.2])
+    )
+
+    a_score = _score("A", [dense_a])
+    b_score = _score("B", [dense_b])
+    a_score_sparse = _score("A", [sparse_a])
+    b_score_sparse = _score("B", [sparse_b])
+
+    dense_res = compare_scores(a_score, b_score)
+    sparse_res = compare_scores(a_score_sparse, b_score_sparse)
+    mixed_res = compare_scores(a_score_sparse, b_score)        # v3 vs v2
+    assert abs(sparse_res.decision_median_combined - dense_res.decision_median_combined) < 1e-6
+    assert abs(mixed_res.decision_median_combined - dense_res.decision_median_combined) < 1e-6
+
+
+def test_sparsify_rollout_is_idempotent():
+    rollout = _rollout("k", "CDE", [-0.1, -0.7, -0.1])
+    once = sparsify_rollout(rollout)
+    twice = sparsify_rollout(once)
+    assert twice is once or (
+        twice["decision_positions"] == once["decision_positions"]
+        and twice["decision_lps"] == once["decision_lps"]
+    )

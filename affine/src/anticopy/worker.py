@@ -54,7 +54,10 @@ from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 
 # Worker no longer runs verdict — VerdictBackfillService in the
-# anticopy-refresh container owns that pipeline now.
+# anticopy-refresh container owns that pipeline now. The only pairwise
+# helper still needed here is the sparsifier that shrinks the score
+# blob before it goes to R2.
+from affine.src.anticopy.pairwise import sparsify_rollout
 from affine.src.anticopy.r2 import AntiCopyR2
 from affine.src.anticopy.threshold import (
     AntiCopyConfig,
@@ -384,14 +387,16 @@ class ForwardWorker:
                 f"{len(per_rollout)}/{len(rollouts)} rollouts in {time.time()-t0:.1f}s"
             )
 
-            # 4) Persist score blob + index row.
-            # ``ceac.score/v2`` indicates the logprobs were produced against
-            # a v2 (full-trajectory + assistant_mask) rollout — i.e. the
-            # resp_lp covers only the masked assistant tokens, not the
-            # entire response array of the older v1 path. The on-disk shape
-            # of per_rollout is the same as v1, but the semantics differ.
+            # 4) Sparsify and persist. ``ceac.score/v3`` carries only
+            # decision positions (where self.lp < CUTOFF) — ~5% of the
+            # original token count. This is the only data the verdict
+            # math reads, so dropping the rest shrinks the on-disk blob
+            # and the backfill service's in-memory peer cache ~20×.
+            # resp_top is dropped entirely; it only fed the diagnostic
+            # ``top1_match`` field which no longer exists.
+            per_rollout = [sparsify_rollout(r) for r in per_rollout]
             score_payload = {
-                "schema": "ceac.score/v2",
+                "schema": "ceac.score/v3",
                 "hotkey": hotkey,
                 "revision": revision,
                 "model": model,

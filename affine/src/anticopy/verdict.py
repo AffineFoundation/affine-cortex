@@ -33,9 +33,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from affine.core.setup import logger
 from affine.database.dao.anticopy import AntiCopyScoresIndexDAO
 from affine.database.dao.system_config import SystemConfigDAO
+import numpy as np
+
 from affine.src.anticopy.pairwise import (
     CopyDecision,
     PairResult,
+    _normalize_rollout,
     _per_env_decision_medians,
     compare_scores,
     is_copy_verdict,
@@ -48,13 +51,34 @@ from affine.src.anticopy.threshold import (
 )
 
 
-def _strip_resp_top(blob: Dict[str, Any]) -> Dict[str, Any]:
-    """``resp_top`` is the per-position top-K matrix and is ~10× the
-    resp_lp footprint per rollout. It only feeds the diagnostic
-    ``top1_match`` field — the verdict rule never reads it — so
-    drop it on the way in."""
+def _normalize_blob_for_cache(blob: Dict[str, Any]) -> Dict[str, Any]:
+    """Replace each ``per_rollout`` entry with a sparse-numpy form so
+    the in-memory peer cache stays tiny.
+
+    Three layouts may arrive from R2:
+
+    * v3 sparse (``decision_positions`` + ``decision_lps``): convert
+      both to numpy and keep ONLY those fields per rollout. ~5% of
+      the original token count.
+    * v2 dense (``resp_lp``, sometimes ``resp_top``): derive decision
+      positions from ``resp_lp < CUTOFF`` on the fly, drop the rest.
+    * Legacy/partial: anything else is preserved as a best-effort but
+      contributes no gaps.
+
+    After this pass every rollout dict contains only ``rollout_key``,
+    ``env``, ``decision_positions`` (np.int32) and ``decision_lps``
+    (np.float32) — the only fields :func:`compare_scores` consults.
+    """
+    new_per_rollout = []
     for ro in (blob.get("per_rollout") or []):
-        ro.pop("resp_top", None)
+        pos, lp = _normalize_rollout(ro)
+        new_per_rollout.append({
+            "rollout_key": ro.get("rollout_key"),
+            "env": ro.get("env", ""),
+            "decision_positions": pos,        # np.int32
+            "decision_lps": lp,               # np.float32
+        })
+    blob["per_rollout"] = new_per_rollout
     return blob
 
 
@@ -207,7 +231,7 @@ class VerdictBackfillService:
                 continue
             if not blob:
                 continue
-            _strip_resp_top(blob)
+            _normalize_blob_for_cache(blob)
             blob["first_block"] = int(row.get("first_block", 0) or 0)
             peer_cache[(row.get("hotkey", ""), row.get("revision", ""))] = blob
 

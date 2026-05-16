@@ -6,40 +6,67 @@ produced by the forward worker). Each entry is keyed by
 ``rollout_key`` (``{champion_hotkey}#{env}#{task_id}``) so the
 intersection is naturally apple-to-apple — different miners scored on
 the same prompt.
+
+Sparse format (``ceac.score/v3``):
+
+  Per-rollout entries carry only the **decision positions** —
+  positions where the scoring model's own top-1 logprob fell below
+  ``DECISION_LOGP_CUTOFF`` (i.e. tokens that model was uncertain
+  about). All other positions are dropped at upload time, since the
+  verdict math only looks at decision-position |Δlogp| anyway.
+
+  This drops the per-blob in-memory footprint ~20× vs storing the
+  full per-position resp_lp array (~8 k uncertain positions out of
+  ~137 k total in production).
+
+  Legacy ``ceac.score/v2`` blobs carry full ``resp_lp`` lists; they
+  are auto-converted to sparse on the fly via :func:`_normalize_rollout`.
+
+The pair median is computed over the **union** of the two sides'
+decision positions; positions present in only one side are treated as
+``lp ≈ 0`` on the missing side (the model was confident there). The
+approximation error per position is bounded by
+``|DECISION_LOGP_CUTOFF| = 0.5``, which the median absorbs.
 """
 
 from __future__ import annotations
 
-import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 
-# A ``rollout`` inside the score blob is shaped like::
+
+# Cutoff: a token position counts as "decision" only when the scoring
+# model's logprob on the ground-truth token is below this value (~ top-1
+# probability ≲ 0.6). Trivial-prediction positions (lp ≈ 0, model 99%+
+# sure) are excluded — every Qwen3 fine-tune agrees on them, so they
+# would otherwise pin every median to ~0 and mask real divergence.
+DECISION_LOGP_CUTOFF = -0.5
+_DECISION_LOGP_CUTOFF = DECISION_LOGP_CUTOFF        # back-compat alias
+
+
+# A v3 rollout inside the score blob is shaped like::
 #   {
 #     "rollout_key": "<hk>#<env>#<task_id>",
 #     "env": "CDE",
-#     "resp_lp":  [float, ...]                     # per-token logprob
-#     "resp_top": [[[lp, tid], ...], ...]          # optional top-K per pos
+#     "n_tokens": 4426,                         # original total tokens (info)
+#     "decision_positions": [int, ...],         # positions where lp < cutoff
+#     "decision_lps":       [float, ...],       # corresponding lps
 #   }
+# A v2 rollout carries the full ``resp_lp: [float, ...]`` instead;
+# _normalize_rollout sparsifies it on the fly.
 
 
 @dataclass
 class EnvCompare:
+    """Per-env pairwise summary. The verdict rule only reads
+    ``decision_median``; ``decision_n`` lets operators tell apart
+    "no signal" (decision_n == 0) from "low signal" (decision_n small)
+    when diagnosing edge cases."""
     env: str
-    n_tokens: int
-    nll_median: float       # median |Δlogp| over ALL positions (diagnostic)
-    nll_mean: float
-    top1_match: float       # 0..1, fraction of positions where top-1 token id agreed
-    # ``decision_median`` is the median |Δlogp| restricted to positions
-    # where the reference model's top-1 logprob was below -0.5 — i.e.
-    # tokens the reference model was genuinely uncertain about. These
-    # are the positions where weight differences actually surface; the
-    # overwhelming mass of "trivial" positions (punctuation, BOS, format
-    # tokens) where any fine-tune predicts the same thing would
-    # otherwise pin ``nll_median`` to ~0 and mask real divergence.
     decision_n: int
     decision_median: float
 
@@ -49,77 +76,117 @@ class PairResult:
     n_overlap_rollouts: int
     n_overlap_tokens: int
     per_env: Dict[str, EnvCompare]
-    # Median |Δlogp| over the union of every env's decision positions
-    # (positions where the reference model's top-1 logprob fell below
-    # ``_DECISION_LOGP_CUTOFF``). ``-1.0`` sentinel means "no env had
-    # any uncertain positions" — the pair carries no usable signal.
-    # This is the single number the verdict rule compares against
-    # ``nll_threshold`` directly.
+    # Median |Δlogp| pooled over every env's decision positions
+    # (i.e. one big bag rather than a per-env vote). ``-1.0`` means
+    # "no env produced any decision-position evidence" — the pair
+    # carries no usable signal. This is the single number
+    # ``is_copy_verdict`` compares against ``nll_threshold``.
     decision_median_combined: float = -1.0
 
 
-# Reference logprob below this threshold marks a "decision" position —
-# the model was uncertain (top1 probability ≲ 0.6), so weight changes
-# actually move which token gets picked. Trivial-prediction positions
-# (lp ≈ 0, model 99%+ sure) are excluded from the decision metric.
-_DECISION_LOGP_CUTOFF = -0.5
+# --------------------------------------------------------- format helpers
 
 
-def _per_token_diffs(
-    a_lp: List[float], b_lp: List[float],
-    a_top: Optional[List[List[List[Any]]]] = None,
-    b_top: Optional[List[List[List[Any]]]] = None,
-) -> Tuple[List[float], List[int], List[float]]:
-    """Return ``(all_gaps, top1_match, decision_gaps)``.
+def _normalize_rollout(
+    rollout: Dict[str, Any],
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return ``(positions, lps)`` as numpy arrays containing only the
+    decision positions for ``rollout``. Accepts both v3 (sparse) and
+    v2 (full ``resp_lp``) rollout dicts.
 
-    ``decision_gaps`` is the |a-b| series restricted to positions where
-    the reference (``a``) logprob is below ``_DECISION_LOGP_CUTOFF`` —
-    i.e. tokens the reference model wasn't confident about. Empirically
-    those positions carry the signal: trivial-prediction positions
-    agree across every fine-tune and would otherwise dominate the
-    overall median.
+    The arrays returned are int32 positions and float32 lps. The
+    caller may rely on positions being sorted ascending (v3 uploads
+    are written sorted; v2 ``np.flatnonzero`` is naturally sorted).
     """
-    gaps: List[float] = []
-    decision_gaps: List[float] = []
-    top1: List[int] = []
-    n = min(len(a_lp), len(b_lp))
-    for i in range(n):
-        a, b = a_lp[i], b_lp[i]
-        if a is None or b is None:
-            continue
-        g = abs(float(a) - float(b))
-        gaps.append(g)
-        if float(a) < _DECISION_LOGP_CUTOFF:
-            decision_gaps.append(g)
-        if a_top is None or b_top is None:
-            continue
-        if i >= len(a_top) or i >= len(b_top):
-            continue
-        ta, tb = a_top[i], b_top[i]
-        if ta and tb:
-            try:
-                top1.append(1 if int(ta[0][1]) == int(tb[0][1]) else 0)
-            except (IndexError, TypeError, ValueError):
-                pass
-    return gaps, top1, decision_gaps
+    pos = rollout.get("decision_positions")
+    lps = rollout.get("decision_lps")
+    if pos is not None and lps is not None:
+        pos_arr = pos if isinstance(pos, np.ndarray) else np.asarray(pos, dtype=np.int32)
+        lp_arr = lps if isinstance(lps, np.ndarray) else np.asarray(lps, dtype=np.float32)
+        return pos_arr.astype(np.int32, copy=False), lp_arr.astype(np.float32, copy=False)
+
+    resp = rollout.get("resp_lp")
+    if not resp:
+        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32))
+    # ``None`` entries (masked tokens) drop from the comparison; convert
+    # them to a value the mask can't pick up.
+    arr = np.asarray(
+        [float(x) if x is not None else 0.0 for x in resp],
+        dtype=np.float32,
+    )
+    mask = arr < DECISION_LOGP_CUTOFF
+    pos_arr = np.flatnonzero(mask).astype(np.int32)
+    lp_arr = arr[mask].astype(np.float32, copy=False)
+    return pos_arr, lp_arr
+
+
+def sparsify_rollout(rollout: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a v3 sparse rollout dict from a v2 one (or pass v3
+    through unchanged). Used by the worker at upload time so the R2
+    blob carries only decision positions instead of the full ~137 k
+    per-token logprob array — typically a ~20× shrink on disk."""
+    if "decision_positions" in rollout and "decision_lps" in rollout:
+        return rollout
+    pos, lp = _normalize_rollout(rollout)
+    return {
+        "rollout_key": rollout.get("rollout_key"),
+        "env": rollout.get("env", ""),
+        "n_tokens": rollout.get("n_tokens", 0),
+        "decision_positions": [int(x) for x in pos.tolist()],
+        "decision_lps": [float(x) for x in lp.tolist()],
+    }
+
+
+def _sparse_decision_gaps(
+    pos_a: np.ndarray, lp_a: np.ndarray,
+    pos_b: np.ndarray, lp_b: np.ndarray,
+) -> np.ndarray:
+    """Return ``|a - b|`` over the union of ``pos_a`` and ``pos_b``.
+    For positions present in only one side, the missing side's lp is
+    assumed to be ``0.0`` (the model was confident there, so its true
+    lp lies in ``[CUTOFF, 0]`` and the approximation error per
+    position is bounded by ``|CUTOFF|``)."""
+    if pos_a.size == 0 and pos_b.size == 0:
+        return np.empty(0, dtype=np.float32)
+    union = np.union1d(pos_a, pos_b)
+
+    if pos_a.size > 0:
+        a_idx = np.searchsorted(pos_a, union)
+        a_safe = np.minimum(a_idx, pos_a.size - 1)
+        a_present = pos_a[a_safe] == union
+        a_vals = np.where(a_present, lp_a[a_safe], np.float32(0.0))
+    else:
+        a_vals = np.zeros(union.size, dtype=np.float32)
+
+    if pos_b.size > 0:
+        b_idx = np.searchsorted(pos_b, union)
+        b_safe = np.minimum(b_idx, pos_b.size - 1)
+        b_present = pos_b[b_safe] == union
+        b_vals = np.where(b_present, lp_b[b_safe], np.float32(0.0))
+    else:
+        b_vals = np.zeros(union.size, dtype=np.float32)
+
+    return np.abs(a_vals - b_vals).astype(np.float32, copy=False)
+
+
+# --------------------------------------------------------- compare_scores
 
 
 def compare_scores(
-    score_a: Dict[str, Any], score_b: Dict[str, Any]
+    score_a: Dict[str, Any], score_b: Dict[str, Any],
 ) -> PairResult:
-    """Pairwise comparison over the intersection of rollout_keys.
+    """Pairwise comparison over the intersection of ``rollout_key`` s.
 
-    Returns one :class:`EnvCompare` per env that had at least one
-    overlapping rollout. Caller is responsible for applying
-    ``min_overlap`` / threshold logic."""
+    Returns one :class:`EnvCompare` per env that produced at least one
+    decision-position gap. Caller (``is_copy_verdict``) applies
+    ``min_overlap`` and ``nll_threshold``.
+    """
     by_key_b: Dict[str, Dict[str, Any]] = {}
     for r in score_b.get("per_rollout", []) or []:
         k = r.get("rollout_key")
         if k:
             by_key_b[k] = r
 
-    per_env_gaps: Dict[str, List[float]] = defaultdict(list)
-    per_env_top1: Dict[str, List[int]] = defaultdict(list)
     per_env_decision: Dict[str, List[float]] = defaultdict(list)
     n_overlap_rollouts = 0
     n_overlap_tokens = 0
@@ -130,35 +197,24 @@ def compare_scores(
         if not rb:
             continue
         env = ra.get("env") or rb.get("env") or "?"
-        gaps, top1, decision = _per_token_diffs(
-            ra.get("resp_lp") or [],
-            rb.get("resp_lp") or [],
-            ra.get("resp_top"),
-            rb.get("resp_top"),
-        )
-        if not gaps:
+        pos_a, lp_a = _normalize_rollout(ra)
+        pos_b, lp_b = _normalize_rollout(rb)
+        gaps = _sparse_decision_gaps(pos_a, lp_a, pos_b, lp_b)
+        if gaps.size == 0:
             continue
         n_overlap_rollouts += 1
-        n_overlap_tokens += len(gaps)
-        per_env_gaps[env].extend(gaps)
-        per_env_top1[env].extend(top1)
-        per_env_decision[env].extend(decision)
+        n_overlap_tokens += int(gaps.size)
+        per_env_decision[env].extend(float(g) for g in gaps.tolist())
 
     per_env: Dict[str, EnvCompare] = {}
     all_decision_gaps: List[float] = []
-    for env, gaps in per_env_gaps.items():
-        top1 = per_env_top1.get(env, [])
-        decision = per_env_decision.get(env, [])
+    for env, gaps in per_env_decision.items():
         per_env[env] = EnvCompare(
             env=env,
-            n_tokens=len(gaps),
-            nll_median=float(median(gaps)),
-            nll_mean=float(sum(gaps) / len(gaps)),
-            top1_match=(sum(top1) / len(top1)) if top1 else 0.0,
-            decision_n=len(decision),
-            decision_median=float(median(decision)) if decision else 0.0,
+            decision_n=len(gaps),
+            decision_median=float(median(gaps)) if gaps else 0.0,
         )
-        all_decision_gaps.extend(decision)
+        all_decision_gaps.extend(gaps)
 
     decision_median_combined = (
         float(median(all_decision_gaps)) if all_decision_gaps else -1.0
@@ -179,21 +235,17 @@ def is_copy_verdict(
     agreement_ratio: float = 1.0,  # noqa: ARG001 — accepted for back-compat
 ) -> bool:
     """Final verdict: ``copy`` iff the combined decision-position
-    median (every env's "uncertain" positions pooled into one bag)
+    median (every env's decision positions pooled into one bag)
     lands below ``nll_threshold``.
 
-    Pooling across envs lets the high-signal ones (NAVWORLD / TERMINAL
-    with thousands of decision tokens) anchor the verdict while low-
-    signal envs (MEMORY) blend in by their share of the union — they
-    can't single-handedly veto a copy call the way per-env voting did.
-
-    The threshold is applied to ``decision_median`` (|Δlogp| over
-    positions where the reference model was uncertain), not the
-    all-positions median: trivial-prediction tokens agree across
-    every Qwen3 fine-tune and would otherwise drag the median to ~0.
+    Pooling across envs lets high-signal envs (NAVWORLD / TERMINAL
+    with thousands of decision tokens) anchor the verdict while
+    low-signal envs (MEMORY) blend in by their share of the union —
+    they can't single-handedly veto a copy call the way per-env voting
+    did.
 
     ``agreement_ratio`` is accepted for backward-compat with callers
-    that still pass it; the verdict now comes from a single number,
+    that still pass it; the verdict comes from a single number now,
     not a per-env vote, so the ratio has no effect.
     """
     return (
