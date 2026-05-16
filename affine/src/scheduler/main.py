@@ -46,7 +46,7 @@ from affine.src.scorer.window_state import (
 
 from . import ssh as ssh_lifecycle
 from . import targon as targon_lifecycle
-from .flow import FlowConfig, FlowScheduler
+from .flow import FlowConfig, FlowScheduler, NoSpareEndpoint
 
 
 NETUID = int(os.getenv("NETUID", "120"))
@@ -100,11 +100,18 @@ def _resolve_provider_kind(active: List[object]) -> tuple:
 def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List[object]:
     """Pick SSH machines for one miner.
 
-    Policy is intentionally simple:
-    - reuse endpoints already assigned to the same miner (restart/adopt);
-    - champion gets up to N-1 free endpoints, leaving capacity for a challenger;
-    - challenger gets all remaining free endpoints;
-    - with one machine, challenger may reuse it sequentially.
+    Policy:
+    - The first endpoint in sort order is the **primary** — the only
+      one that hosts the active battle. Champion and current challenger
+      time-share the primary under single-instance semantics, so both
+      always resolve to ``[primary]``.
+    - ``pre_challenger`` (NEW) targets one **free non-primary** endpoint
+      so a queued miner can accumulate baseline samples in parallel
+      with the active battle. Pre-sampled miners NEVER occupy the
+      primary — they get torn down on promotion and redeployed on the
+      primary as the next current challenger.
+    - Already-assigned endpoints to the same miner are reused
+      (restart/adopt).
     """
     if not endpoints:
         raise RuntimeError("no active ssh endpoints")
@@ -112,23 +119,30 @@ def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List
     if matching:
         return matching
 
-    free = [ep for ep in endpoints if ep.assigned_uid is None]
-    if role == "champion":
-        if len(endpoints) == 1:
-            return [endpoints[0]]
-        desired = max(1, len(endpoints) - 1)
-        selected = free[:desired]
-    elif role == "challenger":
-        selected = free or ([endpoints[0]] if len(endpoints) == 1 else [])
-    else:
-        selected = free or endpoints
+    primary = endpoints[0]
+    if role == "pre_challenger":
+        # Free non-primary endpoint. The pre-sample slot intentionally
+        # cannot land on the primary — that's reserved for the active
+        # battle's champion/challenger time-share. The structured
+        # ``NoSpareEndpoint`` (vs a generic ``RuntimeError``) lets the
+        # fill loop in ``FlowScheduler._predeploy_fill_spare`` tell
+        # 'no spare' apart from real deploy failures (e.g. ssh /
+        # docker errors that ssh_lifecycle.deploy itself raises as
+        # ``RuntimeError``).
+        candidates = [
+            ep for ep in endpoints[1:] if ep.assigned_uid is None
+        ]
+        if not candidates:
+            raise NoSpareEndpoint(
+                f"no free non-primary ssh endpoint for pre_challenger "
+                f"target_uid={target.uid}"
+            )
+        return [candidates[0]]
 
-    if not selected:
-        raise RuntimeError(
-            f"no ssh endpoints available for role={role} "
-            f"target_uid={target.uid}"
-        )
-    return selected
+    # champion / challenger / legacy "active": battle host = primary.
+    # With single_instance semantics, primary may currently host the
+    # opposing miner; ssh_lifecycle.deploy handles the displacement.
+    return [primary]
 
 
 async def _run() -> None:
@@ -239,7 +253,26 @@ async def _run() -> None:
                 f"scheduler: no ssh endpoint owns deployment_id={deployment_id!r}"
             )
 
-        flow_config = FlowConfig(single_instance_provider=(len(active) == 1))
+        # SSH is always single-instance from the active battle's point of
+        # view: champion and current challenger time-share the primary
+        # endpoint regardless of how many machines are configured. Extra
+        # machines exist only to pre-sample queued miners on free
+        # non-primary endpoints — they never host an active battle. So
+        # the flag is True for ssh under all ``len(active)`` values.
+        #
+        # Trade-off vs the pre-PR multi-endpoint policy (champion on
+        # N-1 hosts, challenger on 1 host, no pre-sampling): the new
+        # policy gives up "champion never redeploys" — under
+        # single-instance the primary is torn down at every battle
+        # start, so champion pays a ~2-minute redeploy cost per
+        # battle. In exchange the other N-1 hosts run pre-samples in
+        # parallel and the next battle can decide on tick-after-promotion
+        # without waiting for samples. Net win when the queue is
+        # steadily non-empty; baseline cost when it's not. The fix for
+        # 'pre-sampled miner adopted into battle still has to redeploy
+        # on primary' is to swap primary identity at adoption time —
+        # not implemented here, a known follow-up.
+        flow_config = FlowConfig(single_instance_provider=True)
         targon_client = None
         logger.info(
             "scheduler: ssh control plane → "

@@ -65,18 +65,28 @@ class ChampionRecord:
 
 @dataclass
 class BattleRecord:
-    """An in-flight contest. The challenger's Targon workload only lives
-    as long as this record does.
+    """A deployed challenger.
 
-    ``previous_champion`` captures the champion's identity at the moment
-    ``_start_battle`` ran. We need this for recovery: if the scheduler
-    crashes between ``set_champion(new)`` and ``clear_battle()``, the
-    canonical champion record has already been overwritten with the
-    challenger, so we'd lose the old champion's UID/hotkey — and miss
-    marking them ``terminated`` and re-emitting weights. Optional only
-    for backward compat with battle rows written before this field
-    existed.
-    """
+    Two lifecycle states share this shape:
+
+    * **Active battle** (``current_battle``) — the challenger the
+      comparator is currently deciding on. Deployed on the primary
+      endpoint under single-instance semantics. ``previous_champion``
+      is set so crash recovery can still terminate the displaced
+      champion and re-emit weights if a tick crashes between
+      ``set_champion(new)`` and ``clear_battle()``.
+    * **Pre-deployed** (``predeployed_challengers``) — a queued miner
+      deployed onto a spare non-primary endpoint so it can accumulate
+      baseline samples in parallel with the active battle. Promotion
+      to active battle is a teardown-then-deploy on the primary;
+      sample_results survives because rows are keyed by
+      ``(hotkey, revision, env, task_id, refresh_block)``, not by host
+      or deployment id. ``previous_champion`` is ``None`` for these.
+
+    The structural identity is intentional: every dispatch / drift-check
+    / invalidation / early-loss code path treats both states identically
+    on the data side. The only divergence is bookkeeping at promotion
+    and decide time, both of which live in the scheduler."""
     challenger: MinerSnapshot
     deployment_id: str
     base_url: str
@@ -141,6 +151,7 @@ class StateStore:
 
     KEY_CHAMPION = "champion"
     KEY_BATTLE = "current_battle"
+    KEY_PREDEPLOYED = "predeployed_challengers"
     KEY_TASK_IDS = "current_task_ids"
     KEY_ENVIRONMENTS = "environments"
 
@@ -174,6 +185,36 @@ class StateStore:
 
     async def clear_battle(self) -> None:
         await self._kv.delete(self.KEY_BATTLE)
+
+    # -- pre-deployed challengers ------------------------------------------
+
+    async def get_predeployed_challengers(self) -> List[BattleRecord]:
+        """Pre-deployed challengers — queued miners loaded onto spare ssh
+        endpoints so they accumulate baseline samples in parallel with
+        the active battle. Empty list when no spare endpoints exist
+        (single-machine) or no eligible queued miners remain. Uses the
+        same :class:`BattleRecord` shape as ``current_battle`` —
+        ``previous_champion`` is ``None`` for these entries (it only
+        becomes meaningful at promotion)."""
+        raw = await self._kv.get(self.KEY_PREDEPLOYED, default=[]) or []
+        if not isinstance(raw, list):
+            return []
+        return [
+            _battle_from_dict(item)
+            for item in raw
+            if isinstance(item, dict)
+        ]
+
+    async def set_predeployed_challengers(
+        self, items: List[BattleRecord],
+    ) -> None:
+        await self._kv.set(
+            self.KEY_PREDEPLOYED,
+            [_battle_to_dict(p) for p in items],
+        )
+
+    async def clear_predeployed_challengers(self) -> None:
+        await self._kv.delete(self.KEY_PREDEPLOYED)
 
     # -- task ids -----------------------------------------------------------
 

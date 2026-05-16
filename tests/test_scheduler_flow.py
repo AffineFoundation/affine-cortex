@@ -93,10 +93,36 @@ class _DeployTracker:
     deploys: List[DeployTarget] = field(default_factory=list)
     teardowns: List[Optional[str]] = field(default_factory=list)
     fail_on_deploy: bool = False
+    # Default: simulate a single-endpoint deployment — no spare for
+    # pre-sampling. ``_predeploy_fill_spare`` stops cleanly on this
+    # ``NoSpareEndpoint`` exactly like ``_select_ssh_endpoints`` would
+    # report under one endpoint. Tests that want pre-sample slots set
+    # ``pre_challenger_slots`` to allow that many extra deploys.
+    pre_challenger_slots: int = 0
     next_deployment_id: int = 0
+    predeploys: List[DeployTarget] = field(default_factory=list)
+    # uids that should raise a non-NoSpareEndpoint error on pre-deploy
+    # (simulates a real ssh / docker failure). The fill loop must
+    # ``mark_terminated(FAILED)`` and advance to the next candidate.
+    predeploy_failures: set = field(default_factory=set)
 
     async def deploy(self, target: DeployTarget, role: str = "active") -> DeployResult:
-        self.deploys.append(target)
+        if role == "pre_challenger":
+            if target.uid in self.predeploy_failures:
+                # Real deploy failure — distinct from 'no spare'. ssh.py's
+                # ``deploy`` raises generic ``RuntimeError`` on docker
+                # errors; we use that exact shape here.
+                raise RuntimeError(
+                    f"simulated ssh deploy failure for uid={target.uid}"
+                )
+            if len(self.predeploys) >= self.pre_challenger_slots:
+                from affine.src.scheduler.flow import NoSpareEndpoint
+                raise NoSpareEndpoint(
+                    "no free non-primary ssh endpoint for pre_challenger"
+                )
+            self.predeploys.append(target)
+        else:
+            self.deploys.append(target)
         if self.fail_on_deploy:
             raise RuntimeError("simulated targon deploy failure")
         self.next_deployment_id += 1
@@ -2152,3 +2178,355 @@ async def test_no_early_invalidation_when_challenger_still_valid():
 
     assert (await state.get_battle()) is not None
     assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+# ---- pre-deployed challengers (multi-host pre-sampling) -------------------
+
+
+@pytest.mark.asyncio
+async def test_predeploy_fills_spare_endpoints_in_fifo_order():
+    """With pre-sample capacity, queued miners are pre-deployed in
+    ``(first_block, uid)`` order. Champion is excluded; the active
+    battle's challenger (if any) is also excluded."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(5, "early", 50, revision="r5"),    # earliest
+        _make_miner(7, "mid", 200, revision="r7"),
+        _make_miner(9, "late", 300, revision="r9"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=2)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)   # refresh task_ids
+    await scheduler.tick(current_block=51)   # champion deploy + predeploy
+
+    pre = await state.get_predeployed_challengers()
+    assert [p.challenger.uid for p in pre] == [5, 7]
+    # Champion was deployed once (1 entry); pre_challenger entries are
+    # tracked separately on the deployer.
+    assert [t.uid for t in deployer.predeploys] == [5, 7]
+
+
+@pytest.mark.asyncio
+async def test_predeploy_stops_cleanly_when_no_spare_endpoint():
+    """Default single-machine config (``pre_challenger_slots=0``)
+    surfaces ``RuntimeError`` on the first attempt; the scheduler must
+    bail without leaving partial state."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal", 200, revision="r2"),
+    ])
+    deployer = _DeployTracker()  # default: 0 pre-sample slots
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+
+    assert (await state.get_predeployed_challengers()) == []
+    assert deployer.predeploys == []
+
+
+@pytest.mark.asyncio
+async def test_predeploy_invalidation_sweep_tears_down_without_status_write():
+    """When a pre-deployed miner becomes invalid, the sweep tears down
+    its deployment but leaves ``challenge_status`` untouched —
+    ``invalid_reason`` on the miners row is the authoritative cause,
+    same policy as :meth:`_decide_invalidation_lost` for the active
+    battle."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(5, "early", 50, revision="r5"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=4)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    assert len(await state.get_predeployed_challengers()) == 1
+
+    # Monitor flips uid=5 to invalid.
+    miner_store.rows[5]["is_valid"] = "false"
+    pre_dep_id = (await state.get_predeployed_challengers())[0].deployment_id
+
+    await scheduler.tick(current_block=52)
+
+    assert (await state.get_predeployed_challengers()) == []
+    assert pre_dep_id in deployer.teardowns
+    # No status mutation — still in SAMPLING (or unchanged).
+    assert miner_store.rows[5]["challenge_status"] == STATUS_SAMPLING
+
+
+@pytest.mark.asyncio
+async def test_predeploy_early_loss_terminates_sure_loser():
+    """Pre-deployed miner with a definitive env regression past the
+    not_worse threshold is marked LOST + torn down before ever entering
+    the formal battle — the user's 'fail fast' semantic."""
+    kv = _seed_state(sampling_count=2)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(9, "loser", 80, revision="r9"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=4)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    # Tick 1+2: refresh + champion deploy + predeploy uid=9
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+
+    task_state = await state.get_task_state()
+    refresh = task_state.refreshed_at_block
+
+    # Champion scored well, pre-deployed scored definitively below the
+    # not_worse threshold on every overlap.
+    for env in ("ENV_A", "ENV_B"):
+        ids = task_state.task_ids[env][:2]   # sampling_count=2
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, ids, score=0.9,
+            refresh_block=refresh,
+        )
+        samples.set_samples(
+            "r9_hk_unused", "r9", env, ids, score=0.1,
+            refresh_block=refresh,
+        )
+        # The pre-deployed miner's hotkey in _make_miner is "loser",
+        # set those rows too.
+        samples.set_samples(
+            "loser", "r9", env, ids, score=0.1,
+            refresh_block=refresh,
+        )
+
+    await scheduler.tick(current_block=52)
+
+    pre = await state.get_predeployed_challengers()
+    assert pre == []
+    assert miner_store.rows[9]["challenge_status"] == STATUS_TERMINATED
+    reason = miner_store.rows[9].get("termination_reason") or ""
+    assert "early_regression_in_" in reason
+    assert reason.endswith(":predeploy")
+
+
+@pytest.mark.asyncio
+async def test_start_battle_adopts_predeployed_record():
+    """When ``pick_next`` selects a miner that was pre-deployed, the
+    pre-sample slot is torn down (one extra teardown) and the active
+    battle deploys on the primary."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=4)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    # Refresh + champion deploy + predeploy uid=2 on a spare slot.
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    pre = await state.get_predeployed_challengers()
+    assert [p.challenger.uid for p in pre] == [2]
+    pre_dep_id = pre[0].deployment_id
+    teardowns_before = len(deployer.teardowns)
+
+    # Complete champion baseline so step 7 fires _start_battle.
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            refresh_block=task_state.refreshed_at_block,
+        )
+
+    await scheduler.tick(current_block=52)
+
+    battle = await state.get_battle()
+    assert battle is not None and battle.challenger.uid == 2
+    assert pre_dep_id in deployer.teardowns
+    # Pre-sample slot freed before active deploy went out.
+    assert len(deployer.teardowns) > teardowns_before
+    # No longer in pre-list (adopted).
+    assert (await state.get_predeployed_challengers()) == []
+
+
+@pytest.mark.asyncio
+async def test_predeploy_does_not_disturb_fifo_battle_order():
+    """If a later-submitted miner has been pre-sampled while an
+    earlier-submitted one hasn't, the next battle still picks the
+    earlier one (FIFO). Pre-sampling order is independent of pick
+    order — the queue's ``(first_block, uid)`` sort is authoritative."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "early", 50, revision="r2"),    # earliest queued
+        _make_miner(3, "late", 300, revision="r3"),    # later queued
+    ])
+    # Only 1 pre-sample slot; uid=2 (earliest) takes it first.
+    deployer = _DeployTracker(pre_challenger_slots=1)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    pre = await state.get_predeployed_challengers()
+    assert [p.challenger.uid for p in pre] == [2]
+
+    # Complete champion baseline → _start_battle picks earliest = uid=2.
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            refresh_block=task_state.refreshed_at_block,
+        )
+    await scheduler.tick(current_block=52)
+    battle = await state.get_battle()
+    assert battle is not None
+    assert battle.challenger.uid == 2  # FIFO preserved
+
+
+@pytest.mark.asyncio
+async def test_predeploy_phase_noop_without_champion():
+    """Cold-start tick (no champion yet) must not pre-deploy anything —
+    the gating samples don't exist yet."""
+    kv = _seed_state(with_champion=False)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(5, "early", 50, revision="r5"),
+        _make_miner(7, "late", 200, revision="r7"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=4)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    # Tick 1 refresh, tick 2 cold-start promotes uid=5.
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+
+    # Pre-deploy ran in tick 2 AFTER cold_start set the champion. uid=7
+    # is the only remaining miner, so it lands as a pre-challenger.
+    pre = await state.get_predeployed_challengers()
+    assert [p.challenger.uid for p in pre] == [7]
+
+
+@pytest.mark.asyncio
+async def test_predeploy_excludes_active_battle_challenger():
+    """The active ``current_battle.challenger`` must never appear in
+    the pre-deployed list — they occupy the primary endpoint, not a
+    spare. The exclusion lives in :meth:`_predeploy_fill_spare`."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "active", 200, revision="r2"),
+        _make_miner(3, "queued", 300, revision="r3"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=4)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    # Get champion sampled, then start a battle with uid=2.
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            refresh_block=task_state.refreshed_at_block,
+        )
+    # First "complete" tick triggers start_battle with uid=2 (FIFO);
+    # next tick's predeploy phase should pick uid=3, not uid=2.
+    await scheduler.tick(current_block=52)
+    battle = await state.get_battle()
+    assert battle is not None and battle.challenger.uid == 2
+
+    pre_uids = {p.challenger.uid for p in await state.get_predeployed_challengers()}
+    assert 2 not in pre_uids
+    assert pre_uids == {3}
+
+
+@pytest.mark.asyncio
+async def test_predeploy_deploy_failure_marks_failed_and_advances():
+    """A real ssh / docker deploy error during pre-deploy (distinct
+    from ``NoSpareEndpoint``) must:
+
+    1. mark the failing miner ``FAILED`` so the queue advances (mirror
+       of :meth:`_start_battle`'s deploy-failure handling), and
+    2. continue filling the remaining spare slots with the next
+       candidates — without the failure path the head-of-queue miner
+       would starve every pre-sample slot forever, since
+       ``peek_next`` re-picks the same uid each tick.
+    """
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(5, "broken", 50, revision="r5"),    # earliest, will fail
+        _make_miner(7, "fine", 200, revision="r7"),
+        _make_miner(9, "alsofine", 300, revision="r9"),
+    ])
+    deployer = _DeployTracker(
+        pre_challenger_slots=3,
+        predeploy_failures={5},  # uid=5 fails to deploy
+    )
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+
+    # uid=5 marked FAILED and out of the queue; uid=7 and uid=9 took
+    # the remaining slots.
+    assert miner_store.rows[5]["challenge_status"] == STATUS_TERMINATED
+    reason = miner_store.rows[5].get("termination_reason") or ""
+    assert "deployment_failed_predeploy" in reason
+
+    pre_uids = [p.challenger.uid for p in await state.get_predeployed_challengers()]
+    assert pre_uids == [7, 9], (
+        f"expected uid=5 failure not to starve later candidates, got {pre_uids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_predeploy_no_spare_does_not_mark_failed():
+    """``NoSpareEndpoint`` is a clean termination signal — the
+    candidate miner must NOT be marked FAILED (they're a valid
+    candidate, just no host for them right now). This is the
+    asymmetry between 'no spare' and 'real deploy error' that
+    motivated introducing ``NoSpareEndpoint`` as a distinct
+    exception class."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "queued", 50, revision="r2"),
+    ])
+    deployer = _DeployTracker()  # 0 pre-sample slots → NoSpareEndpoint
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+
+    # uid=2 was eligible but had no host. Status must stay SAMPLING.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert (await state.get_predeployed_challengers()) == []
