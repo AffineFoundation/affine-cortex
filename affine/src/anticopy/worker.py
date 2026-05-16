@@ -54,8 +54,10 @@ from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 
 from affine.src.anticopy.pairwise import (
+    CopyDecision,
+    PairResult,
+    _per_env_decision_medians,
     compare_scores,
-    detect_copies,
     is_copy_verdict,
 )
 from affine.src.anticopy.r2 import AntiCopyR2
@@ -1090,6 +1092,131 @@ class ForwardWorker:
                 f"closest_peer={(closest_peer_model or '-')[:40]}"
             )
 
+    async def _fetch_peer_blob(
+        self, row: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch a peer's score blob from R2 and strip the diagnostic
+        ``resp_top`` field (which alone is ~10× the resp_lp footprint
+        and isn't consulted by the verdict rule). Returns ``None`` on
+        fetch failure or missing key/blob."""
+        r2_key = row.get("r2_key")
+        if not r2_key:
+            return None
+        try:
+            blob = await asyncio.to_thread(self.r2.get_score_by_key, r2_key)
+        except Exception as e:
+            logger.debug(
+                f"[anticopy.worker] peer score fetch failed {r2_key}: {e}"
+            )
+            return None
+        if not blob:
+            return None
+        for ro in (blob.get("per_rollout") or []):
+            ro.pop("resp_top", None)
+        blob["first_block"] = int(row.get("first_block", 0) or 0)
+        return blob
+
+    async def _stream_pick_origin(
+        self,
+        *,
+        cfg: AntiCopyConfig,
+        ref_score: Dict[str, Any],
+        ref_first_block: int,
+        candidate_rows: List[Dict[str, Any]],
+        extra_loaded_peers: Optional[List[Dict[str, Any]]] = None,
+    ) -> CopyDecision:
+        """Memory-bounded ``detect_copies`` equivalent.
+
+        Iterates ``candidate_rows`` (DDB index rows, lazy-fetched) plus
+        any ``extra_loaded_peers`` (already-resident blobs, used to
+        thread the freshly-scored ``new_score`` into a retroactive
+        re-evaluation). Holds at most one peer blob alive at a time;
+        early-exits on the first row whose pair crosses
+        ``nll_threshold`` and has ``n_overlap_tokens >= min_overlap``
+        — the (first_block, hotkey)-ordered iteration guarantees that
+        first hit is the earliest committer (i.e. the winner).
+        """
+        lookback_blocks = cfg.verdict_lookback_days * BLOCKS_PER_DAY
+        ref_hk = ref_score.get("hotkey", "")
+        ref_rev = ref_score.get("revision", "")
+
+        # Merge rows + extra blobs into one sequence tagged by source.
+        items: List[tuple] = []
+        for row in candidate_rows:
+            fb = int(row.get("first_block", 0) or 0)
+            hk = row.get("hotkey", "")
+            items.append(("row", fb, hk, row))
+        for peer in (extra_loaded_peers or []):
+            fb = int(peer.get("first_block", 0) or 0)
+            hk = peer.get("hotkey", "")
+            items.append(("blob", fb, hk, peer))
+        items.sort(key=lambda x: (x[1], x[2]))
+
+        closest_median: float = -1.0
+        closest_per_env: Dict[str, float] = {}
+        closest_peer_model: str = ""
+        winning_pair: Optional[PairResult] = None
+        winning_hk: str = ""
+        winning_model: str = ""
+
+        for kind, fb, hk, payload in items:
+            if not hk or hk == ref_hk:
+                continue
+            if (fb, hk) >= (ref_first_block, ref_hk):
+                continue
+            if (
+                lookback_blocks > 0 and fb > 0
+                and (ref_first_block - fb) > lookback_blocks
+            ):
+                continue
+            if kind == "row":
+                if (
+                    payload.get("hotkey") == ref_hk
+                    and payload.get("revision") == ref_rev
+                ):
+                    continue
+                blob = await self._fetch_peer_blob(payload)
+                if blob is None:
+                    continue
+            else:
+                blob = payload
+
+            pair = compare_scores(ref_score, blob)
+            pair_med = pair.decision_median_combined
+            peer_model = str(blob.get("model", ""))
+            if pair_med >= 0 and (closest_median < 0 or pair_med < closest_median):
+                closest_median = pair_med
+                closest_per_env = _per_env_decision_medians(pair)
+                closest_peer_model = peer_model
+            if (
+                pair.n_overlap_tokens >= cfg.min_overlap
+                and is_copy_verdict(
+                    pair,
+                    nll_threshold=cfg.nll_threshold,
+                    agreement_ratio=cfg.agreement_ratio,
+                )
+            ):
+                winning_pair = pair
+                winning_hk = hk
+                winning_model = peer_model
+                if kind == "row":
+                    del blob
+                break
+            if kind == "row":
+                del blob
+
+        decision = CopyDecision()
+        if winning_pair is not None:
+            decision.copy_of_hotkey = winning_hk
+            decision.decision_median = float(winning_pair.decision_median_combined)
+            decision.decision_per_env = _per_env_decision_medians(winning_pair)
+            decision.closest_peer_model = winning_model
+        else:
+            decision.decision_median = closest_median
+            decision.decision_per_env = dict(closest_per_env)
+            decision.closest_peer_model = closest_peer_model
+        return decision
+
     async def _run_verdict(
         self,
         *,
@@ -1101,7 +1228,11 @@ class ForwardWorker:
         the verdicts of any later-committed peer that turns out to be a
         copy of it.
 
-        Returns ``(copy_of_hotkey, overlap_max)`` for ``new_score``.
+        Streaming implementation: at most one peer blob is held in
+        memory at a time. With ~90 peers each carrying ~4 MB of float
+        logprobs this previously OOM'd the worker's 4 GB cgroup; the
+        per-peer fetch+compare+release pattern keeps the resident set
+        bounded regardless of how many peers exist.
 
         Why the retroactive pass: candidates are not necessarily scored
         in commit order (priority overrides, retries, parallel workers).
@@ -1112,69 +1243,18 @@ class ForwardWorker:
         was visible when they were scored — or at nothing.
         """
         index_rows = await self.scores_dao.list_all()
-        lookback_blocks = cfg.verdict_lookback_days * BLOCKS_PER_DAY
-        peer_scores: List[Dict[str, Any]] = []
-        for row in index_rows:
-            if (
-                row.get("hotkey") == new_score.get("hotkey")
-                and row.get("revision") == new_score.get("revision")
-            ):
-                continue
-            r2_key = row.get("r2_key")
-            if not r2_key:
-                continue
-            row_first_block = int(row.get("first_block", 0) or 0)
-            # Pre-filter on first_block so we don't pay the R2 fetch
-            # for peers we'd discard inside detect_copies anyway.
-            # Peers strictly later than the candidate still get fetched
-            # — _refresh_later_peer_verdicts needs them.
-            if (
-                lookback_blocks > 0
-                and row_first_block > 0
-                and row_first_block < new_first_block
-                and (new_first_block - row_first_block) > lookback_blocks
-            ):
-                continue
-            try:
-                blob = await asyncio.to_thread(self.r2.get_score_by_key, r2_key)
-            except Exception as e:
-                logger.debug(f"[anticopy.worker] peer score fetch failed {r2_key}: {e}")
-                continue
-            if not blob:
-                continue
-            # Strip the resp_top matrix (~10× the resp_lp footprint —
-            # 137k positions × top-K × 2 ints per rollout) before the
-            # blob enters peer_scores. resp_top only feeds the
-            # ``top1_match`` diagnostic, which the verdict rule doesn't
-            # consult; keeping it would OOM the worker for ~90 peers.
-            for ro in (blob.get("per_rollout") or []):
-                ro.pop("resp_top", None)
-            blob["first_block"] = row_first_block
-            peer_scores.append(blob)
-
-        decision = detect_copies(
-            new_score,
-            new_first_block,
-            peer_scores,
-            nll_threshold=cfg.nll_threshold,
-            min_overlap=cfg.min_overlap,
-            agreement_ratio=cfg.agreement_ratio,
-            lookback_blocks=lookback_blocks,
+        decision = await self._stream_pick_origin(
+            cfg=cfg,
+            ref_score=new_score,
+            ref_first_block=new_first_block,
+            candidate_rows=index_rows,
         )
-
-        # Retroactive pass: any peer that committed AFTER new_score and
-        # is a copy of it might now have an earlier origin (new_score
-        # itself, or something detect_copies finds when we re-evaluate
-        # with new_score included). Refresh those peers' scores_index
-        # rows in place. We only re-evaluate peers we have evidence to
-        # update, so this stays O(n_overlapping_copies).
         await self._refresh_later_peer_verdicts(
             cfg=cfg,
             new_score=new_score,
             new_first_block=new_first_block,
-            peer_scores=peer_scores,
+            all_rows=index_rows,
         )
-
         return (
             decision.copy_of_hotkey,
             decision.decision_median,
@@ -1188,46 +1268,60 @@ class ForwardWorker:
         cfg: AntiCopyConfig,
         new_score: Dict[str, Any],
         new_first_block: int,
-        peer_scores: List[Dict[str, Any]],
+        all_rows: List[Dict[str, Any]],
     ) -> None:
         """For each peer committed strictly later than ``new_score`` and
-        pairwise-similar to it, recompute the peer's full ``detect_copies``
-        verdict (with ``new_score`` now included as a candidate origin)
-        and write the refreshed result back to ``anticopy_scores_index``.
+        pairwise-similar to it, recompute the peer's verdict (with
+        ``new_score`` now included as a candidate origin) and write the
+        refreshed result back to ``anticopy_scores_index``.
 
-        Only peers that are *copies of* ``new_score`` are touched —
-        independents stay independent, and copies pointed at an older
-        peer than ``new_score`` are re-checked but typically unchanged.
+        Streaming: holds at most 2 peer blobs concurrently (the later
+        peer being checked + whichever earlier peer ``_stream_pick_origin``
+        is currently fetching). Only peers that are *copies of*
+        ``new_score`` trigger the inner re-evaluation, so the work
+        stays O(n_overlapping_copies).
         """
-        new_hotkey = new_score.get("hotkey", "")
-        for peer in peer_scores:
-            peer_hk = peer.get("hotkey", "")
-            peer_rev = peer.get("revision", "")
-            peer_first = int(peer.get("first_block", 0) or 0)
-            # Strict later-committer check (matches detect_copies' ordering).
-            if (peer_first, peer_hk) <= (new_first_block, new_hotkey):
+        new_hk = new_score.get("hotkey", "")
+        new_rev = new_score.get("revision", "")
+        new_first_block = int(new_first_block)
+        # Make sure new_score itself participates in re-evaluations as
+        # an inline peer (it's the freshly-computed candidate that
+        # hasn't been written to peers' R2 yet from the peer's POV).
+        if "first_block" not in new_score:
+            new_score["first_block"] = new_first_block
+        for row in all_rows:
+            peer_hk = row.get("hotkey", "")
+            peer_rev = row.get("revision", "")
+            peer_first = int(row.get("first_block", 0) or 0)
+            if peer_hk == new_hk and peer_rev == new_rev:
                 continue
-            # Quick prune: is peer a copy of new_score at all? If the
-            # pair isn't above-threshold, peer's existing verdict can't
-            # be affected by the new arrival.
+            # Strict later-committer check.
+            if (peer_first, peer_hk) <= (new_first_block, new_hk):
+                continue
+            # Fetch + quick prune: is peer a copy of new_score at all?
+            peer = await self._fetch_peer_blob(row)
+            if peer is None:
+                continue
             pair = compare_scores(peer, new_score)
-            if pair.n_overlap_tokens < cfg.min_overlap:
-                continue
-            if not is_copy_verdict(
-                pair,
-                nll_threshold=cfg.nll_threshold,
-                agreement_ratio=cfg.agreement_ratio,
+            if (
+                pair.n_overlap_tokens < cfg.min_overlap
+                or not is_copy_verdict(
+                    pair,
+                    nll_threshold=cfg.nll_threshold,
+                    agreement_ratio=cfg.agreement_ratio,
+                )
             ):
+                del peer
                 continue
-            # Full re-evaluation: pick the earliest origin among ALL
-            # other peers + new_score. (Excluding peer itself.)
-            others = [p for p in peer_scores if p is not peer] + [new_score]
-            refreshed = detect_copies(
-                peer, peer_first, others,
-                nll_threshold=cfg.nll_threshold,
-                min_overlap=cfg.min_overlap,
-                agreement_ratio=cfg.agreement_ratio,
-                lookback_blocks=cfg.verdict_lookback_days * BLOCKS_PER_DAY,
+            # Drop pre-evaluated peer blob; _stream_pick_origin re-fetches
+            # it via the row-list mechanism if needed... wait, peer IS the
+            # target here. Keep it as the ref_score.
+            refreshed = await self._stream_pick_origin(
+                cfg=cfg,
+                ref_score=peer,
+                ref_first_block=peer_first,
+                candidate_rows=all_rows,
+                extra_loaded_peers=[new_score],
             )
             try:
                 await self.scores_dao.update_verdict(
@@ -1241,13 +1335,14 @@ class ForwardWorker:
                     f"[anticopy.worker] retroactive verdict {peer_hk[:10]} "
                     f"copy_of={(refreshed.copy_of_hotkey or 'independent')[:14]} "
                     f"dec_med={refreshed.decision_median:.4f} "
-                    f"(after {new_hotkey[:10]} arrived)"
+                    f"(after {new_hk[:10]} arrived)"
                 )
             except Exception as e:
                 logger.warning(
                     f"[anticopy.worker] retroactive verdict update "
                     f"failed for {peer_hk[:10]}: {e}"
                 )
+            del peer
 
 
     async def _lookup_first_block(
