@@ -24,7 +24,7 @@ from affine.database.dao.system_config import SystemConfigDAO
 # ``_DECISION_LOGP_CUTOFF``). Not the all-positions median, which
 # pins to ~0 for every Qwen3 fine-tune because trivial-prediction
 # tokens dominate.
-DEFAULT_NLL_THRESHOLD = 0.04
+DEFAULT_NLL_THRESHOLD = 0.05
 
 # Minimum token-position overlap a pair must share before we issue a
 # verdict either way. Below this we say "pending: insufficient data"
