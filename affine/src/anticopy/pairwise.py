@@ -254,6 +254,7 @@ def detect_copies(
     nll_threshold: float,
     min_overlap: int,
     agreement_ratio: float,
+    lookback_blocks: int = 0,
 ) -> CopyDecision:
     """For a freshly computed score, scan every active peer that
     committed earlier (lower ``first_block``) and return the earliest
@@ -261,6 +262,12 @@ def detect_copies(
 
     Ties on ``first_block`` resolve in favour of the lower ``hotkey``
     (lexicographic), matching ``miners_monitor._detect_plagiarism``.
+
+    ``lookback_blocks`` (default 0 = unbounded) caps how far back the
+    scan reaches. Peers whose ``first_block`` is more than that many
+    blocks earlier than the candidate are skipped — stale "previous
+    season" miners aren't realistic copy origins for a fresh upload
+    and only add noise + comparison cost.
 
     ``CopyDecision.decision_median`` is populated from the WINNING peer
     (when one exists) or from the closest peer otherwise — i.e. the
@@ -282,6 +289,12 @@ def detect_copies(
         peer_first_block = int(peer.get("first_block", 0) or 0)
         if (peer_first_block, peer_hotkey) >= (new_first_block, new_hotkey):
             continue                      # later or same → cannot be the origin
+        if (
+            lookback_blocks > 0
+            and peer_first_block > 0
+            and (new_first_block - peer_first_block) > lookback_blocks
+        ):
+            continue                      # too old → not a realistic origin
         pair = compare_scores(new_score, peer)
         pair_med = _aggregate_decision_median(pair)
         if pair_med >= 0 and (closest_median < 0 or pair_med < closest_median):

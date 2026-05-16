@@ -202,6 +202,60 @@ def test_detect_copies_ignores_later_peers():
     assert dec.copy_of_hotkey == ""
 
 
+def test_detect_copies_lookback_skips_ancient_peer():
+    """Peers older than ``lookback_blocks`` are out of the comparison
+    window — even a perfect match doesn't flag copy."""
+    new = _score(
+        "Z",
+        [_rollout("k", "CDE", [-0.7] * 100)],
+        first_block=100_000,
+    )
+    ancient = _score(   # 50_000 blocks ≈ 7 days earlier, identical lps
+        "A",
+        [_rollout("k", "CDE", [-0.7] * 100)],
+        first_block=50_000,
+    )
+    # lookback 5 days × 7200 blocks/day = 36000 → ancient is OUT of window
+    dec = detect_copies(
+        new, new_first_block=100_000,
+        all_peer_scores=[ancient],
+        nll_threshold=0.004, min_overlap=10, agreement_ratio=0.5,
+        lookback_blocks=36000,
+    )
+    assert dec.copy_of_hotkey == ""
+    assert dec.closest_peer_model == ""     # ancient never compared
+
+    # Widen to 8 days → ancient IS in window, flags copy
+    dec2 = detect_copies(
+        new, new_first_block=100_000,
+        all_peer_scores=[ancient],
+        nll_threshold=0.004, min_overlap=10, agreement_ratio=0.5,
+        lookback_blocks=57_600,
+    )
+    assert dec2.copy_of_hotkey == "A"
+
+
+def test_detect_copies_lookback_zero_means_unbounded():
+    """``lookback_blocks=0`` (default) keeps prior behaviour: any
+    earlier peer is fair game regardless of how old it is."""
+    new = _score(
+        "Z",
+        [_rollout("k", "CDE", [-0.7] * 100)],
+        first_block=10_000_000,
+    )
+    very_old = _score(
+        "A",
+        [_rollout("k", "CDE", [-0.7] * 100)],
+        first_block=1,
+    )
+    dec = detect_copies(
+        new, new_first_block=10_000_000,
+        all_peer_scores=[very_old],
+        nll_threshold=0.004, min_overlap=10, agreement_ratio=0.5,
+    )
+    assert dec.copy_of_hotkey == "A"
+
+
 # --- decision-metric coverage -----------------------------------------------
 
 

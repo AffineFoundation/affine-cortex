@@ -59,7 +59,11 @@ from affine.src.anticopy.pairwise import (
     is_copy_verdict,
 )
 from affine.src.anticopy.r2 import AntiCopyR2
-from affine.src.anticopy.threshold import AntiCopyConfig, load_anticopy_config
+from affine.src.anticopy.threshold import (
+    AntiCopyConfig,
+    BLOCKS_PER_DAY,
+    load_anticopy_config,
+)
 from affine.src.anticopy.tokenizer_sig import compute_tokenizer_signature
 
 
@@ -1108,6 +1112,7 @@ class ForwardWorker:
         was visible when they were scored — or at nothing.
         """
         index_rows = await self.scores_dao.list_all()
+        lookback_blocks = cfg.verdict_lookback_days * BLOCKS_PER_DAY
         peer_scores: List[Dict[str, Any]] = []
         for row in index_rows:
             if (
@@ -1118,6 +1123,18 @@ class ForwardWorker:
             r2_key = row.get("r2_key")
             if not r2_key:
                 continue
+            row_first_block = int(row.get("first_block", 0) or 0)
+            # Pre-filter on first_block so we don't pay the R2 fetch
+            # for peers we'd discard inside detect_copies anyway.
+            # Peers strictly later than the candidate still get fetched
+            # — _refresh_later_peer_verdicts needs them.
+            if (
+                lookback_blocks > 0
+                and row_first_block > 0
+                and row_first_block < new_first_block
+                and (new_first_block - row_first_block) > lookback_blocks
+            ):
+                continue
             try:
                 blob = await asyncio.to_thread(self.r2.get_score_by_key, r2_key)
             except Exception as e:
@@ -1125,7 +1142,7 @@ class ForwardWorker:
                 continue
             if not blob:
                 continue
-            blob["first_block"] = int(row.get("first_block", 0) or 0)
+            blob["first_block"] = row_first_block
             peer_scores.append(blob)
 
         decision = detect_copies(
@@ -1135,6 +1152,7 @@ class ForwardWorker:
             nll_threshold=cfg.nll_threshold,
             min_overlap=cfg.min_overlap,
             agreement_ratio=cfg.agreement_ratio,
+            lookback_blocks=lookback_blocks,
         )
 
         # Retroactive pass: any peer that committed AFTER new_score and
@@ -1202,6 +1220,7 @@ class ForwardWorker:
                 nll_threshold=cfg.nll_threshold,
                 min_overlap=cfg.min_overlap,
                 agreement_ratio=cfg.agreement_ratio,
+                lookback_blocks=cfg.verdict_lookback_days * BLOCKS_PER_DAY,
             )
             try:
                 await self.scores_dao.update_verdict(

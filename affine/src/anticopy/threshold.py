@@ -47,6 +47,18 @@ DEFAULT_POOL_DAYS = 7
 # UTC hour the refresh service runs once per day.
 DEFAULT_REFRESH_UTC_HOUR = 2
 
+# Verdict only considers peers that committed within this many days
+# before the candidate. Older miners — from previous "seasons" — are
+# very unlikely to be the actual origin of a recent copy, and including
+# them inflates the comparison cost + opens room for false positives
+# from unrelated fine-tunes that happen to look similar. Set to 0 to
+# disable the cutoff (compare against every earlier peer).
+DEFAULT_VERDICT_LOOKBACK_DAYS = 7
+
+# Bittensor mainnet target block time is 12s → 7200 blocks/day. Used
+# only to translate ``verdict_lookback_days`` into a block window.
+BLOCKS_PER_DAY = 7200
+
 # Number of HuggingFace ckpts the worker keeps in the local cache. The
 # current job's ckpt is always kept; the prefetched-next ckpt counts as
 # one of the slots, leaving headroom = (gc_keep_recent - 2) for prior
@@ -75,6 +87,7 @@ class AntiCopyConfig:
     refresh_utc_hour: int = DEFAULT_REFRESH_UTC_HOUR
     enabled_envs: List[str] = field(default_factory=lambda: list(DEFAULT_ENABLED_ENVS))
     gc_keep_recent: int = DEFAULT_GC_KEEP_RECENT
+    verdict_lookback_days: int = DEFAULT_VERDICT_LOOKBACK_DAYS
 
 
 async def load_anticopy_config(
@@ -118,4 +131,7 @@ async def load_anticopy_config(
         refresh_utc_hour=_i("refresh_utc_hour", DEFAULT_REFRESH_UTC_HOUR),
         enabled_envs=enabled_envs,
         gc_keep_recent=max(2, _i("gc_keep_recent", DEFAULT_GC_KEEP_RECENT)),
+        verdict_lookback_days=max(
+            0, _i("verdict_lookback_days", DEFAULT_VERDICT_LOOKBACK_DAYS)
+        ),
     )
