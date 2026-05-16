@@ -125,6 +125,53 @@ class ChallengerQueue:
                 )
         return None
 
+    async def peek_next(
+        self, n: int, *, champion_uid: Optional[int],
+        exclude_uids: Optional[set] = None,
+    ) -> list["MinerCandidate"]:
+        """Return up to ``n`` next-up eligible candidates in pick order
+        WITHOUT claiming any of them.
+
+        Same filters and sort as :meth:`pick_next` so a candidate
+        returned here is what ``pick_next`` will see next:
+        ``is_valid=true``, ``challenge_status`` missing or
+        ``'sampling'``, ``uid != champion_uid``, ordered by
+        ``(first_block ASC, uid ASC)``. ``exclude_uids`` skips miners
+        the caller already accounted for (e.g. the active
+        ``current_battle.challenger`` and previously pre-deployed
+        miners).
+
+        Pure read — no DDB writes. Safe to call every scheduler tick
+        from the pre-deploy decision path."""
+        if n <= 0:
+            return []
+        skip = exclude_uids or set()
+        candidates = await self._store.list_valid_pending()
+        ordered = sorted(
+            candidates,
+            key=lambda m: (m.get("first_block", float("inf")), m.get("uid", 0)),
+        )
+        out: list[MinerCandidate] = []
+        for row in ordered:
+            uid = row.get("uid")
+            if uid is None or uid == champion_uid or uid in skip:
+                continue
+            status = row.get("challenge_status")
+            if status is not None and status != STATUS_SAMPLING:
+                continue
+            if not _is_truthy(row.get("is_valid")):
+                continue
+            out.append(MinerCandidate(
+                uid=uid,
+                hotkey=row["hotkey"],
+                model=row.get("model", ""),
+                revision=row.get("revision", ""),
+                first_block=int(row.get("first_block", 0)),
+            ))
+            if len(out) >= n:
+                break
+        return out
+
     async def mark_terminated(
         self,
         uid: int,

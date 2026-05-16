@@ -57,6 +57,7 @@ from affine.src.scorer.window_state import (
     DeploymentRecord,
     EnvConfig,
     MinerSnapshot,
+    PreDeployedChallenger,
     StateStore,
     TaskIdState,
 )
@@ -154,6 +155,29 @@ class FlowScheduler:
     # ---- entry point ------------------------------------------------------
 
     async def tick(self, current_block: int) -> None:
+        """One scheduling step. Two phases:
+
+        1. **Battle phase** (:meth:`_tick_main`): the unchanged tick body
+           — task_id refresh, champion validation/deploy, current-battle
+           progression, decide.
+        2. **Pre-sample phase** (:meth:`_predeploy_phase`): runs on
+           every tick the battle phase didn't crash. Sweeps the
+           pre-deployed list for invalidations + early-loss verdicts,
+           then fills any free non-primary endpoint with the next FIFO
+           queued miner. Wrapped in a guard so a flaky deploy/teardown
+           can't block the next tick's battle phase.
+        """
+        await self._tick_main(current_block)
+        try:
+            await self._predeploy_phase(current_block)
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: predeploy phase error "
+                f"(non-fatal, will retry next tick): "
+                f"{type(e).__name__}: {e}"
+            )
+
+    async def _tick_main(self, current_block: int) -> None:
         envs = await self.state.get_environments()
         if not envs:
             logger.warning("FlowScheduler: no sampling-enabled envs; skipping tick")
@@ -675,6 +699,196 @@ class FlowScheduler:
             await self.state.set_champion(champion)
         await self.state.clear_battle()
 
+    # ---- pre-sample phase -------------------------------------------------
+
+    async def _predeploy_phase(self, current_block: int) -> None:
+        """Maintain the pre-deployed list on non-primary endpoints.
+
+        Three sub-steps in order, all on a best-effort basis:
+
+          (a) Invalidation sweep — tear down any pre-deployed miner
+              whose ``is_valid`` flipped to false since deployment. No
+              status write (``invalid_reason`` on the miners row is the
+              authoritative cause; same policy as
+              :meth:`_decide_invalidation_lost` for the active battle).
+          (b) Early-loss sweep — apply the same
+              :meth:`_check_early_regression` that step 7.5 uses for
+              the active battle. Pre-deployed miners whose data already
+              proves them sure losers get marked ``LOST`` and torn down
+              without ever entering the formal battle (the user's
+              "提前发现必输直接终止" semantic).
+          (c) Fill spare — peek next queued miners in FIFO order and
+              deploy one per free non-primary endpoint until the queue
+              empties or the selector reports no spare.
+
+        Without a champion or task_state, the gating samples don't
+        exist yet — bail rather than deploy a pre-challenger that
+        nothing can sample for.
+        """
+        champion = await self.state.get_champion()
+        if champion is None:
+            return
+        task_state = await self.state.get_task_state()
+        if task_state is None:
+            return
+        await self._predeploy_invalidation_sweep()
+        await self._predeploy_early_loss_sweep(
+            champion, task_state, current_block,
+        )
+        await self._predeploy_fill_spare(champion, current_block)
+
+    async def _predeploy_invalidation_sweep(self) -> None:
+        records = await self.state.get_predeployed_challengers()
+        if not records:
+            return
+        valid_uids = {
+            int(r.get("uid", -1)) for r in await self._list_valid_miners()
+        }
+        kept: List[PreDeployedChallenger] = []
+        for record in records:
+            if record.challenger.uid in valid_uids:
+                kept.append(record)
+                continue
+            logger.warning(
+                f"FlowScheduler: pre-deployed uid="
+                f"{record.challenger.uid} became invalid; tearing down "
+                f"(challenge_status unchanged — invalid_reason is the "
+                f"authoritative cause)"
+            )
+            await self._teardown_record(record)
+        if len(kept) != len(records):
+            await self.state.set_predeployed_challengers(kept)
+
+    async def _predeploy_early_loss_sweep(
+        self,
+        champion: ChampionRecord,
+        task_state: TaskIdState,
+        current_block: int,
+    ) -> None:
+        records = await self.state.get_predeployed_challengers()
+        if not records:
+            return
+        scoring_envs = await self.state.get_scoring_environments()
+        kept: List[PreDeployedChallenger] = []
+        for record in records:
+            early = await self._check_early_regression(
+                champion, record.challenger,
+                scoring_envs=scoring_envs, task_state=task_state,
+            )
+            if early is None:
+                kept.append(record)
+                continue
+            regression_env, per_env_data = early
+            await self._decide_predeployed_early_lost(
+                champion, record,
+                regression_env=regression_env,
+                per_env_data=per_env_data,
+                task_state=task_state,
+                current_block=current_block,
+            )
+        if len(kept) != len(records):
+            await self.state.set_predeployed_challengers(kept)
+
+    async def _decide_predeployed_early_lost(
+        self,
+        champion: ChampionRecord,
+        record: PreDeployedChallenger,
+        *,
+        regression_env: str,
+        per_env_data: Dict[str, Dict[str, float]],
+        task_state: TaskIdState,
+        current_block: int,
+    ) -> None:
+        """Pre-deployed counterpart of :meth:`_decide_early_lost`.
+
+        Same verdict semantics — LOST with the comparator's frozen
+        per-env view — but no battle teardown (this miner never had a
+        ``current_battle`` slot) and no champion deployment cleanup
+        (champion lives on a different machine in the multi-host
+        topology; only this pre-sample slot is freed).
+
+        ``reason`` carries the ``:predeploy`` suffix so operators can
+        distinguish at the rank UI which path produced the verdict.
+        """
+        await self._teardown_record(record)
+        await self.queue.mark_terminated(
+            record.challenger.uid,
+            OUTCOME_LOST,
+            reason=(
+                f"lost_to_champion:{champion.hotkey[:10]}:"
+                f"early_regression_in_{regression_env}:predeploy"
+            ),
+            hotkey=record.challenger.hotkey,
+            revision=record.challenger.revision,
+            model=record.challenger.model,
+            scores_by_env=per_env_data,
+            scores_refresh_block=task_state.refreshed_at_block,
+            terminated_at_block=current_block,
+        )
+        logger.info(
+            f"FlowScheduler: pre-deployed uid={record.challenger.uid} "
+            f"early-LOST on {regression_env} regression vs champion "
+            f"uid={champion.uid} — terminated without entering battle"
+        )
+
+    async def _predeploy_fill_spare(
+        self, champion: ChampionRecord, current_block: int,
+    ) -> None:
+        """Deploy queued miners on free non-primary endpoints, FIFO.
+
+        Loop one miner at a time so each deploy gets its own
+        ``set_predeployed_challengers`` write — if any single deploy
+        fails (selector RuntimeError = no spare; ssh deploy error =
+        host issue), we keep the work already done and stop. ``RuntimeError``
+        from the selector is the natural termination signal.
+        """
+        while True:
+            battle = await self.state.get_battle()
+            records = await self.state.get_predeployed_challengers()
+            exclude = {p.challenger.uid for p in records}
+            if battle is not None:
+                exclude.add(battle.challenger.uid)
+            next_up = await self.queue.peek_next(
+                n=1, champion_uid=champion.uid, exclude_uids=exclude,
+            )
+            if not next_up:
+                return
+            cand = next_up[0]
+            target = targon_lifecycle.DeployTarget(
+                uid=cand.uid, hotkey=cand.hotkey,
+                model=cand.model, revision=cand.revision,
+            )
+            try:
+                result = await self._deploy(target, "pre_challenger")
+            except RuntimeError as e:
+                logger.debug(
+                    f"FlowScheduler: predeploy fill stopped: {e}"
+                )
+                return
+            except Exception as e:
+                logger.error(
+                    f"FlowScheduler: pre-deploy failed uid={cand.uid}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return
+            deployments = _deployments_from_result(result)
+            records.append(PreDeployedChallenger(
+                challenger=MinerSnapshot(
+                    uid=cand.uid, hotkey=cand.hotkey,
+                    revision=cand.revision, model=cand.model,
+                ),
+                deployment_id=result.deployment_id,
+                base_url=result.base_url,
+                started_at_block=current_block,
+                deployments=deployments,
+            ))
+            await self.state.set_predeployed_challengers(records)
+            host = deployments[0].endpoint_name if deployments else "?"
+            logger.info(
+                f"FlowScheduler: pre-deployed uid={cand.uid} on {host} "
+                f"(pre-sample slot {len(records)})"
+            )
+
     async def _start_battle(
         self, champion: ChampionRecord, current_block: int,
     ) -> None:
@@ -685,6 +899,14 @@ class FlowScheduler:
         )
         if candidate is None:
             return  # idle, no challengers
+        # Adoption: if the picked miner was pre-deployed for baseline
+        # sampling, tear down its pre-sample slot before deploying it
+        # on the primary as the active challenger. The pre-samples in
+        # ``sample_results`` remain valid (keyed by
+        # ``(hotkey, revision, env, task_id, refresh_block)`` — the
+        # role change is invisible to that index) so the battle starts
+        # with the overlap progress already accumulated.
+        await self._adopt_predeployed_if_present(candidate.uid)
         target = targon_lifecycle.DeployTarget(
             uid=candidate.uid, hotkey=candidate.hotkey,
             model=candidate.model, revision=candidate.revision,
@@ -973,6 +1195,33 @@ class FlowScheduler:
                 await self._teardown(dep.deployment_id)
             return
         await self._teardown(getattr(record, "deployment_id", None))
+
+    async def _adopt_predeployed_if_present(self, uid: int) -> None:
+        """If ``uid`` was pre-deployed on a spare endpoint, tear down
+        that pre-sample slot and remove the record. Caller then deploys
+        ``uid`` fresh on the primary as the active challenger. The
+        existing pre-samples in ``sample_results`` survive — they're
+        keyed only by ``(hotkey, revision, env, task_id, refresh_block)``,
+        not by deployment id or host."""
+        records = await self.state.get_predeployed_challengers()
+        if not records:
+            return
+        remaining: List[PreDeployedChallenger] = []
+        adopted: Optional[PreDeployedChallenger] = None
+        for record in records:
+            if adopted is None and record.challenger.uid == uid:
+                adopted = record
+                continue
+            remaining.append(record)
+        if adopted is None:
+            return
+        await self._teardown_record(adopted)
+        await self.state.set_predeployed_challengers(remaining)
+        logger.info(
+            f"FlowScheduler: adopted pre-deployed uid={uid} as active "
+            f"challenger (pre-sample slot torn down; pre-samples retained "
+            f"via sample_results)"
+        )
 
     async def _write_weights(
         self, champion: ChampionRecord, block_number: int, result: Any,

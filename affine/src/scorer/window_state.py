@@ -86,6 +86,25 @@ class BattleRecord:
 
 
 @dataclass
+class PreDeployedChallenger:
+    """A queued miner deployed onto a spare endpoint so it can accumulate
+    baseline samples while the active battle proceeds on another host.
+
+    When ``pick_next`` later claims this miner, its deployment is adopted
+    into ``current_battle`` with no re-deploy — sample_results is keyed
+    by ``(hotkey, revision, env, task_id, refresh_block)`` so any rows
+    collected pre-battle stay usable once the role flips. The record
+    holds the same deployment fields a ``BattleRecord`` does (minus
+    ``previous_champion``, which is meaningless before promotion).
+    """
+    challenger: MinerSnapshot
+    deployment_id: str
+    base_url: str
+    started_at_block: int
+    deployments: List[DeploymentRecord] = field(default_factory=list)
+
+
+@dataclass
 class TaskIdState:
     """Per-env task_id pool the executor evaluates against. Regenerated
     every ~7200 blocks (always between battles)."""
@@ -141,6 +160,7 @@ class StateStore:
 
     KEY_CHAMPION = "champion"
     KEY_BATTLE = "current_battle"
+    KEY_PREDEPLOYED = "predeployed_challengers"
     KEY_TASK_IDS = "current_task_ids"
     KEY_ENVIRONMENTS = "environments"
 
@@ -174,6 +194,33 @@ class StateStore:
 
     async def clear_battle(self) -> None:
         await self._kv.delete(self.KEY_BATTLE)
+
+    # -- pre-deployed challengers ------------------------------------------
+
+    async def get_predeployed_challengers(self) -> List[PreDeployedChallenger]:
+        """Pre-deployed challengers — queued miners loaded onto spare ssh
+        endpoints so they accumulate baseline samples in parallel with
+        the active battle. Empty list when no spare endpoints exist
+        (single-machine) or no eligible queued miners remain."""
+        raw = await self._kv.get(self.KEY_PREDEPLOYED, default=[]) or []
+        if not isinstance(raw, list):
+            return []
+        return [
+            _predeployed_from_dict(item)
+            for item in raw
+            if isinstance(item, dict)
+        ]
+
+    async def set_predeployed_challengers(
+        self, items: List[PreDeployedChallenger],
+    ) -> None:
+        await self._kv.set(
+            self.KEY_PREDEPLOYED,
+            [_predeployed_to_dict(p) for p in items],
+        )
+
+    async def clear_predeployed_challengers(self) -> None:
+        await self._kv.delete(self.KEY_PREDEPLOYED)
 
     # -- task ids -----------------------------------------------------------
 
@@ -381,6 +428,37 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
         started_at_block=int(raw.get("started_at_block", 0)),
         deployments=deployments,
         previous_champion=previous_champion,
+    )
+
+
+def _predeployed_to_dict(p: PreDeployedChallenger) -> Dict[str, Any]:
+    return {
+        "challenger": asdict(p.challenger),
+        "deployment_id": p.deployment_id,
+        "base_url": p.base_url,
+        "started_at_block": p.started_at_block,
+        "deployments": [asdict(d) for d in p.deployments],
+    }
+
+
+def _predeployed_from_dict(raw: Dict[str, Any]) -> PreDeployedChallenger:
+    chal_raw = raw.get("challenger") or {}
+    deployments = _deployment_list(raw)
+    deployment_id = str(raw.get("deployment_id") or "")
+    base_url = str(raw.get("base_url") or "")
+    if deployments and (not deployment_id or not base_url):
+        primary_id, primary_url = _primary_deployment(deployments)
+        deployment_id = primary_id or ""
+        base_url = primary_url or ""
+    return PreDeployedChallenger(
+        challenger=MinerSnapshot(**{
+            k: chal_raw[k] for k in ("uid", "hotkey", "revision", "model")
+            if k in chal_raw
+        }),
+        deployment_id=deployment_id,
+        base_url=base_url,
+        started_at_block=int(raw.get("started_at_block", 0)),
+        deployments=deployments,
     )
 
 

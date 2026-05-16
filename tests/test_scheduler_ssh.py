@@ -131,17 +131,54 @@ def test_select_ssh_endpoints_reuses_matching_assignment():
     assert _select_ssh_endpoints(endpoints, target, role="champion") == [endpoints[1]]
 
 
-def test_select_ssh_endpoints_splits_champion_and_challenger_capacity():
+def test_select_ssh_endpoints_battle_roles_pin_to_primary():
+    """Champion and current-challenger always run on the primary
+    endpoint (single-instance time-share semantics — see
+    ``flow_config.single_instance_provider``). The pre-sample slot is
+    what consumes the other endpoints."""
     target = _target()
     endpoints = [_EndpointStub("a"), _EndpointStub("b"), _EndpointStub("c")]
 
     champion = _select_ssh_endpoints(endpoints, target, role="champion")
-    assert [ep.name for ep in champion] == ["a", "b"]
+    assert [ep.name for ep in champion] == ["a"]
 
-    endpoints[0].assigned_uid = target.uid
-    endpoints[1].assigned_uid = target.uid
     challenger = _select_ssh_endpoints(endpoints, target, role="challenger")
-    assert [ep.name for ep in challenger] == ["c"]
+    assert [ep.name for ep in challenger] == ["a"]
+
+
+def test_select_ssh_endpoints_pre_challenger_takes_first_free_non_primary():
+    target = _target()
+    endpoints = [_EndpointStub("a"), _EndpointStub("b"), _EndpointStub("c")]
+
+    pre = _select_ssh_endpoints(endpoints, target, role="pre_challenger")
+    assert [ep.name for ep in pre] == ["b"]
+
+    endpoints[1].assigned_uid = 999
+    pre2 = _select_ssh_endpoints(endpoints, target, role="pre_challenger")
+    assert [ep.name for ep in pre2] == ["c"]
+
+
+def test_select_ssh_endpoints_pre_challenger_raises_when_no_spare():
+    """Single-endpoint deployments have no spare for pre-sampling, and
+    pre-deploy attempts must surface as ``RuntimeError`` so the
+    scheduler's fill loop terminates cleanly."""
+    target = _target()
+    endpoints = [_EndpointStub("a")]
+
+    try:
+        _select_ssh_endpoints(endpoints, target, role="pre_challenger")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected RuntimeError for no spare endpoint")
+
+    endpoints2 = [_EndpointStub("a"), _EndpointStub("b", assigned_uid=99)]
+    try:
+        _select_ssh_endpoints(endpoints2, target, role="pre_challenger")
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected RuntimeError when only spare is assigned")
 
 
 def test_sglang_args_carry_model_and_revision():
