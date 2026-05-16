@@ -27,9 +27,15 @@ from typing import Dict, Optional, Tuple
 from huggingface_hub import HfApi
 
 from affine.core.setup import logger
+from affine.database.dao.anticopy import (
+    AntiCopyScoresIndexDAO,
+    AntiCopyStateDAO,
+)
 from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
+from affine.src.anticopy.threshold import load_anticopy_config
+from affine.src.anticopy.tokenizer_sig import compute_tokenizer_signature
 from affine.utils.model_size_checker import check_model_size
 from affine.utils.subtensor import get_subtensor
 from affine.utils.template_checker import check_template_safety
@@ -54,6 +60,7 @@ class MinerInfo:
     model_hash: str = ""
     hf_revision: str = ""
     template_check_result: Optional[str] = None  # "safe" | "unsafe:<reason>" | None
+    tokenizer_sig: str = ""
 
     def key(self) -> str:
         return f"{self.hotkey}#{self.revision}"
@@ -74,11 +81,15 @@ class MinersMonitor:
         self.dao = MinersDAO()
         self.stats_dao = MinerStatsDAO()
         self.config_dao = SystemConfigDAO()
+        self.anticopy_scores_dao = AntiCopyScoresIndexDAO()
+        self.anticopy_state_dao = AntiCopyStateDAO()
         self.refresh_interval_seconds = refresh_interval_seconds
         self.last_update: int = 0
         # (model, revision) -> (cached result or None, fetched_at)
         self._weights_cache: Dict[Tuple[str, str], Tuple[Optional[Tuple[str, str, str]], float]] = {}
         self._weights_ttl_sec = 1800
+        # (model, revision) -> (tokenizer_sig_or_empty, fetched_at)
+        self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
         self._background_task: Optional[asyncio.Task] = None
 
     # ---- lifecycle -------------------------------------------------------
@@ -305,10 +316,117 @@ class MinersMonitor:
                 except Exception as e:
                     logger.debug(f"[MinersMonitor] template check failed uid={uid}: {e}")
 
+        # step 8.0: CEAC tokenizer-signature early reject. A candidate
+        # whose tokenizer.json differs from the active champion's
+        # cannot be teacher-forced apple-to-apple, so we never bother
+        # putting it on the queue. Inactive (no champion sig yet) →
+        # skip the check, anticopy is in cold-start.
+        anticopy_cfg = await self._safe_load_anticopy_config()
+        champion_sig = ""
+        if anticopy_cfg is not None and anticopy_cfg.enabled:
+            try:
+                champion_sig = await self.anticopy_state_dao.get_champion_tokenizer_sig() or ""
+                # legacy: fall back to system_config for backward-compat
+                # in case ``anticopy_state`` hasn't been populated yet on
+                # an older deployment. Drop this branch once all live
+                # validators have rolled past the migration.
+                if not champion_sig:
+                    champion_sig = await self.config_dao.get_param_value(
+                        "anticopy_champion_tokenizer_sig", default="",
+                    ) or ""
+            except Exception:
+                champion_sig = ""
+
+        if uid != 0 and anticopy_cfg is not None and anticopy_cfg.enabled and champion_sig:
+            cand_sig = await self._get_tokenizer_sig(model, revision)
+            info.tokenizer_sig = cand_sig
+            if not cand_sig:
+                info.mark_invalid("tokenizer_sig_fetch_failed", permanent=False)
+                return info
+            if cand_sig != champion_sig:
+                info.mark_invalid(
+                    f"tokenizer_sig_mismatch:cand={cand_sig[:12]}",
+                    permanent=True,
+                )
+                return info
+
+        # CEAC step 8.1: if anticopy backfill flagged this miner as a
+        # copy of an earlier model, mark it invalid here so downstream
+        # weight-setting drops it. Lookup is keyed by (hotkey, revision)
+        # so a re-uploaded ckpt is re-evaluated fresh — we don't carry
+        # over a stale verdict.
+        # permanent=False so that if backfill re-runs (threshold change,
+        # origin deregistration, etc.) and the verdict clears, the next
+        # monitor cycle picks the miner back up.
+        if (
+            uid != 0
+            and anticopy_cfg is not None
+            and anticopy_cfg.enabled
+        ):
+            try:
+                score_row = await self.anticopy_scores_dao.get_score(
+                    hotkey, revision,
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[MinersMonitor] anticopy score lookup failed "
+                    f"{hotkey[:10]}: {e}"
+                )
+                score_row = None
+            if score_row and (score_row.get("verdict_copy_of") or "").strip():
+                origin_model = (
+                    score_row.get("closest_peer_model") or "unknown"
+                )
+                dm = score_row.get("decision_median")
+                try:
+                    dm_str = f"{float(dm):.4f}"
+                except (TypeError, ValueError):
+                    dm_str = "?"
+                info.mark_invalid(
+                    f"anticopy_copy:copied_from={origin_model},dm={dm_str}",
+                    permanent=False,
+                )
+                return info
+
         info.is_valid = True
         if not info.template_check_result:
             info.template_check_result = "safe"
+
+        # CEAC step 8 (job enqueue) was removed when the worker switched
+        # to a pull-based model: it now reads the live miners table
+        # itself, sorts by commit time, and skips already-scored rows.
+        # The monitor only needs to stamp the tokenizer signature here
+        # (step 8.0 above) and persist ``miners.is_valid``; no queue
+        # write is required.
         return info
+
+    async def _safe_load_anticopy_config(self):
+        """Resolve the anticopy config but never break a monitor cycle
+        on a transient KV read failure."""
+        try:
+            return await load_anticopy_config(self.config_dao)
+        except Exception as e:
+            logger.debug(f"[MinersMonitor] load_anticopy_config failed: {e}")
+            return None
+
+    async def _get_tokenizer_sig(self, model_id: str, revision: str) -> str:
+        """Cached sha256 of the candidate's ``tokenizer.json``. Empty
+        string means HF couldn't supply it (treat as transient)."""
+        key = (model_id, revision)
+        now = time.time()
+        cached = self._tokenizer_sig_cache.get(key)
+        if cached and now - cached[1] < self._weights_ttl_sec:
+            return cached[0]
+        try:
+            sig, _src = await compute_tokenizer_signature(model_id, revision)
+        except Exception as e:
+            logger.debug(
+                f"[MinersMonitor] tokenizer_sig fetch failed {model_id}@{revision[:8]}: {e}"
+            )
+            sig = None
+        sig_str = sig or ""
+        self._tokenizer_sig_cache[key] = (sig_str, now)
+        return sig_str
 
     async def _get_model_info(
         self, model_id: str, revision: str

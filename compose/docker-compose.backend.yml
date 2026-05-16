@@ -89,13 +89,58 @@ services:
   # rollout pipeline is wanted (DISTILL env currently consumes the existing
   # R2 rollout snapshot without it).
 
+  # Anti-Copy Refresh — daily transform of the champion's recent
+  # sample_results into the CEAC rollout pool (DDB index + private R2
+  # blob). Lightweight CPU-only loop; one global instance.
+  anticopy_refresh:
+    image: affinefoundation/affine:latest
+    container_name: affine-anticopy-refresh
+    restart: unless-stopped
+    mem_reservation: "1g"
+    mem_limit: "2g"
+    env_file:
+      - .env
+    volumes:
+      - /var/log/affine/anticopy_refresh:/var/log/affine/anticopy_refresh
+    command: ["-v", "servers", "anticopy-refresh"]
+
+  # Anti-Copy Worker — CPU-side service. Owns the DDB / R2 writes
+  # (this is where the production credentials live) and drives the
+  # GPU host's sglang server entirely over SSH:
+  #   - SSH-exec snapshot_download / scan_cache_dir / GC on the GPU host
+  #   - SSH-tunnel sglang HTTP through localhost:<ANTICOPY_SGLANG_URL port>
+  # The GPU host itself never sees an AWS key — it only hosts sglang.
+  #
+  # Requires:
+  #   ANTICOPY_REMOTE_SSH_HOST   user@gpu-host
+  #   ANTICOPY_REMOTE_SSH_KEY    /root/.ssh/id_<...> (mounted RO)
+  #   ANTICOPY_SGLANG_URL        http://localhost:<port>  (tunnel forward)
+  #   ANTICOPY_HF_CACHE          path on the GPU host (e.g. /data)
+  # plus AWS_REGION + R2_ACCESS_KEY/R2_SECRET_KEY in .env.
+  #
+  # The SSH local-port forward is established by the worker entry
+  # script itself (no separate tunnel sidecar needed); see
+  # ``affine/src/anticopy/main.py``.
+  anticopy_worker:
+    image: affinefoundation/affine:latest
+    container_name: affine-anticopy-worker
+    restart: unless-stopped
+    mem_reservation: "2g"
+    mem_limit: "4g"
+    env_file:
+      - .env
+    volumes:
+      - ~/.ssh:/root/.ssh:ro
+      - /var/log/affine/anticopy_worker:/var/log/affine/anticopy_worker
+    command: ["-v", "servers", "anticopy-worker"]
+
   watchtower:
     image: nickfedor/watchtower
     container_name: affine-backend-watchtower
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 30 affine-api affine-monitor affine-scheduler affine-executor
+    command: --interval 30 affine-api affine-monitor affine-scheduler affine-executor affine-anticopy-refresh affine-anticopy-worker
 
 networks:
   default:

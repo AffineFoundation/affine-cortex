@@ -294,3 +294,86 @@ INFERENCE_ENDPOINTS_SCHEMA = {
     ],
     "BillingMode": "PAY_PER_REQUEST",
 }
+
+
+# Anti-Copy (CEAC) — three sibling tables backing the lazy plagiarism
+# detector described in ``devlog/ceac_design.md``.
+#
+# ``anticopy_rollouts`` indexes the rolling pool of champion-generated
+# rollouts. Each row points at an R2 blob that holds the actual
+# tokenized prompt + response. The 7-day rolling window is enforced by
+# ``ttl``; refresh recomputes the daily slice.
+#   PK: ROLLOUT#{champion_hotkey}#{env}#{task_id}
+#   non-key:
+#     champion_hotkey, champion_revision, env, task_id, day
+#     tokenizer_sig, r2_key, response_len, created_at, ttl
+ANTICOPY_ROLLOUTS_SCHEMA = {
+    "TableName": get_table_name("anticopy_rollouts"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "tokenizer_sig", "AttributeType": "S"},
+        {"AttributeName": "created_at", "AttributeType": "N"},
+    ],
+    "GlobalSecondaryIndexes": [
+        {
+            # All current rollouts with a given tokenizer signature,
+            # newest first. Used by ``forward_worker`` to enumerate the
+            # rollout set a candidate should be teacher-forced against.
+            "IndexName": "tokenizer-created-index",
+            "KeySchema": [
+                {"AttributeName": "tokenizer_sig", "KeyType": "HASH"},
+                {"AttributeName": "created_at", "KeyType": "RANGE"},
+            ],
+            "Projection": {"ProjectionType": "ALL"},
+        },
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+ANTICOPY_ROLLOUTS_TTL = {"AttributeName": "ttl"}
+
+
+# ``anticopy_scores_index`` — one row per (miner_hotkey, revision). The
+# heavy per-rollout logprob blob lives in R2; this DDB row is a small
+# index so the verdict pass can scan all active candidates cheaply.
+#   PK: SCORE#{hotkey}#{revision}
+#   non-key:
+#     hotkey, revision, tokenizer_sig, computed_at, r2_key
+#     rollout_keys: list of "{champion_hotkey}#{env}#{task_id}" the
+#                   score covers (used by pairwise intersection)
+#     verdict_copy_of: hotkey of the earliest miner this one copies, or
+#                     "" if independent / not yet evaluated.
+#     n_overlap_max:   the largest overlap observed against any peer
+#                     (debug aid; not used for verdict).
+ANTICOPY_SCORES_INDEX_SCHEMA = {
+    "TableName": get_table_name("anticopy_scores_index"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+
+ANTICOPY_STATE_SCHEMA = {
+    # Machine-managed metadata for the CEAC subsystem. Holds runtime
+    # state the ``anticopy-refresh`` service writes on every daily tick
+    # (active champion uid + tokenizer signature of the rollout pool)
+    # — values that change too often to live in ``system_config``,
+    # which is the human-tunable settings table.
+    "TableName": get_table_name("anticopy_state"),
+    "KeySchema": [
+        {"AttributeName": "key", "KeyType": "HASH"},
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "key", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+

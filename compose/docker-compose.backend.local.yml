@@ -20,6 +20,18 @@ services:
   executor:
     <<: *affine_image
 
+  anticopy_refresh:
+    <<: *affine_image
+
+  anticopy_worker:
+    <<: *affine_image
+    # Local R2-blob cache lives inside the container at the default
+    # ``/var/cache/anticopy`` (created by AntiCopyR2 on first write).
+    # If you want it to survive container restarts, override and mount
+    # a host path, e.g.:
+    #   volumes:
+    #     - /var/cache/affine/anticopy:/var/cache/anticopy
+
   watchtower:
     profiles:
       - production
