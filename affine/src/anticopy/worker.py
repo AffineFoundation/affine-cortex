@@ -296,15 +296,18 @@ class ForwardWorker:
                 stats = None
             if stats and stats.get("challenge_status") == "terminated":
                 continue
-            # ``scores_index`` is the done marker — any row there means
-            # the candidate already has a verdict (independent or copy)
-            # and shouldn't be re-scored on every loop iteration.
+            # A row is the "done" marker ONLY if verdict has actually
+            # run (``verdict_at`` populated). Rows from an older worker
+            # build that wrote the score blob but crashed before
+            # ``update_verdict`` are stuck at ``verdict_at=None`` /
+            # ``decision_median=-1`` and need a verdict-only re-run —
+            # ``_run_job`` detects that and skips teacher-forcing.
             try:
                 score_row = await self.scores_dao.get_score(hk, rev)
             except Exception as e:
                 logger.debug(f"[anticopy.worker] score lookup {hk[:10]}: {e}")
                 score_row = None
-            if score_row is not None:
+            if score_row is not None and score_row.get("verdict_at"):
                 continue
             candidates.append(row)
         candidates.sort(
@@ -339,6 +342,20 @@ class ForwardWorker:
             if not cfg.enabled:
                 logger.info("[anticopy.worker] anticopy disabled — sleeping")
                 await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
+                return
+
+            # Verdict-only fast path: row already exists with score blob
+            # in R2 but ``verdict_at`` is empty (older worker crashed
+            # before update_verdict). Re-run verdict against the current
+            # peer set without touching sglang or re-doing the ~3-min
+            # teacher-force.
+            existing_row = None
+            try:
+                existing_row = await self.scores_dao.get_score(hotkey, revision)
+            except Exception as e:
+                logger.debug(f"[anticopy.worker] existing-row lookup {hotkey[:10]}: {e}")
+            if existing_row is not None and not existing_row.get("verdict_at"):
+                await self._run_verdict_only(cfg, job, existing_row)
                 return
 
             # 1) Compute the candidate's tokenizer signature once so we
@@ -998,6 +1015,76 @@ class ForwardWorker:
         raise last_err or _SglangError("teacher_force exhausted retries")
 
     # ---- verdict + invalid mark -------------------------------------
+
+    async def _run_verdict_only(
+        self,
+        cfg: AntiCopyConfig,
+        job: Dict[str, Any],
+        existing_row: Dict[str, Any],
+    ) -> None:
+        """Verdict re-run for a row whose score blob is already in R2
+        but whose ``verdict_at`` was never written (older-worker crash
+        between ``upsert`` and ``update_verdict``)."""
+        hotkey = str(job.get("hotkey", ""))
+        revision = str(job.get("revision", ""))
+        uid = int(job.get("uid", 0) or 0)
+        r2_key = existing_row.get("r2_key")
+        if not r2_key:
+            logger.warning(
+                f"[anticopy.worker] {hotkey[:10]} verdict-only skipped: "
+                f"row has no r2_key"
+            )
+            return
+        try:
+            blob = await asyncio.to_thread(self.r2.get_score_by_key, r2_key)
+        except Exception as e:
+            logger.warning(
+                f"[anticopy.worker] {hotkey[:10]} verdict-only R2 fetch failed: {e}"
+            )
+            return
+        if not blob:
+            logger.warning(
+                f"[anticopy.worker] {hotkey[:10]} verdict-only skipped: "
+                f"R2 blob {r2_key} missing"
+            )
+            return
+        first_block = int(existing_row.get("first_block") or 0)
+        if not first_block:
+            first_block = await self._lookup_first_block(uid, hotkey, revision)
+        logger.info(
+            f"[anticopy.worker] {hotkey[:10]} verdict-only "
+            f"(R2 score blob, first_block={first_block})"
+        )
+        (
+            verdict_hotkey,
+            decision_med,
+            decision_per_env,
+            closest_peer_model,
+        ) = await self._run_verdict(
+            cfg=cfg, new_score=blob, new_first_block=first_block,
+        )
+        await self.scores_dao.update_verdict(
+            hotkey, revision,
+            copy_of=verdict_hotkey,
+            decision_median=decision_med,
+            decision_per_env=decision_per_env,
+            closest_peer_model=closest_peer_model,
+        )
+        per_env_str = " ".join(
+            f"{env}={med:.4f}" for env, med in sorted(decision_per_env.items())
+        ) or "(no peers)"
+        if verdict_hotkey:
+            logger.info(
+                f"[anticopy.worker] {hotkey[:10]} verdict-only done "
+                f"copy_of={verdict_hotkey[:10]} dec_med={decision_med:.4f} "
+                f"per_env={{{per_env_str}}}"
+            )
+        else:
+            logger.info(
+                f"[anticopy.worker] {hotkey[:10]} verdict-only done "
+                f"dec_med={decision_med:.4f} verdict=independent "
+                f"closest_peer={(closest_peer_model or '-')[:40]}"
+            )
 
     async def _run_verdict(
         self,
