@@ -350,6 +350,44 @@ class MinersMonitor:
                 )
                 return info
 
+        # CEAC step 8.1: if anticopy backfill flagged this miner as a
+        # copy of an earlier model, mark it invalid here so downstream
+        # weight-setting drops it. Lookup is keyed by (hotkey, revision)
+        # so a re-uploaded ckpt is re-evaluated fresh — we don't carry
+        # over a stale verdict.
+        # permanent=False so that if backfill re-runs (threshold change,
+        # origin deregistration, etc.) and the verdict clears, the next
+        # monitor cycle picks the miner back up.
+        if (
+            uid != 0
+            and anticopy_cfg is not None
+            and anticopy_cfg.enabled
+        ):
+            try:
+                score_row = await self.anticopy_scores_dao.get_score(
+                    hotkey, revision,
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[MinersMonitor] anticopy score lookup failed "
+                    f"{hotkey[:10]}: {e}"
+                )
+                score_row = None
+            if score_row and (score_row.get("verdict_copy_of") or "").strip():
+                origin_model = (
+                    score_row.get("closest_peer_model") or "unknown"
+                )
+                dm = score_row.get("decision_median")
+                try:
+                    dm_str = f"{float(dm):.4f}"
+                except (TypeError, ValueError):
+                    dm_str = "?"
+                info.mark_invalid(
+                    f"anticopy_copy:copied_from={origin_model},dm={dm_str}",
+                    permanent=False,
+                )
+                return info
+
         info.is_valid = True
         if not info.template_check_result:
             info.template_check_result = "safe"
