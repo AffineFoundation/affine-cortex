@@ -1749,3 +1749,110 @@ def test_predeployed_challenger_gated_on_champion_done():
     assert pre_tids == {0, 1, 2}, (
         f"pre-deployed must gate on champion-done set {{0,1,2}}, got {pre_tids}"
     )
+
+
+# ---- stale-dispatch cancellation -----------------------------------------
+
+
+def test_collect_current_deployment_ids_unions_subjects():
+    from affine.src.executor.worker import _collect_current_deployment_ids
+    from affine.src.scorer.window_state import (
+        BattleRecord, ChampionRecord, DeploymentRecord, MinerSnapshot,
+    )
+
+    champ = ChampionRecord(
+        uid=1, hotkey="c", revision="r1", model="m",
+        deployment_id="d-champ",
+        deployments=[
+            DeploymentRecord("a", "d-champ", "u1"),
+            DeploymentRecord("a2", "d-champ-2", "u1b"),
+        ],
+    )
+    battle = BattleRecord(
+        challenger=MinerSnapshot(uid=2, hotkey="ch", revision="r2", model="m"),
+        deployment_id="d-bat", base_url="u2", started_at_block=0,
+        deployments=[DeploymentRecord("a", "d-bat", "u2")],
+    )
+    pre = BattleRecord(
+        challenger=MinerSnapshot(uid=3, hotkey="pr", revision="r3", model="m"),
+        deployment_id="d-pre", base_url="u3", started_at_block=0,
+        deployments=[DeploymentRecord("b", "d-pre", "u3")],
+    )
+
+    ids = _collect_current_deployment_ids(champ, battle, [pre])
+    assert ids == {"d-champ", "d-champ-2", "d-bat", "d-pre"}
+
+
+def test_collect_current_deployment_ids_handles_none_records():
+    from affine.src.executor.worker import _collect_current_deployment_ids
+    assert _collect_current_deployment_ids(None, None, []) == set()
+
+
+def test_cancel_stale_dispatches_cancels_only_tasks_for_torn_down_deployments():
+    """A task pointed at a deployment_id that's no longer current must
+    be cancelled so it stops occupying ``in_flight_value`` and the
+    global dispatch slot. Current-deployment tasks must NOT be touched."""
+    import asyncio as _asyncio
+
+    from affine.src.executor.worker import ExecutorWorker
+
+    async def _run():
+        loop = _asyncio.get_running_loop()
+        worker = ExecutorWorker(worker_id=0, env="ENV_A")
+
+        async def _block():
+            await _asyncio.sleep(60)
+
+        live_task = loop.create_task(_block())
+        stale_task = loop.create_task(_block())
+        worker._tasks_by_deployment["live"] = {live_task}
+        worker._tasks_by_deployment["stale"] = {stale_task}
+
+        worker._cancel_stale_dispatches({"live"})
+
+        # Yield once so cancellation propagates.
+        await _asyncio.sleep(0)
+
+        assert stale_task.cancelled() or stale_task.done(), (
+            "stale task must be cancelled"
+        )
+        assert not live_task.cancelled() and not live_task.done(), (
+            "live task must keep running"
+        )
+        assert "stale" not in worker._tasks_by_deployment
+        assert worker._tasks_by_deployment["live"] == {live_task}
+
+        live_task.cancel()
+        try:
+            await live_task
+        except _asyncio.CancelledError:
+            pass
+
+    _asyncio.run(_run())
+
+
+def test_cancel_stale_dispatches_gcs_done_tasks_in_live_buckets():
+    """After tasks finish naturally, they linger in the bucket until
+    next sweep. The sweep must GC them so the bucket doesn't grow
+    unbounded over thousands of dispatches."""
+    import asyncio as _asyncio
+
+    from affine.src.executor.worker import ExecutorWorker
+
+    async def _run():
+        loop = _asyncio.get_running_loop()
+        worker = ExecutorWorker(worker_id=0, env="ENV_A")
+
+        async def _noop():
+            return None
+
+        done_task = loop.create_task(_noop())
+        await done_task  # finish
+        worker._tasks_by_deployment["live"] = {done_task}
+
+        worker._cancel_stale_dispatches({"live"})
+
+        # Bucket pruned to empty → deployment_id key removed entirely.
+        assert "live" not in worker._tasks_by_deployment
+
+    _asyncio.run(_run())
