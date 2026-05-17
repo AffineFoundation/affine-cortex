@@ -91,6 +91,23 @@ class _InMemoryMinerStore:
         if terminated_at_block is not None:
             self.rows[uid]["terminated_at_block"] = terminated_at_block
 
+    async def release_claim(
+        self, uid: int, *,
+        hotkey: str | None = None,
+        revision: str | None = None,
+    ) -> bool:
+        row = self.rows.get(uid)
+        if row is None or row.get("challenge_status") != STATUS_IN_PROGRESS:
+            return False
+        row["challenge_status"] = STATUS_SAMPLING
+        return True
+
+    async def list_in_progress(self) -> List[dict]:
+        return [
+            dict(r) for r in self.rows.values()
+            if r.get("challenge_status") == STATUS_IN_PROGRESS
+        ]
+
 
 @dataclass
 class _DeployTracker:
@@ -1032,11 +1049,16 @@ async def test_challenger_invalidated_mid_battle_does_not_get_promoted():
     # Champion did NOT change — challenger was invalid at decide time.
     champ = await state.get_champion()
     assert champ.uid == 1, f"invalid challenger was wrongly promoted: {champ}"
-    # Challenger's challenge_status stays at IN_PROGRESS: the
-    # ``is_valid=false`` flag plus their original ``invalid_reason``
-    # are the authoritative signal; we don't overwrite with a
-    # generic ``terminated`` label here.
-    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    # Lifecycle converges to terminated. ``invalid_reason`` and
+    # ``termination_reason`` carry orthogonal facts (operational vs
+    # lifecycle), and ``is_valid`` is not durable — it can flip back
+    # to True when e.g. an anticopy verdict reverts, so the lifecycle
+    # write is the only reliable one-shot guarantee. Without it the
+    # row would leak as an in_progress orphan in the rank UI.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miner_store.rows[2]["termination_reason"].startswith(
+        "invalidated_mid_battle:"
+    )
     # No weight write happened (champion didn't change).
     assert weight_writer.calls == []
     # Challenger's Targon was torn down, champion's preserved.
@@ -2101,16 +2123,16 @@ async def test_early_invalidation_fires_before_overlap_ready():
     assert "wrk-002" in deployer.teardowns
     assert "wrk-001" not in deployer.teardowns
 
-    # Crucially: ``challenge_status`` stays at IN_PROGRESS, no new
-    # ``termination_reason`` written. The miner's ``invalid_reason``
-    # already records why; we don't replace specific monitor causes
-    # (anticopy / multi_commit / blacklist) with the generic label.
-    # The queue's ``list_valid_pending`` filters by is_valid=true, so
-    # the still-invalid miner can't be re-picked even though their
-    # row isn't formally TERMINATED.
+    # Lifecycle converges to TERMINATED with reason
+    # ``invalidated_mid_battle:...``. ``invalid_reason`` (operational)
+    # and ``termination_reason`` (lifecycle) are orthogonal: the
+    # former can flip back to None when an underlying transient
+    # signal clears (anticopy ``permanent=False``), so the lifecycle
+    # write is the only reliable one-shot guarantee. No frozen scores
+    # / terminated_at_block because the comparator never decided.
     row = miner_store.rows[2]
-    assert row["challenge_status"] == STATUS_IN_PROGRESS
-    assert row.get("termination_reason") in (None, "")
+    assert row["challenge_status"] == STATUS_TERMINATED
+    assert row["termination_reason"].startswith("invalidated_mid_battle:")
     assert "scores_by_env" not in row
     assert "terminated_at_block" not in row
 
@@ -2212,9 +2234,11 @@ async def test_in_decide_invalidation_guard_catches_concurrent_flip():
     assert champ.uid == 1, "in-decide guard failed to block promotion"
     assert weight_writer.calls == []
     assert "wrk-002" in deployer.teardowns
-    # Same no-status-rewrite policy as the step-4.5 path.
-    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
-    assert miner_store.rows[2].get("termination_reason") in (None, "")
+    # Same lifecycle-converge behavior as the step-4.5 path.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miner_store.rows[2]["termination_reason"].startswith(
+        "invalidated_mid_battle:"
+    )
 
 
 @pytest.mark.asyncio

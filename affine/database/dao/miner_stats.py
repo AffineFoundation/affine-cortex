@@ -66,6 +66,36 @@ class MinerStatsDAO(BaseDAO):
                 return out
             params["ExclusiveStartKey"] = last_key
 
+    async def list_by_challenge_status(
+        self, status: str,
+    ) -> List[Dict[str, Any]]:
+        """Scan all rows currently in the given lifecycle status.
+
+        Used by the orphan reaper to enforce the invariant
+        ``challenge_status='in_progress'`` ↔ ``battle.challenger.uid``.
+        Table is small (one row per (hotkey, revision)), full scan per
+        tick is acceptable.
+        """
+        from affine.database.client import get_client
+
+        client = get_client()
+        params = {
+            "TableName": self.table_name,
+            "FilterExpression": "challenge_status = :s",
+            "ExpressionAttributeValues": {":s": {"S": status}},
+        }
+        out: List[Dict[str, Any]] = []
+        while True:
+            response = await client.scan(**params)
+            out.extend(
+                self._deserialize(item)
+                for item in response.get("Items", [])
+            )
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                return out
+            params["ExclusiveStartKey"] = last_key
+
     async def update_miner_info(
         self,
         *,

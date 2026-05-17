@@ -95,6 +95,16 @@ class MinerQueueStore(Protocol):
         """Set ``uid``'s historical ``challenge_status``."""
         ...
 
+    async def list_in_progress(self) -> list[dict]:
+        """Return all historical rows currently in ``in_progress``.
+
+        Used by :class:`affine.src.scheduler.flow.FlowScheduler` to
+        enforce the invariant ``challenge_status='in_progress'`` ↔
+        ``battle.challenger.uid`` and reap orphans left behind by
+        crash windows.
+        """
+        ...
+
 
 class ChallengerQueue:
     def __init__(self, store: MinerQueueStore):
@@ -196,6 +206,14 @@ class ChallengerQueue:
         return await self._store.release_claim(
             uid, hotkey=hotkey, revision=revision,
         )
+
+    async def list_in_progress(self) -> list[dict]:
+        """Return raw historical rows currently ``in_progress``.
+
+        Thin pass-through; the reaper at the FlowScheduler level
+        applies the active-battle and grace-window filters.
+        """
+        return await self._store.list_in_progress()
 
     async def mark_terminated(
         self,

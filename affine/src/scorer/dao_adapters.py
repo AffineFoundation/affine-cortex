@@ -95,6 +95,16 @@ class MinersQueueAdapter:
             )
             return False
 
+    async def list_in_progress(self) -> List[Dict[str, Any]]:
+        """Return raw historical rows currently ``in_progress``.
+
+        Used by the orphan reaper — the scheduler applies the active-
+        battle and grace-window filters before terminating anything.
+        """
+        return await self._stats.list_by_challenge_status(
+            MinerStatsDAO.STATUS_IN_PROGRESS,
+        )
+
     async def set_terminal(
         self,
         uid: int,
