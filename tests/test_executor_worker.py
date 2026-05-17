@@ -765,6 +765,9 @@ def test_adaptive_caps_priority_inactive_top_tier_does_not_block_cascade():
 
 
 def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
+    """Champion's per-env target is the full oversampled pool;
+    challenger's target is clipped to ``sampling_count`` (overlap
+    threshold). Verified via per-subject ``_last_done`` entries."""
     import asyncio as _asyncio
 
     manager = ExecutorManager(["ENV_A"])
@@ -777,11 +780,14 @@ def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
                     "task_ids": {"ENV_A": ids},
                     "refreshed_at_block": 123,
                 },
-                "champion": {"hotkey": "champ_hk", "revision": "champ_rev"},
+                "champion": {
+                    "uid": 213,
+                    "hotkey": "champ_hk", "revision": "champ_rev",
+                },
                 "current_battle": {
                     "challenger": {
-                        "hotkey": "chal_hk",
-                        "revision": "chal_rev",
+                        "uid": 228,
+                        "hotkey": "chal_hk", "revision": "chal_rev",
                     },
                 },
                 "environments": {
@@ -802,14 +808,23 @@ def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
 
     _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
 
-    assert manager._last_done["ENV_A"] == 400
+    # Per-subject done counts, keyed by (uid, env). Champion sees full
+    # pool (441 clipped to target=441). Challenger sees sampling_count
+    # (400 clipped to target=400).
+    assert manager._last_done[(213, "ENV_A")] == 441
+    assert manager._last_done[(228, "ENV_A")] == 400
+    # No work remaining → planner falls back to initial fair share (the
+    # whole budget when there's exactly one env).
     assert manager.env_cap_values["ENV_A"].value == 600
 
 
-def test_status_label_includes_uid_for_each_role(caplog):
-    """STATUS label must carry the UID so operators don't read role as
-    identity. ``[champion U213]`` / ``[challenger U228]`` instead of
-    ambiguous ``[champion]`` / ``[challenger]``."""
+def test_status_label_includes_uid_for_each_subject(caplog):
+    """STATUS line must report EVERY active subject — champion,
+    current-battle challenger, and pre-deployed challengers — each
+    tagged with its uid. Operators were misreading the legacy single-
+    role label as identity even before pre-deploys; now that multiple
+    miners actually run in parallel, single-subject reporting would
+    hide where the in-flight slots are going."""
     import asyncio as _asyncio
     import logging
 
@@ -819,96 +834,203 @@ def test_status_label_includes_uid_for_each_role(caplog):
     class _SC:
         async def get_param_value(self, name, default=None):
             return {
-                "current_task_ids": {"task_ids": {"ENV_A": ids}, "refreshed_at_block": 1},
-                "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
+                "current_task_ids": {
+                    "task_ids": {"ENV_A": ids}, "refreshed_at_block": 1,
+                },
+                "champion": {
+                    "uid": 213, "hotkey": "champ_hk", "revision": "champ_rev",
+                },
                 "current_battle": {"challenger": {
                     "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
                 }},
+                "predeployed_challengers": [
+                    {"challenger": {
+                        "uid": 305, "hotkey": "pre_hk", "revision": "pre_rev",
+                    }},
+                ],
                 "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
             }.get(name, default)
 
     class _Samples:
-        async def count_samples_for_tasks(self, hotkey, revision, env, task_ids, *, refresh_block):
+        async def count_samples_for_tasks(
+            self, hotkey, revision, env, task_ids, *, refresh_block,
+        ):
             return 5
 
     with caplog.at_level(logging.INFO, logger="affine"):
         _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
 
-    assert any("[challenger U228]" in r.message for r in caplog.records), (
-        "active subject is the challenger in a live battle — STATUS label must say [challenger U228]"
+    log_text = " ".join(r.message for r in caplog.records)
+    assert "champ U213" in log_text, (
+        f"champion segment missing in: {log_text!r}"
     )
-
-    # Now clear the battle: label flips to [champion U213].
-    caplog.clear()
-
-    class _SC2:
-        async def get_param_value(self, name, default=None):
-            return {
-                "current_task_ids": {"task_ids": {"ENV_A": ids}, "refreshed_at_block": 1},
-                "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
-                "current_battle": {},
-                "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
-            }.get(name, default)
-
-    with caplog.at_level(logging.INFO, logger="affine"):
-        _asyncio.run(manager._emit_status_line(_SC2(), _Samples()))
-
-    assert any("[champion U213]" in r.message for r in caplog.records), (
-        "no battle in flight — STATUS label must say [champion U213]"
+    assert "chal U228" in log_text, (
+        f"challenger segment missing in: {log_text!r}"
+    )
+    assert "pre U305" in log_text, (
+        f"pre-deployed segment missing in: {log_text!r}"
     )
 
 
-def test_status_delta_zeroes_on_subject_change(caplog):
-    """Between two STATUS prints the active subject can change (battle
-    decided → role flips). The per-env delta is otherwise computed as
-    ``current_subject_count - previous_subject_count`` — a meaningless
-    cross-miner subtraction. The first frame after a subject change
-    must report ``+0`` instead of that phantom delta."""
+def test_status_delta_zeroes_for_newly_appearing_subject(caplog):
+    """A subject newly visible this frame (just-promoted challenger,
+    just-pre-deployed miner) has no baseline to subtract from. Its
+    per-env delta must be ``0`` for the first frame so we don't display
+    a phantom ``+done`` against a non-existent prior. Subjects that
+    were present last frame keep computing real deltas."""
     import asyncio as _asyncio
     import logging
 
     manager = ExecutorManager(["ENV_A"])
     ids = list(range(10))
 
-    sample_counts = {("chal_hk", "chal_rev"): 7, ("champ_hk", "champ_rev"): 9}
+    sample_counts = {
+        ("chal_hk", "chal_rev"): 7,
+        ("champ_hk", "champ_rev"): 9,
+        ("pre_hk", "pre_rev"): 4,
+    }
 
-    def _make_sc(battle):
+    def _make_sc(battle, *, predeployed=()):
         class _SC:
             async def get_param_value(_self, name, default=None):
                 return {
-                    "current_task_ids": {"task_ids": {"ENV_A": ids},
-                                         "refreshed_at_block": 1},
-                    "champion": {"uid": 213, "hotkey": "champ_hk", "revision": "champ_rev"},
+                    "current_task_ids": {
+                        "task_ids": {"ENV_A": ids}, "refreshed_at_block": 1,
+                    },
+                    "champion": {
+                        "uid": 213,
+                        "hotkey": "champ_hk", "revision": "champ_rev",
+                    },
                     "current_battle": battle,
-                    "environments": {"ENV_A": {"sampling": {"sampling_count": 10}}},
+                    "predeployed_challengers": list(predeployed),
+                    "environments": {
+                        "ENV_A": {"sampling": {"sampling_count": 10}},
+                    },
                 }.get(name, default)
         return _SC()
 
     class _Samples:
-        async def count_samples_for_tasks(self, hotkey, revision, env, task_ids, *, refresh_block):
+        async def count_samples_for_tasks(
+            self, hotkey, revision, env, task_ids, *, refresh_block,
+        ):
             return sample_counts.get((hotkey, revision), 0)
 
-    # First print: challenger active, done=7. Baseline (no delta shown).
+    # Frame 1 (baseline): champion + challenger visible. No deltas.
     _asyncio.run(manager._emit_status_line(
-        _make_sc({"challenger": {"uid": 228, "hotkey": "chal_hk", "revision": "chal_rev"}}),
+        _make_sc({"challenger": {
+            "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
+        }}),
         _Samples(),
     ))
-    assert manager._last_subject_key == ("challenger", "chal_hk", "chal_rev")
-    assert manager._last_done["ENV_A"] == 7
+    assert manager._last_subject_set == frozenset({
+        ("champion", 213), ("challenger", 228),
+    })
+    assert manager._last_done[(213, "ENV_A")] == 9
+    assert manager._last_done[(228, "ENV_A")] == 7
 
-    # Second print: battle cleared, champion is now the active subject.
-    # Done count flips to 9 (champion's count). Without the guard, delta
-    # would be 9-7=+2 (false). With the guard, delta=0.
+    # Frame 2: pre-deployed U305 newly appears. Its done=4 is real but
+    # since it wasn't tracked last frame, its delta must be 0 (not +4).
+    # Champion / challenger keep accumulating with real deltas (here
+    # 9-9=0 and 7-7=0 because counts didn't move).
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="affine"):
-        _asyncio.run(manager._emit_status_line(_make_sc({}), _Samples()))
+        _asyncio.run(manager._emit_status_line(
+            _make_sc(
+                {"challenger": {
+                    "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
+                }},
+                predeployed=[{"challenger": {
+                    "uid": 305, "hotkey": "pre_hk", "revision": "pre_rev",
+                }}],
+            ),
+            _Samples(),
+        ))
 
     log_text = " ".join(r.message for r in caplog.records)
-    assert "[champion U213]" in log_text, "subject flipped to champion"
-    assert "+0 " in log_text or "+0\n" in log_text or log_text.endswith("+0"), (
-        f"delta on subject change must be 0, got: {log_text!r}"
+    assert "pre U305:4/10" in log_text, (
+        f"pre-deployed should print 4/10 without a +delta, got: {log_text!r}"
     )
-    assert "+2" not in log_text, "phantom cross-subject delta must be suppressed"
+    # The exact substring `+4` must NOT appear for U305 — that would be
+    # the phantom delta against an empty baseline.
+    assert "U305:4/10+4" not in log_text
+    # Frame 3: pre-deployed U305 advanced from 4 to 7. Now its delta
+    # SHOULD be +3 (it was tracked in frame 2).
+    sample_counts[("pre_hk", "pre_rev")] = 7
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="affine"):
+        _asyncio.run(manager._emit_status_line(
+            _make_sc(
+                {"challenger": {
+                    "uid": 228, "hotkey": "chal_hk", "revision": "chal_rev",
+                }},
+                predeployed=[{"challenger": {
+                    "uid": 305, "hotkey": "pre_hk", "revision": "pre_rev",
+                }}],
+            ),
+            _Samples(),
+        ))
+    log_text = " ".join(r.message for r in caplog.records)
+    # Head segment uses ``done/target +delta (rate/h)``; per-env
+    # segment is more compact: ``Uxxx:done/target+delta``. Verify both
+    # — the head shows the rate, the per-env shows the per-env delta.
+    assert "pre U305:7/10 +3" in log_text, (
+        f"head segment should show +3 for pre-deployed, got: {log_text!r}"
+    )
+    assert "U305:7/10+3" in log_text, (
+        f"per-env segment should show +3 for pre-deployed, got: {log_text!r}"
+    )
+
+
+def test_status_marks_throttling_when_inflight_exceeds_cap(caplog):
+    """When ``_compute_adaptive_env_caps`` lowers an env cap, in-flight
+    tasks that started under the old cap keep draining. During that
+    transient, ``running > cap`` is normal — not a bug. The STATUS
+    line flags it with ``*`` so operators don't read it as runaway
+    dispatch."""
+    import asyncio as _asyncio
+    import logging
+
+    manager = ExecutorManager(["ENV_A"])
+    # Force the cap down to 100 while in-flight is 111 (the exact
+    # scenario operators reported).
+    manager.env_cap_values["ENV_A"].value = 100
+    manager.in_flight_values["ENV_A"].value = 111
+
+    class _SC:
+        async def get_param_value(self, name, default=None):
+            return {
+                "current_task_ids": {
+                    "task_ids": {"ENV_A": list(range(10))},
+                    "refreshed_at_block": 1,
+                },
+                "champion": {
+                    "uid": 42, "hotkey": "champ", "revision": "r1",
+                },
+                "current_battle": {},
+                "environments": {
+                    "ENV_A": {"sampling": {"sampling_count": 10}},
+                },
+            }.get(name, default)
+
+    class _Samples:
+        async def count_samples_for_tasks(self, *a, **kw):
+            return 0
+
+    with caplog.at_level(logging.INFO, logger="affine"):
+        _asyncio.run(manager._emit_status_line(_SC(), _Samples()))
+
+    log_text = " ".join(r.message for r in caplog.records)
+    # Allow the planner to revise the cap; check for the throttling
+    # marker against whatever it landed at.
+    final_cap = manager.env_cap_values["ENV_A"].value
+    if 111 > final_cap:
+        assert f"r:111/{final_cap}*" in log_text, (
+            f"expected throttling marker for r:111/{final_cap}*, got: {log_text!r}"
+        )
+    else:
+        # Planner may have raised the cap back; nothing to assert in
+        # that case beyond the line printing.
+        assert "[STATUS]" in log_text
 
 
 def test_dispatch_proceeds_when_only_battle_has_url():
@@ -968,6 +1090,9 @@ def test_dispatch_proceeds_when_only_battle_has_url():
                     ),
                 ],
             )
+
+        async def get_predeployed_challengers(self):
+            return []
 
     class _SamplesStub:
         # Champion has already sampled all 3 task_ids — without that the
@@ -1045,6 +1170,9 @@ def test_dispatch_skips_when_neither_has_url():
 
         async def get_battle(self):
             return None
+
+        async def get_predeployed_challengers(self):
+            return []
 
     class _SamplesStub:
         async def has_sample(self, *a, **kw):
@@ -1126,6 +1254,9 @@ class _DeploymentDriftFixture:
 
             async def get_battle(self):
                 return fixture.battle
+
+            async def get_predeployed_challengers(self):
+                return list(getattr(fixture, "predeployed", []))
 
         class _SamplesStub:
             async def persist(self, **kwargs):
@@ -1358,6 +1489,9 @@ def _make_overlap_worker(env="ENV_A"):
                 ],
             )
 
+        async def get_predeployed_challengers(self):
+            return list(getattr(fx, "predeployed", []))
+
     class _SamplesStub:
         async def read_scores_for_tasks(
             self, hotkey, revision, _env, task_ids, *, refresh_block,
@@ -1367,6 +1501,10 @@ def _make_overlap_worker(env="ENV_A"):
                 return {t: s for t, s in fx.champ_scores.items() if t in wanted}
             if hotkey == "chal_hk":
                 return {t: s for t, s in fx.chal_scores.items() if t in wanted}
+            for record in getattr(fx, "predeployed", []):
+                if hotkey == record.challenger.hotkey:
+                    pre_scores = getattr(fx, "pre_scores", {}).get(hotkey, {})
+                    return {t: s for t, s in pre_scores.items() if t in wanted}
             return {}
 
     fx.state = _StateStub()
@@ -1497,3 +1635,224 @@ def test_challenger_ignores_existing_samples_outside_champion_set():
     # dispatches all 210 of champion's set fresh.
     assert len(challenger_dispatches) == 210
     assert all(tid in range(210) for tid in challenger_dispatches)
+
+
+# ---- pre-deployed challengers dispatch -----------------------------------
+
+
+def test_predeployed_challenger_dispatches_to_its_own_url():
+    """Pre-deployed miners run on a non-primary endpoint, so their
+    dispatches must hit that endpoint's base_url — not the
+    primary/battle URL. Ensures the multi-host mode doesn't cross-fire
+    samples between miners.
+    """
+    from affine.src.scorer.window_state import (
+        DeploymentRecord, MinerSnapshot, BattleRecord,
+    )
+
+    fx = _make_overlap_worker()
+    # Champion has sampled 5 task_ids on the primary; battle is None
+    # (no active battle) so the only candidates beyond champion are
+    # pre-deployed miners. Use a small task pool for arithmetic ease.
+    fx.task_ids = list(range(5))
+    fx.sampling_count = 5
+    fx.champ_scores = {t: 0.5 for t in range(5)}
+    fx.chal_scores = {}
+
+    pre_miner = BattleRecord(
+        challenger=MinerSnapshot(
+            uid=42, hotkey="pre_hk", revision="pre_rev", model="org/p",
+        ),
+        deployment_id="wrk-pre",
+        base_url="https://host-b/wrk-pre",
+        started_at_block=0,
+        deployments=[DeploymentRecord(
+            endpoint_name="host-b",
+            deployment_id="wrk-pre",
+            base_url="https://host-b/wrk-pre",
+        )],
+    )
+    fx.predeployed = [pre_miner]
+    fx.pre_scores = {"pre_hk": {}}
+
+    # Force battle to None to isolate pre-deployed dispatch.
+    async def _no_battle(self):
+        return None
+    fx.state.get_battle = _no_battle.__get__(fx.state)
+
+    fx.drive()
+
+    pre_dispatches = [
+        (tid, url) for uid, tid in fx.dispatched
+        for url in [None]  # placeholder; we'll re-fetch with base_url
+    ]
+    # The fixture's _capture only stored (uid, tid). To check URL we
+    # need a richer capture — replace and re-run.
+    fx.dispatched = []
+    captured = []
+
+    async def _capture_full(*, miner, task_id, base_url, **_kwargs):
+        captured.append((miner.uid, int(task_id), base_url))
+
+    fx.worker._dispatch_one = _capture_full
+    fx.drive()
+
+    pre_rows = [row for row in captured if row[0] == 42]
+    assert len(pre_rows) == 5, (
+        f"pre-deployed should dispatch 5 task_ids (all champion-done), "
+        f"got {len(pre_rows)}"
+    )
+    assert all(
+        url == "https://host-b/wrk-pre" for _, _, url in pre_rows
+    ), "pre-deployed dispatches must hit its own endpoint URL"
+
+
+def test_predeployed_challenger_gated_on_champion_done():
+    """Pre-deployed miner only dispatches for task_ids the champion has
+    already sampled — same gating as ``battle.challenger``. While
+    champion is mid-baseline, other machines stay idle automatically
+    (the user's '冠军采样时其他机器空闲' invariant)."""
+    from affine.src.scorer.window_state import (
+        DeploymentRecord, MinerSnapshot, BattleRecord,
+    )
+
+    fx = _make_overlap_worker()
+    fx.task_ids = list(range(10))
+    fx.sampling_count = 10
+    # Champion has only done 3 of 10 so far.
+    fx.champ_scores = {0: 0.5, 1: 0.5, 2: 0.5}
+    fx.chal_scores = {}
+
+    pre_miner = BattleRecord(
+        challenger=MinerSnapshot(
+            uid=42, hotkey="pre_hk", revision="pre_rev", model="org/p",
+        ),
+        deployment_id="wrk-pre",
+        base_url="https://host-b/wrk-pre",
+        started_at_block=0,
+        deployments=[DeploymentRecord(
+            endpoint_name="host-b",
+            deployment_id="wrk-pre",
+            base_url="https://host-b/wrk-pre",
+        )],
+    )
+    fx.predeployed = [pre_miner]
+    fx.pre_scores = {"pre_hk": {}}
+
+    async def _no_battle(self):
+        return None
+    fx.state.get_battle = _no_battle.__get__(fx.state)
+
+    fx.drive()
+
+    pre_tids = {tid for uid, tid in fx.dispatched if uid == 42}
+    assert pre_tids == {0, 1, 2}, (
+        f"pre-deployed must gate on champion-done set {{0,1,2}}, got {pre_tids}"
+    )
+
+
+# ---- stale-dispatch cancellation -----------------------------------------
+
+
+def test_collect_current_deployment_ids_unions_subjects():
+    from affine.src.executor.worker import _collect_current_deployment_ids
+    from affine.src.scorer.window_state import (
+        BattleRecord, ChampionRecord, DeploymentRecord, MinerSnapshot,
+    )
+
+    champ = ChampionRecord(
+        uid=1, hotkey="c", revision="r1", model="m",
+        deployment_id="d-champ",
+        deployments=[
+            DeploymentRecord("a", "d-champ", "u1"),
+            DeploymentRecord("a2", "d-champ-2", "u1b"),
+        ],
+    )
+    battle = BattleRecord(
+        challenger=MinerSnapshot(uid=2, hotkey="ch", revision="r2", model="m"),
+        deployment_id="d-bat", base_url="u2", started_at_block=0,
+        deployments=[DeploymentRecord("a", "d-bat", "u2")],
+    )
+    pre = BattleRecord(
+        challenger=MinerSnapshot(uid=3, hotkey="pr", revision="r3", model="m"),
+        deployment_id="d-pre", base_url="u3", started_at_block=0,
+        deployments=[DeploymentRecord("b", "d-pre", "u3")],
+    )
+
+    ids = _collect_current_deployment_ids(champ, battle, [pre])
+    assert ids == {"d-champ", "d-champ-2", "d-bat", "d-pre"}
+
+
+def test_collect_current_deployment_ids_handles_none_records():
+    from affine.src.executor.worker import _collect_current_deployment_ids
+    assert _collect_current_deployment_ids(None, None, []) == set()
+
+
+def test_cancel_stale_dispatches_cancels_only_tasks_for_torn_down_deployments():
+    """A task pointed at a deployment_id that's no longer current must
+    be cancelled so it stops occupying ``in_flight_value`` and the
+    global dispatch slot. Current-deployment tasks must NOT be touched."""
+    import asyncio as _asyncio
+
+    from affine.src.executor.worker import ExecutorWorker
+
+    async def _run():
+        loop = _asyncio.get_running_loop()
+        worker = ExecutorWorker(worker_id=0, env="ENV_A")
+
+        async def _block():
+            await _asyncio.sleep(60)
+
+        live_task = loop.create_task(_block())
+        stale_task = loop.create_task(_block())
+        worker._tasks_by_deployment["live"] = {live_task}
+        worker._tasks_by_deployment["stale"] = {stale_task}
+
+        worker._cancel_stale_dispatches({"live"})
+
+        # Yield once so cancellation propagates.
+        await _asyncio.sleep(0)
+
+        assert stale_task.cancelled() or stale_task.done(), (
+            "stale task must be cancelled"
+        )
+        assert not live_task.cancelled() and not live_task.done(), (
+            "live task must keep running"
+        )
+        assert "stale" not in worker._tasks_by_deployment
+        assert worker._tasks_by_deployment["live"] == {live_task}
+
+        live_task.cancel()
+        try:
+            await live_task
+        except _asyncio.CancelledError:
+            pass
+
+    _asyncio.run(_run())
+
+
+def test_cancel_stale_dispatches_gcs_done_tasks_in_live_buckets():
+    """After tasks finish naturally, they linger in the bucket until
+    next sweep. The sweep must GC them so the bucket doesn't grow
+    unbounded over thousands of dispatches."""
+    import asyncio as _asyncio
+
+    from affine.src.executor.worker import ExecutorWorker
+
+    async def _run():
+        loop = _asyncio.get_running_loop()
+        worker = ExecutorWorker(worker_id=0, env="ENV_A")
+
+        async def _noop():
+            return None
+
+        done_task = loop.create_task(_noop())
+        await done_task  # finish
+        worker._tasks_by_deployment["live"] = {done_task}
+
+        worker._cancel_stale_dispatches({"live"})
+
+        # Bucket pruned to empty → deployment_id key removed entirely.
+        assert "live" not in worker._tasks_by_deployment
+
+    _asyncio.run(_run())

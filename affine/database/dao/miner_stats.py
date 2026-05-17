@@ -279,6 +279,45 @@ class MinerStatsDAO(BaseDAO):
                 return False
             raise
 
+    async def release_claim_for_challenge(
+        self,
+        *,
+        hotkey: str,
+        revision: str,
+    ) -> bool:
+        """Revert in_progress → sampling. Used when an active-battle
+        deploy hits an infrastructure transient (SSH transport down,
+        host unreachable): the miner had no chance to fail and must
+        stay re-pickable. Atomic — succeeds only if the row is
+        currently ``in_progress``."""
+        from affine.database.client import get_client
+
+        now = int(time.time())
+        client = get_client()
+        try:
+            await client.update_item(
+                TableName=self.table_name,
+                Key={
+                    "pk": {"S": self._make_pk(hotkey)},
+                    "sk": {"S": self._make_sk(revision)},
+                },
+                UpdateExpression=(
+                    "SET challenge_status = :sampling, "
+                    "last_updated_at = :now"
+                ),
+                ConditionExpression="challenge_status = :in_progress",
+                ExpressionAttributeValues={
+                    ":sampling": {"S": self.STATUS_SAMPLING},
+                    ":in_progress": {"S": self.STATUS_IN_PROGRESS},
+                    ":now": {"N": str(now)},
+                },
+            )
+            return True
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
     async def update_challenge_status(
         self,
         *,

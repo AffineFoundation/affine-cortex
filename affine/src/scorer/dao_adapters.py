@@ -74,6 +74,27 @@ class MinersQueueAdapter:
             )
             return False
 
+    async def release_claim(
+        self, uid: int, *,
+        hotkey: Optional[str] = None,
+        revision: Optional[str] = None,
+    ) -> bool:
+        if not hotkey or not revision:
+            miner = await self._dao.get_miner_by_uid(uid)
+            if not miner:
+                return False
+            hotkey = str(miner["hotkey"])
+            revision = str(miner["revision"])
+        try:
+            return await self._stats.release_claim_for_challenge(
+                hotkey=hotkey, revision=revision,
+            )
+        except Exception as e:
+            logger.warning(
+                f"MinersQueueAdapter.release_claim(uid={uid}) failed: {e}"
+            )
+            return False
+
     async def set_terminal(
         self,
         uid: int,
