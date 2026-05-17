@@ -69,16 +69,8 @@ from . import targon as targon_lifecycle
 
 
 class NoSpareEndpoint(RuntimeError):
-    """``deploy_fn`` raises this when the requested role has no host to
-    land on. The pre-deploy fill loop treats it as a clean termination
-    signal (stop filling); any other exception out of ``deploy_fn`` is
-    a real deploy failure and the loop marks the miner FAILED so the
-    queue can advance (symmetric with ``_start_battle``'s deploy
-    failure path).
-
-    Subclassing ``RuntimeError`` keeps backward compatibility with any
-    caller catching ``RuntimeError`` while letting the fill loop pick
-    out the structured 'no spare' case explicitly."""
+    """``deploy_fn`` raises this when no host is free for the role.
+    The pre-deploy fill loop treats it as 'stop filling, not a failure'."""
 
 
 # ---- constants (no longer in system_config) --------------------------------
@@ -99,11 +91,8 @@ WIN_MIN_DOMINANT_ENVS = 1
 """Partial Pareto: at least one env must be dominant; the rest must not regress."""
 
 _PREDEPLOY_PEEK_LIMIT = 32
-"""Upper bound on candidates pulled per ``_predeploy_fill_spare`` tick.
-Sized to comfortably exceed any plausible SSH endpoint count; the real
-terminator is :exc:`NoSpareEndpoint` from ``deploy_fn``. Bounding it
-keeps a pathological queue from materialising thousands of candidates
-per tick when the host runs out of space."""
+"""Upper bound on candidates pulled per fill tick. Real terminator is
+:exc:`NoSpareEndpoint`."""
 
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
@@ -178,18 +167,8 @@ class FlowScheduler:
     # ---- entry point ------------------------------------------------------
 
     async def tick(self, current_block: int) -> None:
-        """One scheduling step. Two phases:
-
-        1. **Battle phase** (:meth:`_tick_main`): the unchanged tick body
-           — task_id refresh, champion validation/deploy, current-battle
-           progression, decide.
-        2. **Pre-sample phase** (:meth:`_predeploy_phase`): runs on
-           every tick the battle phase didn't crash. Sweeps the
-           pre-deployed list for invalidations + early-loss verdicts,
-           then fills any free non-primary endpoint with the next FIFO
-           queued miner. Wrapped in a guard so a flaky deploy/teardown
-           can't block the next tick's battle phase.
-        """
+        """Battle phase, then pre-sample phase (guarded so a flaky
+        teardown can't block the next tick)."""
         await self._tick_main(current_block)
         try:
             await self._predeploy_phase(current_block)
@@ -725,29 +704,8 @@ class FlowScheduler:
     # ---- pre-sample phase -------------------------------------------------
 
     async def _predeploy_phase(self, current_block: int) -> None:
-        """Maintain the pre-deployed list on non-primary endpoints.
-
-        Three sub-steps in order, all on a best-effort basis:
-
-          (a) Invalidation sweep — tear down any pre-deployed miner
-              whose ``is_valid`` flipped to false since deployment. No
-              status write (``invalid_reason`` on the miners row is the
-              authoritative cause; same policy as
-              :meth:`_decide_invalidation_lost` for the active battle).
-          (b) Early-loss sweep — apply the same
-              :meth:`_check_early_regression` that step 7.5 uses for
-              the active battle. Pre-deployed miners whose data already
-              proves them sure losers get marked ``LOST`` and torn down
-              without ever entering the formal battle (the user's
-              "提前发现必输直接终止" semantic).
-          (c) Fill spare — peek next queued miners in FIFO order and
-              deploy one per free non-primary endpoint until the queue
-              empties or the selector reports no spare.
-
-        Without a champion or task_state, the gating samples don't
-        exist yet — bail rather than deploy a pre-challenger that
-        nothing can sample for.
-        """
+        """Invalidation sweep, early-loss sweep, fill spare. No-op until
+        champion + task_state exist."""
         champion = await self.state.get_champion()
         if champion is None:
             return
@@ -822,17 +780,9 @@ class FlowScheduler:
         task_state: TaskIdState,
         current_block: int,
     ) -> None:
-        """Pre-deployed counterpart of :meth:`_decide_early_lost`.
-
-        Same verdict semantics — LOST with the comparator's frozen
-        per-env view — but no battle teardown (this miner never had a
-        ``current_battle`` slot) and no champion deployment cleanup
-        (champion lives on a different machine in the multi-host
-        topology; only this pre-sample slot is freed).
-
-        ``reason`` carries the ``:predeploy`` suffix so operators can
-        distinguish at the rank UI which path produced the verdict.
-        """
+        """Pre-deployed counterpart of :meth:`_decide_early_lost` — no
+        battle teardown or champion cleanup, just LOST + free the slot.
+        ``reason`` carries ``:predeploy`` for rank-UI provenance."""
         await self._teardown_record(record)
         await self.queue.mark_terminated(
             record.challenger.uid,
@@ -858,32 +808,13 @@ class FlowScheduler:
         self, champion: ChampionRecord, current_block: int,
     ) -> None:
         """Deploy queued miners on free non-primary endpoints, FIFO.
-
-        One batch peek per tick (bounded by ``_PREDEPLOY_PEEK_LIMIT``)
-        rather than re-running ``list_valid_pending`` per attempt. Then:
-
-        * :exc:`NoSpareEndpoint` from ``deploy_fn`` (selector reports
-          no host) — stop filling; we're done for this tick.
-        * any other exception — this miner's model can't be served.
-          Mark them ``FAILED`` (symmetric with :meth:`_start_battle`'s
-          deploy-failure handling) so the queue advances, then move on
-          to the next candidate. Without this, a single broken miner
-          at the head of the queue starves every pre-sample slot
-          forever — the peek-then-deploy loop would re-pick the same
-          uid every tick.
-
-        Per-success ``set_predeployed_challengers`` writes are kept so
-        a mid-batch crash leaves consistent state for the next tick.
-        """
+        Real deploy failures mark the miner FAILED so the queue
+        advances; ``NoSpareEndpoint`` ends the loop cleanly."""
         battle = await self.state.get_battle()
         records = await self.state.get_predeployed_challengers()
         exclude = {p.challenger.uid for p in records}
         if battle is not None:
             exclude.add(battle.challenger.uid)
-        # Single batch peek. Limit is sized well above any plausible
-        # endpoint count; ``NoSpareEndpoint`` from ``deploy_fn`` is the
-        # real terminator. Each FAILED-then-continue consumes one slot
-        # from this batch — sufficient headroom for catastrophic days.
         candidates = await self.queue.peek_next(
             n=_PREDEPLOY_PEEK_LIMIT,
             champion_uid=champion.uid,
@@ -896,23 +827,17 @@ class FlowScheduler:
             )
             try:
                 result = await self._deploy(target, "pre_challenger")
-            except NoSpareEndpoint as e:
-                logger.debug(
-                    f"FlowScheduler: predeploy fill stopped: {e}"
-                )
+            except NoSpareEndpoint:
                 return
             except Exception as e:
                 logger.error(
                     f"FlowScheduler: pre-deploy failed uid={cand.uid}: "
-                    f"{type(e).__name__}: {e} — marking FAILED so the "
-                    f"queue advances (symmetric with _start_battle)"
+                    f"{type(e).__name__}: {e}"
                 )
                 await self.queue.mark_terminated(
                     cand.uid,
                     OUTCOME_FAILED,
-                    reason=(
-                        f"deployment_failed_predeploy:{type(e).__name__}"
-                    ),
+                    reason=f"deployment_failed_predeploy:{type(e).__name__}",
                     hotkey=cand.hotkey,
                     revision=cand.revision,
                     model=cand.model,
@@ -946,13 +871,6 @@ class FlowScheduler:
         )
         if candidate is None:
             return  # idle, no challengers
-        # Adoption: if the picked miner was pre-deployed for baseline
-        # sampling, tear down its pre-sample slot before deploying it
-        # on the primary as the active challenger. The pre-samples in
-        # ``sample_results`` remain valid (keyed by
-        # ``(hotkey, revision, env, task_id, refresh_block)`` — the
-        # role change is invisible to that index) so the battle starts
-        # with the overlap progress already accumulated.
         await self._adopt_predeployed_if_present(candidate.uid)
         target = targon_lifecycle.DeployTarget(
             uid=candidate.uid, hotkey=candidate.hotkey,
@@ -1243,12 +1161,8 @@ class FlowScheduler:
         await self._teardown(getattr(record, "deployment_id", None))
 
     async def _adopt_predeployed_if_present(self, uid: int) -> None:
-        """If ``uid`` was pre-deployed on a spare endpoint, tear down
-        that pre-sample slot and remove the record. Caller then deploys
-        ``uid`` fresh on the primary as the active challenger. The
-        existing pre-samples in ``sample_results`` survive — they're
-        keyed only by ``(hotkey, revision, env, task_id, refresh_block)``,
-        not by deployment id or host."""
+        """Tear down the pre-sample slot for ``uid`` (if any) so the
+        caller can deploy it fresh on the primary."""
         records = await self.state.get_predeployed_challengers()
         if not records:
             return

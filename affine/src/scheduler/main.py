@@ -98,21 +98,10 @@ def _resolve_provider_kind(active: List[object]) -> tuple:
 
 
 def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List[object]:
-    """Pick SSH machines for one miner.
-
-    Policy:
-    - The first endpoint in sort order is the **primary** — the only
-      one that hosts the active battle. Champion and current challenger
-      time-share the primary under single-instance semantics, so both
-      always resolve to ``[primary]``.
-    - ``pre_challenger`` (NEW) targets one **free non-primary** endpoint
-      so a queued miner can accumulate baseline samples in parallel
-      with the active battle. Pre-sampled miners NEVER occupy the
-      primary — they get torn down on promotion and redeployed on the
-      primary as the next current challenger.
-    - Already-assigned endpoints to the same miner are reused
-      (restart/adopt).
-    """
+    """``endpoints[0]`` is the primary — champion + current challenger
+    time-share it. ``pre_challenger`` claims a free non-primary endpoint
+    or raises :exc:`NoSpareEndpoint`. Existing assignment for the same
+    miner is reused."""
     if not endpoints:
         raise RuntimeError("no active ssh endpoints")
     matching = [ep for ep in endpoints if _endpoint_matches_target(ep, target)]
@@ -121,14 +110,6 @@ def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List
 
     primary = endpoints[0]
     if role == "pre_challenger":
-        # Free non-primary endpoint. The pre-sample slot intentionally
-        # cannot land on the primary — that's reserved for the active
-        # battle's champion/challenger time-share. The structured
-        # ``NoSpareEndpoint`` (vs a generic ``RuntimeError``) lets the
-        # fill loop in ``FlowScheduler._predeploy_fill_spare`` tell
-        # 'no spare' apart from real deploy failures (e.g. ssh /
-        # docker errors that ssh_lifecycle.deploy itself raises as
-        # ``RuntimeError``).
         candidates = [
             ep for ep in endpoints[1:] if ep.assigned_uid is None
         ]
@@ -139,9 +120,6 @@ def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List
             )
         return [candidates[0]]
 
-    # champion / challenger / legacy "active": battle host = primary.
-    # With single_instance semantics, primary may currently host the
-    # opposing miner; ssh_lifecycle.deploy handles the displacement.
     return [primary]
 
 
@@ -253,25 +231,8 @@ async def _run() -> None:
                 f"scheduler: no ssh endpoint owns deployment_id={deployment_id!r}"
             )
 
-        # SSH is always single-instance from the active battle's point of
-        # view: champion and current challenger time-share the primary
-        # endpoint regardless of how many machines are configured. Extra
-        # machines exist only to pre-sample queued miners on free
-        # non-primary endpoints — they never host an active battle. So
-        # the flag is True for ssh under all ``len(active)`` values.
-        #
-        # Trade-off vs the pre-PR multi-endpoint policy (champion on
-        # N-1 hosts, challenger on 1 host, no pre-sampling): the new
-        # policy gives up "champion never redeploys" — under
-        # single-instance the primary is torn down at every battle
-        # start, so champion pays a ~2-minute redeploy cost per
-        # battle. In exchange the other N-1 hosts run pre-samples in
-        # parallel and the next battle can decide on tick-after-promotion
-        # without waiting for samples. Net win when the queue is
-        # steadily non-empty; baseline cost when it's not. The fix for
-        # 'pre-sampled miner adopted into battle still has to redeploy
-        # on primary' is to swap primary identity at adoption time —
-        # not implemented here, a known follow-up.
+        # SSH primary always time-shares champion + current challenger,
+        # so the flag is True regardless of endpoint count.
         flow_config = FlowConfig(single_instance_provider=True)
         targon_client = None
         logger.info(

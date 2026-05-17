@@ -48,9 +48,7 @@ def _as_uid(raw: Any) -> Optional[int]:
 def _make_subject(
     kind: str, raw: Any,
 ) -> Optional[tuple]:
-    """Identity tuple for a STATUS-tracked miner, or ``None`` when the
-    state row is missing/malformed. Shape:
-    ``(kind, uid_or_None, hotkey, revision)``."""
+    """``(kind, uid_or_None, hotkey, revision)`` or None if malformed."""
     if not isinstance(raw, dict):
         return None
     hk = raw.get("hotkey")
@@ -88,17 +86,10 @@ class ExecutorManager:
             env: self.mp_ctx.Value("i", initial_cap, lock=False) for env in envs
         }
         self.workers: List[WorkerProcess] = []
-        # Per-(uid, env) done counters from the prior status print, used
-        # to compute "finished in last interval" + rate/h. Keyed by uid
-        # (not by role) so promotion/demotion doesn't reset the delta —
-        # the same model keeps accumulating, only its label flips.
+        # ``_last_done`` is keyed by ``(uid, env)`` so a role flip on
+        # the same uid keeps the delta continuous.
         self._last_status_at: float = 0.0
         self._last_done: Dict[tuple, int] = {}
-        # Set of (kind, uid) pairs visible in the previous frame. A
-        # subject newly appearing this frame gets its per-env delta
-        # zeroed for one tick — otherwise we'd subtract its current
-        # done from a non-existent baseline. Removed subjects get their
-        # ``_last_done`` keys garbage-collected to keep the dict bounded.
         self._last_subject_set: frozenset = frozenset()
         self.running = False
         logger.info(
@@ -165,27 +156,11 @@ class ExecutorManager:
         value.value = 0
 
     async def _status_printer(self) -> None:
-        """Periodic ``[STATUS]`` line — one row per active uid.
-
-        With the pre-deployed-challenger feature, multiple miners can be
-        accumulating samples concurrently (champion on primary, current
-        battle's challenger on primary time-share, and one queued miner
-        per non-primary endpoint). Reporting only the "active" subject
-        like the legacy single-uid format did was misleading — operators
-        couldn't tell which model produced which slice of the 365
-        in-flight slots. We now emit a per-subject head segment plus a
-        per-env breakdown with each subject's done/target/+delta tagged
-        by uid.
-
-        First print after start is the baseline (delta+rate omitted).
-        """
+        """Emit a STATUS line per tick, one segment per active uid."""
         sc = SystemConfigDAO()
         samples = SampleResultsAdapter(
             dao=SampleResultsDAO(), validator_hotkey="executor-manager",
         )
-        # Settle period — let warmup complete + first samples land before
-        # the first ``finished:+N`` reading, otherwise the delta vs. an
-        # empty baseline is misleading.
         await asyncio.sleep(STATUS_PRINT_INTERVAL_SEC)
         while self.running:
             try:
@@ -206,8 +181,7 @@ class ExecutorManager:
         task_ids_by_env: Dict[str, List[int]] = tids.get("task_ids") or {}
         refresh_block = int(tids.get("refreshed_at_block", 0) or 0)
 
-        # Subjects in display order: champion → battle challenger →
-        # pre-deployed (FIFO). ``_make_subject`` drops malformed rows.
+        # Display order: champion → battle challenger → pre-deployed (FIFO).
         subjects: List[tuple] = []
         battle_chal = battle.get("challenger") if isinstance(battle, dict) else None
         candidate_rows = [
@@ -228,19 +202,15 @@ class ExecutorManager:
             if self._last_status_at else 0
         )
 
-        # Track which (kind, uid) pairs are visible this frame so we can
-        # zero deltas for newcomers and GC ``_last_done`` for departures.
         current_subject_set = frozenset(
             (kind, uid) for kind, uid, _hk, _rev in subjects
         )
+        # Newcomers get delta=0 — no baseline to subtract from.
         newcomer_set = current_subject_set - self._last_subject_set
 
         in_flight_total = 0
         env_stats: Dict[str, Dict[str, int]] = {}
-        # Per-env, per-subject snapshot used by both the cap planner
-        # (combined) and the displayed per-env breakdown.
         per_env_subject: Dict[str, Dict[tuple, Dict[str, int]]] = {}
-        # Per-subject aggregate across envs for the head segment.
         subject_totals: Dict[tuple, Dict[str, int]] = {
             (kind, uid): {"done": 0, "target": 0, "delta": 0}
             for kind, uid, _hk, _rev in subjects
@@ -249,10 +219,7 @@ class ExecutorManager:
         for env in sorted(self.envs):
             ids = task_ids_by_env.get(env, []) or []
             sampling_count = _sampling_count_for_env(envs_raw, env, len(ids))
-            # Per-role target. Champion samples the full oversampled
-            # pool; current challenger and pre-deployed both gate on
-            # ``sampling_count`` (the overlap threshold the comparator
-            # needs).
+            # Champion samples the full pool; challengers gate on overlap.
             subject_target = {
                 "champion": len(ids),
                 "challenger": min(len(ids), sampling_count),
@@ -307,8 +274,6 @@ class ExecutorManager:
                 "delta": combined_delta,
             }
 
-        # GC ``_last_done`` entries for uids that left this frame, so the
-        # dict stays bounded across many battles / pre-deploy churn.
         live_uids = {uid for _kind, uid in current_subject_set}
         self._last_done = {
             k: v for k, v in self._last_done.items() if k[0] in live_uids
@@ -327,7 +292,6 @@ class ExecutorManager:
         for env, cap in new_caps.items():
             self.env_cap_values[env].value = cap
 
-        # ---- assemble output --------------------------------------
         head_parts: List[str] = []
         for kind, uid, _hk, _rev in subjects:
             tot = subject_totals[(kind, uid)]
@@ -352,10 +316,7 @@ class ExecutorManager:
             running = env_stats[env]["running"]
             cap = int(self.env_cap_values[env].value)
             short = env.split(":")[-1].split("-")[0].lower()
-            # ``*`` flags adaptive-cap throttling — in-flight exceeds the
-            # current cap because the cap was lowered after dispatch.
-            # Existing calls drain naturally; no new dispatch is admitted
-            # until in_flight < cap. Not a bug.
+            # ``*`` marks adaptive-cap throttling (in-flight > cap).
             cap_mark = "*" if running > cap else ""
             row_parts = [f"{short} r:{running}/{cap}{cap_mark}"]
             row = per_env_subject.get(env, {})
@@ -387,15 +348,7 @@ class ExecutorManager:
 
 
 def _kind_short(kind: str) -> str:
-    """Short label for STATUS rows. Full-word abbreviations rather than
-    single letters — single-letter labels (esp. ``H`` for challenger)
-    weren't readable at a glance.
-
-    * ``champ`` — the current crown holder.
-    * ``chal``  — the current battle's challenger, time-sharing the
-      primary endpoint with the champion.
-    * ``pre``   — a pre-deployed challenger: queued miner accumulating
-      baseline samples on a spare non-primary endpoint."""
+    """champion → champ, challenger → chal, pre_challenger → pre."""
     return {
         "champion": "champ",
         "challenger": "chal",

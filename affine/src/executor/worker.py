@@ -90,9 +90,6 @@ class ExecutorWorker:
         self._state: Optional[StateStore] = None
         self._samples: Optional[SampleResultsAdapter] = None
 
-        # In-flight dispatch tasks grouped by ``deployment_id`` so
-        # ``_cancel_stale_dispatches`` can kill calls aimed at a host
-        # that's no longer current.
         self._tasks_by_deployment: Dict[str, set] = {}
 
     # ---- lifecycle ---------------------------------------------------------
@@ -420,15 +417,8 @@ class ExecutorWorker:
                         (key, battle.challenger, tid, url, dep_id)
                     )
 
-        # Pre-deployed challengers: same gating as ``battle.challenger``
-        # but each one runs on its own non-primary endpoint. The
-        # ``champion hasn't sampled yet`` guard naturally pauses their
-        # dispatch while champion is still doing its baseline pass —
-        # which is what makes "其他机器空闲等冠军" automatic without
-        # any explicit wait logic. Their samples flow into
-        # ``sample_results`` keyed by their own hotkey/revision, so
-        # the scheduler's early-loss sweep and (eventually) the
-        # comparator can read them just like a normal challenger's.
+        # Pre-deployed challengers: same gating as ``battle.challenger``,
+        # each on its own non-primary endpoint.
         for record in predeployed:
             pre_urls = _base_urls(
                 record.deployments, record.base_url,
@@ -500,11 +490,8 @@ class ExecutorWorker:
             in_flight_keys.discard(key)
 
     def _cancel_stale_dispatches(self, current_ids: set) -> None:
-        """Cancel any in-flight task whose target deployment_id no longer
-        appears among the current subjects, and GC done tasks from the
-        live buckets. CancelledError propagates through
-        ``_evaluate_and_persist_gated``'s finally so ``in_flight_value``
-        and the global slot are released immediately."""
+        """Cancel tasks for any deployment_id not in ``current_ids``;
+        GC done tasks from the live buckets."""
         for dep_id in list(self._tasks_by_deployment):
             bucket = self._tasks_by_deployment[dep_id]
             if dep_id not in current_ids:
@@ -642,11 +629,6 @@ class ExecutorWorker:
                 for d in battle.deployments
             ):
                 return True
-        # Pre-deployed miners — same hotkey/revision identity check,
-        # any deployment they currently hold counts as current. This
-        # path is what keeps multi-host pre-sample dispatches from
-        # being dropped as 'drift' even though they're attached to a
-        # different (non-primary) endpoint than the active battle's.
         for record in await self._state.get_predeployed_challengers():
             if (
                 record.challenger.hotkey != miner.hotkey
@@ -836,8 +818,7 @@ def _base_urls(deployments: List[DeploymentRecord], fallback: Optional[str]) -> 
 
 
 def _collect_current_deployment_ids(champion, battle, predeployed) -> set:
-    """Every deployment_id reachable through the current state — anything
-    not in this set is stale and safe to cancel."""
+    """Union of deployment_ids across champion + battle + pre-deployed."""
     ids: set = set()
     for record in (champion, battle, *predeployed):
         if record is None:
