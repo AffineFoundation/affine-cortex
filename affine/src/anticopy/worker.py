@@ -151,12 +151,23 @@ class _SglangError(RuntimeError):
     pass
 
 
-def _ssh_run(host: str, key_path: str, cmd: str, *, timeout: int = 600) -> tuple:
+def _ssh_run(
+    host: str, key_path: str, cmd: str,
+    *,
+    timeout: int = 600,
+    env: Optional[Dict[str, str]] = None,
+) -> tuple:
     """Run ``cmd`` over SSH; returns ``(rc, stdout, stderr)``.
 
     Used only when ``REMOTE_SSH_HOST`` is configured. The wrapper
     keeps stderr separate so we don't conflate sglang/HF banner output
     with the python helper's stdout, which we parse.
+
+    ``env`` (optional) is prefixed onto the remote command as
+    ``KEY=VAL python …`` — needed because SSH doesn't forward env
+    vars without server-side ``AcceptEnv`` (Targon's sshd doesn't
+    accept HF_TOKEN). Values are shell-quoted; an empty/missing
+    value is skipped so we don't poison the remote env with ``=``.
     """
     argv = [
         "ssh", "-i", key_path,
@@ -166,6 +177,13 @@ def _ssh_run(host: str, key_path: str, cmd: str, *, timeout: int = 600) -> tuple
     ]
     if REMOTE_SSH_PORT:
         argv += ["-p", REMOTE_SSH_PORT]
+    if env:
+        prefix = " ".join(
+            f"{k}={shlex.quote(str(v))}"
+            for k, v in env.items() if v
+        )
+        if prefix:
+            cmd = f"{prefix} {cmd}"
     argv += [host, cmd]
     proc = subprocess.run(
         argv,
@@ -1032,8 +1050,15 @@ def _remote_snapshot_download(
         "        ok = False; break\n"
         "print(p if ok else 'MISS')"
     )
+    # HF_TOKEN has to be smuggled across the SSH boundary explicitly
+    # — sshd on Targon doesn't AcceptEnv HF_TOKEN, so without this
+    # prefix the python helper sees os.getenv('HF_TOKEN') == None and
+    # falls back to anonymous downloads, which HuggingFace rate-limits
+    # severely (we've seen multi-hour stalls at 2.6 GB/model).
+    hf_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
+
     cmd = f"{shlex.quote(py_path)} -c {shlex.quote(probe)}"
-    rc, out, err = _ssh_run(host, key_path, cmd, timeout=60)
+    rc, out, err = _ssh_run(host, key_path, cmd, timeout=60, env=hf_env)
     if rc == 0:
         line = (out.strip().splitlines() or [""])[-1].strip()
         if line and line != "MISS":
@@ -1049,7 +1074,7 @@ def _remote_snapshot_download(
         "print(p)"
     )
     cmd = f"{shlex.quote(py_path)} -c {shlex.quote(body)}"
-    rc, out, err = _ssh_run(host, key_path, cmd, timeout=3600)
+    rc, out, err = _ssh_run(host, key_path, cmd, timeout=3600, env=hf_env)
     if rc != 0:
         raise RuntimeError(
             f"remote snapshot_download rc={rc}: {err[-200:].strip()}"
