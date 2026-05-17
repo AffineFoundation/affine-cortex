@@ -1055,7 +1055,15 @@ def _remote_snapshot_download(
     # prefix the python helper sees os.getenv('HF_TOKEN') == None and
     # falls back to anonymous downloads, which HuggingFace rate-limits
     # severely (we've seen multi-hour stalls at 2.6 GB/model).
-    hf_env = {"HF_TOKEN": os.environ.get("HF_TOKEN", "")}
+    # HF_HUB_DISABLE_PROGRESS_BARS suppresses tqdm; otherwise the
+    # progress bar's final line (``Fetching N files: 100%|…``) lands
+    # on stdout as the trailing line and gets parsed as if it were
+    # the snapshot path below — sglang's /update_weights_from_disk
+    # then polls forever for the bogus path.
+    hf_env = {
+        "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
+        "HF_HUB_DISABLE_PROGRESS_BARS": "1",
+    }
 
     cmd = f"{shlex.quote(py_path)} -c {shlex.quote(probe)}"
     rc, out, err = _ssh_run(host, key_path, cmd, timeout=60, env=hf_env)
@@ -1079,10 +1087,19 @@ def _remote_snapshot_download(
         raise RuntimeError(
             f"remote snapshot_download rc={rc}: {err[-200:].strip()}"
         )
-    lines = [ln for ln in out.strip().splitlines() if ln.strip()]
+    # Belt-and-suspenders: even with HF_HUB_DISABLE_PROGRESS_BARS=1
+    # we filter to lines that look like absolute paths, so a stray
+    # banner or warning never wins out as "the snapshot directory".
+    # This is the value handed to sglang's /update_weights_from_disk
+    # — a bad string here silently burns the 30-min polling timeout.
+    lines = [
+        ln.strip() for ln in out.splitlines()
+        if ln.strip().startswith("/")
+    ]
     if not lines:
         raise RuntimeError(
-            f"remote snapshot_download produced no path; stderr={err[-200:].strip()}"
+            f"remote snapshot_download produced no path; "
+            f"stdout={out[-200:].strip()!r} stderr={err[-200:].strip()!r}"
         )
     return lines[-1]
 
