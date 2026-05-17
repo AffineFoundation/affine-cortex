@@ -43,7 +43,23 @@ import paramiko
 
 from affine.core.setup import logger
 
+from .flow import TransientDeployError
 from .targon import DeployResult, DeployTarget, MachineDeployment  # reuse the dataclasses
+
+
+# Exceptions ``_ssh_exec`` re-raises as :class:`TransientDeployError` so
+# the scheduler can tell "host's fault" apart from miner-fault deploy
+# failures. ``OSError`` covers ``socket.error`` / ``socket.timeout`` /
+# connection-refused / network-unreachable in Python 3. Paramiko's
+# ``SSHException`` is the umbrella for auth + protocol + transport
+# errors; we still re-raise these as transient because for the
+# scheduler's purpose, the miner doesn't deserve a FAILED stamp from
+# any of them.
+_SSH_TRANSPORT_EXCEPTIONS = (
+    paramiko.SSHException,
+    OSError,
+    EOFError,
+)
 
 
 # All sglang launch defaults match what targon_client.py sends. Endpoint-
@@ -260,8 +276,20 @@ def _ssh_exec_sync(config: SSHConfig, command: str) -> Tuple[int, str, str]:
 
 
 async def _ssh_exec(config: SSHConfig, command: str) -> Tuple[int, str, str]:
-    """Async wrapper around the blocking paramiko call."""
-    return await asyncio.to_thread(_ssh_exec_sync, config, command)
+    """Async wrapper around the blocking paramiko call.
+
+    Transport-level failures (SSH connect/timeout/network errors) are
+    re-raised as :class:`TransientDeployError` so the flow scheduler
+    can distinguish them from miner-fault deploy failures and skip the
+    miner without stamping FAILED on a perfectly good model that just
+    landed on a dead host."""
+    try:
+        return await asyncio.to_thread(_ssh_exec_sync, config, command)
+    except _SSH_TRANSPORT_EXCEPTIONS as e:
+        raise TransientDeployError(
+            f"ssh-provider: transport error on {config.host}:{config.port}: "
+            f"{type(e).__name__}: {e}"
+        ) from e
 
 
 def _parse_label_dump(text: str) -> Dict[str, str]:

@@ -67,6 +67,18 @@ class MinerQueueStore(Protocol):
         """
         ...
 
+    async def release_claim(
+        self, uid: int, *,
+        hotkey: Optional[str] = None,
+        revision: Optional[str] = None,
+    ) -> bool:
+        """Atomically revert ``uid`` from ``in_progress`` to
+        ``sampling``. Used when a deploy hits a transport failure and
+        the miner must remain re-pickable. Returns True iff the row
+        was actually in_progress at the call site (else: race lost,
+        someone already terminated it)."""
+        ...
+
     async def set_terminal(
         self,
         uid: int,
@@ -171,6 +183,19 @@ class ChallengerQueue:
             if len(out) >= n:
                 break
         return out
+
+    async def release_claim(
+        self, uid: int, *,
+        hotkey: Optional[str] = None,
+        revision: Optional[str] = None,
+    ) -> bool:
+        """Atomically revert ``uid`` from ``in_progress`` to
+        ``sampling`` after a transport-level deploy failure. Returns
+        True iff the row was in_progress (else: race already
+        terminated it, no action needed)."""
+        return await self._store.release_claim(
+            uid, hotkey=hotkey, revision=revision,
+        )
 
     async def mark_terminated(
         self,

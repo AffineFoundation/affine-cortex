@@ -73,6 +73,20 @@ class NoSpareEndpoint(RuntimeError):
     The pre-deploy fill loop treats it as 'stop filling, not a failure'."""
 
 
+class TransientDeployError(RuntimeError):
+    """``deploy_fn`` raises this when the deploy failure is an infra
+    transient (SSH transport down, host unreachable, docker daemon
+    dead) rather than a miner fault (bad model id, OOM-on-this-model,
+    model never becomes ready).
+
+    The flow scheduler treats it as 'retry next tick, do NOT mark
+    miner FAILED' — the miner had no chance to fail and shouldn't
+    burn their queue entry on a bad host. Distinct from generic
+    ``RuntimeError`` (which still marks FAILED — that path catches
+    miner-faults like a docker run that returns non-zero because the
+    model can't load)."""
+
+
 # ---- constants (no longer in system_config) --------------------------------
 
 
@@ -899,6 +913,16 @@ class FlowScheduler:
                 result = await self._deploy(target, "pre_challenger")
             except NoSpareEndpoint:
                 return
+            except TransientDeployError as e:
+                # Host's fault, not the miner's — don't burn its queue
+                # entry. Skip the candidate this tick; FIFO will retry
+                # it (possibly on a different spare) on the next pass.
+                logger.error(
+                    f"FlowScheduler: pre-deploy transport error for "
+                    f"uid={cand.uid} (host down or unreachable); leaving "
+                    f"miner in queue for retry: {type(e).__name__}: {e}"
+                )
+                continue
             except Exception as e:
                 logger.error(
                     f"FlowScheduler: pre-deploy failed uid={cand.uid}: "
@@ -948,6 +972,31 @@ class FlowScheduler:
         )
         try:
             result = await self._deploy(target, "challenger")
+        except TransientDeployError as e:
+            # Host's fault, not miner's. ``pick_next`` already flipped
+            # the row to in_progress; release it back to sampling so
+            # the same miner stays re-pickable on the next tick (and
+            # might land on a healed host). Pre-sample slot, if any,
+            # has already been torn down by ``_adopt_predeployed_if_present``
+            # — that work is lost, but we'd rather lose pre-samples
+            # than a miner's queue entry to an infra blip.
+            logger.error(
+                f"FlowScheduler: challenger deploy transport error "
+                f"uid={candidate.uid} (host unreachable); releasing "
+                f"claim so miner stays re-pickable: "
+                f"{type(e).__name__}: {e}"
+            )
+            released = await self.queue.release_claim(
+                candidate.uid,
+                hotkey=candidate.hotkey, revision=candidate.revision,
+            )
+            if not released:
+                logger.warning(
+                    f"FlowScheduler: release_claim race on "
+                    f"uid={candidate.uid} — row no longer in_progress; "
+                    f"leaving as-is"
+                )
+            return
         except Exception as e:
             logger.error(
                 f"FlowScheduler: challenger deploy failed uid={candidate.uid}: "
