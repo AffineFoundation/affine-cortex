@@ -110,12 +110,8 @@ _PREDEPLOY_PEEK_LIMIT = 32
 :exc:`NoSpareEndpoint`."""
 
 ORPHAN_GRACE_SECONDS = 120
-"""How long an ``in_progress`` row may exist without matching the
-active battle pointer before the reaper terminates it. The normal
-window between ``pick_next`` claiming a row and ``set_battle``
-writing the pointer is seconds; 120s gives single-instance deploy
-+ host adoption ample headroom while still bounding the leak from
-any future crash between those two writes."""
+"""Minimum age of an ``in_progress`` row, missing from all in-flight
+roles, before the reaper terminates it."""
 
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
@@ -199,9 +195,9 @@ class FlowScheduler:
     # ---- entry point ------------------------------------------------------
 
     async def tick(self, current_block: int) -> None:
-        """Battle phase, then pre-sample phase (guarded so a flaky
-        teardown can't block the next tick), then orphan reaper
-        (guarded so a flaky DDB scan can't either)."""
+        """Battle phase, then pre-sample phase, then orphan reaper.
+        The latter two are guarded so a flaky teardown / DDB scan
+        can't block the next tick."""
         await self._tick_main(current_block)
         try:
             await self._predeploy_phase(current_block)
@@ -703,23 +699,13 @@ class FlowScheduler:
         champion: ChampionRecord,
         battle: BattleRecord,
     ) -> None:
-        """Interrupt the in-flight battle BECAUSE the challenger
-        became invalid mid-contest, and converge the lifecycle by
-        writing terminated.
+        """Tear down the in-flight battle and terminate the challenger
+        because monitor flipped its ``is_valid`` to false mid-contest.
 
-        ``invalid_reason`` and ``termination_reason`` record orthogonal
-        facts: ``invalid_reason`` is the operational cause (anticopy /
-        multi_commit / blacklist / repo-name) written by the monitor
-        and may flip back to None when the underlying signal clears
-        (e.g. anticopy ``permanent=False`` reverts). ``termination_reason``
-        is the durable lifecycle fact ("this contest ended because the
-        challenger was invalidated mid-battle"). Both are needed —
-        without the lifecycle write the row stays ``in_progress``
-        forever after ``is_valid`` flips back to True, leaking as a
-        VALID-bucket orphan in the rank UI.
-
-        Order: ``mark_terminated`` first so a crash anywhere later
-        still leaves the lifecycle converged.
+        ``mark_terminated`` is written first so any crash later still
+        leaves the lifecycle converged. ``is_valid`` is not durable
+        (anticopy ``permanent=False`` can revert), so the lifecycle
+        write — not ``is_valid`` — carries the one-shot guarantee.
         """
         logger.warning(
             f"FlowScheduler: challenger uid={battle.challenger.uid} "
@@ -744,33 +730,31 @@ class FlowScheduler:
     # ---- invariant reaper -------------------------------------------------
 
     async def _reap_in_progress_orphans(self) -> None:
-        """Enforce ``challenge_status='in_progress'`` ↔ ``battle.challenger.uid``.
+        """Terminate ``in_progress`` rows that don't match any in-flight
+        role (active battle challenger, current champion, predeployed
+        challenger) and are older than :data:`ORPHAN_GRACE_SECONDS`.
 
-        Every lifecycle write happens through the queue and is paired
-        with the corresponding ``battle`` mutation, so in steady state
-        the only ways to violate this invariant are:
-
-        * a crash between ``pick_next``'s claim and ``set_battle``,
-          leaving an in_progress row with no battle pointer; or
-        * a future code path that clears battle without writing a
-          terminal lifecycle status (the very bug this reaper guards
-          against).
-
-        Any in_progress row not matching the current battle pointer
-        and older than :data:`ORPHAN_GRACE_SECONDS` is terminated
-        with reason ``claim_orphan_reaped`` so lifecycle converges
-        and the row stops appearing as a VALID-bucket orphan in the
-        rank UI.
+        Backstop for crash windows in ``pick_next``→``set_battle`` and
+        ``_cold_start`` ``set_champion``→``mark_terminated(WON)``.
         """
         battle = await self.state.get_battle()
-        active_uid = battle.challenger.uid if battle else None
+        champion = await self.state.get_champion()
+        predeployed = await self.state.get_predeployed_challengers()
+        protected: set = set()
+        if battle is not None:
+            protected.add(battle.challenger.uid)
+        if champion is not None:
+            protected.add(champion.uid)
+        for record in predeployed:
+            protected.add(record.challenger.uid)
+
         rows = await self.queue.list_in_progress()
         if not rows:
             return
         now = int(time.time())
         for row in rows:
             uid = row.get("uid")
-            if uid is None or uid == active_uid:
+            if uid is None or uid in protected:
                 continue
             try:
                 claimed_at = int(row.get("challenge_claimed_at") or 0)
@@ -789,7 +773,7 @@ class FlowScheduler:
             )
             logger.warning(
                 f"FlowScheduler: reaped orphan in_progress uid={uid} "
-                f"(age={age}s, active_battle_uid={active_uid})"
+                f"(age={age}s, protected_uids={sorted(protected)})"
             )
 
     # ---- pre-sample phase -------------------------------------------------

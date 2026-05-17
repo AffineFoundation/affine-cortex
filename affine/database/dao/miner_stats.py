@@ -69,13 +69,7 @@ class MinerStatsDAO(BaseDAO):
     async def list_by_challenge_status(
         self, status: str,
     ) -> List[Dict[str, Any]]:
-        """Scan all rows currently in the given lifecycle status.
-
-        Used by the orphan reaper to enforce the invariant
-        ``challenge_status='in_progress'`` ↔ ``battle.challenger.uid``.
-        Table is small (one row per (hotkey, revision)), full scan per
-        tick is acceptable.
-        """
+        """Scan all rows currently in the given lifecycle status."""
         from affine.database.client import get_client
 
         client = get_client()
