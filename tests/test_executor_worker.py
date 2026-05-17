@@ -35,21 +35,23 @@ def test_executor_manager_ipc_handles_survive_spawn():
 
 
 def test_executor_manager_recovers_stale_slots_after_worker_death():
-    from affine.src.executor.config import GLOBAL_DISPATCH_BUDGET
-
-    manager = ExecutorManager(["ENV_A"])
+    manager = ExecutorManager(["ENV_A"], host_names=["b300"])
     # Simulate a worker dying while holding two dispatch slots.
     assert manager.global_sem.acquire(block=False)
     assert manager.global_sem.acquire(block=False)
     manager.in_flight_values["ENV_A"].value = 2
+    manager.per_host_in_flight["b300"].value = 2
+    manager.per_env_host_in_flight["ENV_A"]["b300"].value = 2
 
     manager._recover_dead_worker_slots("ENV_A")
 
     assert manager.in_flight_values["ENV_A"].value == 0
+    assert manager.per_host_in_flight["b300"].value == 0
+    assert manager.per_env_host_in_flight["ENV_A"]["b300"].value == 0
     acquired = 0
     while manager.global_sem.acquire(block=False):
         acquired += 1
-    assert acquired == GLOBAL_DISPATCH_BUDGET
+    assert acquired == manager.total_budget
     for _ in range(acquired):
         manager.global_sem.release()
 
@@ -371,6 +373,109 @@ def test_dynamic_dispatch_slot_releases_global_if_cap_drops_after_acquire():
         assert released["value"] == 1
 
     _asyncio.run(_drive())
+
+
+class _SharedIntWithLock:
+    """``mp.Value(c_int, lock=True)`` substitute for in-process tests."""
+    def __init__(self, value: int):
+        self.value = value
+        self._lock = __import__("threading").Lock()
+    def get_lock(self):
+        return self._lock
+
+
+def test_dispatch_slot_blocks_when_host_at_per_host_budget():
+    """A second concurrent dispatch targeting the same host must wait
+    once ``per_host_in_flight[host] >= per_host_budget``, even if the
+    global sem and env cap have room."""
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+
+    host_counter = _SharedIntWithLock(2)   # already at budget
+    worker = ExecutorWorker(
+        worker_id=0, env="MEMORY",
+        env_cap_value=_SharedInt(500),
+        in_flight_value=_SharedInt(0),
+        per_host_in_flight={"b300": host_counter},
+        per_host_budget=2,
+    )
+    worker._acquire_global_slot = lambda: _asyncio.sleep(0)
+
+    dep_id = "ssh:b300:affine-sglang-current"
+
+    async def _drive():
+        waiter = _asyncio.create_task(
+            worker._acquire_dispatch_slot(expected_deployment_id=dep_id)
+        )
+        await _asyncio.sleep(0.12)
+        assert not waiter.done(), "should block while host_counter=budget"
+        host_counter.value = 1
+        await _asyncio.wait_for(waiter, timeout=1.0)
+
+    _asyncio.run(_drive())
+
+
+def test_dispatch_slot_lets_through_when_target_host_different():
+    """Per-host cap should isolate hosts: with host_a saturated, a
+    dispatch targeting host_b passes immediately."""
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+
+    host_a = _SharedIntWithLock(2)
+    host_b = _SharedIntWithLock(0)
+    worker = ExecutorWorker(
+        worker_id=0, env="MEMORY",
+        env_cap_value=_SharedInt(500),
+        in_flight_value=_SharedInt(0),
+        per_host_in_flight={"b300": host_a, "b300_2": host_b},
+        per_host_budget=2,
+    )
+    worker._acquire_global_slot = lambda: _asyncio.sleep(0)
+
+    async def _drive():
+        await _asyncio.wait_for(
+            worker._acquire_dispatch_slot(
+                expected_deployment_id="ssh:b300_2:affine-sglang-current",
+            ),
+            timeout=0.5,
+        )
+
+    _asyncio.run(_drive())
+
+
+def test_host_slot_acquire_is_atomic_and_tracks_env_owner():
+    from affine.src.executor.worker import ExecutorWorker
+
+    host_counter = _SharedIntWithLock(0)
+    env_host_counter = _SharedIntWithLock(0)
+    worker = ExecutorWorker(
+        worker_id=0, env="MEMORY",
+        per_host_in_flight={"b300": host_counter},
+        per_env_host_in_flight={"b300": env_host_counter},
+        per_host_budget=1,
+    )
+
+    assert worker._try_acquire_host_slot("b300") is True
+    assert host_counter.value == 1
+    assert env_host_counter.value == 1
+    assert worker._try_acquire_host_slot("b300") is False
+    assert host_counter.value == 1
+    assert env_host_counter.value == 1
+
+    worker._release_host_slot("b300")
+
+    assert host_counter.value == 0
+    assert env_host_counter.value == 0
+
+
+def test_host_from_deployment_parses_ssh_only():
+    from affine.src.executor.worker import _host_from_deployment
+    assert _host_from_deployment("ssh:b300:affine-sglang-current") == "b300"
+    assert _host_from_deployment("ssh:b300_2:affine-sglang-current") == "b300_2"
+    assert _host_from_deployment("wrk-001") is None
+    assert _host_from_deployment("targon:abc") is None
+    assert _host_from_deployment(None) is None
+    assert _host_from_deployment("ssh::container") is None
 
 
 def test_env_from_payload_ignores_static_max_concurrent():

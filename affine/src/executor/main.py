@@ -27,7 +27,11 @@ from affine.core.setup import logger, setup_logging
 from affine.database import close_client, init_client
 from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.system_config import SystemConfigDAO
-from affine.src.executor.config import GLOBAL_DISPATCH_BUDGET, get_max_concurrent
+from affine.src.executor.config import (
+    GLOBAL_DISPATCH_BUDGET,
+    PER_HOST_DISPATCH_BUDGET,
+    get_max_concurrent,
+)
 from affine.src.executor.worker_process import WorkerProcess
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
 
@@ -63,25 +67,36 @@ class ExecutorManager:
         self,
         envs: List[str],
         *,
+        host_names: Optional[List[str]] = None,
         verbosity: int = 1,
     ):
         self.envs = envs
+        self.host_names: List[str] = list(host_names or [])
         self.verbosity = verbosity
         self.mp_ctx = multiprocessing.get_context("spawn")
-        # Single cross-process bounded semaphore = the real concurrency
-        # gate. Sized to the b300 saturation point so the inference
-        # backend is the bottleneck (where we want it). Workers first pass
-        # their dynamic per-env cap, then contend on this shared sem before
-        # every evaluate. The manager adjusts per-env caps from live
-        # progress instead of hardcoding env-specific limits.
-        self.global_sem = self.mp_ctx.BoundedSemaphore(GLOBAL_DISPATCH_BUDGET)
+        n_hosts = max(1, len(self.host_names))
+        self.total_budget = n_hosts * PER_HOST_DISPATCH_BUDGET
+        self.global_sem = self.mp_ctx.BoundedSemaphore(self.total_budget)
         # Per-env in-flight counter; worker writes (single writer), manager
         # reads. ``lock=False`` is safe: only one process writes each
         # Value, and aligned c_int reads are atomic on CPython.
         self.in_flight_values: Dict[str, Any] = {
             env: self.mp_ctx.Value("i", 0, lock=False) for env in envs
         }
-        initial_cap = _initial_env_cap(envs, GLOBAL_DISPATCH_BUDGET)
+        # Multiple workers write the per-host counter, so it needs the
+        # built-in lock for atomic increment.
+        self.per_host_in_flight: Dict[str, Any] = {
+            host: self.mp_ctx.Value("i", 0, lock=True)
+            for host in self.host_names
+        }
+        self.per_env_host_in_flight: Dict[str, Dict[str, Any]] = {
+            env: {
+                host: self.mp_ctx.Value("i", 0, lock=True)
+                for host in self.host_names
+            }
+            for env in envs
+        }
+        initial_cap = _initial_env_cap(envs, self.total_budget)
         self.env_cap_values: Dict[str, Any] = {
             env: self.mp_ctx.Value("i", initial_cap, lock=False) for env in envs
         }
@@ -94,7 +109,9 @@ class ExecutorManager:
         self.running = False
         logger.info(
             f"ExecutorManager init: envs={envs}, "
-            f"global_dispatch_budget={GLOBAL_DISPATCH_BUDGET}"
+            f"hosts={self.host_names!r} "
+            f"per_host_budget={PER_HOST_DISPATCH_BUDGET} "
+            f"total_budget={self.total_budget}"
         )
 
     async def start(self) -> None:
@@ -106,6 +123,9 @@ class ExecutorManager:
                 global_sem=self.global_sem,
                 in_flight_value=self.in_flight_values[env],
                 env_cap_value=self.env_cap_values[env],
+                per_host_in_flight=self.per_host_in_flight,
+                per_env_host_in_flight=self.per_env_host_in_flight[env],
+                per_host_budget=PER_HOST_DISPATCH_BUDGET,
                 max_concurrent=get_max_concurrent(env),
                 verbosity=self.verbosity,
             )
@@ -140,20 +160,39 @@ class ExecutorManager:
     def _recover_dead_worker_slots(self, env: str) -> None:
         """Clear dispatch accounting left behind by a dead worker process."""
         value = self.in_flight_values.get(env)
-        if value is None:
-            return
-        stale = max(0, int(value.value))
+        stale = max(0, int(value.value)) if value is not None else 0
+        stale_by_host: Dict[str, int] = {}
+        for host, env_host_value in (
+            self.per_env_host_in_flight.get(env) or {}
+        ).items():
+            with env_host_value.get_lock():
+                held = max(0, int(env_host_value.value))
+                env_host_value.value = 0
+            if not held:
+                continue
+            stale_by_host[host] = held
+            host_value = self.per_host_in_flight.get(host)
+            if host_value is None:
+                continue
+            with host_value.get_lock():
+                host_value.value = max(0, int(host_value.value) - held)
         if stale:
             logger.warning(
                 f"[{env}] recovering {stale} stale dispatch slot(s) "
                 "after subprocess death"
+            )
+        if stale_by_host:
+            logger.warning(
+                f"[{env}] recovering stale per-host dispatch slot(s) "
+                f"after subprocess death: {stale_by_host}"
             )
         for _ in range(stale):
             try:
                 self.global_sem.release()
             except ValueError:
                 break
-        value.value = 0
+        if value is not None:
+            value.value = 0
 
     async def _status_printer(self) -> None:
         """Emit a STATUS line per tick, one segment per active uid."""
@@ -283,7 +322,7 @@ class ExecutorManager:
             self.envs,
             env_stats,
             {env: int(v.value) for env, v in self.env_cap_values.items()},
-            global_budget=GLOBAL_DISPATCH_BUDGET,
+            global_budget=self.total_budget,
             priorities={
                 env: _sampling_priority_for_env(envs_raw, env)
                 for env in self.envs
@@ -339,8 +378,15 @@ class ExecutorManager:
         suffix = f" in {elapsed_s}s" if self._last_status_at else " (baseline)"
         head_main = (
             f"[STATUS] running={in_flight_total}/"
-            f"{GLOBAL_DISPATCH_BUDGET}{suffix}"
+            f"{self.total_budget}{suffix}"
         )
+        host_parts = [
+            f"{host}:{int(self.per_host_in_flight[host].value)}/"
+            f"{PER_HOST_DISPATCH_BUDGET}"
+            for host in self.host_names
+        ]
+        if host_parts:
+            head_main += f" [{' '.join(host_parts)}]"
         logger.info(" | ".join([head_main, *head_parts, *per_env_parts]))
 
         self._last_status_at = now
@@ -371,6 +417,22 @@ async def _enabled_envs() -> List[str]:
         if sampling_flag:
             out.append(name)
     return out
+
+
+async def _active_ssh_endpoint_names() -> List[str]:
+    """SSH endpoint names from ``inference_endpoints``. Empty list for
+    targon-only setups."""
+    try:
+        from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+        return [
+            ep.name for ep in await InferenceEndpointsDAO().list_active(kind="ssh")
+        ]
+    except Exception as e:
+        logger.warning(
+            f"executor: list_active ssh endpoints failed "
+            f"({type(e).__name__}: {e}); falling back to single-host budget"
+        )
+        return []
 
 
 def _initial_env_cap(envs: List[str], global_budget: int) -> int:
@@ -677,7 +739,8 @@ async def _run() -> None:
         )
         return
 
-    manager = ExecutorManager(envs=envs, verbosity=1)
+    host_names = await _active_ssh_endpoint_names()
+    manager = ExecutorManager(envs=envs, host_names=host_names, verbosity=1)
     await manager.start()
 
     stop_event = asyncio.Event()
