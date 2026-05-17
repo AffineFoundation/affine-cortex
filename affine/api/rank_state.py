@@ -121,6 +121,7 @@ def _split_display_scores(
 def _live_sampling_uids(
     champion: Optional[ChampionRecord],
     battle: Optional[BattleRecord],
+    predeployed: List[BattleRecord],
     task_state: Optional[TaskIdState],
     envs: Dict[str, EnvConfig],
     sample_counts: Dict[str, Dict[str, int]],
@@ -144,6 +145,12 @@ def _live_sampling_uids(
         out.append(champion.uid)
     if battle is not None and _is_active(battle.challenger.uid):
         out.append(battle.challenger.uid)
+    for record in predeployed:
+        uid = record.challenger.uid
+        if uid in out:
+            continue
+        if _is_active(uid):
+            out.append(uid)
     return out
 
 
@@ -186,6 +193,7 @@ async def get_current_state() -> Dict[str, Any]:
     if champion is None:
         champion = await _infer_champion_from_scores()
     battle = await store.get_battle()
+    predeployed = await store.get_predeployed_challengers()
     task_state = await store.get_task_state()
     envs = await store.get_environments()
     # One read per miner pulls both live (LiveScoresMonitor) and frozen
@@ -236,7 +244,7 @@ async def get_current_state() -> Dict[str, Any]:
         # entry for the row.
         "terminal_scores": terminal_scores,
         "live_sampling_uids": _live_sampling_uids(
-            champion, battle, task_state, envs, sample_counts,
+            champion, battle, predeployed, task_state, envs, sample_counts,
         ),
     }
 
