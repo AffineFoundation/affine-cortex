@@ -42,11 +42,11 @@ DEFAULT_ROLLOUTS_PER_ENV = 20
 
 # Pool retention. Older rollouts get TTL'd out of the DDB index; the
 # R2 blob may linger but won't be selected. Sized to cover ``current
-# refresh tick + previous refresh tick`` so candidates scored across
-# two adjacent refresh windows still share rollout_keys in the
-# previous-window slice (= pair-comparable). Default: 2 ×
-# ``refresh_interval_days``.
-DEFAULT_POOL_DAYS = 6
+# refresh tick + the two previous ticks`` (= 3 × refresh_interval_days)
+# so candidates scored up to two windows back still share rollout_keys
+# with current-window candidates — pair-comparison stays valid over
+# the full verdict_lookback_days bound.
+DEFAULT_POOL_DAYS = 9
 
 # How often the rollout pool refresh fires. With daily refresh, the
 # pool churned every 24 h and made cross-day pair-comparisons rely on
