@@ -95,6 +95,11 @@ class MinersQueueAdapter:
             )
             return False
 
+    async def list_in_progress(self) -> List[Dict[str, Any]]:
+        return await self._stats.list_by_challenge_status(
+            MinerStatsDAO.STATUS_IN_PROGRESS,
+        )
+
     async def set_terminal(
         self,
         uid: int,

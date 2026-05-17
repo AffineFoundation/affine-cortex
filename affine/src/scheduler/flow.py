@@ -91,6 +91,7 @@ class TransientDeployError(RuntimeError):
 
 
 import math
+import time
 
 WINDOW_BLOCKS = 7200
 """How often the per-env task_id pool is regenerated."""
@@ -107,6 +108,10 @@ WIN_MIN_DOMINANT_ENVS = 1
 _PREDEPLOY_PEEK_LIMIT = 32
 """Upper bound on candidates pulled per fill tick. Real terminator is
 :exc:`NoSpareEndpoint`."""
+
+ORPHAN_GRACE_SECONDS = 120
+"""Minimum age of an ``in_progress`` row, missing from all in-flight
+roles, before the reaper terminates it."""
 
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
@@ -190,14 +195,23 @@ class FlowScheduler:
     # ---- entry point ------------------------------------------------------
 
     async def tick(self, current_block: int) -> None:
-        """Battle phase, then pre-sample phase (guarded so a flaky
-        teardown can't block the next tick)."""
+        """Battle phase, then pre-sample phase, then orphan reaper.
+        The latter two are guarded so a flaky teardown / DDB scan
+        can't block the next tick."""
         await self._tick_main(current_block)
         try:
             await self._predeploy_phase(current_block)
         except Exception as e:
             logger.warning(
                 f"FlowScheduler: predeploy phase error "
+                f"(non-fatal, will retry next tick): "
+                f"{type(e).__name__}: {e}"
+            )
+        try:
+            await self._reap_in_progress_orphans()
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: orphan reaper error "
                 f"(non-fatal, will retry next tick): "
                 f"{type(e).__name__}: {e}"
             )
@@ -685,36 +699,25 @@ class FlowScheduler:
         champion: ChampionRecord,
         battle: BattleRecord,
     ) -> None:
-        """Interrupt the in-flight battle BECAUSE the challenger
-        became invalid mid-contest — and for the same reason, do not
-        write a new challenge_status.
+        """Tear down the in-flight battle and terminate the challenger
+        because monitor flipped its ``is_valid`` to false mid-contest.
 
-        The sampling is being stopped because the miner is invalid
-        (anticopy / multi_commit / blacklist / repo-name picked up
-        late). ``invalid_reason`` on the miners snapshot already
-        captures that cause and renders it in the rank UI. Writing
-        ``challenge_status='terminated', termination_reason=
-        'invalidated_mid_battle'`` on miner_stats would just restate
-        the same fact with less specificity — drop it.
-
-        Queue safety without the status write: the miner stays at
-        ``challenge_status='in_progress'``, but ``list_valid_pending``
-        filters on ``is_valid='true'`` so an invalid hotkey can't be
-        re-picked. If the monitor later restores validity, the
-        inherited ``in_progress`` still blocks ``claim_for_challenge``
-        — the same one-shot lifetime guarantee, just without the
-        redundant write.
-
-        Releases the GPU host immediately: teardown the challenger's
-        deployment, in single-instance mode also clear the now-stale
-        champion deployment so step 5 redeploys next tick, then clear
-        the battle so step 7 picks the next challenger.
+        ``mark_terminated`` is written first so any crash later still
+        leaves the lifecycle converged. ``is_valid`` is not durable
+        (anticopy ``permanent=False`` can revert), so the lifecycle
+        write — not ``is_valid`` — carries the one-shot guarantee.
         """
         logger.warning(
             f"FlowScheduler: challenger uid={battle.challenger.uid} "
-            f"became invalid mid-battle; interrupting sampling "
-            f"(challenge_status unchanged — invalid_reason is the "
-            f"authoritative cause)"
+            f"became invalid mid-battle; terminating lifecycle"
+        )
+        await self.queue.mark_terminated(
+            battle.challenger.uid,
+            OUTCOME_LOST,
+            reason=f"invalidated_mid_battle:{battle.challenger.hotkey[:10]}",
+            hotkey=battle.challenger.hotkey,
+            revision=battle.challenger.revision,
+            model=battle.challenger.model,
         )
         await self._teardown_record(battle)
         if self.cfg.single_instance_provider:
@@ -723,6 +726,62 @@ class FlowScheduler:
             champion.deployments = []
             await self.state.set_champion(champion)
         await self.state.clear_battle()
+
+    # ---- invariant reaper -------------------------------------------------
+
+    async def _reap_in_progress_orphans(self) -> None:
+        """Terminate ``in_progress`` rows that don't match any in-flight
+        role (active battle challenger, current champion, predeployed
+        challenger) and are older than :data:`ORPHAN_GRACE_SECONDS`.
+
+        Backstop for crash windows in ``pick_next``→``set_battle`` and
+        ``_cold_start`` ``set_champion``→``mark_terminated(WON)``.
+        """
+        battle = await self.state.get_battle()
+        champion = await self.state.get_champion()
+        predeployed = await self.state.get_predeployed_challengers()
+        protected: set = set()
+        if battle is not None:
+            protected.add(battle.challenger.uid)
+        if champion is not None:
+            protected.add(champion.uid)
+        for record in predeployed:
+            protected.add(record.challenger.uid)
+
+        rows = await self.queue.list_in_progress()
+        if not rows:
+            return
+        now = int(time.time())
+        for row in rows:
+            uid = row.get("uid")
+            if uid is None or uid in protected:
+                continue
+            try:
+                claimed_at = int(row.get("challenge_claimed_at") or 0)
+            except (TypeError, ValueError):
+                claimed_at = 0
+            age = now - claimed_at if claimed_at > 0 else now
+            if age < ORPHAN_GRACE_SECONDS:
+                continue
+            try:
+                await self.queue.mark_terminated(
+                    int(uid),
+                    OUTCOME_FAILED,
+                    reason=f"claim_orphan_reaped:age={age}s",
+                    hotkey=str(row.get("hotkey") or ""),
+                    revision=str(row.get("revision") or ""),
+                    model=str(row.get("model") or ""),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"FlowScheduler: orphan reaper failed to terminate "
+                    f"uid={uid}: {type(e).__name__}: {e}"
+                )
+                continue
+            logger.warning(
+                f"FlowScheduler: reaped orphan in_progress uid={uid} "
+                f"(age={age}s, protected_uids={sorted(protected)})"
+            )
 
     # ---- pre-sample phase -------------------------------------------------
 

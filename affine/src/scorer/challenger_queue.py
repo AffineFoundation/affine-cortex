@@ -95,6 +95,10 @@ class MinerQueueStore(Protocol):
         """Set ``uid``'s historical ``challenge_status``."""
         ...
 
+    async def list_in_progress(self) -> list[dict]:
+        """Return all rows currently at ``challenge_status='in_progress'``."""
+        ...
+
 
 class ChallengerQueue:
     def __init__(self, store: MinerQueueStore):
@@ -196,6 +200,9 @@ class ChallengerQueue:
         return await self._store.release_claim(
             uid, hotkey=hotkey, revision=revision,
         )
+
+    async def list_in_progress(self) -> list[dict]:
+        return await self._store.list_in_progress()
 
     async def mark_terminated(
         self,

@@ -91,6 +91,23 @@ class _InMemoryMinerStore:
         if terminated_at_block is not None:
             self.rows[uid]["terminated_at_block"] = terminated_at_block
 
+    async def release_claim(
+        self, uid: int, *,
+        hotkey: str | None = None,
+        revision: str | None = None,
+    ) -> bool:
+        row = self.rows.get(uid)
+        if row is None or row.get("challenge_status") != STATUS_IN_PROGRESS:
+            return False
+        row["challenge_status"] = STATUS_SAMPLING
+        return True
+
+    async def list_in_progress(self) -> List[dict]:
+        return [
+            dict(r) for r in self.rows.values()
+            if r.get("challenge_status") == STATUS_IN_PROGRESS
+        ]
+
 
 @dataclass
 class _DeployTracker:
@@ -1032,11 +1049,11 @@ async def test_challenger_invalidated_mid_battle_does_not_get_promoted():
     # Champion did NOT change — challenger was invalid at decide time.
     champ = await state.get_champion()
     assert champ.uid == 1, f"invalid challenger was wrongly promoted: {champ}"
-    # Challenger's challenge_status stays at IN_PROGRESS: the
-    # ``is_valid=false`` flag plus their original ``invalid_reason``
-    # are the authoritative signal; we don't overwrite with a
-    # generic ``terminated`` label here.
-    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    # Lifecycle converges to terminated via the in-decide guard.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miner_store.rows[2]["termination_reason"].startswith(
+        "invalidated_mid_battle:"
+    )
     # No weight write happened (champion didn't change).
     assert weight_writer.calls == []
     # Challenger's Targon was torn down, champion's preserved.
@@ -2101,16 +2118,11 @@ async def test_early_invalidation_fires_before_overlap_ready():
     assert "wrk-002" in deployer.teardowns
     assert "wrk-001" not in deployer.teardowns
 
-    # Crucially: ``challenge_status`` stays at IN_PROGRESS, no new
-    # ``termination_reason`` written. The miner's ``invalid_reason``
-    # already records why; we don't replace specific monitor causes
-    # (anticopy / multi_commit / blacklist) with the generic label.
-    # The queue's ``list_valid_pending`` filters by is_valid=true, so
-    # the still-invalid miner can't be re-picked even though their
-    # row isn't formally TERMINATED.
+    # Lifecycle converges to TERMINATED; no frozen scores or
+    # terminated_at_block because the comparator never decided.
     row = miner_store.rows[2]
-    assert row["challenge_status"] == STATUS_IN_PROGRESS
-    assert row.get("termination_reason") in (None, "")
+    assert row["challenge_status"] == STATUS_TERMINATED
+    assert row["termination_reason"].startswith("invalidated_mid_battle:")
     assert "scores_by_env" not in row
     assert "terminated_at_block" not in row
 
@@ -2212,9 +2224,11 @@ async def test_in_decide_invalidation_guard_catches_concurrent_flip():
     assert champ.uid == 1, "in-decide guard failed to block promotion"
     assert weight_writer.calls == []
     assert "wrk-002" in deployer.teardowns
-    # Same no-status-rewrite policy as the step-4.5 path.
-    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
-    assert miner_store.rows[2].get("termination_reason") in (None, "")
+    # Same lifecycle-converge behavior as the step-4.5 path.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miner_store.rows[2]["termination_reason"].startswith(
+        "invalidated_mid_battle:"
+    )
 
 
 @pytest.mark.asyncio
@@ -2592,3 +2606,121 @@ async def test_predeploy_no_spare_does_not_mark_failed():
     # uid=2 was eligible but had no host. Status must stay SAMPLING.
     assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
     assert (await state.get_predeployed_challengers()) == []
+
+
+# ---- orphan reaper ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminates_old_orphan_in_progress():
+    """Pre-existing in_progress row with no matching battle/champion and
+    age > grace gets terminated with claim_orphan_reaped reason."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(99, "orphan_hk", 50, status=STATUS_IN_PROGRESS,
+                    revision="orphan_rev"),
+    ])
+    # Force the orphan's claim well into the past so age >> grace.
+    miner_store.rows[99]["challenge_claimed_at"] = 1
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[99]["challenge_status"] == STATUS_TERMINATED
+    assert miner_store.rows[99]["termination_reason"].startswith(
+        "claim_orphan_reaped:age="
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_skips_active_battle_challenger():
+    """An in_progress row that IS the current battle challenger must
+    never be reaped, regardless of age."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)   # refresh
+    await scheduler.tick(current_block=51)   # deploy champ
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            score=0.3, refresh_block=task_state.refreshed_at_block,
+        )
+    await scheduler.tick(current_block=52)   # start battle with uid=2
+
+    assert (await state.get_battle()).challenger.uid == 2
+    # Age uid=2's claim into the past so the reaper would reap it
+    # if not for the active-battle protection.
+    miner_store.rows[2]["challenge_claimed_at"] = 1
+
+    await scheduler.tick(current_block=53)
+
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_reaper_skips_champion_uid_for_cold_start_orphan():
+    """If a cold_start crashed between set_champion and mark_terminated,
+    the champion ends up with challenge_status=in_progress. The reaper
+    must NOT reap them — that would terminate the running champion."""
+    kv = _seed_state(with_champion=False)
+    # Champion already set in system_config, but their miner_stats row
+    # is still IN_PROGRESS (mid-cold-start crash scenario).
+    kv.data["champion"] = {
+        "uid": 5, "hotkey": "cold_champ", "revision": "cold_rev",
+        "model": "org/cold",
+        "deployment_id": None, "base_url": None,
+        "since_block": 0,
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(5, "cold_champ", 50,
+                    status=STATUS_IN_PROGRESS, revision="cold_rev"),
+    ])
+    miner_store.rows[5]["challenge_claimed_at"] = 1
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[5]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_reaper_respects_grace_window():
+    """An in_progress row younger than ORPHAN_GRACE_SECONDS must not be
+    reaped — guards the legitimate pick_next → set_battle window."""
+    from affine.src.scheduler.flow import ORPHAN_GRACE_SECONDS
+    import time as _time
+
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(99, "fresh", 50, status=STATUS_IN_PROGRESS, revision="fresh_rev"),
+    ])
+    # Claimed just now — well within grace.
+    miner_store.rows[99]["challenge_claimed_at"] = (
+        int(_time.time()) - (ORPHAN_GRACE_SECONDS // 2)
+    )
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[99]["challenge_status"] == STATUS_IN_PROGRESS
