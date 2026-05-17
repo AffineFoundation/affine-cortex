@@ -17,7 +17,12 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
   ssh_key_path            optional, paramiko key_filename
   public_inference_url    full URL exposed to env containers
                           (defaults to http://<host>:<sglang_port>/v1)
-  sglang_port             sglang listen port (30000)
+  sglang_port             sglang listen port. Default 10001 — most GPU
+                          providers expose only a small, fixed range of
+                          public TCP ports; 10001 is one of those on the
+                          current b300-family hosts, so env containers
+                          can reach sglang directly without an SSH
+                          tunnel + nginx LB hop.
   sglang_dp               data-parallel size (8)
   sglang_cache_dir        HF cache mount point (/data)
   sglang_image            (lmsysorg/sglang:latest)
@@ -51,7 +56,7 @@ from .targon import DeployResult, DeployTarget, MachineDeployment  # reuse the d
 # variables.
 DEFAULT_DOCKER_IMAGE = "lmsysorg/sglang:latest"
 DEFAULT_CACHE_DIR = "/data"
-DEFAULT_PORT = 30000
+DEFAULT_PORT = 10001
 DEFAULT_DP = 8
 DEFAULT_CONTEXT_LEN = 65536
 DEFAULT_MEM_FRACTION = 0.85

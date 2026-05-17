@@ -85,7 +85,7 @@ def test_ssh_config_bad_scheme_raises():
 
 def test_inference_url_defaults_to_host_port():
     cfg = SSHConfig(host="b300", user="root", port=22)
-    assert cfg.inference_url() == "http://b300:30000/v1"
+    assert cfg.inference_url() == "http://b300:10001/v1"
 
 
 def test_inference_url_uses_public_override():
@@ -204,7 +204,7 @@ def test_sglang_args_include_required_perf_flags():
     must_have_pairs = [
         ("--download-dir", "/data"),
         ("--host", "0.0.0.0"),
-        ("--port", "30000"),
+        ("--port", "10001"),
         ("--mem-fraction-static", "0.85"),
         ("--chunked-prefill-size", "4096"),
         ("--tool-call-parser", "qwen"),
@@ -436,7 +436,7 @@ async def test_deploy_adopts_matching_container_without_restart(monkeypatch):
     result = await deploy(cfg, _target())
 
     assert result.deployment_id == f"ssh:ssh_b300:{CONTAINER_NAME}"
-    assert result.base_url == "http://b300:30000/v1"
+    assert result.base_url == "http://b300:10001/v1"
     assert len(calls) == 1
     assert calls[0].startswith("docker inspect")
 

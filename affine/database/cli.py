@@ -728,8 +728,11 @@ def list_endpoints():
 @click.option("--ssh-url", default=None, help="ssh://user@host[:port] — required for kind=ssh")
 @click.option("--ssh-key-path", default=None)
 @click.option("--public-inference-url", default=None,
-              help="What env containers actually connect to (e.g. http://val:30000/v1)")
-@click.option("--sglang-port", type=int, default=30000)
+              help="Override URL env containers connect to. Leave unset to "
+                   "fall back to http://<host>:<sglang_port>/v1 — only needed "
+                   "if there's a reverse-proxy / tunnel layer in front of the "
+                   "GPU host (no longer the case for b300-family hosts).")
+@click.option("--sglang-port", type=int, default=10001)
 @click.option("--sglang-dp", type=int, default=8)
 @click.option("--sglang-image", default="lmsysorg/sglang:latest")
 @click.option("--sglang-cache-dir", default="/data")

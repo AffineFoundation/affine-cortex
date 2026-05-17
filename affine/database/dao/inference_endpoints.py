@@ -55,7 +55,7 @@ class Endpoint:
     # ssh-kind extras
     ssh_url: Optional[str] = None
     ssh_key_path: Optional[str] = None
-    sglang_port: int = 30000
+    sglang_port: int = 10001
     sglang_dp: int = 8
     sglang_image: str = "lmsysorg/sglang:latest"
     sglang_cache_dir: str = "/data"
