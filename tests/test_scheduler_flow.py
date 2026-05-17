@@ -2606,3 +2606,121 @@ async def test_predeploy_no_spare_does_not_mark_failed():
     # uid=2 was eligible but had no host. Status must stay SAMPLING.
     assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
     assert (await state.get_predeployed_challengers()) == []
+
+
+# ---- orphan reaper ---------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminates_old_orphan_in_progress():
+    """Pre-existing in_progress row with no matching battle/champion and
+    age > grace gets terminated with claim_orphan_reaped reason."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(99, "orphan_hk", 50, status=STATUS_IN_PROGRESS,
+                    revision="orphan_rev"),
+    ])
+    # Force the orphan's claim well into the past so age >> grace.
+    miner_store.rows[99]["challenge_claimed_at"] = 1
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[99]["challenge_status"] == STATUS_TERMINATED
+    assert miner_store.rows[99]["termination_reason"].startswith(
+        "claim_orphan_reaped:age="
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_skips_active_battle_challenger():
+    """An in_progress row that IS the current battle challenger must
+    never be reaped, regardless of age."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)   # refresh
+    await scheduler.tick(current_block=51)   # deploy champ
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            score=0.3, refresh_block=task_state.refreshed_at_block,
+        )
+    await scheduler.tick(current_block=52)   # start battle with uid=2
+
+    assert (await state.get_battle()).challenger.uid == 2
+    # Age uid=2's claim into the past so the reaper would reap it
+    # if not for the active-battle protection.
+    miner_store.rows[2]["challenge_claimed_at"] = 1
+
+    await scheduler.tick(current_block=53)
+
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_reaper_skips_champion_uid_for_cold_start_orphan():
+    """If a cold_start crashed between set_champion and mark_terminated,
+    the champion ends up with challenge_status=in_progress. The reaper
+    must NOT reap them — that would terminate the running champion."""
+    kv = _seed_state(with_champion=False)
+    # Champion already set in system_config, but their miner_stats row
+    # is still IN_PROGRESS (mid-cold-start crash scenario).
+    kv.data["champion"] = {
+        "uid": 5, "hotkey": "cold_champ", "revision": "cold_rev",
+        "model": "org/cold",
+        "deployment_id": None, "base_url": None,
+        "since_block": 0,
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(5, "cold_champ", 50,
+                    status=STATUS_IN_PROGRESS, revision="cold_rev"),
+    ])
+    miner_store.rows[5]["challenge_claimed_at"] = 1
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[5]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_reaper_respects_grace_window():
+    """An in_progress row younger than ORPHAN_GRACE_SECONDS must not be
+    reaped — guards the legitimate pick_next → set_battle window."""
+    from affine.src.scheduler.flow import ORPHAN_GRACE_SECONDS
+    import time as _time
+
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(99, "fresh", 50, status=STATUS_IN_PROGRESS, revision="fresh_rev"),
+    ])
+    # Claimed just now — well within grace.
+    miner_store.rows[99]["challenge_claimed_at"] = (
+        int(_time.time()) - (ORPHAN_GRACE_SECONDS // 2)
+    )
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[99]["challenge_status"] == STATUS_IN_PROGRESS

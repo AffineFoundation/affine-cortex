@@ -763,14 +763,21 @@ class FlowScheduler:
             age = now - claimed_at if claimed_at > 0 else now
             if age < ORPHAN_GRACE_SECONDS:
                 continue
-            await self.queue.mark_terminated(
-                int(uid),
-                OUTCOME_FAILED,
-                reason=f"claim_orphan_reaped:age={age}s",
-                hotkey=str(row.get("hotkey") or ""),
-                revision=str(row.get("revision") or ""),
-                model=str(row.get("model") or ""),
-            )
+            try:
+                await self.queue.mark_terminated(
+                    int(uid),
+                    OUTCOME_FAILED,
+                    reason=f"claim_orphan_reaped:age={age}s",
+                    hotkey=str(row.get("hotkey") or ""),
+                    revision=str(row.get("revision") or ""),
+                    model=str(row.get("model") or ""),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"FlowScheduler: orphan reaper failed to terminate "
+                    f"uid={uid}: {type(e).__name__}: {e}"
+                )
+                continue
             logger.warning(
                 f"FlowScheduler: reaped orphan in_progress uid={uid} "
                 f"(age={age}s, protected_uids={sorted(protected)})"
