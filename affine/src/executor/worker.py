@@ -50,6 +50,9 @@ class ExecutorWorker:
         global_sem: Any = None,
         in_flight_value: Any = None,
         env_cap_value: Any = None,
+        per_host_in_flight: Optional[Dict[str, Any]] = None,
+        per_env_host_in_flight: Optional[Dict[str, Any]] = None,
+        per_host_budget: int = 0,
     ):
         self.worker_id = worker_id
         self.env = env
@@ -69,6 +72,14 @@ class ExecutorWorker:
         # Single writer (this worker), single reader (manager); aligned
         # c_int reads are atomic on CPython so no lock needed.
         self._in_flight_value = in_flight_value
+        # Per-host counters shared with manager + sibling workers.
+        # Acquired atomically before each evaluate to cap a single
+        # sglang's in-flight requests.
+        self._per_host_in_flight: Dict[str, Any] = per_host_in_flight or {}
+        self._per_env_host_in_flight: Dict[str, Any] = (
+            per_env_host_in_flight or {}
+        )
+        self._per_host_budget = int(per_host_budget or 0)
         self.poll_interval_sec = poll_interval_sec
         self.idle_sleep_sec = idle_sleep_sec
         # ``warmup_sec``: env containers report "ready" before they are
@@ -562,20 +573,88 @@ class ExecutorWorker:
             return max(0, int(self._in_flight_value.value))
         return max(0, int(self.metrics.tasks_in_flight))
 
-    async def _acquire_dispatch_slot(self) -> None:
-        """Acquire this env's dynamic share, then one global slot.
+    def _increment_env_slot(self) -> None:
+        self.metrics.tasks_in_flight += 1
+        if self._in_flight_value is not None:
+            self._in_flight_value.value += 1
 
-        The cap is rechecked after acquiring the global slot because the
-        manager can lower it while this coroutine is waiting.
+    def _decrement_env_slot(self) -> None:
+        self.metrics.tasks_in_flight = max(
+            0, self.metrics.tasks_in_flight - 1,
+        )
+        if self._in_flight_value is not None:
+            self._in_flight_value.value = max(
+                0, int(self._in_flight_value.value) - 1,
+            )
+
+    async def _acquire_dispatch_slot(
+        self, *, expected_deployment_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """env cap → per-host cap → global sem, re-checking both caps
+        after the global acquire (manager may have lowered either).
+
+        Returns the acquired host name, if a per-host slot was taken.
         """
+        host = _host_from_deployment(expected_deployment_id)
+        host_value = self._per_host_in_flight.get(host) if host else None
         while True:
             while self._current_env_in_flight() >= self._current_env_cap():
                 await asyncio.sleep(0.05)
+            while (
+                host_value is not None
+                and self._per_host_budget > 0
+                and int(host_value.value) >= self._per_host_budget
+            ):
+                await asyncio.sleep(0.05)
             await self._acquire_global_slot()
-            if self._current_env_in_flight() < self._current_env_cap():
-                return
-            self._release_global_slot()
-            await asyncio.sleep(0.05)
+            self._increment_env_slot()
+            if self._current_env_in_flight() > self._current_env_cap():
+                self._decrement_env_slot()
+                self._release_global_slot()
+                await asyncio.sleep(0.05)
+                continue
+            if (
+                host_value is not None
+                and self._per_host_budget > 0
+                and not self._try_acquire_host_slot(host)
+            ):
+                self._decrement_env_slot()
+                self._release_global_slot()
+                await asyncio.sleep(0.05)
+                continue
+            if host_value is not None and self._per_host_budget > 0:
+                return host
+            return None
+
+    def _try_acquire_host_slot(self, host: Optional[str]) -> bool:
+        """Atomically reserve one per-host slot."""
+        if not host or self._per_host_budget <= 0:
+            return False
+        host_value = self._per_host_in_flight.get(host)
+        if host_value is None:
+            return False
+        env_host_value = self._per_env_host_in_flight.get(host)
+        with host_value.get_lock():
+            if int(host_value.value) >= self._per_host_budget:
+                return False
+            host_value.value += 1
+            if env_host_value is not None:
+                with env_host_value.get_lock():
+                    env_host_value.value += 1
+        return True
+
+    def _release_host_slot(self, host: Optional[str]) -> None:
+        if not host:
+            return
+        host_value = self._per_host_in_flight.get(host)
+        if host_value is None:
+            return
+        env_host_value = self._per_env_host_in_flight.get(host)
+        with host_value.get_lock():
+            host_value.value = max(0, int(host_value.value) - 1)
+            if env_host_value is not None:
+                with env_host_value.get_lock():
+                    env_host_value.value = max(0, int(env_host_value.value) - 1)
 
     async def _is_current_deployment(
         self, *, miner: MinerSnapshot, expected_deployment_id: Optional[str],
@@ -671,15 +750,10 @@ class ExecutorWorker:
         refresh_block: int, miner_obj: "_Miner",
         expected_deployment_id: Optional[str] = None,
     ) -> None:
-        await self._acquire_dispatch_slot()
+        acquired_host = await self._acquire_dispatch_slot(
+            expected_deployment_id=expected_deployment_id,
+        )
         started = time.monotonic()
-        # Track real in-flight concurrency. Two counters intentionally:
-        # ``metrics.tasks_in_flight`` is in-process for ``af db worker-status``
-        # back-compat; ``self._in_flight_value`` is shared with the manager
-        # for the ``[STATUS]`` printer.
-        self.metrics.tasks_in_flight += 1
-        if self._in_flight_value is not None:
-            self._in_flight_value.value += 1
         try:
             try:
                 result = await self._env_executor.evaluate(
@@ -722,9 +796,8 @@ class ExecutorWorker:
                 self.metrics.record_completion(success=False, latency_ms=latency_ms)
                 return
         finally:
-            self.metrics.tasks_in_flight -= 1
-            if self._in_flight_value is not None:
-                self._in_flight_value.value -= 1
+            self._decrement_env_slot()
+            self._release_host_slot(acquired_host)
             self._release_global_slot()
 
         score = float(getattr(result, "score", 0.0))
@@ -815,6 +888,14 @@ def _base_urls(deployments: List[DeploymentRecord], fallback: Optional[str]) -> 
         urls = [fallback]
     # Preserve order while removing duplicates.
     return list(dict.fromkeys(urls))
+
+
+def _host_from_deployment(dep_id: Optional[str]) -> Optional[str]:
+    """``ssh:<host>:<container>`` → host. ``None`` for any other shape."""
+    if not dep_id or not dep_id.startswith("ssh:"):
+        return None
+    parts = dep_id.split(":")
+    return parts[1] if len(parts) >= 3 and parts[1] else None
 
 
 def _collect_current_deployment_ids(champion, battle, predeployed) -> set:

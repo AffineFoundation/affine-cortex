@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 from affine.core.setup import logger, setup_logging
 
@@ -22,6 +22,9 @@ def run_worker_subprocess(
     global_sem: Any,
     in_flight_value: Any,
     env_cap_value: Any,
+    per_host_in_flight: Optional[Dict[str, Any]] = None,
+    per_env_host_in_flight: Optional[Dict[str, Any]] = None,
+    per_host_budget: int = 0,
     verbosity: int = 1,
 ) -> None:
     """Subprocess entry point — runs one ExecutorWorker until killed.
@@ -50,6 +53,9 @@ def run_worker_subprocess(
             worker_id=worker_id, env=env, max_concurrent=max_concurrent,
             global_sem=global_sem, in_flight_value=in_flight_value,
             env_cap_value=env_cap_value,
+            per_host_in_flight=per_host_in_flight or {},
+            per_env_host_in_flight=per_env_host_in_flight or {},
+            per_host_budget=per_host_budget,
         )
         loop.run_until_complete(worker.initialize())
         worker.start()
@@ -89,6 +95,9 @@ class WorkerProcess:
         in_flight_value: Any,
         env_cap_value: Any,
         *,
+        per_host_in_flight: Optional[Dict[str, Any]] = None,
+        per_env_host_in_flight: Optional[Dict[str, Any]] = None,
+        per_host_budget: int = 0,
         max_concurrent: int = 60,
         verbosity: int = 1,
     ):
@@ -98,6 +107,9 @@ class WorkerProcess:
         self.global_sem = global_sem
         self.in_flight_value = in_flight_value
         self.env_cap_value = env_cap_value
+        self.per_host_in_flight = per_host_in_flight or {}
+        self.per_env_host_in_flight = per_env_host_in_flight or {}
+        self.per_host_budget = per_host_budget
         self.verbosity = verbosity
         self._proc: Optional[multiprocessing.Process] = None
 
@@ -107,7 +119,10 @@ class WorkerProcess:
             target=run_worker_subprocess,
             args=(self.worker_id, self.env, self.max_concurrent,
                   self.global_sem, self.in_flight_value,
-                  self.env_cap_value, self.verbosity),
+                  self.env_cap_value,
+                  self.per_host_in_flight, self.per_env_host_in_flight,
+                  self.per_host_budget,
+                  self.verbosity),
             name=f"executor-{self.env}",
             daemon=False,
         )
