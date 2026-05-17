@@ -16,7 +16,11 @@ from affine.src.scheduler.flow import (
     FlowConfig,
     FlowScheduler,
 )
-from affine.src.scheduler.targon import DeployResult, DeployTarget
+from affine.src.scheduler.targon import (
+    DeployResult,
+    DeployTarget,
+    MachineDeployment,
+)
 from affine.src.scorer.challenger_queue import (
     ChallengerQueue,
     STATUS_CHAMPION,
@@ -105,6 +109,20 @@ class _DeployTracker:
     # (simulates a real ssh / docker failure). The fill loop must
     # ``mark_terminated(FAILED)`` and advance to the next candidate.
     predeploy_failures: set = field(default_factory=set)
+    # Optional endpoint-name pool. Index 0 → champion/active deploys;
+    # index 1.. → successive pre-deploys. Empty (default) keeps the
+    # legacy behavior where ``deployments[*].endpoint_name`` is "" (from
+    # ``DeployResult.__post_init__``) — most existing tests rely on
+    # that. Tests exercising endpoint-reconciliation supply real names.
+    primary_endpoint: str = ""
+    spare_endpoints: List[str] = field(default_factory=list)
+    # deployment_id → endpoint_name, populated as deploys happen. Used
+    # by ``teardown_with_assignment_clear`` to simulate the production
+    # behavior where teardown also clears the endpoint's assigned_uid.
+    _ep_by_dep: Dict[str, str] = field(default_factory=dict)
+    # uids whose teardown should raise on the FIRST attempt only.
+    teardown_failures_once: Set[int] = field(default_factory=set)
+    _teardown_attempts: Dict[str, int] = field(default_factory=dict)
 
     async def deploy(self, target: DeployTarget, role: str = "active") -> DeployResult:
         if role == "pre_challenger":
@@ -127,10 +145,54 @@ class _DeployTracker:
             raise RuntimeError("simulated targon deploy failure")
         self.next_deployment_id += 1
         did = f"wrk-{self.next_deployment_id:03d}"
-        return DeployResult(deployment_id=did, base_url=f"https://t/{did}")
+        base_url = f"https://t/{did}"
+        # If the test supplied endpoint names, embed one in the
+        # MachineDeployment so reconciliation can find it. Pre-deploys
+        # consume the spare pool in order; active deploys use primary.
+        ep_name = ""
+        if role == "pre_challenger" and self.spare_endpoints:
+            idx = len(self.predeploys) - 1
+            if 0 <= idx < len(self.spare_endpoints):
+                ep_name = self.spare_endpoints[idx]
+        elif role != "pre_challenger" and self.primary_endpoint:
+            ep_name = self.primary_endpoint
+        if ep_name:
+            self._ep_by_dep[did] = ep_name
+            return DeployResult(
+                deployment_id=did,
+                base_url=base_url,
+                deployments=[
+                    MachineDeployment(
+                        endpoint_name=ep_name,
+                        deployment_id=did,
+                        base_url=base_url,
+                    )
+                ],
+            )
+        return DeployResult(deployment_id=did, base_url=base_url)
 
     async def teardown(self, deployment_id: Optional[str]) -> None:
         self.teardowns.append(deployment_id)
+        # Optional: simulate a flaky teardown by raising once for a
+        # configured uid. Test resets ``teardown_failures_once`` after
+        # the expected retry boundary.
+        ep_name = self._ep_by_dep.get(deployment_id or "")
+        attempts = self._teardown_attempts.get(deployment_id or "", 0) + 1
+        self._teardown_attempts[deployment_id or ""] = attempts
+        if ep_name and attempts == 1:
+            # Look up by endpoint identity, not deployment, so tests can
+            # arm a failure before the deployment_id is known.
+            ep_uid_map = {v: k for k, v in self._ep_by_dep.items()}
+            del ep_uid_map  # noqa — kept for readability
+        if attempts == 1 and deployment_id in {
+            f"wrk-{i:03d}" for i in range(self.next_deployment_id + 1)
+        }:
+            # Match by deployment_id directly via ``teardown_failures_once``
+            # if test inserted the deployment_id there.
+            if deployment_id in self.teardown_failures_once:
+                raise RuntimeError(
+                    f"simulated teardown failure for {deployment_id}"
+                )
 
 
 class _SamplesFake:

@@ -117,6 +117,13 @@ DeployFn = Callable[[targon_lifecycle.DeployTarget, str],
                     Awaitable[targon_lifecycle.DeployResult]]
 TeardownFn = Callable[[Optional[str]], Awaitable[None]]
 
+ListActiveEndpointNamesFn = Callable[[], Awaitable[set]]
+"""Return the set of currently-active endpoint names. Used by the
+pre-deploy invalidation sweep to drop records whose endpoint has been
+removed from ``inference_endpoints`` while the scheduler was down
+(``af db set-endpoint --no-active`` or row deletion). Optional —
+non-ssh providers don't need it."""
+
 
 @dataclass
 class FlowConfig:
@@ -151,6 +158,7 @@ class FlowScheduler:
         sample_count_fn: SampleCountFn,
         scores_reader: ScoresReader,
         list_valid_miners_fn: ListValidMinersFn,
+        list_active_endpoint_names_fn: Optional[ListActiveEndpointNamesFn] = None,
     ):
         self.cfg = config
         self.state = state
@@ -163,6 +171,7 @@ class FlowScheduler:
         self._sample_count = sample_count_fn
         self._scores_reader = scores_reader
         self._list_valid_miners = list_valid_miners_fn
+        self._list_active_endpoint_names = list_active_endpoint_names_fn
 
     # ---- entry point ------------------------------------------------------
 
@@ -725,8 +734,42 @@ class FlowScheduler:
         valid_uids = {
             int(r.get("uid", -1)) for r in await self._list_valid_miners()
         }
+        # An endpoint that's been removed from ``inference_endpoints``
+        # (``af db set-endpoint --no-active`` or row deletion) is no
+        # longer ours to teardown — the cfg may not even exist anymore.
+        # Drop the record so the executor stops dispatching to a
+        # base_url the operator removed.
+        active_endpoints: Optional[set] = None
+        if self._list_active_endpoint_names is not None:
+            try:
+                active_endpoints = await self._list_active_endpoint_names()
+            except Exception as e:
+                logger.warning(
+                    f"FlowScheduler: list_active_endpoint_names failed; "
+                    f"skipping endpoint reconciliation this tick: "
+                    f"{type(e).__name__}: {e}"
+                )
         kept: List[BattleRecord] = []
+        changed = False
         for record in records:
+            record_endpoints = {
+                d.endpoint_name for d in (record.deployments or [])
+                if getattr(d, "endpoint_name", None)
+            }
+            if (
+                active_endpoints is not None
+                and record_endpoints
+                and not (record_endpoints & active_endpoints)
+            ):
+                logger.warning(
+                    f"FlowScheduler: pre-deployed uid="
+                    f"{record.challenger.uid} on endpoint(s) "
+                    f"{sorted(record_endpoints)} no longer in active "
+                    f"inference_endpoints; dropping record without "
+                    f"teardown (endpoint is no longer ours to manage)"
+                )
+                changed = True
+                continue
             if record.challenger.uid in valid_uids:
                 kept.append(record)
                 continue
@@ -736,8 +779,20 @@ class FlowScheduler:
                 f"(challenge_status unchanged — invalid_reason is the "
                 f"authoritative cause)"
             )
-            await self._teardown_record(record)
-        if len(kept) != len(records):
+            try:
+                await self._teardown_record(record)
+            except Exception as e:
+                # Keep the record so next tick retries — don't strand
+                # the rest of the batch on one teardown's DDB hiccup.
+                logger.error(
+                    f"FlowScheduler: teardown failed for invalidated "
+                    f"pre-deployed uid={record.challenger.uid}: "
+                    f"{type(e).__name__}: {e} — keeping for retry"
+                )
+                kept.append(record)
+                continue
+            changed = True
+        if changed:
             await self.state.set_predeployed_challengers(kept)
 
     async def _predeploy_early_loss_sweep(
@@ -751,6 +806,7 @@ class FlowScheduler:
             return
         scoring_envs = await self.state.get_scoring_environments()
         kept: List[BattleRecord] = []
+        changed = False
         for record in records:
             early = await self._check_early_regression(
                 champion, record.challenger,
@@ -760,14 +816,28 @@ class FlowScheduler:
                 kept.append(record)
                 continue
             regression_env, per_env_data = early
-            await self._decide_predeployed_early_lost(
-                champion, record,
-                regression_env=regression_env,
-                per_env_data=per_env_data,
-                task_state=task_state,
-                current_block=current_block,
-            )
-        if len(kept) != len(records):
+            try:
+                await self._decide_predeployed_early_lost(
+                    champion, record,
+                    regression_env=regression_env,
+                    per_env_data=per_env_data,
+                    task_state=task_state,
+                    current_block=current_block,
+                )
+            except Exception as e:
+                # Same retry policy as the invalidation sweep — one
+                # bad record shouldn't strand the rest. teardown +
+                # mark_terminated are both idempotent so re-running
+                # on the next tick is safe.
+                logger.error(
+                    f"FlowScheduler: early-loss decide failed for "
+                    f"pre-deployed uid={record.challenger.uid}: "
+                    f"{type(e).__name__}: {e} — keeping for retry"
+                )
+                kept.append(record)
+                continue
+            changed = True
+        if changed:
             await self.state.set_predeployed_challengers(kept)
 
     async def _decide_predeployed_early_lost(
@@ -1177,6 +1247,24 @@ class FlowScheduler:
             return
         await self._teardown_record(adopted)
         await self.state.set_predeployed_challengers(remaining)
+        # Pre-samples are keyed by ``refresh_block``; if the task-id pool
+        # refreshed after this miner was pre-deployed, old-refresh samples
+        # won't count toward current-refresh overlap and the battle
+        # effectively starts from zero pre-sample value. Flag the wasted
+        # work so operators can see it.
+        task_state = await self.state.get_task_state()
+        if (
+            task_state is not None
+            and adopted.started_at_block < task_state.refreshed_at_block
+        ):
+            logger.warning(
+                f"FlowScheduler: adopted pre-deployed uid={uid} crosses "
+                f"task-id refresh boundary (started_at_block="
+                f"{adopted.started_at_block} < refreshed_at_block="
+                f"{task_state.refreshed_at_block}); pre-samples from "
+                f"earlier refresh are not counted toward current-refresh "
+                f"overlap"
+            )
         logger.info(
             f"FlowScheduler: adopted pre-deployed uid={uid} as active "
             f"challenger (pre-sample slot torn down; pre-samples retained "

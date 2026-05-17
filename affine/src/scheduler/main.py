@@ -219,17 +219,64 @@ async def _run() -> None:
                 deployments=deployments,
             )
 
+        async def _resolve_ssh_cfg(deployment_id):
+            """Find the (name, cfg) that owns ``deployment_id``.
+            ``ssh_configs`` is a startup snapshot; an endpoint added at
+            runtime (or one whose row was edited after start) won't be
+            there. Fall back to a live ``list_active`` so teardown can
+            still find a cfg to docker-rm + clear_assignment on."""
+            for name, cfg in ssh_configs.items():
+                if deployment_id == cfg.deployment_id():
+                    return name, cfg
+            try:
+                live = await endpoints_dao.list_active(kind="ssh")
+            except Exception as e:
+                logger.warning(
+                    f"scheduler: live endpoint lookup failed during "
+                    f"teardown_fn for deployment_id={deployment_id!r}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return None, None
+            for ep in live:
+                cfg = ssh_lifecycle.SSHConfig.from_endpoint(ep)
+                if deployment_id == cfg.deployment_id():
+                    ssh_configs[ep.name] = cfg  # cache for next time
+                    return ep.name, cfg
+            return None, None
+
         async def teardown_fn(deployment_id):
             if not deployment_id:
                 return
-            for name, cfg in ssh_configs.items():
-                if deployment_id == cfg.deployment_id():
-                    await ssh_lifecycle.teardown(cfg, deployment_id)
-                    await endpoints_dao.clear_assignment(name)
-                    return
-            logger.warning(
-                f"scheduler: no ssh endpoint owns deployment_id={deployment_id!r}"
-            )
+            name, cfg = await _resolve_ssh_cfg(deployment_id)
+            if cfg is None:
+                # Endpoint no longer in inference_endpoints — either
+                # operator removed it after this miner was deployed,
+                # or this is a stale state record pointing at a host
+                # we no longer manage. Either way, nothing to docker-rm
+                # and no assignment row to clear.
+                logger.warning(
+                    f"scheduler: no ssh endpoint owns deployment_id="
+                    f"{deployment_id!r} (likely a removed endpoint); "
+                    f"skipping teardown"
+                )
+                return
+            # clear_assignment runs in finally so a transient ssh
+            # failure can't leave the endpoint's assigned_uid pointing
+            # at a dead miner — that would starve pre-deploy capacity
+            # on this endpoint until restart. The DB row tracks the
+            # scheduler's intent; the next deploy reconciles any
+            # container the host might still be running
+            # (``ssh_lifecycle.deploy`` is idempotent — ``docker rm -f``
+            # step at the top).
+            try:
+                await ssh_lifecycle.teardown(cfg, deployment_id)
+            finally:
+                await endpoints_dao.clear_assignment(name)
+
+        async def list_active_ssh_endpoint_names():
+            return {
+                ep.name for ep in await endpoints_dao.list_active(kind="ssh")
+            }
 
         # SSH primary always time-shares champion + current challenger,
         # so the flag is True regardless of endpoint count.
@@ -262,6 +309,7 @@ async def _run() -> None:
         async def teardown_fn(deployment_id):
             await targon_lifecycle.teardown(targon_client, deployment_id)
 
+        list_active_ssh_endpoint_names = None
         flow_config = FlowConfig()
         logger.info(
             f"scheduler: provider=targon endpoint={primary.name!r} "
@@ -280,6 +328,7 @@ async def _run() -> None:
         sample_count_fn=sample_count_fn,
         scores_reader=scores_reader,
         list_valid_miners_fn=list_valid_miners_fn,
+        list_active_endpoint_names_fn=list_active_ssh_endpoint_names,
     )
 
     stop_event = asyncio.Event()
