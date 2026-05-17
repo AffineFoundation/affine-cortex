@@ -97,12 +97,12 @@ class RolloutRefreshService:
         ``cfg.refresh_interval_days`` days, and only after the
         ``refresh_utc_hour`` boundary on the firing day.
 
-        Promoting weekly (default 7d) keeps the rollout pool stable
+        Promoting weekly (default 3d) keeps the rollout pool stable
         within a window: every candidate scored between two refresh
         ticks gets an identical rollout_key set, so pair-comparisons
         on the same window have perfect alignment. Adjacent windows
-        overlap because ``pool_days`` retention (default 14d = 2 ×
-        refresh_interval_days) keeps the previous tick's rollouts
+        overlap because ``pool_days`` retention (default 9d = 3 ×
+        refresh_interval_days) keeps the previous two ticks' rollouts
         live, so cross-window pairs share the previous-window slice.
         """
         cfg = await load_anticopy_config(self.config_dao)

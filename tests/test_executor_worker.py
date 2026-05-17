@@ -567,6 +567,203 @@ def test_sampling_count_for_env_reads_current_config():
     assert _sampling_count_for_env(envs, "ENV_A", 441) == 0
 
 
+def test_sampling_priority_for_env_reads_current_config():
+    from affine.src.executor.main import _sampling_priority_for_env
+
+    envs = {
+        "ENV_A": {"sampling": {"priority": 2}},
+        "ENV_B": {"sampling": {"priority": "1"}},
+        "ENV_C": {"sampling": {}},
+        "ENV_D": {"sampling": {"priority": None}},
+        "ENV_E": {"sampling": "not-a-dict"},
+        "ENV_F": "not-a-dict",
+    }
+
+    assert _sampling_priority_for_env(envs, "ENV_A") == 2
+    assert _sampling_priority_for_env(envs, "ENV_B") == 1
+    assert _sampling_priority_for_env(envs, "ENV_C") == 0
+    assert _sampling_priority_for_env(envs, "ENV_D") == 0
+    assert _sampling_priority_for_env(envs, "ENV_E") == 0
+    assert _sampling_priority_for_env(envs, "ENV_F") == 0
+    assert _sampling_priority_for_env(envs, "MISSING") == 0
+    assert _sampling_priority_for_env("garbage", "ENV_A") == 0
+    assert _sampling_priority_for_env(envs, "MISSING", default=5) == 5
+
+
+def test_adaptive_caps_priority_unset_is_bit_identical_to_flat():
+    """priorities=None / single-tier path must not perturb the existing
+    allocator — regression guard for the refactor.
+    """
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    envs = ["LIVEWEB", "MEMORY", "NAVWORLD", "SWE-INFINITE", "TERMINAL"]
+    stats = {
+        "LIVEWEB": {"target": 841, "done": 516, "running": 25, "delta": 0},
+        "MEMORY": {"target": 421, "done": 421, "running": 0, "delta": 0},
+        "NAVWORLD": {"target": 841, "done": 841, "running": 0, "delta": 0},
+        "SWE-INFINITE": {"target": 630, "done": 410, "running": 25, "delta": 1},
+        "TERMINAL": {"target": 630, "done": 625, "running": 5, "delta": 0},
+    }
+    prev = {
+        "LIVEWEB": 25, "MEMORY": 120, "NAVWORLD": 120,
+        "SWE-INFINITE": 25, "TERMINAL": 25,
+    }
+    flat = _compute_adaptive_env_caps(envs, stats, prev, global_budget=600)
+    untiered = _compute_adaptive_env_caps(
+        envs, stats, prev, global_budget=600,
+        priorities={env: 0 for env in envs},
+    )
+    assert flat == untiered
+
+
+def test_adaptive_caps_priority_tier_gets_dominant_share():
+    """High-priority active envs claim most of the budget; low-priority
+    envs are throttled to just enough to keep probing.
+    """
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    envs = ["LIVEWEB", "MEMORY", "NAVWORLD", "SWE-INFINITE", "TERMINAL"]
+    stats = {env: {"target": 1000, "done": 0, "running": 0, "delta": 0} for env in envs}
+    caps = _compute_adaptive_env_caps(
+        envs, stats, {}, global_budget=600,
+        priorities={
+            "MEMORY": 1, "SWE-INFINITE": 1,
+            "LIVEWEB": 0, "NAVWORLD": 0, "TERMINAL": 0,
+        },
+    )
+
+    top = caps["MEMORY"] + caps["SWE-INFINITE"]
+    bottom = caps["LIVEWEB"] + caps["NAVWORLD"] + caps["TERMINAL"]
+    assert top > bottom
+    assert caps["MEMORY"] > caps["LIVEWEB"]
+    assert caps["SWE-INFINITE"] > caps["TERMINAL"]
+    # Every active env still gets a non-zero probe (no starvation).
+    assert all(caps[env] >= 1 for env in envs)
+
+
+def test_adaptive_caps_priority_cascade_when_top_demand_low():
+    """When the top tier's remaining work cannot consume its budget,
+    the unused slots flow down to the next tier instead of staying
+    parked at high priority.
+    """
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    envs = ["MEMORY", "SWE-INFINITE", "LIVEWEB", "TERMINAL"]
+    stats = {
+        # Tier 1: tiny remaining each.
+        "MEMORY": {"target": 100, "done": 95, "running": 5, "delta": 1},
+        "SWE-INFINITE": {"target": 100, "done": 95, "running": 5, "delta": 1},
+        # Tier 0: big backlog.
+        "LIVEWEB": {"target": 1000, "done": 0, "running": 0, "delta": 0},
+        "TERMINAL": {"target": 1000, "done": 0, "running": 0, "delta": 0},
+    }
+    caps = _compute_adaptive_env_caps(
+        envs, stats, {}, global_budget=600,
+        priorities={
+            "MEMORY": 1, "SWE-INFINITE": 1, "LIVEWEB": 0, "TERMINAL": 0,
+        },
+    )
+
+    # Top tier can't use more than its remaining work.
+    assert caps["MEMORY"] <= 100
+    assert caps["SWE-INFINITE"] <= 100
+    # Cascaded budget reached the bottom tier.
+    assert caps["LIVEWEB"] >= 100
+    assert caps["TERMINAL"] >= 100
+
+
+def test_adaptive_caps_priority_lower_tier_keeps_probe_floor_under_saturation():
+    """Top tier with infinite-looking demand cannot starve a backlogged
+    bottom-tier env; bottom tier still receives at least a probe floor
+    (positive cap) so it can detect a stall or make slow progress.
+    """
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    envs = ["MEMORY", "SWE-INFINITE", "LIVEWEB"]
+    stats = {
+        "MEMORY": {"target": 10_000, "done": 0, "running": 0, "delta": 0},
+        "SWE-INFINITE": {"target": 10_000, "done": 0, "running": 0, "delta": 0},
+        "LIVEWEB": {"target": 10_000, "done": 0, "running": 0, "delta": 0},
+    }
+    caps = _compute_adaptive_env_caps(
+        envs, stats, {}, global_budget=600,
+        priorities={"MEMORY": 1, "SWE-INFINITE": 1, "LIVEWEB": 0},
+    )
+
+    assert caps["LIVEWEB"] >= 1
+    assert caps["MEMORY"] > caps["LIVEWEB"]
+    assert caps["SWE-INFINITE"] > caps["LIVEWEB"]
+
+
+def test_adaptive_caps_priority_top_tier_shares_internally_by_pressure():
+    """Two envs at the same priority tier still resolve by the same
+    pressure-weighted logic the un-tiered allocator uses — a saturated
+    laggard within the tier wins capacity from a near-done peer.
+    """
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    envs = ["MEMORY", "SWE-INFINITE", "LIVEWEB"]
+    stats = {
+        # Same tier; MEMORY is far behind, SWE near done.
+        "MEMORY": {"target": 500, "done": 100, "running": 150, "delta": 1},
+        "SWE-INFINITE": {"target": 500, "done": 450, "running": 150, "delta": 10},
+        # Low tier idle.
+        "LIVEWEB": {"target": 0, "done": 0, "running": 0, "delta": 0},
+    }
+    caps = _compute_adaptive_env_caps(
+        envs, stats, {"MEMORY": 150, "SWE-INFINITE": 150, "LIVEWEB": 5},
+        global_budget=600,
+        priorities={"MEMORY": 1, "SWE-INFINITE": 1, "LIVEWEB": 0},
+    )
+
+    assert caps["MEMORY"] > caps["SWE-INFINITE"]
+
+
+def test_adaptive_caps_priority_no_active_envs_returns_positive_caps():
+    """Edge: every env idle (no work anywhere, e.g. just after a battle
+    ended and before the next picks up). Each tier still receives a
+    placeholder cap from its pool — operationally inert (nothing is
+    running) but a fresh battle can ramp immediately without a
+    one-tick zero floor.
+    """
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    envs = ["MEMORY", "SWE-INFINITE", "LIVEWEB"]
+    stats = {env: {"target": 0, "done": 0, "running": 0, "delta": 0} for env in envs}
+    caps = _compute_adaptive_env_caps(
+        envs, stats, {}, global_budget=600,
+        priorities={"MEMORY": 1, "SWE-INFINITE": 1, "LIVEWEB": 0},
+    )
+
+    assert set(caps.keys()) == set(envs)
+    assert all(caps[env] >= 1 for env in envs)
+
+
+def test_adaptive_caps_priority_inactive_top_tier_does_not_block_cascade():
+    """If every top-tier env is inactive (nothing to do), the entire
+    global budget cascades to lower tiers.
+    """
+    from affine.src.executor.main import _compute_adaptive_env_caps
+
+    envs = ["MEMORY", "SWE-INFINITE", "LIVEWEB", "TERMINAL"]
+    stats = {
+        "MEMORY": {"target": 0, "done": 0, "running": 0, "delta": 0},
+        "SWE-INFINITE": {"target": 0, "done": 0, "running": 0, "delta": 0},
+        "LIVEWEB": {"target": 1000, "done": 0, "running": 0, "delta": 0},
+        "TERMINAL": {"target": 1000, "done": 0, "running": 0, "delta": 0},
+    }
+    caps = _compute_adaptive_env_caps(
+        envs, stats, {}, global_budget=600,
+        priorities={
+            "MEMORY": 1, "SWE-INFINITE": 1, "LIVEWEB": 0, "TERMINAL": 0,
+        },
+    )
+
+    assert caps["LIVEWEB"] >= 150
+    assert caps["TERMINAL"] >= 150
+    assert sum(caps.values()) <= 600 + caps["MEMORY"] + caps["SWE-INFINITE"]
+
+
 def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
     import asyncio as _asyncio
 

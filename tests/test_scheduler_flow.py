@@ -944,8 +944,11 @@ async def test_challenger_invalidated_mid_battle_does_not_get_promoted():
     # Champion did NOT change — challenger was invalid at decide time.
     champ = await state.get_champion()
     assert champ.uid == 1, f"invalid challenger was wrongly promoted: {champ}"
-    # Challenger marked terminated (used their shot).
-    assert miner_store.rows[2]["challenge_status"] in (STATUS_TERMINATED,)
+    # Challenger's challenge_status stays at IN_PROGRESS: the
+    # ``is_valid=false`` flag plus their original ``invalid_reason``
+    # are the authoritative signal; we don't overwrite with a
+    # generic ``terminated`` label here.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
     # No weight write happened (champion didn't change).
     assert weight_writer.calls == []
     # Challenger's Targon was torn down, champion's preserved.
@@ -1962,3 +1965,190 @@ async def test_early_regression_reason_format_pins_hotkey_prefix():
 
     reason = miner_store.rows[2]["termination_reason"]
     assert reason == "lost_to_champion:champ_long:early_regression_in_ENV_A"
+
+
+# ---- early-invalidation guard ----------------------------------------------
+#
+# Step 4.5 runs the mid-battle invalidation check BEFORE the
+# overlap-ready gate, so a challenger flagged invalid by the monitor
+# (anticopy / multi_commit / blacklist / repo-name) is torn down on
+# the next tick rather than continuing to accumulate useless samples
+# until ``_battle_overlap_ready`` is satisfied many minutes later.
+
+
+@pytest.mark.asyncio
+async def test_early_invalidation_fires_before_overlap_ready():
+    """Challenger flipped to is_valid=false mid-battle is terminated
+    even when neither side has produced enough samples to reach
+    sampling_count overlap. Without the step 4.5 guard the executor
+    would burn GPU time until step 8 finally fires."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+    task_state = await _drive_through_start_of_battle(scheduler, state, samples)
+    assert (await state.get_battle()) is not None
+    # Both miners only have a trickle of overlap — far below sampling_count;
+    # step 8 would refuse to fire.
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "chal_hk", "chal_rev", env, task_state.task_ids[env][:1],
+            score=0.9, refresh_block=task_state.refreshed_at_block,
+        )
+
+    # Monitor flips uid=2 invalid mid-battle.
+    miner_store.rows[2]["is_valid"] = "false"
+
+    await scheduler.tick(current_block=80)
+
+    # Battle cleared, challenger's Targon torn down, champion untouched.
+    assert (await state.get_battle()) is None
+    assert "wrk-002" in deployer.teardowns
+    assert "wrk-001" not in deployer.teardowns
+
+    # Crucially: ``challenge_status`` stays at IN_PROGRESS, no new
+    # ``termination_reason`` written. The miner's ``invalid_reason``
+    # already records why; we don't replace specific monitor causes
+    # (anticopy / multi_commit / blacklist) with the generic label.
+    # The queue's ``list_valid_pending`` filters by is_valid=true, so
+    # the still-invalid miner can't be re-picked even though their
+    # row isn't formally TERMINATED.
+    row = miner_store.rows[2]
+    assert row["challenge_status"] == STATUS_IN_PROGRESS
+    assert row.get("termination_reason") in (None, "")
+    assert "scores_by_env" not in row
+    assert "terminated_at_block" not in row
+
+
+@pytest.mark.asyncio
+async def test_early_invalidation_clears_champion_deployment_in_single_instance():
+    """Single-instance provider host is shared by both miners — when
+    the challenger's container is torn down on invalidation, the
+    champion's stored deployment becomes stale. Step 4.5 must clear it
+    so step 5 re-deploys champion next tick, symmetric to the regular
+    LOST branch."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+    scheduler.cfg = FlowConfig(
+        window_blocks=WINDOW_BLOCKS,
+        single_instance_provider=True,
+    )
+    await _drive_through_start_of_battle(scheduler, state, samples)
+    champ = await state.get_champion()
+    champ.deployment_id = "wrk-champion"
+    champ.base_url = "https://t/wrk-champion"
+    await state.set_champion(champ)
+
+    miner_store.rows[2]["is_valid"] = "false"
+
+    await scheduler.tick(current_block=80)
+
+    champ_after = await state.get_champion()
+    assert champ_after.deployment_id is None
+    assert champ_after.base_url is None
+
+
+@pytest.mark.asyncio
+async def test_in_decide_invalidation_guard_catches_concurrent_flip():
+    """Defense-in-depth: monitor can flip ``is_valid`` to false AFTER
+    step 4.5 has read valid_miners but BEFORE ``_decide`` runs the
+    comparator. Within a single tick there are many awaits between
+    those two points; the in-decide invalidation guard catches the
+    flip and refuses to promote.
+
+    Wires a ``_list_valid_miners`` mock that returns the challenger
+    valid on the first two calls (step 3 + step 4.5) and invalid
+    thereafter (step-9 in-decide check), simulating the monitor
+    writing concurrently during the tick.
+    """
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+    weight_writer = _WeightWriterFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        weight_writer=weight_writer,
+    )
+
+    # Bring up the battle with full overlap and challenger==champion
+    # avg, so step 7.5 (regression) doesn't fire and step 8
+    # (overlap_ready) passes — execution will reach the in-decide
+    # invalidation guard inside _decide.
+    task_state = await _drive_through_start_of_battle(scheduler, state, samples)
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "chal_hk", "chal_rev", env, task_state.task_ids[env],
+            score=0.9, refresh_block=task_state.refreshed_at_block,
+        )
+
+    # Patch _list_valid_miners to flip ``is_valid`` on uid=2 after the
+    # first two calls — step 3 + step 4.5 see the challenger valid,
+    # in-decide sees them invalid.
+    call_count = [0]
+    orig_fn = scheduler._list_valid_miners
+
+    async def flipping_fn():
+        call_count[0] += 1
+        if call_count[0] >= 3:
+            miner_store.rows[2]["is_valid"] = "false"
+        return await orig_fn()
+
+    scheduler._list_valid_miners = flipping_fn
+
+    await scheduler.tick(current_block=77)
+
+    # In-decide guard caught the flip: no promotion, no weight write,
+    # battle cleared, challenger torn down.
+    assert (await state.get_battle()) is None
+    champ = await state.get_champion()
+    assert champ.uid == 1, "in-decide guard failed to block promotion"
+    assert weight_writer.calls == []
+    assert "wrk-002" in deployer.teardowns
+    # Same no-status-rewrite policy as the step-4.5 path.
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert miner_store.rows[2].get("termination_reason") in (None, "")
+
+
+@pytest.mark.asyncio
+async def test_no_early_invalidation_when_challenger_still_valid():
+    """Sanity check: a healthy challenger doesn't get torn down. The
+    guard must only fire on a real invalid signal, not on every tick."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+    await _drive_through_start_of_battle(scheduler, state, samples)
+    assert (await state.get_battle()) is not None
+    assert miner_store.rows[2]["is_valid"] == "true"
+
+    await scheduler.tick(current_block=80)
+
+    assert (await state.get_battle()) is not None
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS

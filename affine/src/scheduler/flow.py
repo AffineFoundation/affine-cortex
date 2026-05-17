@@ -9,6 +9,10 @@ One block tick:
   3. Validate champion against the valid-miner set; drop a stale one.
   4. No champion → bootstrap-promote the earliest pending miner (no
      contest, no Targon).
+  4.5. If a battle is in flight and the challenger has been flipped
+       to ``is_valid=false`` since ``_start_battle``, tear it down
+       immediately — the executor would otherwise keep accumulating
+       samples for a hotkey that can never win on chain.
   5. Champion has no Targon workload → deploy it.
   6. Champion samples for the current task_ids not yet full → return
      (executors are filling them).
@@ -185,6 +189,23 @@ class FlowScheduler:
                 champion, battle, scoring_envs, task_state, current_block,
             )
             return
+
+        # 4.5. Early-invalidation guard. Monitor can flip is_valid to
+        # false on the challenger after ``_start_battle`` claimed them
+        # (multi_commit / blacklist / repo-name / anticopy detected
+        # late). If we don't act here, the executor will keep sampling
+        # an unwinnable hotkey until ``_battle_overlap_ready`` (step 8)
+        # is satisfied many minutes from now — pure waste, plus the
+        # ⚡ marker on the rank UI confuses operators by suggesting an
+        # active contest. Tear down on the first tick we see the miss.
+        if battle is not None:
+            valid_uids = {
+                int(r.get("uid", -1))
+                for r in await self._list_valid_miners()
+            }
+            if battle.challenger.uid not in valid_uids:
+                await self._decide_invalidation_lost(champion, battle)
+                return
 
         # 5. Champion needs inference. During a single-instance battle the
         # champion may intentionally have no live deployment because its
@@ -610,6 +631,50 @@ class FlowScheduler:
             f"uid={champion.uid} — saved waiting on remaining envs"
         )
 
+    async def _decide_invalidation_lost(
+        self,
+        champion: ChampionRecord,
+        battle: BattleRecord,
+    ) -> None:
+        """Interrupt the in-flight battle BECAUSE the challenger
+        became invalid mid-contest — and for the same reason, do not
+        write a new challenge_status.
+
+        The sampling is being stopped because the miner is invalid
+        (anticopy / multi_commit / blacklist / repo-name picked up
+        late). ``invalid_reason`` on the miners snapshot already
+        captures that cause and renders it in the rank UI. Writing
+        ``challenge_status='terminated', termination_reason=
+        'invalidated_mid_battle'`` on miner_stats would just restate
+        the same fact with less specificity — drop it.
+
+        Queue safety without the status write: the miner stays at
+        ``challenge_status='in_progress'``, but ``list_valid_pending``
+        filters on ``is_valid='true'`` so an invalid hotkey can't be
+        re-picked. If the monitor later restores validity, the
+        inherited ``in_progress`` still blocks ``claim_for_challenge``
+        — the same one-shot lifetime guarantee, just without the
+        redundant write.
+
+        Releases the GPU host immediately: teardown the challenger's
+        deployment, in single-instance mode also clear the now-stale
+        champion deployment so step 5 redeploys next tick, then clear
+        the battle so step 7 picks the next challenger.
+        """
+        logger.warning(
+            f"FlowScheduler: challenger uid={battle.challenger.uid} "
+            f"became invalid mid-battle; interrupting sampling "
+            f"(challenge_status unchanged — invalid_reason is the "
+            f"authoritative cause)"
+        )
+        await self._teardown_record(battle)
+        if self.cfg.single_instance_provider:
+            champion.deployment_id = None
+            champion.base_url = None
+            champion.deployments = []
+            await self.state.set_champion(champion)
+        await self.state.clear_battle()
+
     async def _start_battle(
         self, champion: ChampionRecord, current_block: int,
     ) -> None:
@@ -771,30 +836,17 @@ class FlowScheduler:
             await self.state.clear_battle()
             return
 
-        # Mid-battle invalidation guard. Monitor can flip ``is_valid`` to
-        # false on the challenger between ``pick_next`` (start_battle) and
-        # this decide tick (multi-commit / blacklist / repo-name mismatch
-        # picked up late). Promoting an invalid hotkey would write
-        # ``scores.overall_score = 1.0`` for them and the validator would
-        # try to set on-chain weight for a banned miner. Treat as
-        # "challenger loses" regardless of the comparator outcome.
+        # Mid-battle invalidation guard, defense-in-depth pair with
+        # ``tick`` step 4.5. The early guard catches the cross-tick
+        # window (most monitor updates land there), but ``is_valid``
+        # can still flip while this tick is running — there are many
+        # awaits between step 4.5 and here, each a point where the
+        # monitor's DDB update can become visible. Re-check right
+        # before the promotion path to keep on-chain weight from ever
+        # going to a hotkey that just became invalid.
         valid_uids = {int(r.get("uid", -1)) for r in await self._list_valid_miners()}
         if battle.challenger.uid not in valid_uids:
-            logger.warning(
-                f"FlowScheduler: challenger uid={battle.challenger.uid} "
-                f"invalidated mid-battle; forcing LOST regardless of scores"
-            )
-            await self._teardown_record(battle)
-            # No frozen scores: kicked for being invalid, not on score.
-            await self.queue.mark_terminated(
-                battle.challenger.uid,
-                OUTCOME_LOST,
-                reason="invalidated_mid_battle",
-                hotkey=battle.challenger.hotkey,
-                revision=battle.challenger.revision,
-                model=battle.challenger.model,
-            )
-            await self.state.clear_battle()
+            await self._decide_invalidation_lost(champion, battle)
             return
 
         env_configs = {
