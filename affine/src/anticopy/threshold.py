@@ -41,10 +41,23 @@ DEFAULT_AGREEMENT_RATIO = 0.5
 DEFAULT_ROLLOUTS_PER_ENV = 20
 
 # Pool retention. Older rollouts get TTL'd out of the DDB index; the
-# R2 blob may linger but won't be selected.
-DEFAULT_POOL_DAYS = 7
+# R2 blob may linger but won't be selected. Sized to cover ``current
+# refresh tick + previous refresh tick`` so candidates scored across
+# two adjacent refresh windows still share rollout_keys in the
+# previous-window slice (= pair-comparable). Default: 2 ×
+# ``refresh_interval_days``.
+DEFAULT_POOL_DAYS = 14
 
-# UTC hour the refresh service runs once per day.
+# How often the rollout pool refresh fires. With daily refresh, the
+# pool churned every 24 h and made cross-day pair-comparisons rely on
+# whichever rollouts happened to overlap. Promoting once per week
+# instead gives every candidate scored within the same 7-day window
+# an identical key set (perfect alignment) and lets adjacent windows
+# overlap fully on the previous tick's rollouts.
+DEFAULT_REFRESH_INTERVAL_DAYS = 7
+
+# UTC hour the refresh service prefers to fire at (only when a refresh
+# is otherwise due per ``refresh_interval_days``).
 DEFAULT_REFRESH_UTC_HOUR = 2
 
 # Verdict only considers peers that committed within this many days
@@ -84,6 +97,7 @@ class AntiCopyConfig:
     agreement_ratio: float = DEFAULT_AGREEMENT_RATIO
     rollouts_per_env: int = DEFAULT_ROLLOUTS_PER_ENV
     pool_days: int = DEFAULT_POOL_DAYS
+    refresh_interval_days: int = DEFAULT_REFRESH_INTERVAL_DAYS
     refresh_utc_hour: int = DEFAULT_REFRESH_UTC_HOUR
     enabled_envs: List[str] = field(default_factory=lambda: list(DEFAULT_ENABLED_ENVS))
     gc_keep_recent: int = DEFAULT_GC_KEEP_RECENT
@@ -128,6 +142,9 @@ async def load_anticopy_config(
         agreement_ratio=_f("agreement_ratio", DEFAULT_AGREEMENT_RATIO),
         rollouts_per_env=_i("rollouts_per_env", DEFAULT_ROLLOUTS_PER_ENV),
         pool_days=_i("pool_days", DEFAULT_POOL_DAYS),
+        refresh_interval_days=max(
+            1, _i("refresh_interval_days", DEFAULT_REFRESH_INTERVAL_DAYS)
+        ),
         refresh_utc_hour=_i("refresh_utc_hour", DEFAULT_REFRESH_UTC_HOUR),
         enabled_envs=enabled_envs,
         gc_keep_recent=max(2, _i("gc_keep_recent", DEFAULT_GC_KEEP_RECENT)),

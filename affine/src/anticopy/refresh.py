@@ -93,6 +93,18 @@ class RolloutRefreshService:
         self._running = False
 
     async def _maybe_tick(self) -> None:
+        """Fire the refresh tick at most once every
+        ``cfg.refresh_interval_days`` days, and only after the
+        ``refresh_utc_hour`` boundary on the firing day.
+
+        Promoting weekly (default 7d) keeps the rollout pool stable
+        within a window: every candidate scored between two refresh
+        ticks gets an identical rollout_key set, so pair-comparisons
+        on the same window have perfect alignment. Adjacent windows
+        overlap because ``pool_days`` retention (default 14d = 2 ×
+        refresh_interval_days) keeps the previous tick's rollouts
+        live, so cross-window pairs share the previous-window slice.
+        """
         cfg = await load_anticopy_config(self.config_dao)
         if not cfg.enabled:
             return
@@ -103,8 +115,18 @@ class RolloutRefreshService:
         today = now.strftime("%Y-%m-%d")
 
         state = await self.state_dao.get_state()
-        if state.get(_LAST_REFRESH_FIELD) == today:
-            return
+        last = state.get(_LAST_REFRESH_FIELD)
+        if last:
+            try:
+                last_date = dt.datetime.strptime(last, "%Y-%m-%d").date()
+                today_date = now.date()
+                days_since = (today_date - last_date).days
+                if days_since < cfg.refresh_interval_days:
+                    return                      # not yet time
+            except ValueError:
+                # Corrupt timestamp; treat as "never refreshed" and
+                # let the tick run.
+                pass
 
         await self.tick(cfg, day=today)
 
