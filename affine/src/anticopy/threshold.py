@@ -46,15 +46,15 @@ DEFAULT_ROLLOUTS_PER_ENV = 20
 # two adjacent refresh windows still share rollout_keys in the
 # previous-window slice (= pair-comparable). Default: 2 ×
 # ``refresh_interval_days``.
-DEFAULT_POOL_DAYS = 14
+DEFAULT_POOL_DAYS = 6
 
 # How often the rollout pool refresh fires. With daily refresh, the
 # pool churned every 24 h and made cross-day pair-comparisons rely on
-# whichever rollouts happened to overlap. Promoting once per week
-# instead gives every candidate scored within the same 7-day window
+# whichever rollouts happened to overlap. Promoting once per N days
+# instead gives every candidate scored within the same N-day window
 # an identical key set (perfect alignment) and lets adjacent windows
-# overlap fully on the previous tick's rollouts.
-DEFAULT_REFRESH_INTERVAL_DAYS = 7
+# overlap on the previous tick's rollouts (retention = 2 × interval).
+DEFAULT_REFRESH_INTERVAL_DAYS = 3
 
 # UTC hour the refresh service prefers to fire at (only when a refresh
 # is otherwise due per ``refresh_interval_days``).
