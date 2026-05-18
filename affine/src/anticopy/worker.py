@@ -732,43 +732,76 @@ class ForwardWorker:
                 f"REMOTE_SSH_HOST configured — bring sglang up manually"
             )
 
-        # SSH-exec the launcher under setsid+nohup so the engine
-        # survives the SSH session that started it. Logs land in
-        # ``/tmp/sglang_<port>.log`` for post-mortem.
-        #
-        # We intentionally do NOT touch ``CUDA_VISIBLE_DEVICES`` here —
-        # ``--base-gpu-id`` already steers the process to the right GPU,
-        # and any explicit env mask (especially an empty one, which
-        # masks *all* GPUs) would clash with that and crash sglang at
-        # ``get_device()`` with "no accelerator available".
-        launch = (
-            f"{shlex.quote(REMOTE_PYTHON)} -m sglang.launch_server "
-            f"--model-path {shlex.quote(model_path)} "
-            f"--host 127.0.0.1 --port {REMOTE_SGLANG_PORT} "
-            f"--base-gpu-id {SGLANG_BASE_GPU_ID} "
-            f"--trust-remote-code "
-            f"{SGLANG_EXTRA_ARGS}"
-        )
-        cmd = (
-            "setsid nohup bash -c "
-            + shlex.quote(
-                f"{launch} > /tmp/sglang_{REMOTE_SGLANG_PORT}.log 2>&1"
+        # Race-guard: an existing launch is still loading model shards
+        # if its ``sglang.launch_server`` process is alive but
+        # ``/model_info`` hasn't responded yet (60 GB ckpt → ~3-5 min
+        # on a hot cache, longer on cold). Without this check the
+        # worker would happily spawn a SECOND launch, both processes
+        # would try to load the model concurrently, and the GPU OOMs
+        # at one allocator already holding ~136 GB of 143 GB — burning
+        # the next 15 min on the deadline poll for nothing. Skip the
+        # launch when an instance is already starting and just wait it
+        # out below.
+        try:
+            rc, out, _err = await asyncio.to_thread(
+                lambda: _ssh_run(
+                    REMOTE_SSH_HOST, REMOTE_SSH_KEY,
+                    "pgrep -f sglang.launch_server",
+                    timeout=15,
+                )
             )
-            + " </dev/null >/dev/null 2>&1 &"
-        )
-        logger.info(
-            f"[anticopy.worker] launching remote sglang gpu={SGLANG_BASE_GPU_ID} "
-            f"port={REMOTE_SGLANG_PORT} model={os.path.basename(model_path)}"
-        )
-        rc, _out, err = await asyncio.to_thread(
-            lambda: _ssh_run(
-                REMOTE_SSH_HOST, REMOTE_SSH_KEY, cmd, timeout=60,
+            already_running = rc == 0 and bool(out.strip())
+        except Exception as e:
+            logger.debug(
+                f"[anticopy.worker] sglang pgrep failed: {e}; assuming none"
             )
-        )
-        if rc != 0:
-            raise _SglangError(
-                f"remote sglang launch rc={rc}: {err[-300:].strip()}"
+            already_running = False
+
+        if already_running:
+            logger.info(
+                f"[anticopy.worker] existing sglang.launch_server still "
+                f"loading; skipping fresh launch and polling /model_info"
             )
+        else:
+            # SSH-exec the launcher under setsid+nohup so the engine
+            # survives the SSH session that started it. Logs land in
+            # ``/tmp/sglang_<port>.log`` for post-mortem.
+            #
+            # We intentionally do NOT touch ``CUDA_VISIBLE_DEVICES``
+            # here — ``--base-gpu-id`` already steers the process to
+            # the right GPU, and any explicit env mask (especially an
+            # empty one, which masks *all* GPUs) would clash with that
+            # and crash sglang at ``get_device()`` with "no
+            # accelerator available".
+            launch = (
+                f"{shlex.quote(REMOTE_PYTHON)} -m sglang.launch_server "
+                f"--model-path {shlex.quote(model_path)} "
+                f"--host 127.0.0.1 --port {REMOTE_SGLANG_PORT} "
+                f"--base-gpu-id {SGLANG_BASE_GPU_ID} "
+                f"--trust-remote-code "
+                f"{SGLANG_EXTRA_ARGS}"
+            )
+            cmd = (
+                "setsid nohup bash -c "
+                + shlex.quote(
+                    f"{launch} > /tmp/sglang_{REMOTE_SGLANG_PORT}.log 2>&1"
+                )
+                + " </dev/null >/dev/null 2>&1 &"
+            )
+            logger.info(
+                f"[anticopy.worker] launching remote sglang "
+                f"gpu={SGLANG_BASE_GPU_ID} port={REMOTE_SGLANG_PORT} "
+                f"model={os.path.basename(model_path)}"
+            )
+            rc, _out, err = await asyncio.to_thread(
+                lambda: _ssh_run(
+                    REMOTE_SSH_HOST, REMOTE_SSH_KEY, cmd, timeout=60,
+                )
+            )
+            if rc != 0:
+                raise _SglangError(
+                    f"remote sglang launch rc={rc}: {err[-300:].strip()}"
+                )
 
         # Poll until /model_info answers AND the engine actually
         # responds to a tiny /generate. Loading 60 GB shards on a B300
