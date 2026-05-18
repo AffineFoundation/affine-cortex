@@ -36,7 +36,7 @@ import os
 import shlex
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import aiohttp
 import paramiko
@@ -292,26 +292,6 @@ async def _ssh_exec(config: SSHConfig, command: str) -> Tuple[int, str, str]:
         ) from e
 
 
-def _parse_label_dump(text: str) -> Dict[str, str]:
-    labels: Dict[str, str] = {}
-    for line in text.splitlines():
-        if "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        labels[key.strip()] = value.strip()
-    return labels
-
-
-def _expected_labels(config: SSHConfig, target: DeployTarget) -> Dict[str, str]:
-    return {
-        "io.affine.endpoint": config.endpoint_name or config.host,
-        "io.affine.uid": str(target.uid),
-        "io.affine.hotkey": target.hotkey,
-        "io.affine.model": target.model,
-        "io.affine.revision": target.revision,
-    }
-
-
 def _hf_cache_dir_name(model: str) -> str:
     """HuggingFace's snapshot dir convention: ``<prefix><owner><sep><name>``
     (the org separator ``/`` is flattened to ``--``)."""
@@ -402,26 +382,6 @@ async def _cleanup_stale_caches(
             logger.info(f"ssh-provider: stale cache {line}")
 
 
-async def _existing_container_matches(
-    config: SSHConfig, target: DeployTarget,
-) -> bool:
-    """Return True when the current endpoint already serves ``target``.
-
-    The scheduler persists assignment in system_config, but crash recovery
-    can land after docker run and before state write. Labels on the remote
-    container are the machine-local truth that lets the next scheduler adopt
-    the workload instead of restarting the model.
-    """
-    fmt = "{{range $k,$v := .Config.Labels}}{{println $k \"=\" $v}}{{end}}"
-    cmd = f"docker inspect --format {shlex.quote(fmt)} {CONTAINER_NAME}"
-    rc, out, _ = await _ssh_exec(config, cmd)
-    if rc != 0:
-        return False
-    labels = _parse_label_dump(out)
-    expected = _expected_labels(config, target)
-    return all(labels.get(k) == v for k, v in expected.items())
-
-
 # ---- ready probe -----------------------------------------------------------
 
 
@@ -445,12 +405,33 @@ async def _probe_ready(base_url: str, *, timeout_sec: float = 5.0) -> bool:
     return isinstance(data, list) and len(data) > 0
 
 
+async def _container_exit_status(config: "SSHConfig") -> Optional[int]:
+    """``int`` exit code if the sglang container is no longer running,
+    ``None`` if it's running or absent (``docker inspect`` failure)."""
+    fmt = "{{.State.Status}} {{.State.ExitCode}}"
+    cmd = f"docker inspect --format {shlex.quote(fmt)} {CONTAINER_NAME}"
+    rc, out, _ = await _ssh_exec(config, cmd)
+    if rc != 0:
+        return None
+    parts = out.strip().split()
+    if len(parts) != 2 or parts[0] == "running":
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
 async def _wait_ready(
     base_url: str, *,
     deadline_sec: int = DEFAULT_READY_TIMEOUT_SEC,
     poll_interval_sec: float = DEFAULT_POLL_INTERVAL_SEC,
+    config: Optional["SSHConfig"] = None,
 ) -> None:
-    """Block until /v1/models reports the loaded model, or timeout."""
+    """Block until /v1/models reports the loaded model. Raise early if
+    the sglang container has exited (sglang crashed on startup —
+    waiting the full ``deadline_sec`` is pure waste; the upstream
+    deploy-failure handler will leave the miner in queue regardless)."""
     deadline = time.monotonic() + deadline_sec
     attempt = 0
     while time.monotonic() < deadline:
@@ -460,6 +441,14 @@ async def _wait_ready(
                 f"ssh-provider: model ready after {attempt} probes ({base_url})"
             )
             return
+        if config is not None:
+            exit_code = await _container_exit_status(config)
+            if exit_code is not None:
+                raise RuntimeError(
+                    f"ssh-provider: sglang container {CONTAINER_NAME!r} "
+                    f"exited with code {exit_code} before /v1/models came up "
+                    f"({base_url})"
+                )
         await asyncio.sleep(poll_interval_sec)
     raise TimeoutError(
         f"ssh-provider: {base_url} did not become ready in {deadline_sec}s"
@@ -483,28 +472,6 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
     On success returns ``DeployResult(deployment_id="ssh:<endpoint>:...", base_url=...)``.
     """
     base_url = config.inference_url()
-    if await _existing_container_matches(config, target):
-        await _wait_ready(
-            base_url,
-            deadline_sec=config.ready_timeout_sec,
-            poll_interval_sec=config.poll_interval_sec,
-        )
-        logger.info(
-            f"ssh-provider: adopted existing {config.deployment_id()} for "
-            f"{target.model}@{target.revision[:8]} on "
-            f"{config.endpoint_name or config.host}"
-        )
-        return DeployResult(
-            deployment_id=config.deployment_id(),
-            base_url=base_url,
-            deployments=[
-                MachineDeployment(
-                    endpoint_name=config.endpoint_name,
-                    deployment_id=config.deployment_id(),
-                    base_url=base_url,
-                )
-            ],
-        )
 
     # Purge stale HF caches before the new container starts. The previous
     # container's open files keep its own model dir alive against the
@@ -530,6 +497,7 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
         base_url,
         deadline_sec=config.ready_timeout_sec,
         poll_interval_sec=config.poll_interval_sec,
+        config=config,
     )
     return DeployResult(
         deployment_id=config.deployment_id(),

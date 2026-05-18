@@ -83,10 +83,23 @@ class TransientDeployError(RuntimeError):
 
     The flow scheduler treats it as 'retry next tick, do NOT mark
     miner FAILED' — the miner had no chance to fail and shouldn't
-    burn their queue entry on a bad host. Distinct from generic
-    ``RuntimeError`` (which still marks FAILED — that path catches
-    miner-faults like a docker run that returns non-zero because the
-    model can't load)."""
+    burn their queue entry on a bad host."""
+
+
+class DeploymentStateInvalidatedError(RuntimeError):
+    """``deploy_fn`` raises this when a deployment attempt may have
+    invalidated one or more existing deployment ids before failing.
+
+    Example: SSH deploy starts with ``docker rm -f`` on the selected
+    endpoint, then ``docker run`` fails. The scheduler must not trust
+    any state record still pointing at that endpoint's stable
+    deployment id."""
+
+    def __init__(self, message: str, *, deployment_ids: List[str]):
+        super().__init__(message)
+        self.invalidated_deployment_ids = tuple(
+            did for did in deployment_ids if did
+        )
 
 
 # ---- constants (no longer in system_config) --------------------------------
@@ -511,6 +524,7 @@ class FlowScheduler:
         try:
             result = await self._deploy(target, "champion")
         except Exception as e:
+            await self._forget_invalidated_deployments_from_error(e)
             logger.error(
                 f"FlowScheduler: champion deploy failed for uid={champion.uid}: "
                 f"{type(e).__name__}: {e}"
@@ -840,6 +854,10 @@ class FlowScheduler:
         valid_uids = {
             int(r.get("uid", -1)) for r in await self._list_valid_miners()
         }
+        # Champion is read for the post-adoption stale-record check below;
+        # ``None`` is fine for cold-start ticks.
+        champion = await self.state.get_champion()
+        champion_uid = champion.uid if champion is not None else None
         # An endpoint that's been removed from ``inference_endpoints``
         # (``af db set-endpoint --no-active`` or row deletion) is no
         # longer ours to teardown — the cfg may not even exist anymore.
@@ -874,6 +892,31 @@ class FlowScheduler:
                     f"inference_endpoints; dropping record without "
                     f"teardown (endpoint is no longer ours to manage)"
                 )
+                changed = True
+                continue
+            # A record whose uid is now champion can only be left over
+            # from a crash mid-``_adopt_predeployed_if_present``: the
+            # champion write committed but the ``set_predeployed_challengers``
+            # for the remaining list did not. The spare endpoint stays
+            # assigned to that uid, blocking future fills. Tear down +
+            # drop here so the fill loop can recover on the next tick.
+            if champion_uid is not None and record.challenger.uid == champion_uid:
+                logger.warning(
+                    f"FlowScheduler: pre-deployed uid="
+                    f"{record.challenger.uid} matches current champion; "
+                    f"dropping stale crash-recovery record"
+                )
+                try:
+                    await self._teardown_record(record)
+                except Exception as e:
+                    logger.error(
+                        f"FlowScheduler: teardown failed for stale "
+                        f"champion-matching pre-deployed uid="
+                        f"{record.challenger.uid}: {type(e).__name__}: "
+                        f"{e} — keeping for retry"
+                    )
+                    kept.append(record)
+                    continue
                 changed = True
                 continue
             if record.challenger.uid in valid_uids:
@@ -984,8 +1027,8 @@ class FlowScheduler:
         self, champion: ChampionRecord, current_block: int,
     ) -> None:
         """Deploy queued miners on free non-primary endpoints, FIFO.
-        Real deploy failures mark the miner FAILED so the queue
-        advances; ``NoSpareEndpoint`` ends the loop cleanly."""
+        Deploy failures leave the miner in queue and advance to the next
+        candidate; ``NoSpareEndpoint`` ends the loop cleanly."""
         battle = await self.state.get_battle()
         records = await self.state.get_predeployed_challengers()
         exclude = {p.challenger.uid for p in records}
@@ -1005,28 +1048,26 @@ class FlowScheduler:
                 result = await self._deploy(target, "pre_challenger")
             except NoSpareEndpoint:
                 return
-            except TransientDeployError as e:
-                # Host's fault, not the miner's — don't burn its queue
-                # entry. Skip the candidate this tick; FIFO will retry
-                # it (possibly on a different spare) on the next pass.
-                logger.error(
-                    f"FlowScheduler: pre-deploy transport error for "
-                    f"uid={cand.uid} (host down or unreachable); leaving "
-                    f"miner in queue for retry: {type(e).__name__}: {e}"
-                )
-                continue
             except Exception as e:
-                logger.error(
-                    f"FlowScheduler: pre-deploy failed uid={cand.uid}: "
-                    f"{type(e).__name__}: {e}"
+                await self._forget_invalidated_deployments_from_error(e)
+                # Any non-NoSpareEndpoint deploy failure (transient
+                # transport, sglang container crash on startup, HF
+                # 5xx, ``_wait_ready`` timeout) leaves the miner in
+                # queue. Scheduler can't tell a true model fault apart
+                # from infra noise; the monitor's ``hf_model_fetch``
+                # check is the authoritative signal for "this model
+                # is broken" — it flips ``is_valid=false`` and the
+                # invalidation sweep tears the record down. Marking
+                # FAILED here burns a miner's queue slot on every
+                # infra blip.
+                kind = (
+                    "transport" if isinstance(e, TransientDeployError)
+                    else "deploy"
                 )
-                await self.queue.mark_terminated(
-                    cand.uid,
-                    OUTCOME_FAILED,
-                    reason=f"deployment_failed_predeploy:{type(e).__name__}",
-                    hotkey=cand.hotkey,
-                    revision=cand.revision,
-                    model=cand.model,
+                logger.error(
+                    f"FlowScheduler: pre-deploy {kind} error for "
+                    f"uid={cand.uid}; leaving miner in queue: "
+                    f"{type(e).__name__}: {e}"
                 )
                 continue
             deployments = _deployments_from_result(result)
@@ -1064,19 +1105,28 @@ class FlowScheduler:
         )
         try:
             result = await self._deploy(target, "challenger")
-        except TransientDeployError as e:
-            # Host's fault, not miner's. ``pick_next`` already flipped
-            # the row to in_progress; release it back to sampling so
-            # the same miner stays re-pickable on the next tick (and
-            # might land on a healed host). Pre-sample slot, if any,
-            # has already been torn down by ``_adopt_predeployed_if_present``
-            # — that work is lost, but we'd rather lose pre-samples
-            # than a miner's queue entry to an infra blip.
+        except Exception as e:
+            await self._forget_invalidated_deployments_from_error(e)
+            # Any deploy failure (transient transport, sglang container
+            # crash on startup, HF 5xx, ``_wait_ready`` timeout) leaves
+            # the miner in queue. ``pick_next`` already flipped the row
+            # to ``in_progress``; release it back so the same uid stays
+            # re-pickable on the next tick (and may land on a healed
+            # host). Pre-sample work, if any, was already torn down by
+            # ``_adopt_predeployed_if_present`` — that work is lost,
+            # but we'd rather lose pre-samples than a miner's queue
+            # entry to an infra blip. The monitor's ``hf_model_fetch``
+            # check is the authoritative signal for "model is broken";
+            # scheduler doesn't have enough info to judge from a single
+            # deploy failure.
+            kind = (
+                "transport" if isinstance(e, TransientDeployError)
+                else "deploy"
+            )
             logger.error(
-                f"FlowScheduler: challenger deploy transport error "
-                f"uid={candidate.uid} (host unreachable); releasing "
-                f"claim so miner stays re-pickable: "
-                f"{type(e).__name__}: {e}"
+                f"FlowScheduler: challenger {kind} error "
+                f"uid={candidate.uid}; releasing claim so miner stays "
+                f"re-pickable: {type(e).__name__}: {e}"
             )
             released = await self.queue.release_claim(
                 candidate.uid,
@@ -1088,23 +1138,6 @@ class FlowScheduler:
                     f"uid={candidate.uid} — row no longer in_progress; "
                     f"leaving as-is"
                 )
-            return
-        except Exception as e:
-            logger.error(
-                f"FlowScheduler: challenger deploy failed uid={candidate.uid}: "
-                f"{type(e).__name__}: {e}"
-            )
-            # Used their one shot — mark FAILED so the queue doesn't keep
-            # retrying a model the platform can't host. No frozen scores
-            # to pass: this miner never sampled anything.
-            await self.queue.mark_terminated(
-                candidate.uid,
-                OUTCOME_FAILED,
-                reason=f"deployment_failed:{type(e).__name__}",
-                hotkey=candidate.hotkey,
-                revision=candidate.revision,
-                model=candidate.model,
-            )
             return
         if self.cfg.single_instance_provider:
             champion.deployment_id = None
@@ -1372,6 +1405,76 @@ class FlowScheduler:
                 await self._teardown(dep.deployment_id)
             return
         await self._teardown(getattr(record, "deployment_id", None))
+
+    async def _forget_invalidated_deployments_from_error(
+        self, error: Exception,
+    ) -> None:
+        deployment_ids = getattr(error, "invalidated_deployment_ids", None)
+        if not deployment_ids:
+            return
+        await self._forget_deployments(deployment_ids)
+
+    async def _forget_deployments(self, deployment_ids: Any) -> None:
+        ids = {str(did) for did in deployment_ids if did}
+        if not ids:
+            return
+
+        champion = await self.state.get_champion()
+        if champion is not None:
+            deployments = list(champion.deployments or [])
+            kept_deployments = [
+                dep for dep in deployments if dep.deployment_id not in ids
+            ]
+            changed = len(kept_deployments) != len(deployments)
+            if champion.deployment_id in ids:
+                champion.deployment_id = None
+                champion.base_url = None
+                changed = True
+            if changed:
+                champion.deployments = kept_deployments
+                if not kept_deployments and champion.deployment_id is None:
+                    champion.base_url = None
+                await self.state.set_champion(champion)
+                logger.warning(
+                    f"FlowScheduler: forgot invalidated champion "
+                    f"deployment(s) {sorted(ids)}"
+                )
+
+        battle = await self.state.get_battle()
+        if battle is not None and (
+            battle.deployment_id in ids
+            or any(d.deployment_id in ids for d in battle.deployments)
+        ):
+            released = await self.queue.release_claim(
+                battle.challenger.uid,
+                hotkey=battle.challenger.hotkey,
+                revision=battle.challenger.revision,
+            )
+            await self.state.clear_battle()
+            logger.warning(
+                f"FlowScheduler: cleared battle for invalidated "
+                f"deployment(s) {sorted(ids)} (claim_released={released})"
+            )
+
+        records = await self.state.get_predeployed_challengers()
+        if records:
+            kept: List[BattleRecord] = []
+            changed = False
+            for record in records:
+                if (
+                    record.deployment_id in ids
+                    or any(d.deployment_id in ids for d in record.deployments)
+                ):
+                    changed = True
+                    logger.warning(
+                        f"FlowScheduler: dropped pre-deployed uid="
+                        f"{record.challenger.uid} for invalidated "
+                        f"deployment(s) {sorted(ids)}"
+                    )
+                    continue
+                kept.append(record)
+            if changed:
+                await self.state.set_predeployed_challengers(kept)
 
     async def _adopt_predeployed_if_present(self, uid: int) -> None:
         """Tear down the pre-sample slot for ``uid`` (if any) so the
