@@ -55,7 +55,7 @@ REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
 # requiring N consecutive "repo gone" responses before flipping the row to
 # permanent_invalid (and terminating it in miner_stats so it disappears from
 # the rank queue with a real reason).
-HF_GONE_PERMANENT_THRESHOLD = 3
+HF_GONE_PERMANENT_THRESHOLD = 2
 
 @dataclass
 class MinerInfo:
