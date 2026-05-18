@@ -1293,7 +1293,8 @@ class FlowScheduler:
                 new_champion, current_block, result,
                 previous_champion=champion,
             )
-            await self._refresh_task_ids(current_block, envs)
+            # Disabled until sampling budget grows: too frequent on rapid turnover.
+            # await self._refresh_task_ids(current_block, envs)
             logger.info(
                 f"FlowScheduler: champion uid {champion.uid} dethroned by "
                 f"uid {battle.challenger.uid}"
