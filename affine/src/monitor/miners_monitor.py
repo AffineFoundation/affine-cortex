@@ -25,6 +25,10 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from huggingface_hub import HfApi
+from huggingface_hub.errors import (
+    GatedRepoError,
+    RepositoryNotFoundError,
+)
 
 from affine.core.setup import logger
 from affine.database.dao.anticopy import (
@@ -45,6 +49,30 @@ NETUID = int(os.getenv("AFFINE_NETUID", "120"))
 
 MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
 REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
+
+# A miner whose HF repo has been deleted/privated returns 404 deterministically
+# — retrying changes nothing. Tolerate a few transient flips of HF's CDN by
+# requiring N consecutive "repo gone" responses before flipping the row to
+# permanent_invalid (and terminating it in miner_stats so it disappears from
+# the rank queue with a real reason).
+HF_GONE_PERMANENT_THRESHOLD = 3
+
+# Invalid reasons that justify writing miner_stats.challenge_status='terminated'
+# alongside is_valid=false. These are deterministic, miner-attributable rejects;
+# transient ones (hf_model_fetch_failed, tokenizer_sig_fetch_failed, ...) stay
+# off this list so a flaky cycle never burns a row.
+_TERMINAL_INVALID_REASON_PREFIXES = (
+    "hf_repo_not_found",
+    "hf_repo_private",
+    "multiple_commits",
+    "model_name_missing_affine",
+    "repo_name_not_ending_with_hotkey",
+    "revision_mismatch",
+    "model_check",
+    "duplicate_repo",
+    "malicious_template",
+    "tokenizer_sig_mismatch",
+)
 
 
 @dataclass
@@ -90,6 +118,10 @@ class MinersMonitor:
         self._weights_ttl_sec = 1800
         # (model, revision) -> (tokenizer_sig_or_empty, fetched_at)
         self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
+        # (model, revision) -> consecutive HF "repo gone" (404/gated) count.
+        # Resets on a successful fetch. At HF_GONE_PERMANENT_THRESHOLD it
+        # flips permanent → row is terminated in miner_stats.
+        self._hf_gone_counts: Dict[Tuple[str, str], int] = {}
         self._background_task: Optional[asyncio.Task] = None
 
     # ---- lifecycle -------------------------------------------------------
@@ -272,7 +304,11 @@ class MinersMonitor:
         # HuggingFace lookup → model_hash + sha + commit-history flags.
         model_info = await self._get_model_info(model, revision)
         if not model_info:
-            info.mark_invalid("hf_model_fetch_failed", permanent=False)
+            gone_count = self._hf_gone_counts.get((model, revision), 0)
+            if gone_count >= HF_GONE_PERMANENT_THRESHOLD:
+                info.mark_invalid("hf_repo_not_found", permanent=True)
+            else:
+                info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
         model_hash, hf_revision, duplicate_source = model_info
         info.model_hash = model_hash
@@ -497,7 +533,17 @@ class MinersMonitor:
 
             result = (model_hash, hf_revision, duplicate_source)
             self._weights_cache[key] = (result, now)
+            self._hf_gone_counts.pop(key, None)
             return result
+        except (RepositoryNotFoundError, GatedRepoError) as e:
+            self._hf_gone_counts[key] = self._hf_gone_counts.get(key, 0) + 1
+            logger.warning(
+                f"[MinersMonitor] HF repo gone {model_id}@{revision[:8]}: "
+                f"{type(e).__name__} (attempt "
+                f"{self._hf_gone_counts[key]}/{HF_GONE_PERMANENT_THRESHOLD})"
+            )
+            self._weights_cache[key] = (None, now)
+            return None
         except Exception as e:
             logger.warning(
                 f"[MinersMonitor] HF fetch failed {model_id}@{revision[:8]}: "
@@ -543,9 +589,13 @@ class MinersMonitor:
     async def _persist_miners(self, miners: list[MinerInfo], *, current_block: int) -> None:
         """Save the current online miner snapshot.
 
-        Do not write challenge lifecycle fields here. ``miners`` is rebuilt
-        from the current metagraph and can drop rows when miners leave; the
-        durable lifecycle source is ``miner_stats``.
+        Lifecycle (``challenge_status``) is owned by ``miner_stats`` and is
+        written by the scheduler, with one exception: when ``mark_invalid``
+        sets ``permanent_invalid=True`` with a deterministic, miner-attributable
+        reason (HF repo deleted/privated, plagiarism, malicious template, ...),
+        we also terminate the row here so the rank queue stops showing it as
+        "still sampling" and the rejection reason is visible in miner_stats.
+        Transient errors never trigger that path.
         """
         from affine.database.client import get_client
 
@@ -576,6 +626,7 @@ class MinersMonitor:
                     model_hash=miner.model_hash,
                     is_online=True,
                 )
+                await self._maybe_terminate_stats(miner)
             # template_check_result is a non-key attr we still want to keep
             # cached on the row — write it separately so the DAO signature
             # stays free of optional bric-à-brac.
@@ -594,6 +645,29 @@ class MinersMonitor:
                         f"[MinersMonitor] template_check_result write failed "
                         f"uid={miner.uid}: {e}"
                     )
+
+    async def _maybe_terminate_stats(self, miner: MinerInfo) -> None:
+        if not miner.permanent_invalid:
+            return
+        reason = miner.invalid_reason or ""
+        if not any(reason.startswith(p) for p in _TERMINAL_INVALID_REASON_PREFIXES):
+            return
+        try:
+            wrote = await self.stats_dao.terminate_if_sampling(
+                hotkey=miner.hotkey,
+                revision=miner.revision,
+                reason=reason,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[MinersMonitor] terminate_if_sampling failed "
+                f"uid={miner.uid} reason={reason}: {e}"
+            )
+            return
+        if wrote:
+            logger.info(
+                f"[MinersMonitor] terminated uid={miner.uid} reason={reason}"
+            )
 
     # ---- public read ----------------------------------------------------
 
