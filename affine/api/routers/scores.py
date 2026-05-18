@@ -23,7 +23,7 @@ from affine.api.dependencies import (
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
-from affine.database.dao.miners import MinersDAO
+from affine.database.dao.miners import MinersDAO, select_preferred_hotkey_row
 from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scorer.window_state import StateStore
@@ -47,6 +47,21 @@ _AVG_CACHE: Dict[
 # API request cost effectively independent of request rate (one
 # query per miner per 10 min, regardless of caller count).
 _ACTIVE_CACHE_TTL_S = 600
+
+
+def _preferred_miners_by_hotkey(
+    miners: List[Dict[str, Any]],
+) -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for miner in miners:
+        hk = miner.get("hotkey")
+        if hk:
+            grouped.setdefault(str(hk), []).append(miner)
+    return {
+        hk: row
+        for hk, rows in grouped.items()
+        if (row := select_preferred_hotkey_row(rows)) is not None
+    }
 
 
 def _reset_terminated_cache_for_test() -> None:
@@ -104,9 +119,10 @@ async def _build_validity_map() -> dict:
     cheap).
     """
     miners = await MinersDAO().get_all_miners()
+    preferred_by_hotkey = _preferred_miners_by_hotkey(miners)
     states = await MinerStatsDAO().build_challenge_state_map(miners)
     out: dict = {}
-    for m in miners:
+    for m in preferred_by_hotkey.values():
         hk = m.get("hotkey")
         if not hk:
             continue
@@ -190,18 +206,18 @@ async def _build_score_rows_from_validity(
         if hk:
             snapshot_by_hk[hk] = s
 
-    miner_meta = {
-        m.get("hotkey"): m
-        for m in await MinersDAO().get_all_miners()
-        if m.get("hotkey")
-    }
+    miner_meta = _preferred_miners_by_hotkey(await MinersDAO().get_all_miners())
 
     env_list = sorted(scoring_envs) if scoring_envs else []
 
     async def _row(hk: str) -> Dict[str, Any]:
         snap = snapshot_by_hk.get(hk) or {}
         meta = miner_meta.get(hk) or {}
-        revision = snap.get("model_revision") or meta.get("revision") or ""
+        # Row identity comes from the current miners snapshot. Snapshot
+        # metadata can be stale after uid recycling / hotkey re-register, so
+        # use it only as a fallback when the row was injected for an offline
+        # champion and no current miner row exists.
+        revision = meta.get("revision") or snap.get("model_revision") or ""
         # validity tuple: (is_valid, invalid_reason, challenge_status, ...)
         challenge_status = (validity.get(hk) or (None, None, None, None))[2]
         agg_scores, agg_total = await _avg_scores_for_miner(
@@ -242,14 +258,14 @@ async def _build_score_rows_from_validity(
         total_samples = snap.get("total_samples")
         if not isinstance(total_samples, int):
             total_samples = agg_total
-        uid_value = snap.get("uid")
+        uid_value = meta.get("uid")
         if not isinstance(uid_value, int):
-            uid_value = meta.get("uid") if isinstance(meta.get("uid"), int) else -1
-        first_block = snap.get("first_block") or meta.get("first_block") or 0
+            uid_value = snap.get("uid") if isinstance(snap.get("uid"), int) else -1
+        first_block = meta.get("first_block") or snap.get("first_block") or 0
         return {
             "miner_hotkey": hk,
             "uid": int(uid_value),
-            "model": str(snap.get("model") or meta.get("model") or ""),
+            "model": str(meta.get("model") or snap.get("model") or ""),
             "model_revision": str(revision or ""),
             "first_block": int(first_block),
             "overall_score": float(overall),
@@ -309,6 +325,16 @@ async def get_latest_scores(
         snapshot_scores = scores_data.get("scores", []) or []
 
         validity = await _build_validity_map()
+        champion_cfg = await SystemConfigDAO().get_param_value(
+            "champion", default=None,
+        )
+        champion_hotkey = (
+            champion_cfg.get("hotkey")
+            if isinstance(champion_cfg, dict) else None
+        )
+        _add_snapshot_champion_if_offline(
+            validity, snapshot_scores, champion_hotkey=champion_hotkey,
+        )
         scoring_envs = await _scoring_env_names()
         samples_dao = SampleResultsDAO()
 
@@ -465,6 +491,7 @@ async def get_score_by_uid(
 WEIGHTS_SPLIT_AFTER_BLOCK_PARAM = "weights_split_after_block"
 WEIGHTS_SPLIT_CHAMPION_COUNT_PARAM = "weights_split_champion_count"
 _DEFAULT_SPLIT_CHAMPION_COUNT = 5
+BURN_UID = -1
 
 # Cap snapshot fan-out. One row per championship transition; TTL is now
 # 365 days, so 500 comfortably covers a year of swaps.
@@ -514,27 +541,60 @@ def _winner_hotkey_from_snapshot(snapshot: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _add_snapshot_champion_if_offline(
+    validity: Dict[
+        str,
+        Tuple[Optional[bool], Optional[str], Optional[str], Optional[str]],
+    ],
+    snapshot_scores: List[Dict[str, Any]],
+    *,
+    champion_hotkey: Optional[str],
+) -> None:
+    """Keep a deregistered champion visible in the rank score table."""
+    if not champion_hotkey:
+        return
+    for row in snapshot_scores:
+        try:
+            is_champion = float(row.get("overall_score") or 0.0) > 0.0
+        except (TypeError, ValueError):
+            is_champion = False
+        hotkey = row.get("miner_hotkey")
+        if (
+            is_champion
+            and hotkey == champion_hotkey
+            and hotkey not in validity
+        ):
+            validity[str(hotkey)] = (
+                False, "deregistered", "champion", None,
+            )
+
+
 async def _resolve_split_payees(
     snapshots: List[Dict[str, Any]],
     miners_dao: MinersDAO,
     *,
     needed: int,
+    seed_hotkeys: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Walk ``snapshots`` (newest-first), dedupe past champions by hotkey,
-    look up each hotkey's *current* miner row in the miners table, and
-    keep the first ``needed`` whose miner is still registered AND
-    currently valid.
+    """Resolve active split payees by champion hotkey.
+
+    ``seed_hotkeys`` are considered first. This lets the live
+    ``system_config.champion`` lead the split even when the latest
+    ``score_snapshots`` row lags behind the current champion record
+    (for example after a promotion before the next snapshot write).
+    We then walk ``snapshots`` (newest-first), dedupe champions by
+    hotkey, look up each hotkey's *current* miner row in the miners
+    table, and keep the first ``needed`` whose miner is still registered
+    AND currently valid.
 
     Two filters are applied at resolution time:
 
     * **Deregistered hotkeys** are skipped. Paying them on their stale
       snapshot uid would in fact pay whoever now sits on that uid.
     * **Currently-invalid hotkeys** (``is_valid != "true"``: model
-      mismatch, anticopy, multi-commit, …) are skipped. They were valid
-      when they won the championship but have since been flagged; the
-      legacy single-champion path can't even surface this case (the
-      active champion is valid by construction), so the split path
-      shouldn't either.
+      mismatch, anticopy, multi-commit, …) are skipped. They may still be
+      the benchmark identity until beaten, but they should not receive an
+      on-chain split share while flagged invalid.
 
     Either filter outcome causes us to walk further back in history to
     backfill the count, so churn at the top of the leaderboard doesn't
@@ -544,32 +604,40 @@ async def _resolve_split_payees(
     that need display metadata (e.g. ``af get-rank``) don't have to
     re-query the miners table.
     """
-    out: List[Dict[str, Any]] = []
     seen_hotkeys: set = set()
-    for snap in snapshots:
+    out: List[Dict[str, Any]] = []
+
+    async def _append_hotkey(hotkey: Optional[str]) -> None:
         if len(out) >= needed:
-            break
-        hotkey = _winner_hotkey_from_snapshot(snap)
+            return
         if hotkey is None or hotkey in seen_hotkeys:
-            continue
+            return
         seen_hotkeys.add(hotkey)
         miner = await miners_dao.get_miner_by_hotkey(hotkey)
         if not miner:
-            continue  # hotkey no longer registered → don't pay its successor
+            return  # hotkey no longer registered → don't pay its successor
         # ``is_valid`` is stored as the string ``"true"`` / ``"false"``
         # to be a GSI partition key, so compare against the string form.
         if str(miner.get("is_valid") or "").lower() != "true":
-            continue  # registered but currently flagged invalid → skip
+            return  # registered but currently flagged invalid → skip
         try:
             uid = int(miner.get("uid"))
         except (TypeError, ValueError):
-            continue
+            return
         out.append({
             "uid": uid,
             "hotkey": hotkey,
             "model": miner.get("model") or "",
             "revision": miner.get("revision") or "",
         })
+
+    for hotkey in seed_hotkeys or []:
+        await _append_hotkey(hotkey)
+
+    for snap in snapshots:
+        if len(out) >= needed:
+            break
+        await _append_hotkey(_winner_hotkey_from_snapshot(snap))
     return out
 
 
@@ -612,8 +680,13 @@ async def compute_split_payees(
             default=_DEFAULT_SPLIT_CHAMPION_COUNT,
         ),
     )
+    champion_cfg = await config_dao.get_param_value("champion", default=None)
+    seed_hotkeys = []
+    if isinstance(champion_cfg, dict) and champion_cfg.get("hotkey"):
+        seed_hotkeys.append(str(champion_cfg["hotkey"]))
     payees = await _resolve_split_payees(
         snapshots, miners_dao, needed=champion_count,
+        seed_hotkeys=seed_hotkeys,
     )
     if not payees:
         return []
@@ -621,6 +694,60 @@ async def compute_split_payees(
     for p in payees:
         p["share"] = share
     return payees
+
+
+async def _legacy_weights_response(
+    *,
+    raw_weights: Dict[str, Any],
+    latest: Dict[str, Any],
+    miners_dao: MinersDAO,
+) -> Dict[str, Dict[str, float]]:
+    """Resolve winner-takes-all weights by hotkey when possible.
+
+    Snapshots are uid-based, but uids can be recycled after the winning
+    hotkey deregisters. If the snapshot includes a winner hotkey, map it
+    to the current valid uid. If it is offline or invalid, return the
+    winning share on ``BURN_UID`` so the validator routes it to burn
+    instead of paying the stale uid.
+    """
+    winner_hotkey = _winner_hotkey_from_snapshot(latest)
+    winner_uid = _winner_uid_from_snapshot(latest)
+    resolved_uid: Optional[int] = None
+
+    if winner_hotkey:
+        miner = await miners_dao.get_miner_by_hotkey(winner_hotkey)
+        if miner and str(miner.get("is_valid") or "").lower() == "true":
+            try:
+                resolved_uid = int(miner.get("uid"))
+            except (TypeError, ValueError):
+                resolved_uid = BURN_UID
+        else:
+            resolved_uid = BURN_UID
+
+    weights_response: Dict[str, Dict[str, float]] = {}
+    winner_weight = 1.0
+    for uid_str, weight in raw_weights.items():
+        try:
+            uid = int(uid_str)
+            w = float(weight)
+        except (TypeError, ValueError):
+            continue
+        if w > 0:
+            winner_weight = w
+            if resolved_uid is not None:
+                continue
+        if (
+            resolved_uid is not None
+            and winner_uid is not None
+            and uid == int(winner_uid)
+        ):
+            continue
+        weights_response[str(uid)] = {"weight": w}
+
+    if resolved_uid is not None:
+        weights_response[str(resolved_uid)] = {"weight": winner_weight}
+
+    return weights_response
 
 
 def _config_response_from_snapshot(
@@ -664,12 +791,13 @@ async def get_latest_weights(
 
     Pre-activation (``system_config`` row
     ``weights_split_after_block`` missing or ``0``, or the latest
-    snapshot's ``block_number`` is below that threshold) this passes
-    through the scheduler's winner-takes-all snapshot:
-    ``statistics.final_weights`` as ``{uid_str: weight_str}`` — exactly
-    one uid at ``"1.0"`` and everyone else at ``"0.0"`` (legacy snapshots
-    used the equivalent ``statistics.miner_final_scores`` field; both are
-    accepted).
+    snapshot's ``block_number`` is below that threshold) this returns the
+    scheduler's winner-takes-all snapshot. When the snapshot carries a
+    winner hotkey, the winner is resolved to that hotkey's current valid
+    uid so recycled uids are not accidentally paid; if the hotkey is no
+    longer registered/valid, the winner share is returned on ``-1``,
+    which the validator folds into UID 0 burn. Snapshots without a
+    winner hotkey keep the historical uid-only pass-through behavior.
 
     Post-activation we split weight evenly across the most recent
     ``weights_split_champion_count`` (default 5) distinct champion
@@ -728,16 +856,12 @@ async def get_latest_weights(
             detail="No weights found in latest snapshot",
         )
 
-    weights_response: dict = {}
-    for uid_str, weight in raw_weights.items():
-        try:
-            w = float(weight)
-        except (TypeError, ValueError):
-            continue
-        weights_response[str(uid_str)] = {"weight": w}
-
     return {
         "block_number": latest.get("block_number"),
         "config": _config_response_from_snapshot(latest),
-        "weights": weights_response,
+        "weights": await _legacy_weights_response(
+            raw_weights=raw_weights,
+            latest=latest,
+            miners_dao=miners_dao,
+        ),
     }

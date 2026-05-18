@@ -162,6 +162,9 @@ async def _run() -> None:
     async def list_valid_miners_fn():
         return await miners_dao.get_valid_miners()
 
+    async def list_current_miners_fn():
+        return await miners_dao.get_all_miners()
+
     # Provider dispatch is DB-driven: ``inference_endpoints`` rows determine
     # which lifecycle (ssh/sglang via docker, or Targon API) the scheduler
     # uses. ``ssh`` is single-instance — one model on the GPU host at a
@@ -328,6 +331,7 @@ async def _run() -> None:
         sample_count_fn=sample_count_fn,
         scores_reader=scores_reader,
         list_valid_miners_fn=list_valid_miners_fn,
+        list_current_miners_fn=list_current_miners_fn,
         list_active_endpoint_names_fn=list_active_ssh_endpoint_names,
     )
 

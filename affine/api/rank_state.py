@@ -204,6 +204,20 @@ async def get_current_state() -> Dict[str, Any]:
     # terminated and later turned invalid keeps its frozen scores in
     # the rank table.
     all_miners = await MinersDAO().get_all_miners()
+    if champion is not None and not any(
+        m.get("hotkey") == champion.hotkey
+        and str(m.get("revision") or "") == champion.revision
+        for m in all_miners
+    ):
+        all_miners = list(all_miners) + [{
+            "uid": champion.uid,
+            "hotkey": champion.hotkey,
+            "revision": champion.revision,
+            "model": champion.model,
+            "first_block": champion.since_block,
+            "is_valid": "false",
+            "invalid_reason": "deregistered",
+        }]
     current_refresh = (
         int(task_state.refreshed_at_block) if task_state else None
     )

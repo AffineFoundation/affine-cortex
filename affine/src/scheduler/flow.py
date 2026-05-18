@@ -6,9 +6,10 @@ One block tick:
   1. Bootstrap task_ids if never refreshed.
   2. Refresh task_ids if 7200 blocks elapsed AND no battle in flight
      (don't disrupt a contest mid-flow).
-  3. Validate champion against the valid-miner set; drop a stale one.
-  4. No champion → bootstrap-promote the earliest pending miner (no
-     contest, no Targon).
+  3. Sync champion uid from their hotkey; if the hotkey is offline,
+     keep the champion identity and use a burn sentinel uid.
+  4. No champion because the system is truly uninitialized →
+     bootstrap-promote the earliest pending miner (no contest, no Targon).
   4.5. If a battle is in flight and the challenger has been flipped
        to ``is_valid=false`` since ``_start_battle``, tear it down
        immediately — the executor would otherwise keep accumulating
@@ -35,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from affine.core.setup import logger
+from affine.database.dao.miners import select_preferred_hotkey_row
 
 from affine.src.scorer.challenger_queue import (
     ChallengerQueue,
@@ -132,6 +134,9 @@ matches in the current refresh."""
 ListValidMinersFn = Callable[[], Awaitable[List[Dict[str, Any]]]]
 """Return every is_valid=true row in the miners table."""
 
+ListCurrentMinersFn = Callable[[], Awaitable[List[Dict[str, Any]]]]
+"""Return every current row in the miners table, valid or not."""
+
 DeployFn = Callable[[targon_lifecycle.DeployTarget, str],
                     Awaitable[targon_lifecycle.DeployResult]]
 TeardownFn = Callable[[Optional[str]], Awaitable[None]]
@@ -177,6 +182,7 @@ class FlowScheduler:
         sample_count_fn: SampleCountFn,
         scores_reader: ScoresReader,
         list_valid_miners_fn: ListValidMinersFn,
+        list_current_miners_fn: Optional[ListCurrentMinersFn] = None,
         list_active_endpoint_names_fn: Optional[ListActiveEndpointNamesFn] = None,
     ):
         self.cfg = config
@@ -190,6 +196,7 @@ class FlowScheduler:
         self._sample_count = sample_count_fn
         self._scores_reader = scores_reader
         self._list_valid_miners = list_valid_miners_fn
+        self._list_current_miners = list_current_miners_fn or list_valid_miners_fn
         self._list_active_endpoint_names = list_active_endpoint_names_fn
 
     # ---- entry point ------------------------------------------------------
@@ -233,8 +240,8 @@ class FlowScheduler:
             task_state = await self._refresh_task_ids(current_block, envs)
             return  # let executors warm up on the new pool
 
-        # 3. Validate champion against valid-miner set.
-        champion = await self._read_validated_champion()
+        # 3. Read champion and reconcile uid from hotkey registration.
+        champion = await self._read_synced_champion()
 
         # 4. Cold start.
         if champion is None:
@@ -347,25 +354,51 @@ class FlowScheduler:
 
     # ---- helpers ----------------------------------------------------------
 
-    async def _read_validated_champion(self) -> Optional[ChampionRecord]:
-        """Return the saved champion only if their hotkey is still
-        is_valid=true. Monitor may invalidate a champion post-hoc
-        (multi_commit / repo-name / blacklist) — the on-chain weight tx
-        for an invalid hotkey would fail later, so drop the record now
-        and fall through to the cold-start path."""
+    async def _read_synced_champion(self) -> Optional[ChampionRecord]:
+        """Return the saved champion, syncing only its current uid.
+
+        The champion is a hotkey/revision/model identity. A hotkey can
+        deregister and temporarily have no payable uid, but that does
+        not mean the champion disappeared: challengers still have to
+        beat the saved model/samples. Persist uid=-1 while offline so
+        queue selection does not exclude the old recycled uid, and sync
+        back to the current uid when the hotkey registers again.
+        """
         champ = await self.state.get_champion()
         if champ is None:
             return None
-        valid = await self._list_valid_miners()
-        valid_uids = {int(r.get("uid", -1)) for r in valid}
-        if champ.uid not in valid_uids:
+
+        current_miners = await self._list_current_miners()
+        matches = [
+            row for row in current_miners
+            if str(row.get("hotkey") or "") == champ.hotkey
+        ]
+        if matches:
+            row = select_preferred_hotkey_row(matches) or matches[0]
+            try:
+                current_uid = int(row.get("uid"))
+            except (TypeError, ValueError):
+                current_uid = -1
+            if current_uid != champ.uid:
+                old_uid = champ.uid
+                champ.uid = current_uid
+                await self.state.set_champion(champ)
+                logger.info(
+                    f"FlowScheduler: champion hotkey={champ.hotkey[:10]} "
+                    f"uid synced {old_uid} -> {current_uid}"
+                )
+            return champ
+
+        if champ.uid != -1:
+            old_uid = champ.uid
+            champ.uid = -1
+            await self.state.set_champion(champ)
             logger.warning(
-                f"FlowScheduler: champion uid={champ.uid} no longer valid; "
-                f"dropping. Tearing down any live workload."
+                f"FlowScheduler: champion hotkey={champ.hotkey[:10]} "
+                f"is currently deregistered; retaining champion identity "
+                f"and burning weight until it re-registers "
+                f"(old_uid={old_uid})"
             )
-            await self._teardown_record(champ)
-            await self.state.clear_champion()
-            return None
         return champ
 
     async def _refresh_task_ids(

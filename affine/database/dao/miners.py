@@ -9,6 +9,39 @@ from affine.database.base_dao import BaseDAO
 from affine.database.schema import get_table_name
 
 
+def _int_value(row: Dict[str, Any], key: str, default: int = -1) -> int:
+    try:
+        return int(row.get(key))
+    except (TypeError, ValueError):
+        return default
+
+
+def select_preferred_hotkey_row(
+    rows: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """Pick the current miner row when stale duplicate hotkey rows exist.
+
+    The miners table is keyed by uid and refreshed from the metagraph. If a
+    hotkey deregisters and later returns on a different uid, an old uid row can
+    survive until the monitor overwrites that uid. Prefer the freshest
+    ``block_number`` first so callers resolve the current on-chain placement
+    without requiring manual DB cleanup. Validity is only a tie-breaker:
+    a newer invalid row should not be hidden behind an older valid stale row.
+    """
+    if not rows:
+        return None
+    return sorted(
+        rows,
+        key=lambda row: (
+            _int_value(row, "block_number"),
+            str(row.get("is_valid") or "").lower() == "true",
+            _int_value(row, "first_block"),
+            -_int_value(row, "uid", default=10**9),
+        ),
+        reverse=True,
+    )[0]
+
+
 class MinersDAO(BaseDAO):
     """DAO for miners table.
     
@@ -103,13 +136,12 @@ class MinersDAO(BaseDAO):
             'IndexName': 'hotkey-index',
             'KeyConditionExpression': 'hotkey = :hotkey',
             'ExpressionAttributeValues': {':hotkey': {'S': hotkey}},
-            'Limit': 1
         }
         
         response = await client.query(**params)
         items = [self._deserialize(item) for item in response.get('Items', [])]
-        
-        return items[0] if items else None
+
+        return select_preferred_hotkey_row(items)
     
     async def get_valid_miners(self) -> List[Dict[str, Any]]:
         """Get all valid miners using GSI.
