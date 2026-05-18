@@ -83,10 +83,23 @@ class TransientDeployError(RuntimeError):
 
     The flow scheduler treats it as 'retry next tick, do NOT mark
     miner FAILED' — the miner had no chance to fail and shouldn't
-    burn their queue entry on a bad host. Distinct from generic
-    ``RuntimeError`` (which still marks FAILED — that path catches
-    miner-faults like a docker run that returns non-zero because the
-    model can't load)."""
+    burn their queue entry on a bad host."""
+
+
+class DeploymentStateInvalidatedError(RuntimeError):
+    """``deploy_fn`` raises this when a deployment attempt may have
+    invalidated one or more existing deployment ids before failing.
+
+    Example: SSH deploy starts with ``docker rm -f`` on the selected
+    endpoint, then ``docker run`` fails. The scheduler must not trust
+    any state record still pointing at that endpoint's stable
+    deployment id."""
+
+    def __init__(self, message: str, *, deployment_ids: List[str]):
+        super().__init__(message)
+        self.invalidated_deployment_ids = tuple(
+            did for did in deployment_ids if did
+        )
 
 
 # ---- constants (no longer in system_config) --------------------------------
@@ -511,6 +524,7 @@ class FlowScheduler:
         try:
             result = await self._deploy(target, "champion")
         except Exception as e:
+            await self._forget_invalidated_deployments_from_error(e)
             logger.error(
                 f"FlowScheduler: champion deploy failed for uid={champion.uid}: "
                 f"{type(e).__name__}: {e}"
@@ -1035,6 +1049,7 @@ class FlowScheduler:
             except NoSpareEndpoint:
                 return
             except Exception as e:
+                await self._forget_invalidated_deployments_from_error(e)
                 # Any non-NoSpareEndpoint deploy failure (transient
                 # transport, sglang container crash on startup, HF
                 # 5xx, ``_wait_ready`` timeout) leaves the miner in
@@ -1091,6 +1106,7 @@ class FlowScheduler:
         try:
             result = await self._deploy(target, "challenger")
         except Exception as e:
+            await self._forget_invalidated_deployments_from_error(e)
             # Any deploy failure (transient transport, sglang container
             # crash on startup, HF 5xx, ``_wait_ready`` timeout) leaves
             # the miner in queue. ``pick_next`` already flipped the row
@@ -1122,11 +1138,6 @@ class FlowScheduler:
                     f"uid={candidate.uid} — row no longer in_progress; "
                     f"leaving as-is"
                 )
-            if self.cfg.single_instance_provider:
-                champion.deployment_id = None
-                champion.base_url = None
-                champion.deployments = []
-                await self.state.set_champion(champion)
             return
         if self.cfg.single_instance_provider:
             champion.deployment_id = None
@@ -1394,6 +1405,76 @@ class FlowScheduler:
                 await self._teardown(dep.deployment_id)
             return
         await self._teardown(getattr(record, "deployment_id", None))
+
+    async def _forget_invalidated_deployments_from_error(
+        self, error: Exception,
+    ) -> None:
+        deployment_ids = getattr(error, "invalidated_deployment_ids", None)
+        if not deployment_ids:
+            return
+        await self._forget_deployments(deployment_ids)
+
+    async def _forget_deployments(self, deployment_ids: Any) -> None:
+        ids = {str(did) for did in deployment_ids if did}
+        if not ids:
+            return
+
+        champion = await self.state.get_champion()
+        if champion is not None:
+            deployments = list(champion.deployments or [])
+            kept_deployments = [
+                dep for dep in deployments if dep.deployment_id not in ids
+            ]
+            changed = len(kept_deployments) != len(deployments)
+            if champion.deployment_id in ids:
+                champion.deployment_id = None
+                champion.base_url = None
+                changed = True
+            if changed:
+                champion.deployments = kept_deployments
+                if not kept_deployments and champion.deployment_id is None:
+                    champion.base_url = None
+                await self.state.set_champion(champion)
+                logger.warning(
+                    f"FlowScheduler: forgot invalidated champion "
+                    f"deployment(s) {sorted(ids)}"
+                )
+
+        battle = await self.state.get_battle()
+        if battle is not None and (
+            battle.deployment_id in ids
+            or any(d.deployment_id in ids for d in battle.deployments)
+        ):
+            released = await self.queue.release_claim(
+                battle.challenger.uid,
+                hotkey=battle.challenger.hotkey,
+                revision=battle.challenger.revision,
+            )
+            await self.state.clear_battle()
+            logger.warning(
+                f"FlowScheduler: cleared battle for invalidated "
+                f"deployment(s) {sorted(ids)} (claim_released={released})"
+            )
+
+        records = await self.state.get_predeployed_challengers()
+        if records:
+            kept: List[BattleRecord] = []
+            changed = False
+            for record in records:
+                if (
+                    record.deployment_id in ids
+                    or any(d.deployment_id in ids for d in record.deployments)
+                ):
+                    changed = True
+                    logger.warning(
+                        f"FlowScheduler: dropped pre-deployed uid="
+                        f"{record.challenger.uid} for invalidated "
+                        f"deployment(s) {sorted(ids)}"
+                    )
+                    continue
+                kept.append(record)
+            if changed:
+                await self.state.set_predeployed_challengers(kept)
 
     async def _adopt_predeployed_if_present(self, uid: int) -> None:
         """Tear down the pre-sample slot for ``uid`` (if any) so the

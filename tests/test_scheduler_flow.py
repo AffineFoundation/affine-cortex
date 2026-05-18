@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import pytest
 
 from affine.src.scheduler.flow import (
+    DeploymentStateInvalidatedError,
     FlowConfig,
     FlowScheduler,
 )
@@ -667,11 +668,10 @@ async def test_deploy_failure_keeps_challenger_in_queue():
 
 
 @pytest.mark.asyncio
-async def test_single_instance_deploy_failure_clears_champion_deployment_state():
-    """SSH deploy starts by clearing the single machine. If challenger
-    startup then fails, the previous champion workload may already be
-    gone; clear champion deployment state so the next tick redeploys it
-    instead of trusting a stale base_url."""
+async def test_deploy_failure_forgets_invalidated_champion_deployment():
+    """Deploy providers report which deployment ids were invalidated
+    before failure. Flow forgets matching state references generically,
+    without relying on role-specific champion/challenger assumptions."""
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -681,7 +681,6 @@ async def test_single_instance_deploy_failure_clears_champion_deployment_state()
     scheduler, state, _ = _build_scheduler(
         kv=kv, miner_store=miner_store, deployer=_DeployTracker(), samples=samples,
     )
-    scheduler.cfg.single_instance_provider = True
 
     await scheduler.tick(current_block=50)
     await scheduler.tick(current_block=51)
@@ -694,10 +693,15 @@ async def test_single_instance_deploy_failure_clears_champion_deployment_state()
     champ = await state.get_champion()
     assert champ.deployment_id is not None
     assert champ.base_url is not None
+    invalidated_deployment_id = champ.deployment_id
 
-    failing_deployer = _DeployTracker(fail_on_deploy=True)
-    scheduler._deploy = failing_deployer.deploy
-    scheduler._teardown = failing_deployer.teardown
+    async def failing_deploy(target, role: str = "active"):
+        raise DeploymentStateInvalidatedError(
+            "endpoint was cleared before deploy failed",
+            deployment_ids=[invalidated_deployment_id],
+        )
+
+    scheduler._deploy = failing_deploy
 
     await scheduler.tick(current_block=52)
 

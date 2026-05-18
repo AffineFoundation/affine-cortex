@@ -46,7 +46,12 @@ from affine.src.scorer.window_state import (
 
 from . import ssh as ssh_lifecycle
 from . import targon as targon_lifecycle
-from .flow import FlowConfig, FlowScheduler, NoSpareEndpoint
+from .flow import (
+    DeploymentStateInvalidatedError,
+    FlowConfig,
+    FlowScheduler,
+    NoSpareEndpoint,
+)
 
 
 NETUID = int(os.getenv("NETUID", "120"))
@@ -123,6 +128,63 @@ def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List
     return [primary]
 
 
+async def _deploy_ssh_target(
+    endpoints_dao,
+    ssh_configs: Dict[str, ssh_lifecycle.SSHConfig],
+    target,
+    *,
+    role: str = "active",
+):
+    endpoints = sorted(
+        await endpoints_dao.list_active(kind="ssh"),
+        key=lambda ep: ep.name,
+    )
+    selected = _select_ssh_endpoints(endpoints, target, role=role)
+    deployments = []
+    for ep in selected:
+        cfg = ssh_configs.get(ep.name) or ssh_lifecycle.SSHConfig.from_endpoint(ep)
+        deployment_id = cfg.deployment_id()
+        try:
+            result = await ssh_lifecycle.deploy(cfg, target)
+        except Exception as e:
+            try:
+                await endpoints_dao.clear_assignment(ep.name)
+            except Exception as clear_error:
+                logger.warning(
+                    f"scheduler: failed to clear assignment for ssh "
+                    f"endpoint={ep.name!r} after deploy failure: "
+                    f"{type(clear_error).__name__}: {clear_error}"
+                )
+            raise DeploymentStateInvalidatedError(
+                f"ssh deploy failed on endpoint={ep.name!r}; "
+                f"deployment_id={deployment_id!r} invalidated",
+                deployment_ids=[deployment_id],
+            ) from e
+        await endpoints_dao.set_assignment(
+            ep.name,
+            uid=target.uid,
+            hotkey=target.hotkey,
+            model=target.model,
+            revision=target.revision,
+            deployment_id=result.deployment_id,
+            base_url=result.base_url,
+            role=role,
+        )
+        deployments.append(
+            targon_lifecycle.MachineDeployment(
+                endpoint_name=ep.name,
+                deployment_id=result.deployment_id,
+                base_url=result.base_url,
+            )
+        )
+    primary = deployments[0]
+    return targon_lifecycle.DeployResult(
+        deployment_id=primary.deployment_id,
+        base_url=primary.base_url,
+        deployments=deployments,
+    )
+
+
 async def _run() -> None:
     await init_client()
 
@@ -189,37 +251,8 @@ async def _run() -> None:
         )
 
         async def deploy_fn(target, role: str = "active"):
-            endpoints = sorted(
-                await endpoints_dao.list_active(kind="ssh"),
-                key=lambda ep: ep.name,
-            )
-            selected = _select_ssh_endpoints(endpoints, target, role=role)
-            deployments = []
-            for ep in selected:
-                cfg = ssh_configs.get(ep.name) or ssh_lifecycle.SSHConfig.from_endpoint(ep)
-                result = await ssh_lifecycle.deploy(cfg, target)
-                await endpoints_dao.set_assignment(
-                    ep.name,
-                    uid=target.uid,
-                    hotkey=target.hotkey,
-                    model=target.model,
-                    revision=target.revision,
-                    deployment_id=result.deployment_id,
-                    base_url=result.base_url,
-                    role=role,
-                )
-                deployments.append(
-                    targon_lifecycle.MachineDeployment(
-                        endpoint_name=ep.name,
-                        deployment_id=result.deployment_id,
-                        base_url=result.base_url,
-                    )
-                )
-            primary = deployments[0]
-            return targon_lifecycle.DeployResult(
-                deployment_id=primary.deployment_id,
-                base_url=primary.base_url,
-                deployments=deployments,
+            return await _deploy_ssh_target(
+                endpoints_dao, ssh_configs, target, role=role,
             )
 
         async def _resolve_ssh_cfg(deployment_id):

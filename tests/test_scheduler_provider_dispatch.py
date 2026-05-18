@@ -13,7 +13,13 @@ from dataclasses import dataclass
 
 import pytest
 
-from affine.src.scheduler.main import _resolve_provider_kind
+from affine.database.dao.inference_endpoints import Endpoint
+from affine.src.scheduler.flow import DeploymentStateInvalidatedError
+from affine.src.scheduler.main import (
+    _deploy_ssh_target,
+    _resolve_provider_kind,
+)
+from affine.src.scheduler.targon import DeployTarget
 
 
 @dataclass
@@ -53,3 +59,64 @@ def test_unknown_kinds_raises():
     eps = [_Ep("weird", "vllm")]
     with pytest.raises(RuntimeError, match="none are kind=ssh"):
         _resolve_provider_kind(eps)
+
+
+class _EndpointsDAOFake:
+    def __init__(self, endpoints):
+        self.endpoints = endpoints
+        self.cleared = []
+        self.assignments = []
+
+    async def list_active(self, kind=None):
+        return [
+            ep for ep in self.endpoints
+            if ep.active and (kind is None or ep.kind == kind)
+        ]
+
+    async def clear_assignment(self, name):
+        self.cleared.append(name)
+
+    async def set_assignment(self, name, **kwargs):
+        self.assignments.append((name, kwargs))
+
+
+def _target():
+    return DeployTarget(
+        uid=42,
+        hotkey="hk42",
+        model="Qwen/Qwen3-30B-A22B",
+        revision="rev42",
+    )
+
+
+@pytest.mark.asyncio
+async def test_ssh_deploy_failure_clears_assignment_and_reports_deployment(
+    monkeypatch,
+):
+    endpoint = Endpoint(
+        name="b300",
+        kind="ssh",
+        ssh_url="ssh://root@b300",
+        assigned_uid=99,
+        assigned_hotkey="old",
+        assigned_model="old/model",
+        assigned_revision="oldrev",
+    )
+    dao = _EndpointsDAOFake([endpoint])
+
+    async def fail_deploy(config, target):
+        raise RuntimeError("docker run failed")
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.main.ssh_lifecycle.deploy",
+        fail_deploy,
+    )
+
+    with pytest.raises(DeploymentStateInvalidatedError) as excinfo:
+        await _deploy_ssh_target(dao, {}, _target(), role="challenger")
+
+    assert dao.cleared == ["b300"]
+    assert dao.assignments == []
+    assert excinfo.value.invalidated_deployment_ids == (
+        "ssh:b300:affine-sglang-current",
+    )
