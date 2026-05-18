@@ -26,6 +26,7 @@ from typing import Dict, Optional, Tuple
 
 from huggingface_hub import HfApi
 from huggingface_hub.errors import (
+    DisabledRepoError,
     GatedRepoError,
     RepositoryNotFoundError,
 )
@@ -551,6 +552,9 @@ class MinersMonitor:
             result = (model_hash, hf_revision, duplicate_source)
             self._weights_cache[key] = (result, now)
             return result
+        except DisabledRepoError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_disabled", e)
         except GatedRepoError as e:
             self._weights_cache.pop(key, None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_private", e)
@@ -582,6 +586,9 @@ class MinersMonitor:
                     files_metadata=False,
                 )
             )
+        except DisabledRepoError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_disabled", e)
         except GatedRepoError as e:
             self._weights_cache.pop((model_id, revision), None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_private", e)
