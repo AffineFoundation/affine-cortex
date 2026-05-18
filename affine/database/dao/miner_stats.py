@@ -398,6 +398,58 @@ class MinerStatsDAO(BaseDAO):
             ExpressionAttributeValues=values,
         )
 
+    async def terminate_if_sampling(
+        self, *,
+        hotkey: str,
+        revision: str,
+        reason: str,
+    ) -> bool:
+        """Flip the row to ``terminated`` iff it's still ``sampling``.
+
+        Used by the monitor when a deterministic, miner-attributable invalid
+        signal (HF repo deleted/privated, immutable commit-policy reject,
+        malicious template, ...) arrives on a row the scheduler hasn't claimed
+        yet. The conditional write protects in_progress / champion /
+        already-terminated rows from being clobbered by a delayed monitor
+        cycle. Returns True iff this call actually wrote the row.
+        """
+        from affine.database.client import get_client
+
+        now = int(time.time())
+        try:
+            await get_client().update_item(
+                TableName=self.table_name,
+                Key={
+                    "pk": {"S": self._make_pk(hotkey)},
+                    "sk": {"S": self._make_sk(revision)},
+                },
+                UpdateExpression=(
+                    "SET challenge_status = :terminated, "
+                    "termination_reason = :reason, "
+                    "last_updated_at = :now, "
+                    "hotkey = if_not_exists(hotkey, :hotkey), "
+                    "revision = if_not_exists(revision, :revision), "
+                    "first_seen_at = if_not_exists(first_seen_at, :now)"
+                ),
+                ConditionExpression=(
+                    "attribute_not_exists(challenge_status) "
+                    "OR challenge_status = :sampling"
+                ),
+                ExpressionAttributeValues={
+                    ":terminated": {"S": self.STATUS_TERMINATED},
+                    ":sampling": {"S": self.STATUS_SAMPLING},
+                    ":reason": {"S": reason},
+                    ":now": {"N": str(now)},
+                    ":hotkey": {"S": hotkey},
+                    ":revision": {"S": revision},
+                },
+            )
+            return True
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                return False
+            raise
+
     async def update_live_scores(
         self, *,
         hotkey: str,

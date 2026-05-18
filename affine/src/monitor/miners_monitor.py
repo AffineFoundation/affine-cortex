@@ -25,6 +25,11 @@ from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 from huggingface_hub import HfApi
+from huggingface_hub.errors import (
+    DisabledRepoError,
+    GatedRepoError,
+    RepositoryNotFoundError,
+)
 
 from affine.core.setup import logger
 from affine.database.dao.anticopy import (
@@ -57,6 +62,7 @@ class MinerInfo:
     is_valid: bool = False
     invalid_reason: Optional[str] = None
     permanent_invalid: bool = False
+    terminate_stats: bool = False
     model_hash: str = ""
     hf_revision: str = ""
     template_check_result: Optional[str] = None  # "safe" | "unsafe:<reason>" | None
@@ -65,10 +71,19 @@ class MinerInfo:
     def key(self) -> str:
         return f"{self.hotkey}#{self.revision}"
 
-    def mark_invalid(self, reason: str, *, permanent: bool) -> None:
+    def mark_invalid(
+        self, reason: str, *, permanent: bool, terminate_stats: bool = False
+    ) -> None:
         self.is_valid = False
         self.invalid_reason = reason
         self.permanent_invalid = permanent
+        self.terminate_stats = terminate_stats
+
+
+class HFRepoUnavailable(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class MinersMonitor:
@@ -251,12 +266,20 @@ class MinersMonitor:
 
         # Multi-commit rule: a hotkey is only allowed one commit on this subnet.
         if uid != 0 and commit_count > 1 and block >= MULTI_COMMIT_ENFORCE_BLOCK:
-            info.mark_invalid(f"multiple_commits:count={commit_count}", permanent=True)
+            info.mark_invalid(
+                f"multiple_commits:count={commit_count}",
+                permanent=True,
+                terminate_stats=True,
+            )
             return info
 
         # "affine" must appear in the model name (system miners exempt).
         if uid != 0 and "affine" not in model.lower():
-            info.mark_invalid("model_name_missing_affine", permanent=True)
+            info.mark_invalid(
+                "model_name_missing_affine",
+                permanent=True,
+                terminate_stats=True,
+            )
             return info
 
         # Repo name must end with the hotkey from a certain block onward —
@@ -265,12 +288,22 @@ class MinersMonitor:
             repo_name = model.split("/")[-1] if "/" in model else model
             if not repo_name.lower().endswith(hotkey.lower()):
                 info.mark_invalid(
-                    f"repo_name_not_ending_with_hotkey:repo={repo_name}", permanent=True,
+                    f"repo_name_not_ending_with_hotkey:repo={repo_name}",
+                    permanent=True,
+                    terminate_stats=True,
                 )
                 return info
 
         # HuggingFace lookup → model_hash + sha + commit-history flags.
-        model_info = await self._get_model_info(model, revision)
+        try:
+            model_info = await self._get_model_info(model, revision)
+        except HFRepoUnavailable as e:
+            info.mark_invalid(
+                e.reason,
+                permanent=True,
+                terminate_stats=True,
+            )
+            return info
         if not model_info:
             info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
@@ -279,17 +312,29 @@ class MinersMonitor:
         info.hf_revision = hf_revision
 
         if revision != hf_revision:
-            info.mark_invalid(f"revision_mismatch:hf={hf_revision}", permanent=True)
+            info.mark_invalid(
+                f"revision_mismatch:hf={hf_revision}",
+                permanent=True,
+                terminate_stats=True,
+            )
             return info
 
         if uid != 0 and uid <= 1000:
             size_result = await check_model_size(model, revision)
             if not size_result.get("pass"):
-                info.mark_invalid(f"model_check:{size_result.get('reason')}", permanent=True)
+                info.mark_invalid(
+                    f"model_check:{size_result.get('reason')}",
+                    permanent=True,
+                    terminate_stats=True,
+                )
                 return info
 
         if uid != 0 and duplicate_source:
-            info.mark_invalid(f"duplicate_repo:from={duplicate_source}", permanent=True)
+            info.mark_invalid(
+                f"duplicate_repo:from={duplicate_source}",
+                permanent=True,
+                terminate_stats=True,
+            )
             return info
 
         # Template safety. Cached "safe" skips the check; cached "unsafe" is
@@ -299,7 +344,11 @@ class MinersMonitor:
             if cached == "safe":
                 pass
             elif cached and cached.startswith("unsafe:"):
-                info.mark_invalid(f"malicious_template:{cached[7:]}", permanent=True)
+                info.mark_invalid(
+                    f"malicious_template:{cached[7:]}",
+                    permanent=True,
+                    terminate_stats=True,
+                )
                 return info
             else:
                 try:
@@ -307,7 +356,11 @@ class MinersMonitor:
                     if not tr.get("safe"):
                         reason = tr.get("reason", "unknown")
                         transient = reason.startswith("template_fetch_failed:") or reason.startswith("check_error:")
-                        info.mark_invalid(f"malicious_template:{reason}", permanent=not transient)
+                        info.mark_invalid(
+                            f"malicious_template:{reason}",
+                            permanent=not transient,
+                            terminate_stats=not transient,
+                        )
                         if not transient:
                             info.template_check_result = f"unsafe:{reason}"
                         return info
@@ -442,12 +495,13 @@ class MinersMonitor:
         """
         key = (model_id, revision)
         now = time.time()
+        api = HfApi(token=os.getenv("HF_TOKEN"))
         cached = self._weights_cache.get(key)
         if cached and now - cached[1] < self._weights_ttl_sec:
+            await self._verify_repo_accessible(api, model_id, revision)
             return cached[0]
 
         try:
-            api = HfApi(token=os.getenv("HF_TOKEN"))
             info = await asyncio.to_thread(
                 lambda: api.repo_info(
                     repo_id=model_id, repo_type="model", revision=revision, files_metadata=True,
@@ -498,13 +552,63 @@ class MinersMonitor:
             result = (model_hash, hf_revision, duplicate_source)
             self._weights_cache[key] = (result, now)
             return result
+        except DisabledRepoError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_disabled", e)
+        except GatedRepoError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_private", e)
+        except RepositoryNotFoundError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
         except Exception as e:
             logger.warning(
                 f"[MinersMonitor] HF fetch failed {model_id}@{revision[:8]}: "
                 f"{type(e).__name__}: {e}"
             )
-            self._weights_cache[key] = (None, now)
             return None
+
+    async def _verify_repo_accessible(
+        self, api: HfApi, model_id: str, revision: str
+    ) -> None:
+        """Confirm the repo is still publicly reachable even on weight-cache hits.
+
+        Deterministic visibility failures terminate the miner immediately.
+        Generic HF/network failures are treated as transient and keep the
+        cached weight metadata usable for this cycle.
+        """
+        try:
+            await asyncio.to_thread(
+                lambda: api.repo_info(
+                    repo_id=model_id,
+                    repo_type="model",
+                    revision=revision,
+                    files_metadata=False,
+                )
+            )
+        except DisabledRepoError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_disabled", e)
+        except GatedRepoError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_private", e)
+        except RepositoryNotFoundError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
+        except Exception as e:
+            logger.warning(
+                f"[MinersMonitor] HF access check failed {model_id}@{revision[:8]}: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    def _raise_repo_unavailable(
+        self, model_id: str, revision: str, reason: str, error: Exception
+    ) -> None:
+        logger.warning(
+            f"[MinersMonitor] HF repo unavailable {model_id}@{revision[:8]}: "
+            f"{type(error).__name__} reason={reason}"
+        )
+        raise HFRepoUnavailable(reason) from error
 
     def _detect_plagiarism(self, miners: list[MinerInfo]) -> list[MinerInfo]:
         """Flag later committers as invalid when their model_hash collides
@@ -543,9 +647,13 @@ class MinersMonitor:
     async def _persist_miners(self, miners: list[MinerInfo], *, current_block: int) -> None:
         """Save the current online miner snapshot.
 
-        Do not write challenge lifecycle fields here. ``miners`` is rebuilt
-        from the current metagraph and can drop rows when miners leave; the
-        durable lifecycle source is ``miner_stats``.
+        Lifecycle (``challenge_status``) is owned by ``miner_stats`` and is
+        written by the scheduler, with one exception: deterministic,
+        miner-attributable rejects set ``terminate_stats=True`` at the verdict
+        site. Those rows are conditionally terminated here so the rank queue
+        stops showing them as "still sampling" and the rejection reason is
+        visible in miner_stats. Transient or externally reversible rejects
+        leave that flag false.
         """
         from affine.database.client import get_client
 
@@ -576,6 +684,7 @@ class MinersMonitor:
                     model_hash=miner.model_hash,
                     is_online=True,
                 )
+                await self._maybe_terminate_stats(miner)
             # template_check_result is a non-key attr we still want to keep
             # cached on the row — write it separately so the DAO signature
             # stays free of optional bric-à-brac.
@@ -594,6 +703,27 @@ class MinersMonitor:
                         f"[MinersMonitor] template_check_result write failed "
                         f"uid={miner.uid}: {e}"
                     )
+
+    async def _maybe_terminate_stats(self, miner: MinerInfo) -> None:
+        if not (miner.permanent_invalid and miner.terminate_stats):
+            return
+        reason = miner.invalid_reason or ""
+        try:
+            wrote = await self.stats_dao.terminate_if_sampling(
+                hotkey=miner.hotkey,
+                revision=miner.revision,
+                reason=reason,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[MinersMonitor] terminate_if_sampling failed "
+                f"uid={miner.uid} reason={reason}: {e}"
+            )
+            return
+        if wrote:
+            logger.info(
+                f"[MinersMonitor] terminated uid={miner.uid} reason={reason}"
+            )
 
     # ---- public read ----------------------------------------------------
 
