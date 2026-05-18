@@ -58,12 +58,21 @@ REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
 HF_GONE_PERMANENT_THRESHOLD = 3
 
 # Invalid reasons that justify writing miner_stats.challenge_status='terminated'
-# alongside is_valid=false. These are deterministic, miner-attributable rejects;
-# transient ones (hf_model_fetch_failed, tokenizer_sig_fetch_failed, ...) stay
-# off this list so a flaky cycle never burns a row.
+# alongside is_valid=false. These are deterministic, miner-attributable rejects
+# whose verdict cannot flip just because something *outside* the miner changes.
+# Specifically excluded (even though they're marked permanent=True at the
+# MinerInfo layer):
+#   - tokenizer_sig_mismatch — relative to the active champion's sig; a future
+#     champion change can flip a candidate back to valid.
+#   - plagiarism:duplicate_of_uid — relative to the *origin* uid; origin
+#     deregistering shifts the "earliest wins" verdict to the next miner.
+#   - blacklisted — operators can remove an entry from the blacklist.
+# All three are reversible by external state changes, so we let the next
+# monitor cycle re-evaluate them rather than locking the row to terminated.
+# Transient errors (permanent=False) are filtered upstream by the
+# ``permanent_invalid`` check, so they never need to be listed here.
 _TERMINAL_INVALID_REASON_PREFIXES = (
     "hf_repo_not_found",
-    "hf_repo_private",
     "multiple_commits",
     "model_name_missing_affine",
     "repo_name_not_ending_with_hotkey",
@@ -71,7 +80,7 @@ _TERMINAL_INVALID_REASON_PREFIXES = (
     "model_check",
     "duplicate_repo",
     "malicious_template",
-    "tokenizer_sig_mismatch",
+    "invalid_json_commit",
 )
 
 

@@ -293,6 +293,65 @@ async def test_maybe_terminate_skips_permanent_unlisted_reason():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        # Sig flips back to match when the active champion changes — the
+        # row must stay sampleable so the next monitor cycle can re-validate.
+        "tokenizer_sig_mismatch:cand=abc123def456",
+        # "Earliest committer wins" — if the origin uid deregisters, the
+        # collision verdict can shift to the next miner. Don't lock in.
+        "plagiarism:duplicate_of_uid=12",
+        # Operators can remove a hotkey from the blacklist; row must remain
+        # claimable in that case.
+        "blacklisted",
+    ],
+)
+async def test_maybe_terminate_skips_externally_reversible_permanents(reason):
+    """Permanent invalid reasons whose verdict depends on something outside
+    the miner (champion sig, origin uid, operator config) must NOT be
+    terminated in miner_stats. monitor leaves the row sampling and lets the
+    next cycle re-decide once the external state changes."""
+    monitor = _build_monitor()
+    monitor.stats_dao = _RecordingStatsDAO()
+    miner = MinerInfo(
+        uid=42, hotkey="hk_rev", model="org/affine-model-hk_rev", revision="rev",
+        is_valid=False, permanent_invalid=True, invalid_reason=reason,
+    )
+    await monitor._maybe_terminate_stats(miner)
+    assert monitor.stats_dao.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reason",
+    [
+        # Commit JSON on chain is immutable; once it's malformed it stays
+        # malformed forever for this (hotkey, revision).
+        "invalid_json_commit",
+        "multiple_commits:count=3",
+        "model_name_missing_affine",
+        "repo_name_not_ending_with_hotkey:repo=foo",
+        "revision_mismatch:hf=abc",
+        "model_check:too_big",
+        "duplicate_repo:from=origin/repo",
+        "malicious_template:llm_audit_skipped:reason",
+    ],
+)
+async def test_maybe_terminate_fires_for_all_listed_permanent_reasons(reason):
+    monitor = _build_monitor()
+    monitor.stats_dao = _RecordingStatsDAO()
+    miner = MinerInfo(
+        uid=42, hotkey="hk_listed", model="org/affine-model-hk_listed",
+        revision="rev",
+        is_valid=False, permanent_invalid=True, invalid_reason=reason,
+    )
+    await monitor._maybe_terminate_stats(miner)
+    assert len(monitor.stats_dao.calls) == 1
+    assert monitor.stats_dao.calls[0]["reason"] == reason
+
+
+@pytest.mark.asyncio
 async def test_maybe_terminate_swallows_dao_exception():
     """A terminate write failing must not propagate — the row already has
     is_valid=false written; the terminate will be retried next cycle."""

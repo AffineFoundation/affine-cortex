@@ -186,6 +186,63 @@ async def test_update_challenge_status_omits_score_fields_when_not_provided(monk
     assert ":tb" not in values
 
 
+@pytest.mark.asyncio
+async def test_terminate_if_sampling_writes_with_sampling_guard(monkeypatch):
+    """Conditional terminate must guard against in_progress/champion/
+    already-terminated rows by requiring challenge_status='sampling' (or
+    absent) on the existing row."""
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+    dao = MinerStatsDAO()
+    wrote = await dao.terminate_if_sampling(
+        hotkey="hk", revision="rev", reason="hf_repo_not_found",
+    )
+    assert wrote is True
+    assert len(client.update_calls) == 1
+    call = client.update_calls[0]
+    cond = call["ConditionExpression"]
+    assert "challenge_status = :sampling" in cond
+    assert "attribute_not_exists(challenge_status)" in cond
+    values = call["ExpressionAttributeValues"]
+    assert values[":terminated"] == {"S": MinerStatsDAO.STATUS_TERMINATED}
+    assert values[":sampling"] == {"S": MinerStatsDAO.STATUS_SAMPLING}
+    assert values[":reason"] == {"S": "hf_repo_not_found"}
+
+
+@pytest.mark.asyncio
+async def test_terminate_if_sampling_returns_false_when_condition_fails(monkeypatch):
+    """A row already in_progress / champion / terminated must not be
+    clobbered. The DAO surfaces the lost race as a clean False return so
+    the monitor can no-op and let the scheduler own the row."""
+    from botocore.exceptions import ClientError
+
+    class _ConditionalFailClient:
+        def __init__(self):
+            self.calls = 0
+        async def update_item(self, **kwargs):
+            self.calls += 1
+            raise ClientError(
+                {"Error": {"Code": "ConditionalCheckFailedException",
+                            "Message": "the condition is not met"}},
+                "UpdateItem",
+            )
+
+    client = _ConditionalFailClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+    dao = MinerStatsDAO()
+    wrote = await dao.terminate_if_sampling(
+        hotkey="hk", revision="rev", reason="hf_repo_not_found",
+    )
+    assert wrote is False
+    assert client.calls == 1
+
+
 class _StubMinerStatsForMap(MinerStatsDAO):
     def __init__(self, rows):
         super().__init__()
