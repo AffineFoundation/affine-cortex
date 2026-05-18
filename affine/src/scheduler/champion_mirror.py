@@ -44,7 +44,7 @@ class ChampionMirror:
     async def ensure_mirrored(self, champion: ChampionRecord) -> ChampionRecord:
         if not self.enabled():
             return champion
-        repo_id = _target_repo_id(champion.model, self.namespace)
+        repo_id = _target_repo_id(champion.hotkey, self.namespace)
         if champion.model == repo_id:
             return champion
         try:
@@ -125,10 +125,12 @@ def _hf_git_url(repo_id: str, token: Optional[str]) -> str:
     return f"https://huggingface.co/{repo_id}"
 
 
-def _target_repo_id(source_repo_id: str, namespace: str) -> str:
-    name = source_repo_id.rstrip("/").split("/")[-1]
-    if not name.startswith("affine-"):
-        name = f"affine-{name}"
+def _target_repo_id(hotkey: str, namespace: str) -> str:
+    name = "".join(
+        c if c.isalnum() or c in {"-", "_"} else "-"
+        for c in hotkey.strip()
+    ).strip("-_").upper()
+    name = f"affine-{name}"
     return f"{namespace}/{name}"
 
 
