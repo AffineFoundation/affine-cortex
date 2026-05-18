@@ -1386,13 +1386,20 @@ async def test_winning_challenger_must_top_up_samples_before_next_battle():
                             partial_tasks, score=0.9, refresh_block=rb)
     await scheduler.tick(current_block=53)  # decide — challenger wins
 
-    # Promotion happened.
+    # Promotion happened. Champion change also fired a task-ids refresh,
+    # so the new champion's old-refresh samples don't count on the new pool.
     new_champ = await state.get_champion()
     assert new_champ.uid == 2, "challenger should be the new champion"
     assert await state.get_battle() is None
+    new_task_state = await state.get_task_state()
+    assert new_task_state.refreshed_at_block == 53, (
+        "champion-change must trigger a fresh task-ids pool"
+    )
+    new_rb = new_task_state.refreshed_at_block
 
     n_deploys_before = len(deployer.deploys)
-    # Next tick: new champion has 4 samples per env, but threshold is 5.
+    # Next tick: new champion has 0 samples on the new refresh_block
+    # (the 4 partials from tick 52 were tagged with the prior rb).
     # _samples_complete must return False → no new battle, no deploy.
     await scheduler.tick(current_block=54)
 
@@ -1403,11 +1410,11 @@ async def test_winning_challenger_must_top_up_samples_before_next_battle():
         "no challenger should be dispatched while new champion is still ramping samples"
     )
 
-    # Now add the 5th sample to push new champion to the threshold.
+    # Fill the new champion's samples on the new pool / new refresh_block.
     for env in ("ENV_A", "ENV_B"):
-        all_tasks = task_state.task_ids[env]
+        all_tasks = new_task_state.task_ids[env]
         samples.set_samples("chal_hk", "chal_rev", env,
-                            all_tasks, score=0.9, refresh_block=rb)
+                            all_tasks, score=0.9, refresh_block=new_rb)
 
     # And now step 6 passes → step 7 dispatches uid=3.
     await scheduler.tick(current_block=55)
