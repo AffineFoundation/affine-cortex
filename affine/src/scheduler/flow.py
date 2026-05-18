@@ -510,6 +510,26 @@ class FlowScheduler:
             revision=candidate.revision,
             model=candidate.model,
         )
+        # ``compute_split_payees`` derives the 5-way reward split from
+        # ``score_snapshots`` newest-first deduped by ``winner_hotkey``.
+        # Bootstrap doesn't go through the comparator's ``_write_weights``
+        # path, so without this write a champion that ascended via
+        # invalidation (rather than a contest WON) leaves no trace in
+        # split history and gets silently skipped.
+        try:
+            await self.weight_writer.record_champion_held(
+                champion_uid=new_champ.uid,
+                champion_hotkey=new_champ.hotkey,
+                block_number=current_block,
+                scorer_hotkey=self.cfg.scorer_hotkey,
+                outcome_reason="bootstrap",
+            )
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: failed to persist bootstrap snapshot "
+                f"uid={new_champ.uid} block={current_block}: "
+                f"{type(e).__name__}: {e}"
+            )
         logger.info(
             f"FlowScheduler: bootstrap champion = uid {candidate.uid}"
         )
