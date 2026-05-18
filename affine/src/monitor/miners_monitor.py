@@ -50,12 +50,6 @@ NETUID = int(os.getenv("AFFINE_NETUID", "120"))
 MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
 REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
 
-# A miner whose HF repo has been deleted/privated returns 404 deterministically
-# — retrying changes nothing. Require N observed "repo gone" responses before
-# flipping the row to permanent_invalid (and terminating it in miner_stats so
-# it disappears from the rank queue with a real reason). Generic HF transients
-# do not bump the counter; a successful fetch resets it.
-HF_GONE_PERMANENT_THRESHOLD = 2
 
 @dataclass
 class MinerInfo:
@@ -85,6 +79,12 @@ class MinerInfo:
         self.terminate_stats = terminate_stats
 
 
+class HFRepoUnavailable(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
 class MinersMonitor:
     """Refreshes current miner snapshot and historical miner metadata."""
 
@@ -104,11 +104,6 @@ class MinersMonitor:
         self._weights_ttl_sec = 1800
         # (model, revision) -> (tokenizer_sig_or_empty, fetched_at)
         self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
-        # (model, revision) -> observed HF "repo gone" (404/gated) count.
-        # Successful fetches reset it; generic HF transients don't bump it.
-        # At HF_GONE_PERMANENT_THRESHOLD it flips permanent → row is
-        # terminated in miner_stats.
-        self._hf_gone_counts: Dict[Tuple[str, str], int] = {}
         self._background_task: Optional[asyncio.Task] = None
 
     # ---- lifecycle -------------------------------------------------------
@@ -299,17 +294,17 @@ class MinersMonitor:
                 return info
 
         # HuggingFace lookup → model_hash + sha + commit-history flags.
-        model_info = await self._get_model_info(model, revision)
+        try:
+            model_info = await self._get_model_info(model, revision)
+        except HFRepoUnavailable as e:
+            info.mark_invalid(
+                e.reason,
+                permanent=True,
+                terminate_stats=True,
+            )
+            return info
         if not model_info:
-            gone_count = self._hf_gone_counts.get((model, revision), 0)
-            if gone_count >= HF_GONE_PERMANENT_THRESHOLD:
-                info.mark_invalid(
-                    "hf_repo_not_found",
-                    permanent=True,
-                    terminate_stats=True,
-                )
-            else:
-                info.mark_invalid("hf_model_fetch_failed", permanent=False)
+            info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
         model_hash, hf_revision, duplicate_source = model_info
         info.model_hash = model_hash
@@ -499,12 +494,13 @@ class MinersMonitor:
         """
         key = (model_id, revision)
         now = time.time()
+        api = HfApi(token=os.getenv("HF_TOKEN"))
         cached = self._weights_cache.get(key)
         if cached and now - cached[1] < self._weights_ttl_sec:
+            await self._verify_repo_accessible(api, model_id, revision)
             return cached[0]
 
         try:
-            api = HfApi(token=os.getenv("HF_TOKEN"))
             info = await asyncio.to_thread(
                 lambda: api.repo_info(
                     repo_id=model_id, repo_type="model", revision=revision, files_metadata=True,
@@ -554,24 +550,58 @@ class MinersMonitor:
 
             result = (model_hash, hf_revision, duplicate_source)
             self._weights_cache[key] = (result, now)
-            self._hf_gone_counts.pop(key, None)
             return result
-        except (RepositoryNotFoundError, GatedRepoError) as e:
-            self._hf_gone_counts[key] = self._hf_gone_counts.get(key, 0) + 1
-            logger.warning(
-                f"[MinersMonitor] HF repo gone {model_id}@{revision[:8]}: "
-                f"{type(e).__name__} (attempt "
-                f"{self._hf_gone_counts[key]}/{HF_GONE_PERMANENT_THRESHOLD})"
-            )
-            self._weights_cache[key] = (None, now)
-            return None
+        except GatedRepoError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_private", e)
+        except RepositoryNotFoundError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
         except Exception as e:
             logger.warning(
                 f"[MinersMonitor] HF fetch failed {model_id}@{revision[:8]}: "
                 f"{type(e).__name__}: {e}"
             )
-            self._weights_cache[key] = (None, now)
             return None
+
+    async def _verify_repo_accessible(
+        self, api: HfApi, model_id: str, revision: str
+    ) -> None:
+        """Confirm the repo is still publicly reachable even on weight-cache hits.
+
+        Deterministic visibility failures terminate the miner immediately.
+        Generic HF/network failures are treated as transient and keep the
+        cached weight metadata usable for this cycle.
+        """
+        try:
+            await asyncio.to_thread(
+                lambda: api.repo_info(
+                    repo_id=model_id,
+                    repo_type="model",
+                    revision=revision,
+                    files_metadata=False,
+                )
+            )
+        except GatedRepoError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_private", e)
+        except RepositoryNotFoundError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
+        except Exception as e:
+            logger.warning(
+                f"[MinersMonitor] HF access check failed {model_id}@{revision[:8]}: "
+                f"{type(e).__name__}: {e}"
+            )
+
+    def _raise_repo_unavailable(
+        self, model_id: str, revision: str, reason: str, error: Exception
+    ) -> None:
+        logger.warning(
+            f"[MinersMonitor] HF repo unavailable {model_id}@{revision[:8]}: "
+            f"{type(error).__name__} reason={reason}"
+        )
+        raise HFRepoUnavailable(reason) from error
 
     def _detect_plagiarism(self, miners: list[MinerInfo]) -> list[MinerInfo]:
         """Flag later committers as invalid when their model_hash collides
