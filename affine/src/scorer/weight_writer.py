@@ -157,17 +157,10 @@ class WeightWriter:
         scorer_hotkey: str,
         outcome_reason: str,
     ) -> None:
-        """Record one ``score_snapshots`` row stating the champion held
-        the seat through a contest that didn't go through the full
-        comparator (early-loss short-circuit). Per-miner ``scores`` rows
-        are untouched — the champion is already at weight 1.0 from the
-        prior write, and the early-lost challenger's lifecycle row was
-        already frozen by ``mark_terminated``.
-
-        ``compute_split_payees`` walks snapshots newest-first and dedupes
-        by ``winner_hotkey``; without this row, a champion whose entire
-        tenure consists of early-LOST verdicts leaves no trace there
-        and gets silently skipped by the reward split."""
+        """Write one ``score_snapshots`` row marking ``champion_uid``
+        as winner without invoking the full comparator. Used by the
+        cold-start bootstrap path; per-miner ``scores`` rows are left
+        to the prior write."""
         await self._snapshots.save_snapshot(
             block_number=block_number,
             scorer_hotkey=scorer_hotkey,
