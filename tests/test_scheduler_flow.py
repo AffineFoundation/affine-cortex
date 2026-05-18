@@ -2345,6 +2345,59 @@ async def test_predeploy_invalidation_sweep_tears_down_without_status_write():
 
 
 @pytest.mark.asyncio
+async def test_predeploy_invalidation_sweep_drops_record_matching_champion():
+    """Crash mid-``_adopt_predeployed_if_present`` can leave a stale
+    record whose uid is the newly-installed champion. Sweep must tear
+    it down so the spare endpoint can be filled again."""
+    from affine.src.scorer.window_state import (
+        BattleRecord, ChampionRecord, DeploymentRecord, MinerSnapshot,
+    )
+
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(7, "champ_hk", 50, status=STATUS_CHAMPION, revision="r7"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=4)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    # State: uid=7 is current champion AND lingers in predeployed
+    # records (the crash-recovery shape this fix targets).
+    await state.set_champion(ChampionRecord(
+        uid=7, hotkey="champ_hk", revision="r7", model="org/m7",
+        deployment_id="wrk-champ", base_url="https://t/wrk-champ",
+        since_block=0,
+    ))
+    stale_dep_id = "wrk-stale-pre"
+    await state.set_predeployed_challengers([
+        BattleRecord(
+            challenger=MinerSnapshot(
+                uid=7, hotkey="champ_hk", revision="r7", model="org/m7",
+            ),
+            deployment_id=stale_dep_id,
+            base_url="https://t/wrk-stale-pre",
+            started_at_block=0,
+            deployments=[DeploymentRecord(
+                endpoint_name="b300_2",
+                deployment_id=stale_dep_id,
+                base_url="https://t/wrk-stale-pre",
+            )],
+        ),
+    ])
+    await state.set_task_state(TaskIdState(
+        task_ids={"ENV_A": [1, 2, 3], "ENV_B": [4, 5, 6]},
+        refreshed_at_block=0,
+    ))
+
+    await scheduler.tick(current_block=10)
+
+    assert (await state.get_predeployed_challengers()) == []
+    assert stale_dep_id in deployer.teardowns
+
+
+@pytest.mark.asyncio
 async def test_predeploy_early_loss_terminates_sure_loser():
     """Pre-deployed miner with a definitive env regression past the
     not_worse threshold is marked LOST + torn down before ever entering

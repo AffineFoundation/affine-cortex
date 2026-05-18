@@ -840,6 +840,10 @@ class FlowScheduler:
         valid_uids = {
             int(r.get("uid", -1)) for r in await self._list_valid_miners()
         }
+        # Champion is read for the post-adoption stale-record check below;
+        # ``None`` is fine for cold-start ticks.
+        champion = await self.state.get_champion()
+        champion_uid = champion.uid if champion is not None else None
         # An endpoint that's been removed from ``inference_endpoints``
         # (``af db set-endpoint --no-active`` or row deletion) is no
         # longer ours to teardown — the cfg may not even exist anymore.
@@ -874,6 +878,31 @@ class FlowScheduler:
                     f"inference_endpoints; dropping record without "
                     f"teardown (endpoint is no longer ours to manage)"
                 )
+                changed = True
+                continue
+            # A record whose uid is now champion can only be left over
+            # from a crash mid-``_adopt_predeployed_if_present``: the
+            # champion write committed but the ``set_predeployed_challengers``
+            # for the remaining list did not. The spare endpoint stays
+            # assigned to that uid, blocking future fills. Tear down +
+            # drop here so the fill loop can recover on the next tick.
+            if champion_uid is not None and record.challenger.uid == champion_uid:
+                logger.warning(
+                    f"FlowScheduler: pre-deployed uid="
+                    f"{record.challenger.uid} matches current champion; "
+                    f"dropping stale crash-recovery record"
+                )
+                try:
+                    await self._teardown_record(record)
+                except Exception as e:
+                    logger.error(
+                        f"FlowScheduler: teardown failed for stale "
+                        f"champion-matching pre-deployed uid="
+                        f"{record.challenger.uid}: {type(e).__name__}: "
+                        f"{e} — keeping for retry"
+                    )
+                    kept.append(record)
+                    continue
                 changed = True
                 continue
             if record.challenger.uid in valid_uids:
