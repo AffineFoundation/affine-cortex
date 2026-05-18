@@ -667,6 +667,49 @@ async def test_deploy_failure_keeps_challenger_in_queue():
 
 
 @pytest.mark.asyncio
+async def test_single_instance_deploy_failure_clears_champion_deployment_state():
+    """SSH deploy starts by clearing the single machine. If challenger
+    startup then fails, the previous champion workload may already be
+    gone; clear champion deployment state so the next tick redeploys it
+    instead of trusting a stale base_url."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=_DeployTracker(), samples=samples,
+    )
+    scheduler.cfg.single_instance_provider = True
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            refresh_block=task_state.refreshed_at_block,
+        )
+    champ = await state.get_champion()
+    assert champ.deployment_id is not None
+    assert champ.base_url is not None
+
+    failing_deployer = _DeployTracker(fail_on_deploy=True)
+    scheduler._deploy = failing_deployer.deploy
+    scheduler._teardown = failing_deployer.teardown
+
+    await scheduler.tick(current_block=52)
+
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert await state.get_battle() is None
+    champ = await state.get_champion()
+    assert champ.deployment_id is None
+    assert champ.base_url is None
+    assert champ.deployments == []
+
+
+@pytest.mark.asyncio
 async def test_invalid_champion_dropped_and_workload_torn_down():
     kv = _seed_state()
     # Champion uid=1 in system_config, but NOT in valid miners list.

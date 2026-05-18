@@ -1122,6 +1122,11 @@ class FlowScheduler:
                     f"uid={candidate.uid} — row no longer in_progress; "
                     f"leaving as-is"
                 )
+            if self.cfg.single_instance_provider:
+                champion.deployment_id = None
+                champion.base_url = None
+                champion.deployments = []
+                await self.state.set_champion(champion)
             return
         if self.cfg.single_instance_provider:
             champion.deployment_id = None
