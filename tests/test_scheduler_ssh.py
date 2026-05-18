@@ -411,53 +411,11 @@ def test_config_from_endpoint_overrides_module_defaults():
 
 
 @pytest.mark.asyncio
-async def test_deploy_adopts_matching_container_without_restart(monkeypatch):
+async def test_deploy_always_cleans_existing_container_before_start(monkeypatch):
     calls = []
 
     async def fake_ssh_exec(config, command):
         calls.append(command)
-        if command.startswith("docker inspect"):
-            return 0, "\n".join([
-                "io.affine.endpoint = ssh_b300",
-                "io.affine.uid = 42",
-                "io.affine.hotkey = abc123def",
-                "io.affine.model = Qwen/Qwen3-30B-A22B",
-                "io.affine.revision = abcdef01234567",
-            ]), ""
-        raise AssertionError(f"unexpected command: {command}")
-
-    async def fake_wait_ready(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
-    monkeypatch.setattr("affine.src.scheduler.ssh._wait_ready", fake_wait_ready)
-
-    cfg = _config(endpoint_name="ssh_b300")
-    result = await deploy(cfg, _target())
-
-    assert result.deployment_id == f"ssh:ssh_b300:{CONTAINER_NAME}"
-    assert result.base_url == "http://b300:10001/v1"
-    assert len(calls) == 1
-    assert calls[0].startswith("docker inspect")
-
-
-@pytest.mark.asyncio
-async def test_deploy_restarts_when_existing_container_is_wrong(monkeypatch):
-    calls = []
-
-    async def fake_ssh_exec(config, command):
-        calls.append(command)
-        # Existing-container label probe (first call from deploy()).
-        if command.startswith(
-            "docker inspect --format '{{range $k,$v"
-        ):
-            return 0, "\n".join([
-                "io.affine.endpoint = ssh_b300",
-                "io.affine.uid = 99",
-                "io.affine.hotkey = wrong",
-                "io.affine.model = other/model",
-                "io.affine.revision = otherrev",
-            ]), ""
         # Cache cleanup script: keep-only-target shell loop.
         if "for d in" in command and "rm -rf" in command:
             return 0, "", ""
@@ -475,8 +433,60 @@ async def test_deploy_restarts_when_existing_container_is_wrong(monkeypatch):
     result = await deploy(cfg, _target())
 
     assert result.deployment_id == f"ssh:ssh_b300:{CONTAINER_NAME}"
-    # 3 SSH round-trips: labels probe → cache cleanup script → docker run.
-    assert len(calls) == 3
-    assert calls[0].startswith("docker inspect")
-    assert "for d in" in calls[1] and "rm -rf" in calls[1]
-    assert calls[2].startswith(f"docker rm -f {CONTAINER_NAME}")
+    assert result.base_url == "http://b300:10001/v1"
+    # No label-based adoption: every deploy runs startup cleanup first.
+    assert len(calls) == 2
+    assert "docker inspect" not in "\n".join(calls)
+    assert "for d in" in calls[0] and "rm -rf" in calls[0]
+    assert calls[1].startswith(f"docker rm -f {CONTAINER_NAME}")
+
+
+@pytest.mark.asyncio
+async def test_wait_ready_raises_early_on_container_exit(monkeypatch):
+    """Sglang can crash on startup (transient HF blip, bad config, OOM)
+    seconds after ``docker run``. ``_wait_ready`` polls container status
+    next to the HTTP probe and raises immediately on a non-running
+    container — without this it would silently spin until the full
+    ``ready_timeout_sec`` (30 min default), blocking the spare endpoint."""
+    import asyncio
+    from affine.src.scheduler.ssh import _wait_ready
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        return False
+
+    async def fake_ssh_exec(config, command):
+        if command.startswith("docker inspect"):
+            return 0, "exited 1\n", ""
+        raise AssertionError(f"unexpected: {command}")
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+
+    cfg = _config()
+    with pytest.raises(RuntimeError, match="exited with code 1"):
+        await _wait_ready(
+            "http://b300:30000/v1",
+            deadline_sec=60,
+            poll_interval_sec=0.01,
+            config=cfg,
+        )
+
+
+@pytest.mark.asyncio
+async def test_wait_ready_does_not_probe_container_when_config_omitted(monkeypatch):
+    """Backward-compat: call sites that don't pass ``config`` skip the
+    container poll (legacy behavior — pure HTTP wait until timeout)."""
+    import asyncio
+    from affine.src.scheduler.ssh import _wait_ready
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        return False
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+
+    with pytest.raises(TimeoutError):
+        await _wait_ready(
+            "http://b300:30000/v1",
+            deadline_sec=0.05,
+            poll_interval_sec=0.01,
+        )

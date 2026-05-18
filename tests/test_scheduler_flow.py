@@ -629,7 +629,11 @@ async def test_losing_challenger_carries_final_scores_to_miner_stats():
 
 
 @pytest.mark.asyncio
-async def test_deploy_failure_marks_challenger_failed():
+async def test_deploy_failure_keeps_challenger_in_queue():
+    """A deploy failure (host crash / sglang OSError / HF transient)
+    must not mark the miner FAILED. ``pick_next`` already flipped the
+    row to ``in_progress``; the failure path releases the claim back
+    to ``sampling`` so the same uid stays re-pickable next tick."""
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -653,7 +657,12 @@ async def test_deploy_failure_marks_challenger_failed():
     scheduler._teardown = failing_deployer.teardown
 
     await scheduler.tick(current_block=52)
-    assert miner_store.rows[2]["challenge_status"] == STATUS_TERMINATED
+    # No mark FAILED — miner stays usable. Status was flipped to
+    # ``in_progress`` by pick_next and released back to ``sampling``
+    # by the failure handler.
+    assert miner_store.rows[2]["challenge_status"] != STATUS_TERMINATED
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert miner_store.rows[2].get("termination_reason") in (None, "")
     assert await state.get_battle() is None
 
 
@@ -2592,17 +2601,13 @@ async def test_predeploy_excludes_active_battle_challenger():
 
 
 @pytest.mark.asyncio
-async def test_predeploy_deploy_failure_marks_failed_and_advances():
-    """A real ssh / docker deploy error during pre-deploy (distinct
-    from ``NoSpareEndpoint``) must:
-
-    1. mark the failing miner ``FAILED`` so the queue advances (mirror
-       of :meth:`_start_battle`'s deploy-failure handling), and
-    2. continue filling the remaining spare slots with the next
-       candidates — without the failure path the head-of-queue miner
-       would starve every pre-sample slot forever, since
-       ``peek_next`` re-picks the same uid each tick.
-    """
+async def test_predeploy_deploy_failure_keeps_candidate_and_advances():
+    """A pre-deploy failure (sglang OSError on transient HF blip,
+    host issue, etc.) must NOT mark the miner FAILED — scheduler has
+    no info to distinguish infra noise from a true model fault, and
+    the monitor's ``hf_model_fetch`` check is the authoritative signal.
+    The fill loop must continue with the next FIFO candidate so a
+    single broken miner doesn't starve every pre-sample slot."""
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -2622,11 +2627,10 @@ async def test_predeploy_deploy_failure_marks_failed_and_advances():
     await scheduler.tick(current_block=50)
     await scheduler.tick(current_block=51)
 
-    # uid=5 marked FAILED and out of the queue; uid=7 and uid=9 took
+    # uid=5 stays in queue (not marked FAILED); uid=7 and uid=9 take
     # the remaining slots.
-    assert miner_store.rows[5]["challenge_status"] == STATUS_TERMINATED
-    reason = miner_store.rows[5].get("termination_reason") or ""
-    assert "deployment_failed_predeploy" in reason
+    assert miner_store.rows[5]["challenge_status"] != STATUS_TERMINATED
+    assert miner_store.rows[5].get("termination_reason") in (None, "")
 
     pre_uids = [p.challenger.uid for p in await state.get_predeployed_challengers()]
     assert pre_uids == [7, 9], (
