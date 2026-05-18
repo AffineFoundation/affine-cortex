@@ -51,10 +51,10 @@ MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
 REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
 
 # A miner whose HF repo has been deleted/privated returns 404 deterministically
-# — retrying changes nothing. Tolerate a few transient flips of HF's CDN by
-# requiring N consecutive "repo gone" responses before flipping the row to
-# permanent_invalid (and terminating it in miner_stats so it disappears from
-# the rank queue with a real reason).
+# — retrying changes nothing. Require N observed "repo gone" responses before
+# flipping the row to permanent_invalid (and terminating it in miner_stats so
+# it disappears from the rank queue with a real reason). Generic HF transients
+# do not bump the counter; a successful fetch resets it.
 HF_GONE_PERMANENT_THRESHOLD = 2
 
 @dataclass
@@ -104,9 +104,10 @@ class MinersMonitor:
         self._weights_ttl_sec = 1800
         # (model, revision) -> (tokenizer_sig_or_empty, fetched_at)
         self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
-        # (model, revision) -> consecutive HF "repo gone" (404/gated) count.
-        # Resets on a successful fetch. At HF_GONE_PERMANENT_THRESHOLD it
-        # flips permanent → row is terminated in miner_stats.
+        # (model, revision) -> observed HF "repo gone" (404/gated) count.
+        # Successful fetches reset it; generic HF transients don't bump it.
+        # At HF_GONE_PERMANENT_THRESHOLD it flips permanent → row is
+        # terminated in miner_stats.
         self._hf_gone_counts: Dict[Tuple[str, str], int] = {}
         self._background_task: Optional[asyncio.Task] = None
 

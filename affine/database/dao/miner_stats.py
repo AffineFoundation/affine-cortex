@@ -406,11 +406,12 @@ class MinerStatsDAO(BaseDAO):
     ) -> bool:
         """Flip the row to ``terminated`` iff it's still ``sampling``.
 
-        Used by the monitor when a permanent-invalid signal (HF repo deleted,
-        plagiarism, malicious template, ...) arrives on a row the scheduler
-        hasn't claimed yet. The conditional write protects in_progress /
-        champion / already-terminated rows from being clobbered by a delayed
-        monitor cycle. Returns True iff this call actually wrote the row.
+        Used by the monitor when a deterministic, miner-attributable invalid
+        signal (HF repo deleted/privated, immutable commit-policy reject,
+        malicious template, ...) arrives on a row the scheduler hasn't claimed
+        yet. The conditional write protects in_progress / champion /
+        already-terminated rows from being clobbered by a delayed monitor
+        cycle. Returns True iff this call actually wrote the row.
         """
         from affine.database.client import get_client
 
