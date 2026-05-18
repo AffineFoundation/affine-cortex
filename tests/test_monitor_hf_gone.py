@@ -5,9 +5,9 @@ Covers the two-step gate added by HF_GONE_PERMANENT_THRESHOLD:
   1. ``_get_model_info`` differentiates ``RepositoryNotFoundError`` /
      ``GatedRepoError`` from generic transients, and bumps a per-key
      consecutive-failure counter on the deterministic ones only.
-  2. ``_validate_miner`` flips the row to ``permanent_invalid=True`` with
-     reason ``hf_repo_not_found`` once the counter reaches the threshold,
-     and ``_persist_miners`` then writes a conditional terminate into
+  2. ``_validate_miner`` flips the row to ``permanent_invalid=True`` and
+     ``terminate_stats=True`` once the counter reaches the threshold, and
+     ``_persist_miners`` then writes a conditional terminate into
      ``miner_stats`` (only if the row is still ``sampling``).
 """
 
@@ -196,6 +196,7 @@ async def test_validate_below_threshold_is_transient(monkeypatch):
         )
         assert info.is_valid is False
         assert info.permanent_invalid is False
+        assert info.terminate_stats is False
         assert info.invalid_reason == "hf_model_fetch_failed"
 
 
@@ -231,6 +232,7 @@ async def test_validate_at_threshold_flips_permanent(monkeypatch):
     assert info is not None
     assert info.is_valid is False
     assert info.permanent_invalid is True
+    assert info.terminate_stats is True
     assert info.invalid_reason == "hf_repo_not_found"
 
 
@@ -250,12 +252,13 @@ class _RecordingStatsDAO:
 
 
 @pytest.mark.asyncio
-async def test_maybe_terminate_fires_for_permanent_listed_reason():
+async def test_maybe_terminate_fires_for_permanent_terminate_verdict():
     monitor = _build_monitor()
     monitor.stats_dao = _RecordingStatsDAO()
     miner = MinerInfo(
         uid=42, hotkey="hk_x", model="org/affine-model-hk_x", revision="rev",
-        is_valid=False, permanent_invalid=True, invalid_reason="hf_repo_not_found",
+        is_valid=False, permanent_invalid=True, terminate_stats=True,
+        invalid_reason="hf_repo_not_found",
     )
     await monitor._maybe_terminate_stats(miner)
     assert monitor.stats_dao.calls == [
@@ -279,9 +282,9 @@ async def test_maybe_terminate_skips_transient_reason():
 
 
 @pytest.mark.asyncio
-async def test_maybe_terminate_skips_permanent_unlisted_reason():
-    """A reason we don't model as a terminate-worthy lifecycle event (e.g.
-    a hypothetical future permanent flag) is left to the scheduler."""
+async def test_maybe_terminate_skips_permanent_without_terminate_verdict():
+    """A permanent invalid verdict that is externally reversible is left to
+    the scheduler."""
     monitor = _build_monitor()
     monitor.stats_dao = _RecordingStatsDAO()
     miner = MinerInfo(
@@ -338,13 +341,14 @@ async def test_maybe_terminate_skips_externally_reversible_permanents(reason):
         "malicious_template:llm_audit_skipped:reason",
     ],
 )
-async def test_maybe_terminate_fires_for_all_listed_permanent_reasons(reason):
+async def test_maybe_terminate_fires_for_explicit_terminate_verdicts(reason):
     monitor = _build_monitor()
     monitor.stats_dao = _RecordingStatsDAO()
     miner = MinerInfo(
         uid=42, hotkey="hk_listed", model="org/affine-model-hk_listed",
         revision="rev",
-        is_valid=False, permanent_invalid=True, invalid_reason=reason,
+        is_valid=False, permanent_invalid=True, terminate_stats=True,
+        invalid_reason=reason,
     )
     await monitor._maybe_terminate_stats(miner)
     assert len(monitor.stats_dao.calls) == 1
@@ -364,6 +368,7 @@ async def test_maybe_terminate_swallows_dao_exception():
 
     miner = MinerInfo(
         uid=42, hotkey="hk_b", model="org/affine-model-hk_b", revision="rev",
-        is_valid=False, permanent_invalid=True, invalid_reason="hf_repo_not_found",
+        is_valid=False, permanent_invalid=True, terminate_stats=True,
+        invalid_reason="hf_repo_not_found",
     )
     await monitor._maybe_terminate_stats(miner)  # must not raise

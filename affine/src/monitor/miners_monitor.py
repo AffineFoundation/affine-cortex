@@ -57,33 +57,6 @@ REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
 # the rank queue with a real reason).
 HF_GONE_PERMANENT_THRESHOLD = 3
 
-# Invalid reasons that justify writing miner_stats.challenge_status='terminated'
-# alongside is_valid=false. These are deterministic, miner-attributable rejects
-# whose verdict cannot flip just because something *outside* the miner changes.
-# Specifically excluded (even though they're marked permanent=True at the
-# MinerInfo layer):
-#   - tokenizer_sig_mismatch — relative to the active champion's sig; a future
-#     champion change can flip a candidate back to valid.
-#   - plagiarism:duplicate_of_uid — relative to the *origin* uid; origin
-#     deregistering shifts the "earliest wins" verdict to the next miner.
-#   - blacklisted — operators can remove an entry from the blacklist.
-# All three are reversible by external state changes, so we let the next
-# monitor cycle re-evaluate them rather than locking the row to terminated.
-# Transient errors (permanent=False) are filtered upstream by the
-# ``permanent_invalid`` check, so they never need to be listed here.
-_TERMINAL_INVALID_REASON_PREFIXES = (
-    "hf_repo_not_found",
-    "multiple_commits",
-    "model_name_missing_affine",
-    "repo_name_not_ending_with_hotkey",
-    "revision_mismatch",
-    "model_check",
-    "duplicate_repo",
-    "malicious_template",
-    "invalid_json_commit",
-)
-
-
 @dataclass
 class MinerInfo:
     uid: int
@@ -94,6 +67,7 @@ class MinerInfo:
     is_valid: bool = False
     invalid_reason: Optional[str] = None
     permanent_invalid: bool = False
+    terminate_stats: bool = False
     model_hash: str = ""
     hf_revision: str = ""
     template_check_result: Optional[str] = None  # "safe" | "unsafe:<reason>" | None
@@ -102,10 +76,13 @@ class MinerInfo:
     def key(self) -> str:
         return f"{self.hotkey}#{self.revision}"
 
-    def mark_invalid(self, reason: str, *, permanent: bool) -> None:
+    def mark_invalid(
+        self, reason: str, *, permanent: bool, terminate_stats: bool = False
+    ) -> None:
         self.is_valid = False
         self.invalid_reason = reason
         self.permanent_invalid = permanent
+        self.terminate_stats = terminate_stats
 
 
 class MinersMonitor:
@@ -292,12 +269,20 @@ class MinersMonitor:
 
         # Multi-commit rule: a hotkey is only allowed one commit on this subnet.
         if uid != 0 and commit_count > 1 and block >= MULTI_COMMIT_ENFORCE_BLOCK:
-            info.mark_invalid(f"multiple_commits:count={commit_count}", permanent=True)
+            info.mark_invalid(
+                f"multiple_commits:count={commit_count}",
+                permanent=True,
+                terminate_stats=True,
+            )
             return info
 
         # "affine" must appear in the model name (system miners exempt).
         if uid != 0 and "affine" not in model.lower():
-            info.mark_invalid("model_name_missing_affine", permanent=True)
+            info.mark_invalid(
+                "model_name_missing_affine",
+                permanent=True,
+                terminate_stats=True,
+            )
             return info
 
         # Repo name must end with the hotkey from a certain block onward —
@@ -306,7 +291,9 @@ class MinersMonitor:
             repo_name = model.split("/")[-1] if "/" in model else model
             if not repo_name.lower().endswith(hotkey.lower()):
                 info.mark_invalid(
-                    f"repo_name_not_ending_with_hotkey:repo={repo_name}", permanent=True,
+                    f"repo_name_not_ending_with_hotkey:repo={repo_name}",
+                    permanent=True,
+                    terminate_stats=True,
                 )
                 return info
 
@@ -315,7 +302,11 @@ class MinersMonitor:
         if not model_info:
             gone_count = self._hf_gone_counts.get((model, revision), 0)
             if gone_count >= HF_GONE_PERMANENT_THRESHOLD:
-                info.mark_invalid("hf_repo_not_found", permanent=True)
+                info.mark_invalid(
+                    "hf_repo_not_found",
+                    permanent=True,
+                    terminate_stats=True,
+                )
             else:
                 info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
@@ -324,17 +315,29 @@ class MinersMonitor:
         info.hf_revision = hf_revision
 
         if revision != hf_revision:
-            info.mark_invalid(f"revision_mismatch:hf={hf_revision}", permanent=True)
+            info.mark_invalid(
+                f"revision_mismatch:hf={hf_revision}",
+                permanent=True,
+                terminate_stats=True,
+            )
             return info
 
         if uid != 0 and uid <= 1000:
             size_result = await check_model_size(model, revision)
             if not size_result.get("pass"):
-                info.mark_invalid(f"model_check:{size_result.get('reason')}", permanent=True)
+                info.mark_invalid(
+                    f"model_check:{size_result.get('reason')}",
+                    permanent=True,
+                    terminate_stats=True,
+                )
                 return info
 
         if uid != 0 and duplicate_source:
-            info.mark_invalid(f"duplicate_repo:from={duplicate_source}", permanent=True)
+            info.mark_invalid(
+                f"duplicate_repo:from={duplicate_source}",
+                permanent=True,
+                terminate_stats=True,
+            )
             return info
 
         # Template safety. Cached "safe" skips the check; cached "unsafe" is
@@ -344,7 +347,11 @@ class MinersMonitor:
             if cached == "safe":
                 pass
             elif cached and cached.startswith("unsafe:"):
-                info.mark_invalid(f"malicious_template:{cached[7:]}", permanent=True)
+                info.mark_invalid(
+                    f"malicious_template:{cached[7:]}",
+                    permanent=True,
+                    terminate_stats=True,
+                )
                 return info
             else:
                 try:
@@ -352,7 +359,11 @@ class MinersMonitor:
                     if not tr.get("safe"):
                         reason = tr.get("reason", "unknown")
                         transient = reason.startswith("template_fetch_failed:") or reason.startswith("check_error:")
-                        info.mark_invalid(f"malicious_template:{reason}", permanent=not transient)
+                        info.mark_invalid(
+                            f"malicious_template:{reason}",
+                            permanent=not transient,
+                            terminate_stats=not transient,
+                        )
                         if not transient:
                             info.template_check_result = f"unsafe:{reason}"
                         return info
@@ -599,12 +610,12 @@ class MinersMonitor:
         """Save the current online miner snapshot.
 
         Lifecycle (``challenge_status``) is owned by ``miner_stats`` and is
-        written by the scheduler, with one exception: when ``mark_invalid``
-        sets ``permanent_invalid=True`` with a deterministic, miner-attributable
-        reason (HF repo deleted/privated, plagiarism, malicious template, ...),
-        we also terminate the row here so the rank queue stops showing it as
-        "still sampling" and the rejection reason is visible in miner_stats.
-        Transient errors never trigger that path.
+        written by the scheduler, with one exception: deterministic,
+        miner-attributable rejects set ``terminate_stats=True`` at the verdict
+        site. Those rows are conditionally terminated here so the rank queue
+        stops showing them as "still sampling" and the rejection reason is
+        visible in miner_stats. Transient or externally reversible rejects
+        leave that flag false.
         """
         from affine.database.client import get_client
 
@@ -656,11 +667,9 @@ class MinersMonitor:
                     )
 
     async def _maybe_terminate_stats(self, miner: MinerInfo) -> None:
-        if not miner.permanent_invalid:
+        if not (miner.permanent_invalid and miner.terminate_stats):
             return
         reason = miner.invalid_reason or ""
-        if not any(reason.startswith(p) for p in _TERMINAL_INVALID_REASON_PREFIXES):
-            return
         try:
             wrote = await self.stats_dao.terminate_if_sampling(
                 hotkey=miner.hotkey,
