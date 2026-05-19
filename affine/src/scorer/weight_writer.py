@@ -127,6 +127,8 @@ class WeightWriter:
             "total_miners": len(subjects),
             "winner_uid": champions[0].uid,
             "winner_hotkey": champions[0].hotkey,
+            "winner_revision": champions[0].revision,
+            "winner_model": champions[0].model,
             "final_weights": {
                 str(s.uid): "1.0" if s.is_champion else "0.0" for s in subjects
             },
