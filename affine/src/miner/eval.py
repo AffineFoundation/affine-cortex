@@ -141,6 +141,23 @@ def _load_environment(env_name: str, *, network_host: bool, basilica: bool):
     config = ENV_CONFIGS[env_name]
     mode = "basilica" if basilica else "docker"
     env_vars = dict(config.env_vars or {})
+    api_key = os.getenv("API_KEY")
+    if api_key:
+        env_vars["API_KEY"] = api_key
+    for alias in ("CHUTES_API_KEY", "OPENAI_API_KEY"):
+        value = os.getenv(alias) or api_key
+        if value:
+            env_vars[alias] = value
+    for key in config.required_env_vars:
+        value = os.getenv(key)
+        if not value:
+            raise click.ClickException(
+                f"{key} environment variable is required for environment '{env_name}'")
+        env_vars[key] = value
+    for key in getattr(config, "optional_env_vars", []):
+        value = os.getenv(key)
+        if value:
+            env_vars[key] = value
     load_kwargs: Dict[str, Any] = {
         "image": config.docker_image,
         "mode": mode,
