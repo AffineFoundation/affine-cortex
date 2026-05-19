@@ -5,7 +5,7 @@ FROM rust:1.88-slim-bookworm AS base
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     python3 python3-venv python3-pip python3-dev \
-    build-essential curl pkg-config libssl-dev protobuf-compiler libprotobuf-dev docker.io git openssh-client \
+    build-essential curl pkg-config libssl-dev protobuf-compiler libprotobuf-dev docker.io git openssh-client autossh \
  && rm -rf /var/lib/apt/lists/*
 
 # 2) Install the 'uv' CLI
