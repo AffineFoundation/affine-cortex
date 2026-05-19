@@ -362,6 +362,7 @@ _ENV_CONFIGS_CANONICAL = {
         name="memory",
         docker_image="affinefoundation/memorygym:latest",
         env_vars={"UVICORN_WORKERS": "16"},
+        optional_env_vars=["DASHSCOPE_API_KEY"],
         mem_limit="12g",
         eval_params={
             "tier": "standard",
