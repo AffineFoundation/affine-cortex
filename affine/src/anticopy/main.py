@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -120,23 +121,46 @@ def _maybe_start_ssh_tunnel() -> "subprocess.Popen | None":
     remote_port = int(os.getenv("ANTICOPY_REMOTE_SGLANG_PORT", "30000"))
 
     ssh_port = os.getenv("ANTICOPY_REMOTE_SSH_PORT", "")
-    cmd = [
-        "ssh", "-N", "-T",
+    # Use autossh so the tunnel reconnects when sglang stalls past
+    # ServerAlive grace and the ssh client tears down. Bare ssh leaves
+    # the worker hung on a dead localhost port until the container is
+    # restarted (observed: ~8.5h gap during a weight reload stall).
+    # ``-M 0`` disables autossh's own monitor port; we rely entirely on
+    # ssh keepalive (ServerAliveInterval × ServerAliveCountMax).
+    ssh_args = [
+        "-N", "-T",
         "-i", key_path,
         "-o", "StrictHostKeyChecking=no",
         "-o", "ConnectTimeout=30",
         "-o", "ServerAliveInterval=30",
+        "-o", "ServerAliveCountMax=3",
         "-o", "ExitOnForwardFailure=yes",
         "-L", f"{local_port}:127.0.0.1:{remote_port}",
     ]
     if ssh_port:
-        cmd += ["-p", ssh_port]
-    cmd.append(host)
+        ssh_args += ["-p", ssh_port]
+    ssh_args.append(host)
+
+    autossh_bin = shutil.which("autossh")
+    env = os.environ.copy()
+    if autossh_bin:
+        cmd = [autossh_bin, "-M", "0"] + ssh_args
+        # AUTOSSH_GATETIME=0 disables the 30s "first connect must
+        # succeed" gate so reconnect kicks in immediately after a
+        # mid-session drop too.
+        env["AUTOSSH_GATETIME"] = "0"
+        wrapper = "autossh"
+    else:
+        cmd = ["ssh"] + ssh_args
+        wrapper = "ssh (autossh not installed — tunnel will NOT auto-reconnect)"
+
     logger.info(
-        f"[anticopy.worker] starting ssh tunnel "
+        f"[anticopy.worker] starting {wrapper} tunnel "
         f"localhost:{local_port} → {host}:{remote_port}"
     )
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+    )
     # Block until the port answers (or the tunnel dies).
     deadline = time.time() + 30
     while time.time() < deadline:
