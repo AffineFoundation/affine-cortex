@@ -110,6 +110,8 @@ class MinersQueueAdapter:
         revision: Optional[str] = None,
         model: str = "",
         scores_by_env: Optional[Dict[str, Dict[str, float]]] = None,
+        opponent_scores_by_env: Optional[Dict[str, Dict[str, float]]] = None,
+        battle_task_ids: Optional[Dict[str, List[int]]] = None,
         scores_refresh_block: Optional[int] = None,
         terminated_at_block: Optional[int] = None,
     ) -> None:
@@ -129,6 +131,8 @@ class MinersQueueAdapter:
             status=new_status,
             termination_reason=reason,
             scores_by_env=scores_by_env,
+            opponent_scores_by_env=opponent_scores_by_env,
+            battle_task_ids=battle_task_ids,
             scores_refresh_block=scores_refresh_block,
             terminated_at_block=terminated_at_block,
         )

@@ -343,11 +343,12 @@ class FlowScheduler:
             scoring_envs=scoring_envs, task_state=task_state,
         )
         if early is not None:
-            regression_env, per_env_data = early
+            regression_env, per_env_data, overlap_task_ids = early
             await self._decide_early_lost(
                 champion, battle,
                 regression_env=regression_env,
                 per_env_data=per_env_data,
+                overlap_task_ids=overlap_task_ids,
                 task_state=task_state,
                 current_block=current_block,
             )
@@ -624,14 +625,14 @@ class FlowScheduler:
         Returns:
             * ``(env, per_env_data)`` when one env qualifies. ``env`` is
               the trigger env; ``per_env_data`` is the comparator-style
-              view ``{env: {count, avg, champion_overlap_avg}}`` for
-              every scoring env that already has at least one overlap
-              sample, so the rank UI can show as much context as it
-              would after a full decide.
+              view ``{env: {count, avg, champion_overlap_avg}}`` and
+              ``overlap_task_ids`` is ``{env: [task_id, ...]}`` for every
+              scoring env that already has at least one overlap sample.
             * ``None`` when no env has both enough overlap AND a
               regression.
         """
         per_env_data: Dict[str, Dict[str, float]] = {}
+        overlap_task_ids: Dict[str, List[int]] = {}
         regression_env: Optional[str] = None
 
         for env, env_cfg in scoring_envs.items():
@@ -646,17 +647,18 @@ class FlowScheduler:
                 challenger.hotkey, challenger.revision, env, tasks,
                 task_state.refreshed_at_block,
             )
-            overlap = set(champ_scores) & set(chal_scores)
-            if not overlap:
+            overlap_ids = sorted(set(champ_scores) & set(chal_scores))
+            if not overlap_ids:
                 continue
             champ_overlap_avg = (
-                sum(champ_scores[t] for t in overlap) / len(overlap)
+                sum(champ_scores[t] for t in overlap_ids) / len(overlap_ids)
             )
             chal_overlap_avg = (
-                sum(chal_scores[t] for t in overlap) / len(overlap)
+                sum(chal_scores[t] for t in overlap_ids) / len(overlap_ids)
             )
+            overlap_task_ids[env] = overlap_ids
             per_env_data[env] = {
-                "count": len(overlap),
+                "count": len(overlap_ids),
                 "avg": chal_overlap_avg,
                 "champion_overlap_avg": champ_overlap_avg,
             }
@@ -676,14 +678,14 @@ class FlowScheduler:
             )
             if (
                 regression_env is None
-                and len(overlap) >= int(env_cfg.sampling_count)
+                and len(overlap_ids) >= int(env_cfg.sampling_count)
                 and chal_overlap_avg < not_worse_threshold - 1e-9
             ):
                 regression_env = env
 
         if regression_env is None:
             return None
-        return regression_env, per_env_data
+        return regression_env, per_env_data, overlap_task_ids
 
     async def _decide_early_lost(
         self,
@@ -692,6 +694,7 @@ class FlowScheduler:
         *,
         regression_env: str,
         per_env_data: Dict[str, Dict[str, float]],
+        overlap_task_ids: Dict[str, List[int]],
         task_state: TaskIdState,
         current_block: int,
     ) -> None:
@@ -721,6 +724,8 @@ class FlowScheduler:
             revision=battle.challenger.revision,
             model=battle.challenger.model,
             scores_by_env=per_env_data,
+            opponent_scores_by_env=_opponent_scores_from_early_lost(per_env_data),
+            battle_task_ids=overlap_task_ids,
             scores_refresh_block=task_state.refreshed_at_block,
             terminated_at_block=current_block,
         )
@@ -964,12 +969,13 @@ class FlowScheduler:
             if early is None:
                 kept.append(record)
                 continue
-            regression_env, per_env_data = early
+            regression_env, per_env_data, overlap_task_ids = early
             try:
                 await self._decide_predeployed_early_lost(
                     champion, record,
                     regression_env=regression_env,
                     per_env_data=per_env_data,
+                    overlap_task_ids=overlap_task_ids,
                     task_state=task_state,
                     current_block=current_block,
                 )
@@ -996,6 +1002,7 @@ class FlowScheduler:
         *,
         regression_env: str,
         per_env_data: Dict[str, Dict[str, float]],
+        overlap_task_ids: Dict[str, List[int]],
         task_state: TaskIdState,
         current_block: int,
     ) -> None:
@@ -1014,6 +1021,8 @@ class FlowScheduler:
             revision=record.challenger.revision,
             model=record.challenger.model,
             scores_by_env=per_env_data,
+            opponent_scores_by_env=_opponent_scores_from_early_lost(per_env_data),
+            battle_task_ids=overlap_task_ids,
             scores_refresh_block=task_state.refreshed_at_block,
             terminated_at_block=current_block,
         )
@@ -1298,6 +1307,7 @@ class FlowScheduler:
         # neutralised here — both sides see exactly the same task_ids.
         champ_scores: Dict[str, Dict[int, float]] = {}
         chal_scores: Dict[str, Dict[int, float]] = {}
+        overlap_task_ids: Dict[str, List[int]] = {}
         for env in env_configs:
             tasks = task_state.task_ids.get(env, [])
             champ_full = await self._scores_reader(
@@ -1308,9 +1318,10 @@ class FlowScheduler:
                 battle.challenger.hotkey, battle.challenger.revision, env, tasks,
                 task_state.refreshed_at_block,
             )
-            overlap = set(champ_full) & set(chal_full)
-            champ_scores[env] = {t: champ_full[t] for t in overlap}
-            chal_scores[env] = {t: chal_full[t] for t in overlap}
+            overlap_ids = sorted(set(champ_full) & set(chal_full))
+            overlap_task_ids[env] = overlap_ids
+            champ_scores[env] = {t: champ_full[t] for t in overlap_ids}
+            chal_scores[env] = {t: chal_full[t] for t in overlap_ids}
 
         result = self.comparator.compare(
             champion_scores=champ_scores,
@@ -1352,6 +1363,10 @@ class FlowScheduler:
                 scores_by_env=_final_scores_from_result(
                     result, role="champion",
                 ),
+                opponent_scores_by_env=_opponent_scores_from_result(
+                    result, role="champion",
+                ),
+                battle_task_ids=overlap_task_ids,
                 scores_refresh_block=task_state.refreshed_at_block,
                 terminated_at_block=current_block,
             )
@@ -1377,6 +1392,10 @@ class FlowScheduler:
                 scores_by_env=_final_scores_from_result(
                     result, role="challenger",
                 ),
+                opponent_scores_by_env=_opponent_scores_from_result(
+                    result, role="challenger",
+                ),
+                battle_task_ids=overlap_task_ids,
                 scores_refresh_block=task_state.refreshed_at_block,
                 terminated_at_block=current_block,
             )
@@ -1630,6 +1649,39 @@ def _final_scores_from_result(
         if opp_avg is not None:
             entry["champion_overlap_avg"] = opp_avg
         out[str(getattr(e, "env", ""))] = entry
+    return out
+
+
+def _opponent_scores_from_result(
+    result: Any, *, role: str,
+) -> Dict[str, Dict[str, float]]:
+    opponent_role = "challenger" if role == "champion" else "champion"
+    return _own_scores_only(
+        _final_scores_from_result(result, role=opponent_role)
+    )
+
+
+def _opponent_scores_from_early_lost(
+    per_env_data: Dict[str, Dict[str, float]],
+) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for env, data in per_env_data.items():
+        count = data.get("count")
+        avg = data.get("champion_overlap_avg")
+        if count is None or avg is None:
+            continue
+        out[env] = {"count": int(count), "avg": float(avg)}
+    return out
+
+
+def _own_scores_only(
+    scores_by_env: Dict[str, Dict[str, float]],
+) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    for env, data in scores_by_env.items():
+        if "count" not in data or "avg" not in data:
+            continue
+        out[env] = {"count": int(data["count"]), "avg": float(data["avg"])}
     return out
 
 
