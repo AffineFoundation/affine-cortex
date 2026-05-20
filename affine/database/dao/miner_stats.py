@@ -350,13 +350,18 @@ class MinerStatsDAO(BaseDAO):
         status: str,
         termination_reason: str = "",
         scores_by_env: Optional[Dict[str, Dict[str, float]]] = None,
+        opponent_scores_by_env: Optional[Dict[str, Dict[str, float]]] = None,
+        battle_task_ids: Optional[Dict[str, List[int]]] = None,
         scores_refresh_block: Optional[int] = None,
         terminated_at_block: Optional[int] = None,
     ) -> None:
         """Flip lifecycle state. When called at termination with score
         data, also freezes the comparator's decide-time view onto the
         row in the SAME atomic write: ``scores_by_env`` carries the
-        ``{env: {count, avg, champion_overlap_avg?}}`` view and
+        miner's ``{env: {count, avg, champion_overlap_avg?}}`` view,
+        ``opponent_scores_by_env`` carries the opponent's same-overlap
+        ``{env: {count, avg}}`` view, ``battle_task_ids`` carries the
+        common task ids used for that comparison, and
         ``terminated_at_block`` marks the row immutable (live writes
         from :class:`LiveScoresMonitor` skip rows where this attribute
         is set).
@@ -382,6 +387,12 @@ class MinerStatsDAO(BaseDAO):
         if scores_by_env is not None:
             values[":sc"] = self._serialize({"_v": scores_by_env})["_v"]
             update_parts.append("scores_by_env = :sc")
+        if opponent_scores_by_env is not None:
+            values[":opp"] = self._serialize({"_v": opponent_scores_by_env})["_v"]
+            update_parts.append("opponent_scores_by_env = :opp")
+        if battle_task_ids is not None:
+            values[":btids"] = self._serialize({"_v": battle_task_ids})["_v"]
+            update_parts.append("battle_task_ids = :btids")
         if scores_refresh_block is not None:
             values[":srb"] = {"N": str(int(scores_refresh_block))}
             update_parts.append("scores_refresh_block = :srb")

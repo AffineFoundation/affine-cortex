@@ -89,6 +89,8 @@ class MinerQueueStore(Protocol):
         revision: Optional[str] = None,
         model: str = "",
         scores_by_env: Optional[dict] = None,
+        opponent_scores_by_env: Optional[dict] = None,
+        battle_task_ids: Optional[dict] = None,
         scores_refresh_block: Optional[int] = None,
         terminated_at_block: Optional[int] = None,
     ) -> None:
@@ -214,6 +216,8 @@ class ChallengerQueue:
         revision: Optional[str] = None,
         model: str = "",
         scores_by_env: Optional[dict] = None,
+        opponent_scores_by_env: Optional[dict] = None,
+        battle_task_ids: Optional[dict] = None,
         scores_refresh_block: Optional[int] = None,
         terminated_at_block: Optional[int] = None,
     ) -> None:
@@ -235,6 +239,8 @@ class ChallengerQueue:
             revision=revision,
             model=model,
             scores_by_env=scores_by_env,
+            opponent_scores_by_env=opponent_scores_by_env,
+            battle_task_ids=battle_task_ids,
             scores_refresh_block=scores_refresh_block,
             terminated_at_block=terminated_at_block,
         )
