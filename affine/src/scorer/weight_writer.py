@@ -150,6 +150,35 @@ class WeightWriter:
         )
 
 
+    async def record_champion_held(
+        self,
+        *,
+        champion_uid: int,
+        champion_hotkey: str,
+        block_number: int,
+        scorer_hotkey: str,
+        outcome_reason: str,
+    ) -> None:
+        """Write one ``score_snapshots`` row marking ``champion_uid``
+        as winner without invoking the full comparator. Used by the
+        cold-start bootstrap path; per-miner ``scores`` rows are left
+        to the prior write."""
+        await self._snapshots.save_snapshot(
+            block_number=block_number,
+            scorer_hotkey=scorer_hotkey,
+            config={
+                "window_id": block_number,
+                "outcome": {"reason": outcome_reason},
+            },
+            statistics={
+                "total_miners": 1,
+                "winner_uid": champion_uid,
+                "winner_hotkey": champion_hotkey,
+                "final_weights": {str(champion_uid): "1.0"},
+            },
+        )
+
+
 def _average_of_env_scores(scores_by_env: Dict[str, Any]) -> float:
     """Best-effort average of per-env mean scores; ``0.0`` if no numbers found."""
     means: list[float] = []

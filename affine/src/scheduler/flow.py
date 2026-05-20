@@ -510,6 +510,16 @@ class FlowScheduler:
             revision=candidate.revision,
             model=candidate.model,
         )
+        # Bootstrap bypasses ``_write_weights``; record a snapshot row
+        # so the champion remains visible to ``compute_split_payees``
+        # once displaced.
+        await self.weight_writer.record_champion_held(
+            champion_uid=new_champ.uid,
+            champion_hotkey=new_champ.hotkey,
+            block_number=current_block,
+            scorer_hotkey=self.cfg.scorer_hotkey,
+            outcome_reason="bootstrap",
+        )
         logger.info(
             f"FlowScheduler: bootstrap champion = uid {candidate.uid}"
         )

@@ -291,6 +291,282 @@ async def _cmd_set_champion(hotkey: str, revision: str, since_block: Optional[in
         await close_client()
 
 
+async def _cmd_reset_task_state(force: bool, swe_offset: int) -> None:
+    """Drain in-flight battle + predeployed challengers, clear task pool.
+    Champion is preserved. Scheduler must be stopped before calling.
+
+    When ``swe_offset > 0``, after the clear, current_task_ids is
+    re-staged with SWE-INFINITE's resolved range upper bound shifted
+    back by ``swe_offset`` — useful when the SWE remote isn't producing
+    new task_ids and you want to rotate the cohort. The offset is
+    one-shot: the next champion change or 7200-block refresh overwrites
+    it with default behavior.
+    """
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+    from affine.src.scheduler import ssh as ssh_lifecycle
+    from affine.src.scheduler import targon as targon_lifecycle
+    from affine.src.scheduler.main import _resolve_provider_kind
+
+    await init_client()
+    try:
+        sc = SystemConfigDAO()
+        battle = await sc.get_param_value("current_battle")
+        predeployed = await sc.get_param_value("predeployed_challengers") or []
+
+        drain = []
+        claims = []
+        if battle:
+            deps = battle.get("deployments") or (
+                [{"deployment_id": battle.get("deployment_id")}]
+                if battle.get("deployment_id") else []
+            )
+            for d in deps:
+                drain.append(("battle", d.get("deployment_id")))
+            chal = battle.get("challenger") or {}
+            if chal.get("hotkey") and chal.get("revision"):
+                claims.append(("battle", chal["hotkey"], chal["revision"]))
+        for i, p in enumerate(predeployed):
+            deps = p.get("deployments") or (
+                [{"deployment_id": p.get("deployment_id")}]
+                if p.get("deployment_id") else []
+            )
+            for d in deps:
+                drain.append((f"predeploy[{i}]", d.get("deployment_id")))
+            chal = p.get("challenger") or {}
+            if chal.get("hotkey") and chal.get("revision"):
+                claims.append((f"predeploy[{i}]", chal["hotkey"], chal["revision"]))
+
+        preview = None
+        if swe_offset > 0:
+            preview = await _preview_swe_offset(sc, swe_offset)
+
+        click.echo("Plan:")
+        click.echo("  preserve: champion record + deployment")
+        click.echo("  clear:    current_task_ids, current_battle, predeployed_challengers")
+        click.echo(f"  teardown: {len(drain)} deployment(s)")
+        for tag, did in drain:
+            click.echo(f"    [{tag}] {did}")
+        click.echo(f"  release:  {len(claims)} in_progress claim(s) → sampling")
+        for tag, hk, rev in claims:
+            click.echo(f"    [{tag}] {hk[:10]}/{rev[:8]}")
+        if swe_offset > 0:
+            click.echo(
+                f"  stage:    current_task_ids with SWE-INFINITE offset={swe_offset}"
+            )
+            if preview is not None:
+                click.echo(f"    SWE current: {preview['current']}")
+                click.echo(f"    SWE future:  {preview['future']}")
+                if preview.get("warning"):
+                    click.echo(f"    ⚠ {preview['warning']}")
+        if not force:
+            click.confirm("Proceed? Scheduler MUST be stopped.", abort=True)
+
+        endpoints_dao = InferenceEndpointsDAO()
+        active = await endpoints_dao.list_active()
+        provider_kind, ssh_active, targon_active = _resolve_provider_kind(active)
+
+        if provider_kind == "ssh":
+            ssh_configs = {
+                ep.name: ssh_lifecycle.SSHConfig.from_endpoint(ep)
+                for ep in sorted(ssh_active, key=lambda ep: ep.name)
+            }
+
+            async def teardown_fn(deployment_id):
+                if not deployment_id:
+                    return
+                name, cfg = None, None
+                for n, c in ssh_configs.items():
+                    if deployment_id == c.deployment_id():
+                        name, cfg = n, c
+                        break
+                if cfg is None:
+                    for ep in await endpoints_dao.list_active(kind="ssh"):
+                        c = ssh_lifecycle.SSHConfig.from_endpoint(ep)
+                        if deployment_id == c.deployment_id():
+                            name, cfg = ep.name, c
+                            break
+                if cfg is None:
+                    return
+                try:
+                    await ssh_lifecycle.teardown(cfg, deployment_id)
+                finally:
+                    await endpoints_dao.clear_assignment(name)
+        else:
+            from affine.core.providers.targon_client import TargonClient
+            primary = sorted(targon_active, key=lambda ep: ep.name)[0]
+            targon_client = TargonClient(api_url=primary.targon_api_url)
+
+            async def teardown_fn(deployment_id):
+                await targon_lifecycle.teardown(targon_client, deployment_id)
+
+        for tag, did in drain:
+            if not did:
+                continue
+            try:
+                await teardown_fn(did)
+                click.echo(f"✓ teardown [{tag}] {did}")
+            except Exception as e:
+                click.echo(
+                    f"✗ teardown [{tag}] {did}: {type(e).__name__}: {e}",
+                    err=True,
+                )
+
+        await sc.delete_param("current_task_ids")
+        await sc.delete_param("current_battle")
+        await sc.delete_param("predeployed_challengers")
+
+        stats_dao = MinerStatsDAO()
+        for tag, hk, rev in claims:
+            try:
+                released = await stats_dao.release_claim_for_challenge(
+                    hotkey=hk, revision=rev,
+                )
+                click.echo(
+                    f"✓ release [{tag}] {hk[:10]}/{rev[:8]}"
+                    + ("" if released else " (already not in_progress)")
+                )
+            except Exception as e:
+                click.echo(
+                    f"✗ release [{tag}] {hk[:10]}/{rev[:8]}: "
+                    f"{type(e).__name__}: {e}",
+                    err=True,
+                )
+
+        if swe_offset > 0:
+            await _stage_task_ids_with_swe_offset(swe_offset)
+            click.echo("✓ State cleared and SWE-shifted pool staged. Restart scheduler.")
+        else:
+            click.echo("✓ State cleared. Restart scheduler to refresh task_ids.")
+    finally:
+        await close_client()
+
+
+def _shift_range_back(ranges, offset: int):
+    out = []
+    for r in ranges:
+        lo, hi = int(r[0]), int(r[1])
+        new_hi = hi - offset
+        if new_hi > lo:
+            out.append([lo, new_hi])
+    return out
+
+
+def _summarize_ids(ids, *, refresh_block=None):
+    if not ids:
+        return "(empty)"
+    s = f"[{min(ids)}..{max(ids)}] count={len(ids)}"
+    if refresh_block is not None:
+        s += f" refresh_block={refresh_block}"
+    return s
+
+
+async def _preview_swe_offset(sc, swe_offset: int) -> dict:
+    """Compute current vs future SWE-INFINITE task_id ranges for the Plan
+    preview. Read-only — no DB writes, no remote calls beyond the
+    dataset_range_source URL the scheduler itself would hit."""
+    import math
+    from affine.src.scheduler.flow import SAMPLE_BUFFER_RATIO
+    from affine.src.scorer.sampler import WindowSampler
+    from affine.src.scorer.dataset_range_resolver import resolve_dataset_range
+    from affine.src.scorer.window_state import StateStore, SystemConfigKVAdapter
+
+    cur_state = await sc.get_param_value("current_task_ids") or {}
+    cur_swe = (cur_state.get("task_ids") or {}).get("SWE-INFINITE") or []
+    cur_summary = _summarize_ids(
+        cur_swe, refresh_block=cur_state.get("refreshed_at_block"),
+    )
+
+    state = StateStore(SystemConfigKVAdapter(sc, updated_by="cli:preview"))
+    envs = await state.get_environments()
+    swe = envs.get("SWE-INFINITE")
+    if swe is None:
+        return {
+            "current": cur_summary,
+            "future": "(no env config)",
+            "warning": "SWE-INFINITE not enabled_for_sampling — offset has no effect",
+        }
+
+    resolved = list(swe.dataset_range)
+    if swe.dataset_range_source:
+        fresh = await resolve_dataset_range(swe.dataset_range_source)
+        if fresh is not None:
+            resolved = fresh
+    shifted = _shift_range_back(resolved, swe_offset)
+    if not shifted:
+        return {
+            "current": cur_summary,
+            "future": "(empty after shift)",
+            "warning": f"offset={swe_offset} collapses entire resolved range {resolved}",
+        }
+
+    pool_size = math.ceil(swe.sampling_count * (1 + SAMPLE_BUFFER_RATIO))
+    try:
+        fut_ids = WindowSampler._latest_one_env(
+            [(int(s), int(e)) for s, e in shifted], pool_size,
+        )
+    except ValueError as e:
+        return {
+            "current": cur_summary,
+            "future": f"(error: {e})",
+            "warning": "pool_size exceeds shifted range",
+        }
+    return {
+        "current": cur_summary,
+        "future": _summarize_ids(fut_ids),
+        "resolved": resolved,
+        "shifted": shifted,
+    }
+
+
+async def _stage_task_ids_with_swe_offset(swe_offset: int) -> None:
+    import math
+    from affine.src.scheduler.flow import SAMPLE_BUFFER_RATIO, WINDOW_BLOCKS
+    from affine.src.scorer.sampler import EnvSamplingConfig, WindowSampler
+    from affine.src.scorer.dataset_range_resolver import resolve_dataset_range
+    from affine.src.scorer.window_state import (
+        StateStore, SystemConfigKVAdapter, TaskIdState,
+    )
+    from affine.utils.subtensor import get_subtensor
+
+    sc = SystemConfigDAO()
+    state = StateStore(SystemConfigKVAdapter(sc, updated_by="cli:reset-task-state"))
+    envs = await state.get_environments()
+
+    env_configs = {}
+    for env_name, cfg in envs.items():
+        resolved_range = cfg.dataset_range
+        if cfg.dataset_range_source:
+            fresh = await resolve_dataset_range(cfg.dataset_range_source)
+            if fresh is not None:
+                resolved_range = fresh
+        if env_name == "SWE-INFINITE" and swe_offset > 0:
+            resolved_range = _shift_range_back(resolved_range, swe_offset)
+        env_configs[env_name] = EnvSamplingConfig(
+            env=env_name,
+            sampling_count=math.ceil(cfg.sampling_count * (1 + SAMPLE_BUFFER_RATIO)),
+            dataset_range=resolved_range,
+            mode=cfg.sampling_mode,
+        )
+
+    subtensor = await get_subtensor()
+    current_block = int(await subtensor.get_current_block())
+
+    sampler = WindowSampler()
+    task_ids = sampler.generate(
+        window_id=current_block // WINDOW_BLOCKS,
+        block_start=current_block,
+        env_configs=env_configs,
+    )
+    await state.set_task_state(
+        TaskIdState(task_ids=task_ids, refreshed_at_block=current_block)
+    )
+    click.echo(
+        f"✓ Staged current_task_ids at block {current_block} "
+        f"({sum(len(v) for v in task_ids.values())} task units across "
+        f"{len(task_ids)} env(s))"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Blacklist
 # --------------------------------------------------------------------------- #
@@ -542,6 +818,28 @@ def get_config():
 def set_champion(hotkey, revision, since_block):
     """Set the initial champion before the first scorer run."""
     asyncio.run(_cmd_set_champion(hotkey, revision, since_block))
+
+
+@db.command("reset-task-state")
+@click.option("--yes", "force", is_flag=True, help="Skip confirmation prompt.")
+@click.option(
+    "--swe-offset", type=int, default=0,
+    help="Shift SWE-INFINITE's resolved range upper bound back by N "
+         "and stage current_task_ids so the scheduler reuses it on "
+         "restart. Useful when SWE remote isn't publishing new task_ids. "
+         "One-shot: next champion change or 7200-block refresh overwrites.",
+)
+def reset_task_state(force, swe_offset):
+    """Drain in-flight battle + predeployed challengers and clear the task pool.
+
+    Champion is preserved. Their challengers' in_progress claims are
+    reverted to sampling so they're immediately re-pickable. Run with the
+    scheduler stopped; on restart it bootstraps a fresh task_ids pool via
+    the 7200-block refresh path and re-samples the champion against it.
+    """
+    if swe_offset < 0:
+        raise click.BadParameter("--swe-offset must be >= 0")
+    asyncio.run(_cmd_reset_task_state(force, swe_offset))
 
 
 @db.group()

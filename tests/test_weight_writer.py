@@ -109,6 +109,34 @@ async def test_zero_subjects_or_no_champion_raises():
 
 
 @pytest.mark.asyncio
+async def test_record_champion_held_writes_only_snapshot():
+    """``record_champion_held`` is used by paths that confirmed the
+    champion held without going through the full comparator (cold-start
+    bootstrap, early-loss short-circuit). It must write exactly one
+    ``score_snapshots`` row identifying the champion, and zero
+    ``scores`` rows — the per-miner scores are unchanged from the prior
+    write so we must not redundantly stomp them."""
+    scores, snaps = _FakeScores(), _FakeSnapshots()
+    w = WeightWriter(scores, snaps)
+    await w.record_champion_held(
+        champion_uid=42,
+        champion_hotkey="5Champ",
+        block_number=72000,
+        scorer_hotkey="5Scorer",
+        outcome_reason="bootstrap",
+    )
+    assert scores.rows == []
+    assert len(snaps.rows) == 1
+    row = snaps.rows[0]
+    assert row["block_number"] == 72000
+    assert row["scorer_hotkey"] == "5Scorer"
+    assert row["statistics"]["winner_uid"] == 42
+    assert row["statistics"]["winner_hotkey"] == "5Champ"
+    assert row["statistics"]["final_weights"] == {"42": "1.0"}
+    assert row["config"]["outcome"]["reason"] == "bootstrap"
+
+
+@pytest.mark.asyncio
 async def test_two_champions_raises():
     scores, snaps = _FakeScores(), _FakeSnapshots()
     w = WeightWriter(scores, snaps)
