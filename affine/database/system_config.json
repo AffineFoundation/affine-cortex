@@ -57,7 +57,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 200,
+        "sampling_count": 300,
         "dataset_range": [[0, 1000000000]],
         "sampling_mode": "random"
       }
