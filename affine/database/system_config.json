@@ -6,7 +6,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 200,
+        "sampling_count": 300,
         "priority": 1,
         "dataset_range": [[0, 5000]],
         "sampling_mode": "latest",
@@ -37,7 +37,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 200,
+        "sampling_count": 300,
         "dataset_range": [[0, 78060000]],
         "sampling_mode": "random"
       }
@@ -57,7 +57,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 200,
+        "sampling_count": 300,
         "dataset_range": [[0, 1000000000]],
         "sampling_mode": "random"
       }
@@ -78,7 +78,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 200,
+        "sampling_count": 300,
         "dataset_range": [[0, 132000000]],
         "sampling_mode": "random"
       }
