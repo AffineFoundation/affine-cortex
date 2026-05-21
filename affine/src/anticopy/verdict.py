@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from affine.core.setup import logger
 from affine.database.dao.anticopy import AntiCopyScoresIndexDAO
+from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.system_config import SystemConfigDAO
 import numpy as np
 
@@ -180,10 +181,12 @@ class VerdictBackfillService:
         *,
         scores_dao: Optional[AntiCopyScoresIndexDAO] = None,
         config_dao: Optional[SystemConfigDAO] = None,
+        miner_stats_dao: Optional[MinerStatsDAO] = None,
         r2: Optional[AntiCopyR2] = None,
     ):
         self.scores_dao = scores_dao or AntiCopyScoresIndexDAO()
         self.config_dao = config_dao or SystemConfigDAO()
+        self.miner_stats_dao = miner_stats_dao or MinerStatsDAO()
         self.r2 = r2 or AntiCopyR2()
         self._running = False
 
@@ -261,6 +264,13 @@ class VerdictBackfillService:
                 ref_first_block=first_block,
                 peer_cache=peer_cache,
             )
+            if decision.copy_of_hotkey:
+                try:
+                    stats = await self.miner_stats_dao.get_miner_stats(hk, rev)
+                except Exception:
+                    stats = None
+                if stats and stats.get("challenge_status") == MinerStatsDAO.STATUS_CHAMPION:
+                    decision = CopyDecision()
             try:
                 await self.scores_dao.update_verdict(
                     hk, rev,
