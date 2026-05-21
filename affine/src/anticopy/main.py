@@ -13,6 +13,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from urllib.parse import urlparse
 
@@ -193,10 +194,17 @@ def worker_main(verbose: int):
     try:
         tunnel = _maybe_start_ssh_tunnel()
     except Exception as e:
-        logger.error(f"[anticopy.worker] ssh tunnel failed: {e}")
-        # don't crash — worker may be co-located with sglang
-        # (no tunnel needed) and will still operate; otherwise the
-        # /model_info poll will surface the connection failure.
+        # Configured for remote SSH but the tunnel never came up
+        # (typically a transient targon outage at startup). Exit so
+        # the container's restart policy retries — keeping the
+        # worker alive without a tunnel produces a half-zombie that
+        # fails every job against a phantom localhost port and
+        # never reconnects on its own.
+        logger.error(
+            f"[anticopy.worker] ssh tunnel failed: {e} — exiting to "
+            f"trigger container restart"
+        )
+        sys.exit(1)
 
     def _factory():
         return ForwardWorker()
