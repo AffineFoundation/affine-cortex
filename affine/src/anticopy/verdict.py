@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from affine.core.setup import logger
 from affine.database.dao.anticopy import AntiCopyScoresIndexDAO
+from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.system_config import SystemConfigDAO
 import numpy as np
 
@@ -180,10 +181,12 @@ class VerdictBackfillService:
         *,
         scores_dao: Optional[AntiCopyScoresIndexDAO] = None,
         config_dao: Optional[SystemConfigDAO] = None,
+        miner_stats_dao: Optional[MinerStatsDAO] = None,
         r2: Optional[AntiCopyR2] = None,
     ):
         self.scores_dao = scores_dao or AntiCopyScoresIndexDAO()
         self.config_dao = config_dao or SystemConfigDAO()
+        self.miner_stats_dao = miner_stats_dao or MinerStatsDAO()
         self.r2 = r2 or AntiCopyR2()
         self._running = False
 
@@ -261,6 +264,39 @@ class VerdictBackfillService:
                 ref_first_block=first_block,
                 peer_cache=peer_cache,
             )
+            # Champion exemption: a candidate that is already the
+            # network's reigning champion never gets marked as a copy.
+            # Reasoning: champion status is independently certified by
+            # the scoring/scheduler pipeline; if anti-copy disagrees
+            # the conflict is almost always a first_block / peer-pool
+            # artefact (e.g. a copy uploaded its weights with an
+            # earlier on-chain commit than the champion's current rev),
+            # and silently DQ-ing the champion would yank live traffic
+            # off the model the rest of the system already trusts.
+            # We keep the diagnostic fields (decision_median +
+            # closest_peer_model) intact so operators can still see
+            # how close to the threshold the champion is.
+            if decision.copy_of_hotkey:
+                try:
+                    stats = await self.miner_stats_dao.get_miner_stats(hk, rev)
+                except Exception as e:
+                    logger.debug(
+                        f"[anticopy.verdict] miner_stats lookup failed "
+                        f"for {hk[:10]}: {e}"
+                    )
+                    stats = None
+                if (
+                    stats
+                    and stats.get("challenge_status")
+                    == MinerStatsDAO.STATUS_CHAMPION
+                ):
+                    logger.info(
+                        f"[anticopy.verdict] {hk[:10]} would DQ → "
+                        f"{decision.copy_of_hotkey[:10]} "
+                        f"dec_med={decision.decision_median:.4f} "
+                        f"BUT IS CHAMPION — exempting from copy verdict"
+                    )
+                    decision.copy_of_hotkey = ""
             try:
                 await self.scores_dao.update_verdict(
                     hk, rev,
