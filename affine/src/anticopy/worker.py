@@ -163,6 +163,22 @@ def _ssh_run(
     keeps stderr separate so we don't conflate sglang/HF banner output
     with the python helper's stdout, which we parse.
 
+    Two-layer kill protection so a hung remote command can't leave
+    orphan processes on the GPU host:
+
+    1. ``ssh -tt`` forces pty allocation. When the local ssh exits
+       (subprocess timeout, SIGINT, etc.) sshd sends SIGHUP to the
+       remote process group instead of leaving it backgrounded —
+       this is what bare ``ssh`` (no pty) misses, because the remote
+       only learns the client is gone via SIGPIPE on its next write,
+       and a stuck ``snapshot_download`` writes nothing.
+    2. Remote command is wrapped in ``timeout --kill-after=10 <T-30>
+       bash -c <cmd>`` so the GPU side self-terminates ~30 s before
+       the local subprocess timeout fires. Belt-and-braces with the
+       pty SIGHUP: if SIGHUP doesn't reach the python helper for any
+       reason (e.g. it ignored signals), the remote ``timeout`` will
+       SIGTERM + SIGKILL it from the inside.
+
     ``env`` (optional) is prefixed onto the remote command as
     ``KEY=VAL python …`` — needed because SSH doesn't forward env
     vars without server-side ``AcceptEnv`` (Targon's sshd doesn't
@@ -170,7 +186,7 @@ def _ssh_run(
     value is skipped so we don't poison the remote env with ``=``.
     """
     argv = [
-        "ssh", "-i", key_path,
+        "ssh", "-tt", "-i", key_path,
         "-o", "StrictHostKeyChecking=no",
         "-o", "ConnectTimeout=30",
         "-o", "ServerAliveInterval=30",
@@ -184,13 +200,28 @@ def _ssh_run(
         )
         if prefix:
             cmd = f"{prefix} {cmd}"
-    argv += [host, cmd]
+    # Remote-side timeout fires ~30s before the local subprocess
+    # timeout so the GPU host kills the python helper before we
+    # disconnect — defends against sshd not propagating SIGHUP.
+    # 10s SIGTERM grace before SIGKILL gives huggingface_hub a
+    # chance to release fcntl locks on ``.incomplete`` files.
+    remote_timeout = max(timeout - 30, 60)
+    wrapped = (
+        f"timeout --kill-after=10 {remote_timeout} "
+        f"bash -c {shlex.quote(cmd)}"
+    )
+    argv += [host, wrapped]
     proc = subprocess.run(
         argv,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         timeout=timeout, text=True,
     )
-    return proc.returncode, proc.stdout, proc.stderr
+    # ``-tt`` makes sshd write the remote stdout through a pty, which
+    # appends carriage returns to every line. Strip them so callers
+    # that parse line-by-line don't trip over the ``\r``.
+    stdout = proc.stdout.replace("\r\n", "\n").replace("\r", "\n")
+    stderr = proc.stderr.replace("\r\n", "\n").replace("\r", "\n")
+    return proc.returncode, stdout, stderr
 
 
 class ForwardWorker:
