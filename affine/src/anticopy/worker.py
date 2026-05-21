@@ -38,7 +38,7 @@ import shlex
 import shutil
 import subprocess
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
 from huggingface_hub import scan_cache_dir, snapshot_download
@@ -225,6 +225,16 @@ class ForwardWorker:
         # to_thread fan-out keeps logs sane and prevents stacking
         # multiple awaiting tasks on the same lock.
         self._prefetched: set = set()
+        # Per-candidate failure counter. Increments on every
+        # ``_run_job`` exception. Once ``MAX_JOB_ATTEMPTS`` is hit the
+        # ``(hotkey, revision)`` is moved to ``_skipped`` and the
+        # candidate-selection loop hides it for the lifetime of this
+        # process — prevents permanent failures (gated/broken HF repo,
+        # weights that always crash sglang) from monopolising the
+        # worker. State is in-memory only; a container restart
+        # re-tries everything once.
+        self._fail_counts: Dict[Tuple[str, str], int] = {}
+        self._skipped: Set[Tuple[str, str]] = set()
 
     # ---- main loop ---------------------------------------------------
 
@@ -309,6 +319,8 @@ class ForwardWorker:
             if not hk or not rev:
                 continue
             if (hk, rev) in exclude:
+                continue
+            if (hk, rev) in self._skipped:
                 continue
             try:
                 stats = await self.miner_stats_dao.get_miner_stats(hk, rev)
@@ -450,16 +462,27 @@ class ForwardWorker:
                 f"(verdict deferred to anticopy-refresh backfill)"
             )
         except Exception as e:
-            # No retry counter to bump — the loop will pick this same
-            # candidate up next iteration as long as the failure didn't
-            # write a ``scores_index`` row. A sleep here avoids
-            # hot-looping on a permanently-broken miner; downstream
-            # the operator can intervene by terminating the miner via
-            # the scheduler.
+            key = (hotkey, revision)
+            self._fail_counts[key] = self._fail_counts.get(key, 0) + 1
+            attempts = self._fail_counts[key]
             logger.error(
-                f"[anticopy.worker] {hotkey[:10]} job failed: {e}",
+                f"[anticopy.worker] {hotkey[:10]} job failed "
+                f"(attempt {attempts}/{MAX_JOB_ATTEMPTS}): {e}",
                 exc_info=True,
             )
+            if attempts >= MAX_JOB_ATTEMPTS:
+                # Permanently skip for the rest of this process'
+                # lifetime. A container restart wipes the in-memory
+                # set so transient infra issues (e.g. an hour-long
+                # Targon SSH outage) re-try once and resolve on their
+                # own. The skip is logged at WARNING level so it
+                # stands out in operator triage.
+                self._skipped.add(key)
+                logger.warning(
+                    f"[anticopy.worker] {hotkey[:10]} rev={revision[:8]} "
+                    f"failed {attempts}× — skipping for the rest of this "
+                    f"process. Restart the worker to retry it."
+                )
             await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
 
     # ---- prefetcher --------------------------------------------------
