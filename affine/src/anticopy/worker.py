@@ -268,6 +268,14 @@ class ForwardWorker:
         # re-tries everything once.
         self._fail_counts: Dict[Tuple[str, str], int] = {}
         self._skipped: Set[Tuple[str, str]] = set()
+        # Per-(model, revision) asyncio lock used to serialise
+        # snapshot_download calls. The prefetcher and the main fetcher
+        # both touch the same HF cache directory; without this guard
+        # they race for hf_hub's per-shard fcntl locks and deadlock
+        # each other (the SSH-detached helpers can't see each other's
+        # locks until the kernel hands them out, so both sides block
+        # indefinitely on .incomplete files).
+        self._download_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
 
     # ---- main loop ---------------------------------------------------
 
@@ -518,6 +526,19 @@ class ForwardWorker:
                 )
             await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
 
+    def _download_lock(
+        self, model: str, revision: str,
+    ) -> asyncio.Lock:
+        """Return the asyncio Lock that gates snapshot_download for
+        this (model, revision). Lazily created and shared between
+        the prefetcher and the main fetcher so the two can't race."""
+        key = (model, revision)
+        lock = self._download_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._download_locks[key] = lock
+        return lock
+
     # ---- prefetcher --------------------------------------------------
 
     def _maybe_start_prefetch(
@@ -573,21 +594,22 @@ class ForwardWorker:
                 f"[anticopy.worker] prefetch start {model}@{revision[:8]}"
             )
             try:
-                if REMOTE_SSH_HOST:
-                    await asyncio.to_thread(
-                        _remote_snapshot_download,
-                        REMOTE_SSH_HOST, REMOTE_SSH_KEY, REMOTE_PYTHON,
-                        model, revision, HF_CACHE_DIR,
-                    )
-                else:
-                    await asyncio.to_thread(
-                        snapshot_download,
-                        repo_id=model,
-                        revision=revision,
-                        cache_dir=HF_CACHE_DIR,
-                        local_files_only=False,
-                        token=os.getenv("HF_TOKEN"),
-                    )
+                async with self._download_lock(model, revision):
+                    if REMOTE_SSH_HOST:
+                        await asyncio.to_thread(
+                            _remote_snapshot_download,
+                            REMOTE_SSH_HOST, REMOTE_SSH_KEY, REMOTE_PYTHON,
+                            model, revision, HF_CACHE_DIR,
+                        )
+                    else:
+                        await asyncio.to_thread(
+                            snapshot_download,
+                            repo_id=model,
+                            revision=revision,
+                            cache_dir=HF_CACHE_DIR,
+                            local_files_only=False,
+                            token=os.getenv("HF_TOKEN"),
+                        )
                 logger.info(
                     f"[anticopy.worker] prefetch done {model}@{revision[:8]}"
                 )
@@ -617,32 +639,33 @@ class ForwardWorker:
         sglang ``/update_weights_from_disk`` POST then uses that path
         directly because sglang runs on the same host.
         """
-        for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
-            try:
-                if REMOTE_SSH_HOST:
-                    path = await asyncio.to_thread(
-                        _remote_snapshot_download,
-                        REMOTE_SSH_HOST, REMOTE_SSH_KEY, REMOTE_PYTHON,
-                        model, revision, HF_CACHE_DIR,
+        async with self._download_lock(model, revision):
+            for attempt in range(1, MAX_FETCH_ATTEMPTS + 1):
+                try:
+                    if REMOTE_SSH_HOST:
+                        path = await asyncio.to_thread(
+                            _remote_snapshot_download,
+                            REMOTE_SSH_HOST, REMOTE_SSH_KEY, REMOTE_PYTHON,
+                            model, revision, HF_CACHE_DIR,
+                        )
+                    else:
+                        path = await asyncio.to_thread(
+                            snapshot_download,
+                            repo_id=model,
+                            revision=revision,
+                            cache_dir=HF_CACHE_DIR,
+                            local_files_only=False,
+                            token=os.getenv("HF_TOKEN"),
+                        )
+                    return path
+                except Exception as e:
+                    logger.warning(
+                        f"[anticopy.worker] snapshot_download attempt {attempt}/"
+                        f"{MAX_FETCH_ATTEMPTS} for {model}@{revision[:8]}: {e}"
                     )
-                else:
-                    path = await asyncio.to_thread(
-                        snapshot_download,
-                        repo_id=model,
-                        revision=revision,
-                        cache_dir=HF_CACHE_DIR,
-                        local_files_only=False,
-                        token=os.getenv("HF_TOKEN"),
-                    )
-                return path
-            except Exception as e:
-                logger.warning(
-                    f"[anticopy.worker] snapshot_download attempt {attempt}/"
-                    f"{MAX_FETCH_ATTEMPTS} for {model}@{revision[:8]}: {e}"
-                )
-                if attempt == MAX_FETCH_ATTEMPTS:
-                    raise
-                await asyncio.sleep(5 * attempt)
+                    if attempt == MAX_FETCH_ATTEMPTS:
+                        raise
+                    await asyncio.sleep(5 * attempt)
         raise RuntimeError("unreachable")
 
     async def _update_weights(self, model_path: str) -> None:
