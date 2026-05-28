@@ -109,11 +109,7 @@ import math
 import time
 
 WINDOW_BLOCKS = 14400
-"""How often the per-env task_id pool is regenerated.
-14400 × 12s ≈ 48h. Doubled from 7200 (24h) so the single-instance
-inference host doesn't pay a full champion re-sample (≈4–5h on
-b300) every day — each refresh clears champion deployment and
-re-runs ≈330 task_ids per env from scratch."""
+"""How often the per-env task_id pool is regenerated."""
 
 DEFAULT_MARGIN = 0.03
 """Per-env additive margin the challenger must clear to be ``dominant``."""
