@@ -89,18 +89,19 @@ def test_bootstrap_script_handles_pipless_venv():
     assert "ensurepip" in s
 
 
-def test_bootstrap_script_includes_ninja():
-    # Regression: sglang's CUDA graph warmup JIT-builds kernels via
-    # tvm_ffi -> ninja; a cold-start node without ninja installs the
-    # engine fine, loads weights, then SIGQUITs partway through
-    # ``Capture cuda graph`` with ``FileNotFoundError: 'ninja'``.
-    # Probe + bootstrap must include it so a ninja-less host gets
-    # repaired before the worker tries to launch sglang.
+def test_bootstrap_script_apt_installs_ninja_build():
+    # Regression: sglang's CUDA graph warmup shells out to ``ninja``
+    # via PATH while JIT-building kernels (tvm_ffi). The pip ``ninja``
+    # wheel only exposes ninja under the venv's bin — NOT on $PATH at
+    # subprocess time — so a cold-start node SIGQUITs partway through
+    # ``Capture cuda graph`` with FileNotFoundError. apt's
+    # ``ninja-build`` package puts the binary in /usr/bin.
     s = _REMOTE_BOOTSTRAP_SCRIPT.format(
         hf_cache="'/root/hf-cache'",
         remote_python="'/root/.venv/bin/python'",
     )
-    assert "ninja" in s
+    assert "ninja-build" in s
+    assert "command -v ninja" in s
 
 
 def test_bootstrap_script_installs_venv_package():

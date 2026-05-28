@@ -1187,6 +1187,18 @@ _REMOTE_BOOTSTRAP_SCRIPT = """\
 set -e
 mkdir -p {hf_cache}
 VENV_DIR="$(dirname "$(dirname {remote_python})")"
+# Ensure system-level deps sglang's JIT toolchain calls out to via
+# subprocess (PATH lookups, not pip imports). ``ninja`` from the
+# ``ninja`` python wheel installs under the venv's bin, which is NOT
+# on $PATH when sglang shells out — apt's ``ninja-build`` puts it
+# under /usr/bin where the JIT can find it.
+if ! command -v ninja >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -q >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q \\
+            ninja-build >/dev/null 2>&1 || true
+    fi
+fi
 # Reset the venv if either the interpreter is missing OR pip is broken
 # inside it (we've seen ``python3 -m venv`` succeed but leave an
 # ensurepip-less venv on targon Ubuntu 24.04 — pip-less venv passed the
@@ -1219,13 +1231,9 @@ if [ "$need_create" = "1" ]; then
     {remote_python} -m ensurepip --upgrade >/dev/null 2>&1 || true
     {remote_python} -m pip install --quiet --upgrade pip
 fi
-if ! {remote_python} -c 'import sglang, huggingface_hub, hf_transfer, ninja' >/dev/null 2>&1; then
-    # ``ninja`` is a JIT-build dependency that sglang invokes via
-    # tvm_ffi while capturing CUDA graphs; without it the engine
-    # SIGQUITs partway through warmup (FileNotFoundError: 'ninja').
-    # ship it alongside sglang so cold-start hosts are complete.
+if ! {remote_python} -c 'import sglang, huggingface_hub, hf_transfer' >/dev/null 2>&1; then
     {remote_python} -m pip install --quiet --no-cache-dir \\
-        huggingface_hub hf_transfer ninja 'sglang[all]==0.5.10.post1'
+        huggingface_hub hf_transfer 'sglang[all]==0.5.10.post1'
 fi
 echo BOOTSTRAP_OK
 """
@@ -1244,9 +1252,10 @@ def _remote_env_ready(
     cmd = (
         f"test -x {shlex.quote(remote_python)} && "
         f"test -d {shlex.quote(hf_cache)} && "
+        f"command -v ninja >/dev/null 2>&1 && "
         f"{shlex.quote(remote_python)} -m pip --version >/dev/null 2>&1 && "
         f"{shlex.quote(remote_python)} -c "
-        f"'import sglang, huggingface_hub, hf_transfer, ninja' 2>/dev/null"
+        f"'import sglang, huggingface_hub, hf_transfer' 2>/dev/null"
     )
     rc, _out, _err = _ssh_run(host, key_path, cmd, timeout=20)
     return rc == 0
