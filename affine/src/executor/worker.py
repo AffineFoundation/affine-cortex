@@ -404,16 +404,27 @@ class ExecutorWorker:
                 )
                 candidates.append((key, champ_snap, tid, url, dep_id))
 
+        # Shadow-run envs (enabled_for_scoring=false) don't feed DECIDE,
+        # so they don't need challenger samples to overlap champion's.
+        # Without this carve-out a shadow env injected mid-battle would
+        # never dispatch — the current champion has already let go of
+        # its endpoint (single-instance provider), so champ_done stays
+        # empty and the overlap-gated loop below skips every task.
+        is_shadow = not env_cfg.enabled_for_scoring
+
         if battle is not None and battle_urls:
             chal_done = await self._samples.read_scores_for_tasks(
                 battle.challenger.hotkey, battle.challenger.revision,
                 self.env, task_ids, refresh_block=refresh_block,
             )
-            overlap_count = len(champ_done.keys() & chal_done.keys())
-            if overlap_count < sampling_count:
+            chal_progress = (
+                len(chal_done) if is_shadow
+                else len(champ_done.keys() & chal_done.keys())
+            )
+            if chal_progress < sampling_count:
                 for idx, tid in enumerate(task_ids):
                     tid_int = int(tid)
-                    if tid_int not in champ_done:
+                    if not is_shadow and tid_int not in champ_done:
                         continue              # champion hasn't sampled yet
                     if tid_int in chal_done:
                         continue              # challenger already done
@@ -440,11 +451,15 @@ class ExecutorWorker:
                 record.challenger.hotkey, record.challenger.revision,
                 self.env, task_ids, refresh_block=refresh_block,
             )
-            if len(champ_done.keys() & pre_done.keys()) >= sampling_count:
-                continue                  # enough overlap; let scheduler decide
+            pre_progress = (
+                len(pre_done) if is_shadow
+                else len(champ_done.keys() & pre_done.keys())
+            )
+            if pre_progress >= sampling_count:
+                continue                  # enough samples; let scheduler decide
             for idx, tid in enumerate(task_ids):
                 tid_int = int(tid)
-                if tid_int not in champ_done:
+                if not is_shadow and tid_int not in champ_done:
                     continue              # champion hasn't sampled yet
                 if tid_int in pre_done:
                     continue              # this pre-challenger already done

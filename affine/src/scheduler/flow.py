@@ -557,6 +557,8 @@ class FlowScheduler:
         base ``sampling_count``. See
         ``affine/src/scorer/sampling_thresholds.py``."""
         for env, env_cfg in envs.items():
+            if not env_cfg.enabled_for_scoring:
+                continue  # shadow-run env: samples accumulate, DECIDE ignores
             tasks = task_state.task_ids.get(env, [])
             if not tasks:
                 continue
@@ -583,6 +585,8 @@ class FlowScheduler:
         guarantee: contests only run on samples both sides produced for
         the SAME tasks in the SAME refresh — no cross-window leakage."""
         for env, env_cfg in envs.items():
+            if not env_cfg.enabled_for_scoring:
+                continue  # shadow-run env: not part of DECIDE, no overlap req
             tasks = task_state.task_ids.get(env, [])
             if not tasks:
                 continue
