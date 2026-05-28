@@ -32,6 +32,21 @@
         }
       }
     },
+    "DISTILL-V2": {
+      "display_name": "DISTILL-V2",
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": false,
+      "sampling": {
+        "sampling_count": 30,
+        "dataset_range": [[0, 100]],
+        "sampling_mode": "latest",
+        "dataset_range_source": {
+          "url": "https://pub-f6e8aaa82d31450daad5b16e3ca040b1.r2.dev/metadata.json",
+          "field": "tasks.completed_up_to",
+          "range_type": "zero_to_value"
+        }
+      }
+    },
     "LIVEWEB": {
       "display_name": "LIVEWEB",
       "enabled_for_sampling": true,

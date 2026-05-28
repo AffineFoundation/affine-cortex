@@ -346,12 +346,33 @@ _ENV_CONFIGS_CANONICAL = {
     "distill": EnvConfig(
         name="distill",
         docker_image="affinefoundation/distill:latest",
+        env_type="distill",
         env_vars={"UVICORN_WORKERS": "4"},
         mem_limit="2g",
         eval_params={
             "temperature": 0.0,
             "timeout": 600,
         },
+    ),
+
+    # Distill-V2 environment — per-cell GRPO/REINFORCE-style CE scoring
+    # against teacher rollouts published by ``af servers generator-publisher``
+    # (off-policy rollout generator) into a public R2 bucket. The
+    # dataset base URL is baked into the image (public bucket, anonymous
+    # HTTP), so no host-side env var or evaluate kwarg is required.
+    # ``hf_repo`` defaults to the miner's ``model`` so the tokenizer is
+    # loaded from the same HF repo the student is served from.
+    "distill-v2": EnvConfig(
+        name="distill-v2",
+        docker_image="affinefoundation/distill-v2:latest",
+        env_type="distill",
+        env_vars={"UVICORN_WORKERS": "4"},
+        mem_limit="5g",
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 1200,
+        },
+        proxy_timeout=1260,
     ),
 
     # MemoryGym environment (LLM memory management evaluation)
@@ -493,6 +514,12 @@ _ENV_ALIASES = {
     # Distill aliases
     "DISTILL": "distill",
     "Distill": "distill",
+
+    # Distill-V2 aliases
+    "DISTILL-V2": "distill-v2",
+    "Distill-V2": "distill-v2",
+    "distill_v2": "distill-v2",
+    "DISTILL_V2": "distill-v2",
 }
 
 # Build final ENV_CONFIGS with aliases
@@ -777,10 +804,23 @@ class SDKEnvironment:
                     f"miner {getattr(miner, 'hotkey', '?')[:12]}... has no base_url; "
                     "inference now requires an explicit provider-supplied URL"
                 )
+            served_model = inference_model or miner.model
             payload.update({
-                "model": inference_model or miner.model,
+                "model": served_model,
                 "base_url": base_url,
             })
+            # Distill-family envs run tokenizer-aware scoring against
+            # rollouts published under (student, revision) keys, so they
+            # need the miner identity + HF repo to load the right
+            # tokenizer. Other env types ignore these kwargs (their
+            # ``evaluate`` signatures don't list them and **_unused
+            # swallows extras), so passing unconditionally is safe but
+            # we still gate to keep the wire payload small.
+            if self.config.env_type == "distill":
+                payload.setdefault("student_name", miner.hotkey)
+                payload.setdefault("revision", miner.revision)
+                payload.setdefault("hf_repo", miner.model)
+                payload.setdefault("arch", "qwen")
 
         result = await self._env.evaluate(_timeout=self.config.proxy_timeout, **payload)
         
