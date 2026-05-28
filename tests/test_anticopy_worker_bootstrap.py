@@ -89,6 +89,20 @@ def test_bootstrap_script_handles_pipless_venv():
     assert "ensurepip" in s
 
 
+def test_bootstrap_script_includes_ninja():
+    # Regression: sglang's CUDA graph warmup JIT-builds kernels via
+    # tvm_ffi -> ninja; a cold-start node without ninja installs the
+    # engine fine, loads weights, then SIGQUITs partway through
+    # ``Capture cuda graph`` with ``FileNotFoundError: 'ninja'``.
+    # Probe + bootstrap must include it so a ninja-less host gets
+    # repaired before the worker tries to launch sglang.
+    s = _REMOTE_BOOTSTRAP_SCRIPT.format(
+        hf_cache="'/root/hf-cache'",
+        remote_python="'/root/.venv/bin/python'",
+    )
+    assert "ninja" in s
+
+
 def test_bootstrap_script_installs_venv_package():
     # Regression: targon's Ubuntu 24.04 image ships python3 but not
     # python3-venv, so ``python3 -m venv`` fails outright. Bootstrap

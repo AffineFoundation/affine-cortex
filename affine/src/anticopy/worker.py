@@ -1219,9 +1219,13 @@ if [ "$need_create" = "1" ]; then
     {remote_python} -m ensurepip --upgrade >/dev/null 2>&1 || true
     {remote_python} -m pip install --quiet --upgrade pip
 fi
-if ! {remote_python} -c 'import sglang, huggingface_hub, hf_transfer' >/dev/null 2>&1; then
+if ! {remote_python} -c 'import sglang, huggingface_hub, hf_transfer, ninja' >/dev/null 2>&1; then
+    # ``ninja`` is a JIT-build dependency that sglang invokes via
+    # tvm_ffi while capturing CUDA graphs; without it the engine
+    # SIGQUITs partway through warmup (FileNotFoundError: 'ninja').
+    # ship it alongside sglang so cold-start hosts are complete.
     {remote_python} -m pip install --quiet --no-cache-dir \\
-        huggingface_hub hf_transfer 'sglang[all]==0.5.10.post1'
+        huggingface_hub hf_transfer ninja 'sglang[all]==0.5.10.post1'
 fi
 echo BOOTSTRAP_OK
 """
@@ -1242,7 +1246,7 @@ def _remote_env_ready(
         f"test -d {shlex.quote(hf_cache)} && "
         f"{shlex.quote(remote_python)} -m pip --version >/dev/null 2>&1 && "
         f"{shlex.quote(remote_python)} -c "
-        f"'import sglang, huggingface_hub, hf_transfer' 2>/dev/null"
+        f"'import sglang, huggingface_hub, hf_transfer, ninja' 2>/dev/null"
     )
     rc, _out, _err = _ssh_run(host, key_path, cmd, timeout=20)
     return rc == 0
