@@ -70,7 +70,33 @@ def test_bootstrap_script_is_idempotent_shape():
         hf_cache="'/root/hf-cache'",
         remote_python="'/root/.venv/bin/python'",
     )
-    assert "if [ ! -x" in s
     assert "import sglang, huggingface_hub, hf_transfer" in s
     assert "BOOTSTRAP_OK" in s
     assert "set -e" in s
+
+
+def test_bootstrap_script_handles_pipless_venv():
+    # Regression: a previous version of the script only probed
+    # ``-x python`` and walked away when the targon node had a venv
+    # whose ensurepip step had failed silently. The script must also
+    # probe ``pip --version`` and reset the venv if it's broken.
+    s = _REMOTE_BOOTSTRAP_SCRIPT.format(
+        hf_cache="'/root/hf-cache'",
+        remote_python="'/root/.venv/bin/python'",
+    )
+    assert "pip --version" in s
+    assert "--clear" in s  # python3 -m venv --clear forces re-init
+    assert "ensurepip" in s
+
+
+def test_bootstrap_script_installs_venv_package():
+    # Regression: targon's Ubuntu 24.04 image ships python3 but not
+    # python3-venv, so ``python3 -m venv`` fails outright. Bootstrap
+    # must apt-install it (best-effort) before attempting the venv.
+    s = _REMOTE_BOOTSTRAP_SCRIPT.format(
+        hf_cache="'/root/hf-cache'",
+        remote_python="'/root/.venv/bin/python'",
+    )
+    assert "apt-get install" in s
+    assert "python3-venv" in s
+    assert "DEBIAN_FRONTEND=noninteractive" in s

@@ -1178,9 +1178,37 @@ _REMOTE_BOOTSTRAP_SCRIPT = """\
 set -e
 mkdir -p {hf_cache}
 VENV_DIR="$(dirname "$(dirname {remote_python})")"
+# Reset the venv if either the interpreter is missing OR pip is broken
+# inside it (we've seen ``python3 -m venv`` succeed but leave an
+# ensurepip-less venv on targon Ubuntu 24.04 — pip-less venv passed the
+# old ``-x python`` probe and made the bootstrap a silent no-op).
+need_create=0
 if [ ! -x {remote_python} ]; then
-    python3 -m venv "$VENV_DIR"
-    "$VENV_DIR/bin/pip" install --quiet --upgrade pip
+    need_create=1
+elif ! {remote_python} -m pip --version >/dev/null 2>&1; then
+    need_create=1
+fi
+if [ "$need_create" = "1" ]; then
+    # Debian/Ubuntu ship a minimal python3 by default; ``python3 -m
+    # venv`` needs the ``python3-venv`` apt package which targon's
+    # 24.04 image is missing. Try common version-suffixed names and
+    # the generic one — best-effort, swallow failures so non-apt
+    # distros still hit the actual venv attempt below.
+    if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -q >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+                python3-venv >/dev/null 2>&1 \
+              || DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+                python3.12-venv >/dev/null 2>&1 \
+              || DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+                python3.11-venv >/dev/null 2>&1 \
+              || true
+        fi
+    fi
+    python3 -m venv --clear "$VENV_DIR"
+    {remote_python} -m ensurepip --upgrade >/dev/null 2>&1 || true
+    {remote_python} -m pip install --quiet --upgrade pip
 fi
 if ! {remote_python} -c 'import sglang, huggingface_hub, hf_transfer' >/dev/null 2>&1; then
     {remote_python} -m pip install --quiet --no-cache-dir \\
@@ -1196,9 +1224,14 @@ def _remote_env_ready(
     """Quick health probe: does the GPU host still have the venv +
     required packages? Returns False if the container has been
     re-scheduled (wiping /root) since the last bootstrap."""
+    # ``pip --version`` is part of the probe because we've seen targon
+    # nodes where ``python3 -m venv`` succeeded but ensurepip silently
+    # failed, leaving a python binary that imports nothing. Without
+    # this check the startup bootstrap was a silent no-op on those.
     cmd = (
         f"test -x {shlex.quote(remote_python)} && "
         f"test -d {shlex.quote(hf_cache)} && "
+        f"{shlex.quote(remote_python)} -m pip --version >/dev/null 2>&1 && "
         f"{shlex.quote(remote_python)} -c "
         f"'import sglang, huggingface_hub, hf_transfer' 2>/dev/null"
     )
