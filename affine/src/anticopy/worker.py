@@ -268,6 +268,12 @@ class ForwardWorker:
         # re-tries everything once.
         self._fail_counts: Dict[Tuple[str, str], int] = {}
         self._skipped: Set[Tuple[str, str]] = set()
+        # Mid-flight bootstrap rate limiter. Set when the GPU host
+        # looks like it's been re-scheduled (rc=127 + ssh-closed
+        # pattern) so we don't pay the multi-minute pip install on
+        # every transient SSH hiccup.
+        self._consec_remote_env_failures = 0
+        self._last_remote_bootstrap_at = 0.0
         # Per-(model, revision) asyncio lock used to serialise
         # snapshot_download calls. The prefetcher and the main fetcher
         # both touch the same HF cache directory; without this guard
@@ -300,6 +306,40 @@ class ForwardWorker:
         """
         self._running = True
         logger.info(f"[anticopy.worker] starting; sglang={self.sglang_url}")
+
+        # Targon-style GPU containers are ephemeral: when the platform
+        # re-schedules the pod its /root + venv disappear but the SSH
+        # hostname stays the same, so the tunnel comes up fine and
+        # every snapshot_download then exits rc=127 ("Connection ...
+        # closed" because the wrapper python doesn't exist). Probe once
+        # at startup and reinstall the venv if we landed on a fresh
+        # container. The no-op happy path is a single ssh round-trip.
+        if REMOTE_SSH_HOST:
+            try:
+                ready = await asyncio.to_thread(
+                    _remote_env_ready,
+                    REMOTE_SSH_HOST, REMOTE_SSH_KEY,
+                    REMOTE_PYTHON, HF_CACHE_DIR,
+                )
+                if not ready:
+                    logger.warning(
+                        "[anticopy.worker] remote env probe failed — "
+                        "GPU host venv missing; bootstrapping"
+                    )
+                    await asyncio.to_thread(
+                        _bootstrap_remote_env,
+                        REMOTE_SSH_HOST, REMOTE_SSH_KEY,
+                        REMOTE_PYTHON, HF_CACHE_DIR,
+                    )
+                    self._last_remote_bootstrap_at = time.time()
+            except Exception as e:
+                # Don't abort — main loop will surface concrete errors
+                # per-job and mid-flight bootstrap can still catch up.
+                logger.error(
+                    f"[anticopy.worker] startup bootstrap failed: {e}",
+                    exc_info=True,
+                )
+
         while self._running:
             try:
                 cand = await self._get_next_candidate()
@@ -502,6 +542,11 @@ class ForwardWorker:
                 f"rollouts={len(per_rollout)} "
                 f"(verdict deferred to anticopy-refresh backfill)"
             )
+            # Job ran end-to-end — GPU host is healthy. Reset the
+            # mid-flight rescue counter so a fresh streak of errors
+            # later is what triggers another bootstrap, not a stale
+            # tally from hours ago.
+            self._consec_remote_env_failures = 0
         except Exception as e:
             key = (hotkey, revision)
             self._fail_counts[key] = self._fail_counts.get(key, 0) + 1
@@ -511,6 +556,39 @@ class ForwardWorker:
                 f"(attempt {attempts}/{MAX_JOB_ATTEMPTS}): {e}",
                 exc_info=True,
             )
+            # Mid-flight rescue: if the GPU container got re-scheduled
+            # under us (rc=127 + connection-closed signature), kick a
+            # bootstrap so we don't burn the rest of the day looping on
+            # a dead venv. Rate-limited to one attempt per 10 minutes —
+            # one pip install round-trip is enough; if it didn't take,
+            # something deeper is wrong and a tight retry won't help.
+            if REMOTE_SSH_HOST and _is_remote_env_missing_error(e):
+                self._consec_remote_env_failures += 1
+                if (
+                    self._consec_remote_env_failures >= 2
+                    and time.time() - self._last_remote_bootstrap_at > 600
+                ):
+                    logger.warning(
+                        "[anticopy.worker] remote env missing pattern "
+                        f"({self._consec_remote_env_failures}× rc=127); "
+                        "attempting mid-flight bootstrap"
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            _bootstrap_remote_env,
+                            REMOTE_SSH_HOST, REMOTE_SSH_KEY,
+                            REMOTE_PYTHON, HF_CACHE_DIR,
+                        )
+                        self._last_remote_bootstrap_at = time.time()
+                        self._consec_remote_env_failures = 0
+                    except Exception as be:
+                        logger.error(
+                            f"[anticopy.worker] mid-flight bootstrap "
+                            f"failed: {be}",
+                            exc_info=True,
+                        )
+            else:
+                self._consec_remote_env_failures = 0
             if attempts >= MAX_JOB_ATTEMPTS:
                 # Permanently skip for the rest of this process'
                 # lifetime. A container restart wipes the in-memory
@@ -1086,6 +1164,120 @@ class ForwardWorker:
             return int(row.get("first_block", 0) or 0)
         except (TypeError, ValueError):
             return 0
+
+
+# ---------------------------------------------------------------- bootstrap
+
+# Bootstrap script run on the GPU host when ``_remote_env_ready``
+# reports the venv / deps are missing. Idempotent: if the venv is
+# already present and importable it short-circuits in milliseconds.
+# Heredoc-ed over SSH so the worker container ships its own deploy
+# recipe — no manual targon redeploy needed when the GPU container
+# gets re-scheduled (which wipes /root + /workspace state).
+_REMOTE_BOOTSTRAP_SCRIPT = """\
+set -e
+mkdir -p {hf_cache}
+VENV_DIR="$(dirname "$(dirname {remote_python})")"
+# Reset the venv if either the interpreter is missing OR pip is broken
+# inside it (we've seen ``python3 -m venv`` succeed but leave an
+# ensurepip-less venv on targon Ubuntu 24.04 — pip-less venv passed the
+# old ``-x python`` probe and made the bootstrap a silent no-op).
+need_create=0
+if [ ! -x {remote_python} ]; then
+    need_create=1
+elif ! {remote_python} -m pip --version >/dev/null 2>&1; then
+    need_create=1
+fi
+if [ "$need_create" = "1" ]; then
+    # Debian/Ubuntu ship a minimal python3 by default; ``python3 -m
+    # venv`` needs the ``python3-venv`` apt package which targon's
+    # 24.04 image is missing. Try common version-suffixed names and
+    # the generic one — best-effort, swallow failures so non-apt
+    # distros still hit the actual venv attempt below.
+    if ! python3 -c 'import ensurepip' >/dev/null 2>&1; then
+        if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -q >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+                python3-venv >/dev/null 2>&1 \
+              || DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+                python3.12-venv >/dev/null 2>&1 \
+              || DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+                python3.11-venv >/dev/null 2>&1 \
+              || true
+        fi
+    fi
+    python3 -m venv --clear "$VENV_DIR"
+    {remote_python} -m ensurepip --upgrade >/dev/null 2>&1 || true
+    {remote_python} -m pip install --quiet --upgrade pip
+fi
+if ! {remote_python} -c 'import sglang, huggingface_hub, hf_transfer' >/dev/null 2>&1; then
+    {remote_python} -m pip install --quiet --no-cache-dir \\
+        huggingface_hub hf_transfer 'sglang[all]==0.5.10.post1'
+fi
+echo BOOTSTRAP_OK
+"""
+
+
+def _remote_env_ready(
+    host: str, key_path: str, remote_python: str, hf_cache: str,
+) -> bool:
+    """Quick health probe: does the GPU host still have the venv +
+    required packages? Returns False if the container has been
+    re-scheduled (wiping /root) since the last bootstrap."""
+    # ``pip --version`` is part of the probe because we've seen targon
+    # nodes where ``python3 -m venv`` succeeded but ensurepip silently
+    # failed, leaving a python binary that imports nothing. Without
+    # this check the startup bootstrap was a silent no-op on those.
+    cmd = (
+        f"test -x {shlex.quote(remote_python)} && "
+        f"test -d {shlex.quote(hf_cache)} && "
+        f"{shlex.quote(remote_python)} -m pip --version >/dev/null 2>&1 && "
+        f"{shlex.quote(remote_python)} -c "
+        f"'import sglang, huggingface_hub, hf_transfer' 2>/dev/null"
+    )
+    rc, _out, _err = _ssh_run(host, key_path, cmd, timeout=20)
+    return rc == 0
+
+
+def _bootstrap_remote_env(
+    host: str, key_path: str, remote_python: str, hf_cache: str,
+) -> None:
+    """Recreate venv + (re)install sglang & hf deps on the GPU host.
+
+    Raises ``RuntimeError`` if the bootstrap script does not finish
+    with the ``BOOTSTRAP_OK`` sentinel. Worst-case duration is the
+    sglang wheel install (~3-5 min); the no-op happy path is <1s.
+    """
+    script = _REMOTE_BOOTSTRAP_SCRIPT.format(
+        hf_cache=shlex.quote(hf_cache),
+        remote_python=shlex.quote(remote_python),
+    )
+    logger.info(
+        f"[anticopy.worker] bootstrapping remote env on {host} "
+        f"(can take several minutes if sglang must be installed)"
+    )
+    rc, out, err = _ssh_run(host, key_path, script, timeout=900)
+    if rc != 0 or "BOOTSTRAP_OK" not in out:
+        raise RuntimeError(
+            f"remote bootstrap failed rc={rc} "
+            f"stderr={(err or '')[-400:].strip()}"
+        )
+    logger.info("[anticopy.worker] remote env ready")
+
+
+def _is_remote_env_missing_error(exc: BaseException) -> bool:
+    """Signature for "GPU host lost its venv" — e.g. targon container
+    rescheduled mid-flight. Distinguishes from transient network errors
+    so we only trigger an expensive bootstrap when warranted."""
+    msg = str(exc)
+    return (
+        "rc=127" in msg
+        and ("Connection to" in msg or "command not found" in msg
+             or "No such file or directory" in msg)
+    )
+
+
+# ----------------------------------------------------------------
 
 
 def _remote_snapshot_download(
