@@ -1,7 +1,7 @@
 """
 Model Size Checker
 
-Validates that miners use the required model architecture (Qwen3-32B).
+Validates that miners use one of the allowed model architectures.
 Checks config.json architecture fields from HuggingFace.
 
 Key properties:
@@ -23,37 +23,86 @@ logger = logging.getLogger("affine")
 
 
 # ---------------------------------------------------------------------------
-# Required model architecture
+# Allowed model architectures
 # ---------------------------------------------------------------------------
-# Only models matching this exact architecture are allowed.
+# A miner's config.json must match exactly one entry in this list.
 # Fine-tunes of the same base model share these fields (weights differ,
 # architecture stays the same), so this correctly permits fine-tuned variants.
+#
+# Keys may be dotted paths to reach nested fields (e.g. ``text_config.hidden_size``
+# for multimodal configs where the language-model fields live under text_config).
 
-REQUIRED_MODEL_CONFIG = {
-    "model_type": "qwen3",
-    "hidden_size": 5120,
-    "num_hidden_layers": 64,
-    "intermediate_size": 25600,
-    "vocab_size": 151936,
-    "num_attention_heads": 64,
-    "num_key_value_heads": 8,
-}
+ALLOWED_MODEL_CONFIGS = [
+    # Qwen3-32B (dense, text-only)
+    {
+        "model_type": "qwen3",
+        "hidden_size": 5120,
+        "num_hidden_layers": 64,
+        "intermediate_size": 25600,
+        "vocab_size": 151936,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 8,
+    },
+    # Qwen3.6-35B-A3B (MoE, multimodal — language fields nested under text_config)
+    {
+        "model_type": "qwen3_5_moe",
+        "text_config.hidden_size": 2048,
+        "text_config.num_hidden_layers": 40,
+        "text_config.num_attention_heads": 16,
+        "text_config.num_key_value_heads": 2,
+        "text_config.vocab_size": 248320,
+        "text_config.num_experts": 256,
+        "text_config.num_experts_per_tok": 8,
+        "text_config.moe_intermediate_size": 512,
+    },
+]
 
 
-def _check_required_model(config: dict) -> Optional[str]:
-    """Check if config matches the required model architecture.
+def _lookup(config: dict, path: str) -> Any:
+    """Resolve a dotted ``a.b.c`` path inside ``config``; missing nodes → None."""
+    cur: Any = config
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
 
-    Returns None if config matches, or a mismatch description string.
-    """
-    for field, expected in REQUIRED_MODEL_CONFIG.items():
-        actual = config.get(field)
-        if actual != expected:
-            return f"{field}={actual} (expected {expected})"
+
+def _check_against(config: dict, expected: dict) -> Optional[str]:
+    """Return None if config matches ``expected``, else a mismatch description."""
+    for field, want in expected.items():
+        actual = _lookup(config, field)
+        if actual != want:
+            return f"{field}={actual} (expected {want})"
     return None
 
 
+def _check_allowed_models(config: dict) -> Optional[str]:
+    """Try each allowed config; pass if any matches, else describe the failure.
+
+    Picks the mismatch from the entry that agreed on ``model_type`` (best signal
+    that the miner *intended* that architecture); falls back to listing the
+    permitted model_types when no entry's model_type matches.
+    """
+    actual_type = config.get("model_type")
+    type_match_mismatch: Optional[str] = None
+    for expected in ALLOWED_MODEL_CONFIGS:
+        mismatch = _check_against(config, expected)
+        if mismatch is None:
+            return None
+        if expected.get("model_type") == actual_type and type_match_mismatch is None:
+            type_match_mismatch = mismatch
+
+    if type_match_mismatch is not None:
+        return type_match_mismatch
+    allowed_types = ", ".join(
+        sorted({str(e.get("model_type")) for e in ALLOWED_MODEL_CONFIGS})
+    )
+    return f"model_type={actual_type} (expected one of: {allowed_types})"
+
+
 class ModelSizeChecker:
-    """Check model architecture against the required model (Qwen3-32B)."""
+    """Check model architecture against the allowed model whitelist."""
 
     def __init__(self, hf_token: Optional[str] = None):
         self.hf_token = hf_token or os.getenv("HF_TOKEN")
@@ -83,7 +132,7 @@ class ModelSizeChecker:
             return None
 
     async def check(self, model_id: str, revision: str) -> Dict[str, Any]:
-        """Check if model matches the required architecture (Qwen3-32B).
+        """Check if model matches any allowed architecture.
 
         Returns:
             Dict with keys:
@@ -94,7 +143,7 @@ class ModelSizeChecker:
         if config is None:
             return {"pass": False, "reason": "config_fetch_failed"}
 
-        mismatch = _check_required_model(config)
+        mismatch = _check_allowed_models(config)
         if mismatch is not None:
             model_type = config.get("model_type", "<missing>")
             logger.info(
@@ -107,7 +156,7 @@ class ModelSizeChecker:
 
 
 async def check_model_size(model_id: str, revision: str) -> Dict[str, Any]:
-    """Check if a model matches the required architecture.
+    """Check if a model matches one of the allowed architectures.
 
     This is the main entry point for model validation.
 
