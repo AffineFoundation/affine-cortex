@@ -918,9 +918,18 @@ class ForwardWorker:
             f"[anticopy.worker] launching remote sglang gpu={SGLANG_BASE_GPU_ID} "
             f"port={REMOTE_SGLANG_PORT} model={os.path.basename(model_path)}"
         )
+        # ``detach=True`` is mandatory here: this is a fire-and-forget
+        # launch that backgrounds an sglang server on the GPU host.
+        # Without it _ssh_run wraps the command in ``ssh -tt`` + remote
+        # ``timeout``, both of which kill the grandchild on the way
+        # out (pty SIGHUP racing setsid; the wrapper exits as soon as
+        # the outer ``&`` returns) — observed on cold-start: sglang
+        # never even wrote /tmp/sglang_<port>.log because it was
+        # SIGHUP'd before exec'ing.
         rc, _out, err = await asyncio.to_thread(
             lambda: _ssh_run(
                 REMOTE_SSH_HOST, REMOTE_SSH_KEY, cmd, timeout=60,
+                detach=True,
             )
         )
         if rc != 0:
@@ -1178,6 +1187,18 @@ _REMOTE_BOOTSTRAP_SCRIPT = """\
 set -e
 mkdir -p {hf_cache}
 VENV_DIR="$(dirname "$(dirname {remote_python})")"
+# Ensure system-level deps sglang's JIT toolchain calls out to via
+# subprocess (PATH lookups, not pip imports). ``ninja`` from the
+# ``ninja`` python wheel installs under the venv's bin, which is NOT
+# on $PATH when sglang shells out — apt's ``ninja-build`` puts it
+# under /usr/bin where the JIT can find it.
+if ! command -v ninja >/dev/null 2>&1; then
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -q >/dev/null 2>&1 || true
+        DEBIAN_FRONTEND=noninteractive apt-get install -y -q \\
+            ninja-build >/dev/null 2>&1 || true
+    fi
+fi
 # Reset the venv if either the interpreter is missing OR pip is broken
 # inside it (we've seen ``python3 -m venv`` succeed but leave an
 # ensurepip-less venv on targon Ubuntu 24.04 — pip-less venv passed the
@@ -1231,6 +1252,7 @@ def _remote_env_ready(
     cmd = (
         f"test -x {shlex.quote(remote_python)} && "
         f"test -d {shlex.quote(hf_cache)} && "
+        f"command -v ninja >/dev/null 2>&1 && "
         f"{shlex.quote(remote_python)} -m pip --version >/dev/null 2>&1 && "
         f"{shlex.quote(remote_python)} -c "
         f"'import sglang, huggingface_hub, hf_transfer' 2>/dev/null"
