@@ -108,7 +108,7 @@ class DeploymentStateInvalidatedError(RuntimeError):
 import math
 import time
 
-WINDOW_BLOCKS = 7200
+WINDOW_BLOCKS = 14400
 """How often the per-env task_id pool is regenerated."""
 
 DEFAULT_MARGIN = 0.03
