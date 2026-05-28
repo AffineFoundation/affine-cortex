@@ -69,11 +69,16 @@ def _lookup(config: dict, path: str) -> Any:
 
 
 def _check_against(config: dict, expected: dict) -> Optional[str]:
-    """Return None if config matches ``expected``, else a mismatch description."""
+    """Return None if config matches ``expected``, else a mismatch description.
+
+    Uses ``repr()`` for both values so a type mismatch (e.g. ``"5120"`` vs
+    ``5120``) is visible in the rejection reason instead of printing as
+    identical-looking strings.
+    """
     for field, want in expected.items():
         actual = _lookup(config, field)
         if actual != want:
-            return f"{field}={actual} (expected {want})"
+            return f"{field}={actual!r} (expected {want!r})"
     return None
 
 
