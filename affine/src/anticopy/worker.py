@@ -918,9 +918,18 @@ class ForwardWorker:
             f"[anticopy.worker] launching remote sglang gpu={SGLANG_BASE_GPU_ID} "
             f"port={REMOTE_SGLANG_PORT} model={os.path.basename(model_path)}"
         )
+        # ``detach=True`` is mandatory here: this is a fire-and-forget
+        # launch that backgrounds an sglang server on the GPU host.
+        # Without it _ssh_run wraps the command in ``ssh -tt`` + remote
+        # ``timeout``, both of which kill the grandchild on the way
+        # out (pty SIGHUP racing setsid; the wrapper exits as soon as
+        # the outer ``&`` returns) — observed on cold-start: sglang
+        # never even wrote /tmp/sglang_<port>.log because it was
+        # SIGHUP'd before exec'ing.
         rc, _out, err = await asyncio.to_thread(
             lambda: _ssh_run(
                 REMOTE_SSH_HOST, REMOTE_SSH_KEY, cmd, timeout=60,
+                detach=True,
             )
         )
         if rc != 0:
