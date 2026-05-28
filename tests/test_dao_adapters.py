@@ -186,6 +186,69 @@ async def test_update_challenge_status_omits_score_fields_when_not_provided(monk
     assert ":tb" not in values
 
 
+@pytest.mark.asyncio
+async def test_update_challenge_status_writes_terminated_at_only_on_terminated(monkeypatch):
+    """``terminated_at`` is the dashboard's wall-clock anchor for the
+    history view (``last_updated_at`` is unsafe — monitor reuses it for
+    every metagraph refresh). The clause must be appended on the
+    terminated flip and ONLY then, so champion/in_progress transitions
+    don't bleed a timestamp into a still-active row. Uses
+    ``if_not_exists`` so re-termination writes (recovery path, retry)
+    don't clobber the first one."""
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+    dao = MinerStatsDAO()
+
+    # Terminated → clause present, value source is :now (already in values).
+    await dao.update_challenge_status(
+        hotkey="hk",
+        revision="rev",
+        status=MinerStatsDAO.STATUS_TERMINATED,
+        termination_reason="lost_to_champion:foo",
+    )
+    expr = client.update_calls[0]["UpdateExpression"]
+    assert "terminated_at = if_not_exists(terminated_at, :now)" in expr
+
+    # Non-terminated flips must NOT carry the clause.
+    for status in (
+        MinerStatsDAO.STATUS_IN_PROGRESS,
+        MinerStatsDAO.STATUS_CHAMPION,
+        MinerStatsDAO.STATUS_SAMPLING,
+    ):
+        client.update_calls.clear()
+        await dao.update_challenge_status(
+            hotkey="hk",
+            revision="rev",
+            status=status,
+        )
+        expr = client.update_calls[0]["UpdateExpression"]
+        assert "terminated_at" not in expr, f"leaked for status={status}"
+
+
+@pytest.mark.asyncio
+async def test_terminate_if_sampling_writes_terminated_at(monkeypatch):
+    """The monitor's deterministic-invalid path goes through
+    ``terminate_if_sampling`` rather than ``update_challenge_status``;
+    it must produce the same frozen wall-clock attribute so the
+    dashboard history view doesn't have a hole for these rows."""
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+    dao = MinerStatsDAO()
+    await dao.terminate_if_sampling(
+        hotkey="hk",
+        revision="rev",
+        reason="hf_repo_deleted",
+    )
+    expr = client.update_calls[0]["UpdateExpression"]
+    assert "terminated_at = if_not_exists(terminated_at, :now)" in expr
+
+
 class _StubMinerStatsForMap(MinerStatsDAO):
     def __init__(self, rows):
         super().__init__()

@@ -399,6 +399,14 @@ class MinerStatsDAO(BaseDAO):
         if terminated_at_block is not None:
             values[":tb"] = {"N": str(int(terminated_at_block))}
             update_parts.append("terminated_at_block = :tb")
+        if status == self.STATUS_TERMINATED:
+            # Wall-clock unix-second snapshot frozen on the first flip to
+            # terminated. ``if_not_exists`` makes any later termination write
+            # (recovery path, duplicate dethrone) idempotent so downstream
+            # consumers see a stable timestamp.
+            update_parts.append(
+                "terminated_at = if_not_exists(terminated_at, :now)"
+            )
         await get_client().update_item(
             TableName=self.table_name,
             Key={
@@ -438,6 +446,7 @@ class MinerStatsDAO(BaseDAO):
                     "SET challenge_status = :terminated, "
                     "termination_reason = :reason, "
                     "last_updated_at = :now, "
+                    "terminated_at = if_not_exists(terminated_at, :now), "
                     "hotkey = if_not_exists(hotkey, :hotkey), "
                     "revision = if_not_exists(revision, :revision), "
                     "first_seen_at = if_not_exists(first_seen_at, :now)"
