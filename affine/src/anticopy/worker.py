@@ -860,6 +860,60 @@ class ForwardWorker:
             f"never saw model_path={expected}"
         )
 
+    async def _read_remote_model_config(
+        self, model_path: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch ``config.json`` from a model snapshot dir on the GPU
+        host. Returns ``None`` when the file is missing or unreadable —
+        callers must treat that as "no info" rather than failure.
+        """
+        cfg_path = f"{model_path.rstrip('/')}/config.json"
+        if REMOTE_SSH_HOST:
+            try:
+                rc, out, _err = await asyncio.to_thread(
+                    _ssh_run, REMOTE_SSH_HOST, REMOTE_SSH_KEY,
+                    f"cat {shlex.quote(cfg_path)}", timeout=15,
+                )
+                if rc != 0:
+                    return None
+                return _json.loads(out)
+            except Exception as e:
+                logger.debug(f"[anticopy.worker] read remote config: {e}")
+                return None
+        try:
+            with open(cfg_path) as f:
+                return _json.load(f)
+        except Exception:
+            return None
+
+    async def _kill_remote_sglang(self) -> None:
+        """SSH-pkill the running sglang launcher so the next
+        ``_ensure_sglang_running`` cold-starts fresh. Used when a
+        candidate's architecture differs from what sglang is currently
+        serving (``update_weights_from_disk`` can't span model classes).
+
+        A short sleep lets CUDA tear down the device allocation before
+        the next launch races for the same memory.
+        """
+        if not REMOTE_SSH_HOST:
+            return
+        cmd = (
+            f"pkill -9 -f 'sglang.launch_server.*--port "
+            f"{REMOTE_SGLANG_PORT}' || true; sleep 5"
+        )
+        try:
+            rc, _out, _err = await asyncio.to_thread(
+                _ssh_run, REMOTE_SSH_HOST, REMOTE_SSH_KEY, cmd, timeout=30,
+            )
+            logger.info(
+                f"[anticopy.worker] killed remote sglang for architecture "
+                f"switch (rc={rc})"
+            )
+        except Exception as e:
+            logger.warning(
+                f"[anticopy.worker] kill remote sglang failed: {e}"
+            )
+
     async def _ensure_sglang_running(self, model_path: str) -> None:
         """Make sure an sglang server is up on the remote host. If
         ``/model_info`` already answers, return immediately (the running
@@ -868,19 +922,52 @@ class ForwardWorker:
         with the supplied model as the initial weights so subsequent
         ``update_weights`` calls work against a live engine.
 
+        Cross-architecture handling: ``update_weights_from_disk`` only
+        rebinds weight buffers, so it cannot swap between model classes
+        (qwen3 dense -> qwen3_5_moe MoE, vocab_size change, layer count
+        change, etc.). When the running engine and the candidate
+        disagree on ``model_type`` we kill sglang and fall through to a
+        clean launch with the new architecture's weights.
+
         Only effective in ``REMOTE_SSH_HOST`` mode; local-sglang
         deployments are expected to be brought up by the operator
         (compose / systemd).
         """
-        # Probe first. We accept any 200 — even if it says a different
-        # model is loaded, ``update_weights`` will swap correctly.
+        # Probe first. If sglang answers, decide whether we can swap
+        # weights in place or whether the architecture diverges and we
+        # need a cold restart.
         try:
             async with aiohttp.ClientSession() as s:
                 async with s.get(
                     f"{self.sglang_url}/model_info", timeout=10,
                 ) as r:
                     if r.status == 200:
-                        return
+                        info = await r.json()
+                        current_path = (
+                            info.get("model_path") or ""
+                        ).rstrip("/")
+                        # Compare model_type of currently-served weights
+                        # with the candidate. If we can't read either
+                        # config the helper returns True (optimistic);
+                        # the existing update_weights path will surface
+                        # any real mismatch.
+                        new_cfg = await self._read_remote_model_config(
+                            model_path
+                        )
+                        current_cfg = (
+                            await self._read_remote_model_config(current_path)
+                            if current_path else None
+                        )
+                        if _arch_compatible(current_cfg, new_cfg):
+                            return
+                        logger.info(
+                            f"[anticopy.worker] architecture switch "
+                            f"current={(current_cfg or {}).get('model_type')} "
+                            f"-> new={(new_cfg or {}).get('model_type')}; "
+                            f"killing sglang for cold restart"
+                        )
+                        await self._kill_remote_sglang()
+                        # Fall through to launch below.
         except Exception:
             pass
 
@@ -1297,6 +1384,34 @@ def _is_remote_env_missing_error(exc: BaseException) -> bool:
         and ("Connection to" in msg or "command not found" in msg
              or "No such file or directory" in msg)
     )
+
+
+def _arch_compatible(
+    current_cfg: Optional[Dict[str, Any]],
+    new_cfg: Optional[Dict[str, Any]],
+) -> bool:
+    """Return True iff sglang's ``update_weights_from_disk`` can swap
+    the running engine to ``new_cfg``'s weights without a full restart.
+
+    ``update_weights_from_disk`` rebinds weight buffers in place, so it
+    only works inside an architecture family — a ``model_type`` change
+    (e.g. ``qwen3`` -> ``qwen3_5_moe``) means a different model class,
+    different vocab size, different layer count and a different
+    parameter layout altogether. Caller must kill and re-launch sglang
+    when this returns False.
+
+    Be optimistic when config metadata is missing: a probe failure
+    shouldn't trigger a spurious 5-minute cold-start. The existing
+    ``update_weights`` POST surfaces a concrete error if a real
+    mismatch slips through.
+    """
+    if not current_cfg or not new_cfg:
+        return True
+    ct = current_cfg.get("model_type")
+    nt = new_cfg.get("model_type")
+    if not ct or not nt:
+        return True
+    return ct == nt
 
 
 # ----------------------------------------------------------------
