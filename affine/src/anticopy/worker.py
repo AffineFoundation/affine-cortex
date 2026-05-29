@@ -41,7 +41,7 @@ import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiohttp
-from huggingface_hub import scan_cache_dir, snapshot_download
+from huggingface_hub import hf_hub_download, scan_cache_dir, snapshot_download
 
 from affine.core.setup import logger
 from affine.database.dao.anticopy import (
@@ -129,6 +129,22 @@ SGLANG_EXTRA_ARGS = os.getenv(
     "ANTICOPY_SGLANG_EXTRA_ARGS",
     "--mem-fraction-static 0.85 --context-length 32768 --dtype bfloat16",
 ).strip()
+
+# Architectures we will actually drive through sglang. Any candidate
+# whose ``config.json:model_type`` is not in this set gets a sentinel
+# empty score row at job claim time and is dropped — we don't download
+# weights, don't swap sglang, don't burn anti-copy GPU time.
+#
+# Currently single-value: only Qwen3-dense (``qwen3``) is supported by
+# the rollout pool (champion-keyed by tokenizer_sig, which differs per
+# architecture). Adding ``qwen3_5_moe`` here is necessary but not
+# sufficient — refresh service has to grow multi-tokenizer pools and
+# sglang would need cross-arch kill+restart (see closed PR #520) first.
+ALLOWED_MODEL_TYPES = {
+    t.strip() for t in os.getenv(
+        "ANTICOPY_ALLOWED_MODEL_TYPES", "qwen3"
+    ).split(",") if t.strip()
+}
 
 # When we hit a network blip mid-fetch, retry rather than fail the job
 # outright.
@@ -456,6 +472,24 @@ class ForwardWorker:
                 await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
                 return
 
+            # 0) Architecture allow-list — gate this BEFORE any heavy
+            # work (weight download, sglang swap, teacher-force).
+            # Pulls only ``config.json`` so an unsupported arch costs us
+            # one HF API call instead of 60+ GB of disk + a 5-min sglang
+            # restart that ``update_weights_from_disk`` can't service
+            # anyway. The sentinel score row pins this (hotkey, revision)
+            # as "done" so the next ``_get_next_candidate`` skips it.
+            if ALLOWED_MODEL_TYPES:
+                model_type = await asyncio.to_thread(
+                    _fetch_hf_model_type, model, revision,
+                )
+                if model_type and model_type not in ALLOWED_MODEL_TYPES:
+                    await self._mark_skipped_unsupported_arch(
+                        hotkey=hotkey, revision=revision, model=model,
+                        uid=uid, model_type=model_type,
+                    )
+                    return
+
             # 1) Compute the candidate's tokenizer signature once so we
             # can stamp it on the score row for later filtering.
             cand_sig, _ = await compute_tokenizer_signature(model, revision)
@@ -603,6 +637,74 @@ class ForwardWorker:
                     f"process. Restart the worker to retry it."
                 )
             await asyncio.sleep(EMPTY_QUEUE_SLEEP_SEC)
+
+    async def _mark_skipped_unsupported_arch(
+        self, *,
+        hotkey: str, revision: str, model: str, uid: int,
+        model_type: str,
+    ) -> None:
+        """Persist a sentinel score row so unsupported-architecture
+        candidates are not re-selected by ``_get_next_candidate`` on
+        every iteration.
+
+        The blob carries ``per_rollout=[]`` plus a ``skipped_reason``
+        marker for operator triage. The verdict service treats an empty
+        per-rollout list as "no evidence" → ``decision_median=-1.0`` →
+        clean; matching how it already handles miners whose rollout
+        pool was empty for other reasons.
+        """
+        logger.info(
+            f"[anticopy.worker] {hotkey[:10]} model_type={model_type!r} "
+            f"not in allow-list {sorted(ALLOWED_MODEL_TYPES)}; writing "
+            f"sentinel score row and skipping (no weights download, no "
+            f"sglang swap)"
+        )
+        try:
+            cand_sig, _src = await compute_tokenizer_signature(
+                model, revision,
+            )
+        except Exception as e:
+            logger.debug(
+                f"[anticopy.worker] {hotkey[:10]} tokenizer_sig "
+                f"compute failed during skip: {e}"
+            )
+            cand_sig = ""
+        score_payload = {
+            "schema": "ceac.score/v3",
+            "hotkey": hotkey,
+            "revision": revision,
+            "model": model,
+            "tokenizer_sig": cand_sig or "",
+            "computed_at": int(time.time()),
+            "per_rollout": [],
+            "skipped_reason": f"unsupported_model_type:{model_type}",
+        }
+        try:
+            r2_key = await asyncio.to_thread(
+                self.r2.put_score,
+                hotkey=hotkey, revision=revision, payload=score_payload,
+            )
+            first_block = await self._lookup_first_block(uid, hotkey, revision)
+            await self.scores_dao.upsert(
+                hotkey=hotkey,
+                revision=revision,
+                tokenizer_sig=cand_sig or "",
+                r2_key=r2_key,
+                rollout_keys=[],
+                first_block=first_block,
+            )
+            logger.info(
+                f"[anticopy.worker] {hotkey[:10]} skipped "
+                f"(unsupported_model_type:{model_type})"
+            )
+        except Exception as e:
+            # Persistence failed — fall back to in-memory skip so the
+            # worker doesn't loop on this candidate in the meantime.
+            self._skipped.add((hotkey, revision))
+            logger.warning(
+                f"[anticopy.worker] {hotkey[:10]} unsupported-arch "
+                f"sentinel write failed: {e}; in-memory skipped instead"
+            )
 
     def _download_lock(
         self, model: str, revision: str,
@@ -1285,6 +1387,31 @@ def _bootstrap_remote_env(
             f"stderr={(err or '')[-400:].strip()}"
         )
     logger.info("[anticopy.worker] remote env ready")
+
+
+def _fetch_hf_model_type(model: str, revision: str) -> Optional[str]:
+    """Pull just ``config.json`` (a few KB) for a HF model revision and
+    return its ``model_type`` field. ForwardWorker uses this as the
+    cheap gate for ``ALLOWED_MODEL_TYPES`` so unsupported architectures
+    short-circuit *before* the 60+ GB weight download.
+
+    Returns ``None`` on any error so callers can fall back to "let it
+    through" rather than silently swallow real candidates due to an HF
+    blip.
+    """
+    try:
+        path = hf_hub_download(
+            repo_id=model,
+            filename="config.json",
+            revision=revision,
+            token=os.getenv("HF_TOKEN"),
+        )
+        with open(path) as f:
+            cfg = _json.load(f)
+        mt = cfg.get("model_type")
+        return str(mt) if mt else None
+    except Exception:
+        return None
 
 
 def _is_remote_env_missing_error(exc: BaseException) -> bool:
