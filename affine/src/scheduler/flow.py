@@ -102,6 +102,30 @@ class DeploymentStateInvalidatedError(RuntimeError):
         )
 
 
+def _format_cause_chain(exc: BaseException, *, max_depth: int = 8) -> str:
+    """Render ``exc``'s ``__cause__`` chain as a `` -> Type: msg`` suffix so
+    the real underlying error (docker stderr, sglang argv reject, HF auth,
+    ...) lands in the log instead of just the wrapper. Bounded by
+    ``max_depth`` and a seen-set: a pathological deep wrap can't blow up the
+    log line and a cyclic chain (``a.__cause__ is b`` and back) can't loop
+    forever — both truncate to `` -> ...``."""
+    parts: List[str] = []
+    seen: set = set()
+    inner = exc.__cause__
+    depth = 0
+    while inner is not None and depth < max_depth:
+        if id(inner) in seen:
+            inner = None
+            break
+        seen.add(id(inner))
+        parts.append(f" -> {type(inner).__name__}: {inner}")
+        inner = inner.__cause__
+        depth += 1
+    if inner is not None:
+        parts.append(" -> ...")
+    return "".join(parts)
+
+
 # ---- constants (no longer in system_config) --------------------------------
 
 
@@ -1077,10 +1101,15 @@ class FlowScheduler:
                     "transport" if isinstance(e, TransientDeployError)
                     else "deploy"
                 )
+                # Append e.__cause__ chain so the actual underlying error
+                # (docker stderr, sglang argv reject, HF auth, ...) lands
+                # in the log instead of just the DeploymentStateInvalidatedError
+                # wrapper. Otherwise root-causing a consistently-failing
+                # candidate requires repro outside the scheduler.
                 logger.error(
                     f"FlowScheduler: pre-deploy {kind} error for "
                     f"uid={cand.uid}; leaving miner in queue: "
-                    f"{type(e).__name__}: {e}"
+                    f"{type(e).__name__}: {e}{_format_cause_chain(e)}"
                 )
                 continue
             deployments = _deployments_from_result(result)
@@ -1139,7 +1168,7 @@ class FlowScheduler:
             logger.error(
                 f"FlowScheduler: challenger {kind} error "
                 f"uid={candidate.uid}; releasing claim so miner stays "
-                f"re-pickable: {type(e).__name__}: {e}"
+                f"re-pickable: {type(e).__name__}: {e}{_format_cause_chain(e)}"
             )
             released = await self.queue.release_claim(
                 candidate.uid,

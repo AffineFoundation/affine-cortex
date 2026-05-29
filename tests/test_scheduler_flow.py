@@ -2828,3 +2828,49 @@ async def test_reaper_respects_grace_window():
     await scheduler.tick(current_block=50)
 
     assert miner_store.rows[99]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+def test_format_cause_chain_linear():
+    """Walks the full __cause__ chain, outermost-cause-first suffix."""
+    from affine.src.scheduler.flow import _format_cause_chain
+    root = ValueError("docker stderr")
+    mid = RuntimeError("mid")
+    top = Exception("wrapper")
+    mid.__cause__ = root
+    top.__cause__ = mid
+    assert _format_cause_chain(top) == (
+        " -> RuntimeError: mid -> ValueError: docker stderr"
+    )
+
+
+def test_format_cause_chain_none():
+    """No __cause__ → empty suffix (the bare wrapper is logged on its own)."""
+    from affine.src.scheduler.flow import _format_cause_chain
+    assert _format_cause_chain(Exception("x")) == ""
+
+
+def test_format_cause_chain_cycle_terminates():
+    """A cyclic __cause__ (a <-> b) must not loop forever; the seen-set
+    breaks it and the line stays bounded."""
+    from affine.src.scheduler.flow import _format_cause_chain
+    a = Exception("A")
+    b = Exception("B")
+    a.__cause__ = b
+    b.__cause__ = a
+    out = _format_cause_chain(a)
+    assert out == " -> Exception: B -> Exception: A"
+
+
+def test_format_cause_chain_depth_capped():
+    """A chain deeper than max_depth truncates to ' -> ...' so a deep wrap
+    can't produce an unbounded log line."""
+    from affine.src.scheduler.flow import _format_cause_chain
+    top = Exception("top")
+    cur = top
+    for i in range(20):
+        nxt = Exception(f"e{i}")
+        cur.__cause__ = nxt
+        cur = nxt
+    out = _format_cause_chain(top, max_depth=8)
+    assert out.count(" -> ") == 9          # 8 causes + the truncation marker
+    assert out.endswith(" -> ...")
