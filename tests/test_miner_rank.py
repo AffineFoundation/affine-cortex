@@ -128,7 +128,7 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     assert "70.00[78.40,83.00]/77" in out
     assert out.count("⚡| org/") == 2
     assert "  | org/q" in out
-    assert "Sampling: ⚡ marks miners in the current live sampling set" in out
+    assert "Sampling: ⚡ marks miners with a live inference deployment" in out
     assert "Queue: #1 UID 3" not in out
 
 

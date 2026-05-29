@@ -106,11 +106,88 @@ async def test_current_state_with_battle_in_flight(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(monkeypatch):
-    """When the per-miner display map has live entries, those drive
-    ``sample_counts`` / ``sample_averages``; the helper flags any
-    battle subject whose live count hasn't reached the env's sampling
-    target."""
+async def test_live_sampling_uids_deployment_based(monkeypatch):
+    """⚡ reflects deployment state, not sampling quota. A role lights up
+    whenever it has a live deployment; order is stable: champion → battle
+    challenger → predeployed."""
+    from affine.api.rank_state import _live_sampling_uids
+    from affine.src.scorer.window_state import (
+        BattleRecord, ChampionRecord, MinerSnapshot,
+    )
+
+    champion = ChampionRecord(
+        uid=1, hotkey="A", revision="r1", model="org/a",
+        deployment_id="ep-1", base_url="http://x/v1", since_block=0,
+    )
+    battle = BattleRecord(
+        challenger=MinerSnapshot(uid=2, hotkey="B", revision="r2", model="org/b"),
+        deployment_id="ep-2", base_url="http://y/v1", started_at_block=10,
+    )
+    pre1 = BattleRecord(
+        challenger=MinerSnapshot(uid=3, hotkey="C", revision="r3", model="org/c"),
+        deployment_id="ep-3", base_url="http://z/v1", started_at_block=20,
+    )
+    # No deployment yet (cold-start champion scenario).
+    cold = ChampionRecord(
+        uid=9, hotkey="Z", revision="rZ", model="org/z",
+        deployment_id=None, base_url=None, since_block=0,
+    )
+
+    assert _live_sampling_uids(champion, battle, [pre1]) == [1, 2, 3]
+    assert _live_sampling_uids(champion, None, []) == [1]
+    assert _live_sampling_uids(None, battle, [pre1]) == [2, 3]
+    assert _live_sampling_uids(cold, None, []) == []   # no deployment → no ⚡
+    assert _live_sampling_uids(None, None, []) == []
+
+
+@pytest.mark.asyncio
+async def test_live_sampling_uids_deployments_list_without_primary_id(monkeypatch):
+    """Has a deployment → lit. Even when the primary deployment_id field is
+    empty, a non-empty deployments list (multi-deployment / primary field
+    not backfilled) still counts as deployed → ⚡."""
+    from affine.api.rank_state import _live_sampling_uids
+    from affine.src.scorer.window_state import (
+        BattleRecord, ChampionRecord, DeploymentRecord, MinerSnapshot,
+    )
+
+    dep = DeploymentRecord(
+        endpoint_name="ep", deployment_id="wrk-1", base_url="http://x/v1",
+    )
+    # Primary deployment_id is None but the deployments list is populated.
+    champ = ChampionRecord(
+        uid=1, hotkey="A", revision="r1", model="org/a",
+        deployment_id=None, base_url=None, deployments=[dep], since_block=0,
+    )
+    bat = BattleRecord(
+        challenger=MinerSnapshot(uid=2, hotkey="B", revision="r2", model="org/b"),
+        deployment_id="", base_url="", started_at_block=5, deployments=[dep],
+    )
+    assert _live_sampling_uids(champ, bat, []) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_live_sampling_uids_deduplication(monkeypatch):
+    """When the same uid appears under more than one role (crash-recovery
+    edge cases), keep only the first occurrence."""
+    from affine.api.rank_state import _live_sampling_uids
+    from affine.src.scorer.window_state import BattleRecord, ChampionRecord, MinerSnapshot
+
+    champion = ChampionRecord(
+        uid=1, hotkey="A", revision="r1", model="org/a",
+        deployment_id="ep-1", base_url="http://x/v1", since_block=0,
+    )
+    # Same uid=1 shows up as a predeployed record too.
+    dup = BattleRecord(
+        challenger=MinerSnapshot(uid=1, hotkey="A", revision="r1", model="org/a"),
+        deployment_id="ep-dup", base_url="http://dup/v1", started_at_block=5,
+    )
+    assert _live_sampling_uids(champion, None, [dup]) == [1]
+
+
+@pytest.mark.asyncio
+async def test_current_state_live_sampling_uids_uses_deployment_records(monkeypatch):
+    """get_current_state passes ⚡ through to the response correctly: a role
+    with a deployment_id lights up."""
 
     class _MinersDAOWith:
         async def get_valid_miners(self):
@@ -118,7 +195,6 @@ async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(mon
                 {"uid": 1, "hotkey": "A", "revision": "r1"},
                 {"uid": 2, "hotkey": "B", "revision": "r2"},
             ]
-
         async def get_all_miners(self):
             return await self.get_valid_miners()
 
@@ -129,36 +205,27 @@ async def test_current_state_marks_only_incomplete_subjects_as_live_sampling(mon
                 "2": {"scores": {"ENV_A": {"count": 2, "avg": 0.10}}, "frozen": False},
             }
 
-    kv = InMemoryConfigStore()
-    kv.data["environments"] = {
-        "ENV_A": {
-            "display_name": "A",
-            "enabled_for_sampling": True,
-            "sampling": {"sampling_count": 5, "dataset_range": [[0, 100]]},
-        },
-    }
-    store = StateStore(kv)
+    store = StateStore(InMemoryConfigStore())
     await store.set_champion(ChampionRecord(
         uid=1, hotkey="A", revision="r1", model="org/a",
-        deployment_id="wrk-A", base_url="https://t/A", since_block=0,
+        deployment_id="ep-1", base_url="http://x/v1", since_block=0,
     ))
     await store.set_battle(BattleRecord(
         challenger=MinerSnapshot(uid=2, hotkey="B", revision="r2", model="org/b"),
-        deployment_id="wrk-B", base_url="https://t/B", started_at_block=42,
+        deployment_id="ep-2", base_url="http://y/v1", started_at_block=42,
     ))
     await store.set_task_state(TaskIdState(
         task_ids={"ENV_A": [1, 2, 3, 4, 5, 6]}, refreshed_at_block=42,
     ))
+
     monkeypatch.setattr(rank_state, "_state_store", lambda: store)
     monkeypatch.setattr(rank_state, "_infer_champion_from_scores", _no_inferred_champion)
     monkeypatch.setattr(rank_state, "MinersDAO", _MinersDAOWith)
     monkeypatch.setattr(rank_state, "MinerStatsDAO", _StatsDAOWith)
 
     resp = await rank_state.get_current_state()
-
-    assert resp["sample_counts"] == {"1": {"ENV_A": 5}, "2": {"ENV_A": 2}}
-    assert resp["sample_averages"] == {"1": {"ENV_A": 0.42}, "2": {"ENV_A": 0.10}}
-    assert resp["live_sampling_uids"] == [2]
+    # Both carry a deployment_id, so both light up.
+    assert resp["live_sampling_uids"] == [1, 2]
 
 
 class _FakeScoresDAO:

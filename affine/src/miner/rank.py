@@ -494,7 +494,7 @@ def _print_rank_table(
         f"  |  Battle: {battle_uid if battle_uid is not None else '-'}"
         f"  |  Queue head: {queue_count}  |  Valid: {valid}  |  Invalid: {invalid}"
     )
-    print(f"Sampling: {_ansi('⚡', '1;92')} marks miners in the current live sampling set")
+    print(f"Sampling: {_ansi('⚡', '1;92')} marks miners with a live inference deployment")
     print(_ansi("=" * width, "2"))
 
 async def get_rank_command(*, show_reason: bool = False) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
@@ -12,10 +12,8 @@ from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
-    EnvConfig,
     StateStore,
     SystemConfigKVAdapter,
-    TaskIdState,
 )
 
 
@@ -122,34 +120,63 @@ def _live_sampling_uids(
     champion: Optional[ChampionRecord],
     battle: Optional[BattleRecord],
     predeployed: List[BattleRecord],
-    task_state: Optional[TaskIdState],
-    envs: Dict[str, EnvConfig],
-    sample_counts: Dict[str, Dict[str, int]],
 ) -> List[int]:
-    if task_state is None:
-        return []
-    out: List[int] = []
+    """UIDs with a live inference deployment in the active roster.
 
-    def _is_active(uid: int) -> bool:
-        counts = sample_counts.get(str(uid)) or {}
-        for env, cfg in envs.items():
-            task_ids = task_state.task_ids.get(env) or []
-            if not task_ids:
-                continue
-            target = min(len(task_ids), int(cfg.sampling_count))
-            if target > 0 and int(counts.get(env) or 0) < target:
-                return True
-        return False
+    ⚡ marks deployment liveness, NOT sampling progress. A role object
+    carrying a non-empty ``deployment_id`` (or a ``deployments`` entry) is
+    the authoritative, locally known signal that the scheduler has an
+    endpoint up for that miner in the current roster (champion / battle
+    challenger / pre-deployed). It's read straight off state already loaded
+    for this render — no ``sample_results`` GSI look-up, nothing to flap, no
+    recency window to tune. ``BattleRecord.deployment_id`` is always set; the
+    champion's is Optional (None before its first deploy / during cold-start).
 
-    if champion is not None and _is_active(champion.uid):
-        out.append(champion.uid)
-    if battle is not None and _is_active(battle.challenger.uid):
-        out.append(battle.challenger.uid)
+    This tracks the host occupant correctly across the lifecycle: on
+    single-instance providers (SSH/sglang) ``deployment_id`` is cleared when
+    the host is re-tasked (see flow.py), so a champion frozen at e.g.
+    1425/1461 while a battle borrows b300 correctly loses ⚡; on multi-instance
+    providers (Targon) the champion owns its endpoint for its full reign, so
+    ⚡ persists until a challenger wins.
+
+    What ⚡ can't catch is a deployment that stays up but stops producing (a
+    multi-instance champion mid-reign, or a single-instance champion holding
+    the host while its samples keep erroring, e.g. SWE-INFINITE "Failed to
+    pull image"). ⚡ marks the endpoint as up, not the writes as flowing —
+    diagnosing *why* a live deployment stopped producing is the job of the
+    deploy ``__cause__`` chain now in the scheduler log. Detecting
+    producing-vs-stalled would need per-write recency, which has no usable
+    index on sample_results (the declared timestamp-index GSI doesn't exist
+    on the live table) and would otherwise cost a per-render query, blank a
+    freshly-deployed challenger until its first row, and fail closed on a DDB
+    blip.
+
+    Roles are visited in stable declaration order; a uid appearing under more
+    than one role (pathological, crash-recovery ticks only) is deduplicated
+    keeping first occurrence.
+    """
+    # A role is "deployed" when it carries a primary ``deployment_id`` OR any
+    # entry in its ``deployments`` list. deployment_id is normally backfilled
+    # from deployments[0] on load (see _champion_from_dict/_battle_from_dict),
+    # but we check both so the icon can't miss a multi-deployment role whose
+    # primary field happened not to be populated.
+    def _deployed(rec: Any) -> bool:
+        return bool(getattr(rec, "deployment_id", None)
+                    or getattr(rec, "deployments", None))
+
+    subjects: List[Tuple[int, bool]] = []
+    if champion is not None:
+        subjects.append((champion.uid, _deployed(champion)))
+    if battle is not None:
+        subjects.append((battle.challenger.uid, _deployed(battle)))
     for record in predeployed:
-        uid = record.challenger.uid
-        if uid in out:
-            continue
-        if _is_active(uid):
+        subjects.append((record.challenger.uid, _deployed(record)))
+
+    seen: set = set()
+    out: List[int] = []
+    for uid, deployed in subjects:
+        if deployed and uid not in seen:
+            seen.add(uid)
             out.append(uid)
     return out
 
@@ -257,9 +284,7 @@ async def get_current_state() -> Dict[str, Any]:
         # The CLI uses these as the fallback when the live cache has no
         # entry for the row.
         "terminal_scores": terminal_scores,
-        "live_sampling_uids": _live_sampling_uids(
-            champion, battle, predeployed, task_state, envs, sample_counts,
-        ),
+        "live_sampling_uids": _live_sampling_uids(champion, battle, predeployed),
     }
 
 
