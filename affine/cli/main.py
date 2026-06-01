@@ -23,6 +23,7 @@ Miner Commands:
 - af get-score   : Query score for a specific miner
 - af get-miner   : Query public miner metadata
 - af get-rank    : Query the public rank/status table
+- af rotate-champion : Manually stale or rotate the champion task pool
 
 Docker Commands:
 - af deploy : Deploy docker containers (validator/backend)
@@ -293,6 +294,33 @@ def get_rank(show_reason):
     from affine.src.miner.rank import get_rank_command
 
     asyncio.run(get_rank_command(show_reason=show_reason))
+
+
+@cli.command("rotate-champion", hidden=not SHOW_ADMIN_COMMANDS)
+@click.option(
+    "--commit",
+    is_flag=True,
+    help="Write the rotation change; default is dry-run",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Stale-only mode: allow staling while a battle is in flight",
+)
+@click.option(
+    "--full-rotate",
+    is_flag=True,
+    help="Release challenger, stale task ids, and clear current battle",
+)
+def rotate_champion(commit, force, full_rotate):
+    """Manually stale or rotate the champion task pool."""
+    from affine.src.scheduler.commands import rotate_champion_command
+
+    asyncio.run(rotate_champion_command(
+        commit=commit,
+        force=force,
+        full_rotate=full_rotate,
+    ))
 
 
 @cli.command("miner-deploy", context_settings={"ignore_unknown_options": True, "allow_extra_args": True})

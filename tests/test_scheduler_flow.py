@@ -74,6 +74,8 @@ class _InMemoryMinerStore:
         revision: str | None = None,
         model: str = "",
         scores_by_env: dict | None = None,
+        opponent_scores_by_env: dict | None = None,
+        battle_task_ids: dict | None = None,
         scores_refresh_block: int | None = None,
         terminated_at_block: int | None = None,
     ) -> None:
@@ -87,6 +89,10 @@ class _InMemoryMinerStore:
             self.rows[uid]["model"] = model
         if scores_by_env is not None:
             self.rows[uid]["scores_by_env"] = scores_by_env
+        if opponent_scores_by_env is not None:
+            self.rows[uid]["opponent_scores_by_env"] = opponent_scores_by_env
+        if battle_task_ids is not None:
+            self.rows[uid]["battle_task_ids"] = battle_task_ids
         if scores_refresh_block is not None:
             self.rows[uid]["scores_refresh_block"] = scores_refresh_block
         if terminated_at_block is not None:
@@ -1032,6 +1038,8 @@ async def test_cold_start_set_champion_writes_before_mark_terminated():
         revision=None,
         model="",
         scores_by_env=None,
+        opponent_scores_by_env=None,
+        battle_task_ids=None,
         scores_refresh_block=None,
         terminated_at_block=None,
     ):
@@ -1041,6 +1049,8 @@ async def test_cold_start_set_champion_writes_before_mark_terminated():
             uid, status, reason=reason,
             hotkey=hotkey, revision=revision, model=model,
             scores_by_env=scores_by_env,
+            opponent_scores_by_env=opponent_scores_by_env,
+            battle_task_ids=battle_task_ids,
             scores_refresh_block=scores_refresh_block,
             terminated_at_block=terminated_at_block,
         )
