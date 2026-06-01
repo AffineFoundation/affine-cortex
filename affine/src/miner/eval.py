@@ -44,6 +44,8 @@ def _available_environments() -> List[str]:
 @click.option("--seed", type=int, default=None)
 @click.option("--network-host", is_flag=True, default=False,
               help="Use Docker host networking (needed for localhost --base-url)")
+@click.option("--no-pull", is_flag=True, default=False,
+              help="Use the local environment image without pulling first")
 @click.option("--output", "-o", default=None,
               help="Output JSON path (default: eval/results_<ts>.json)")
 @click.option("--list-envs", is_flag=True, default=False, help="List envs and exit")
@@ -62,6 +64,7 @@ def eval_cmd(
     temperature: float,
     seed: Optional[int],
     network_host: bool,
+    no_pull: bool,
     output: Optional[str],
     list_envs: bool,
     basilica: bool,
@@ -90,7 +93,8 @@ def eval_cmd(
     asyncio.run(_run(
         env=env, base_url=base_url, model=model, samples=samples,
         task_id=task_id, task_id_range=task_id_range, temperature=temperature,
-        seed=seed, network_host=network_host, output=output, basilica=basilica,
+        seed=seed, network_host=network_host, pull_image=not no_pull,
+        output=output, basilica=basilica,
         delay=delay, max_retries=max_retries,
     ))
 
@@ -104,9 +108,15 @@ async def _run(
     *, env: str, base_url: str, model: str, samples: int,
     task_id: Optional[int], task_id_range: Optional[Tuple[int, int]],
     temperature: float, seed: Optional[int], network_host: bool,
-    output: Optional[str], basilica: bool, delay: float, max_retries: int,
+    pull_image: bool, output: Optional[str], basilica: bool, delay: float,
+    max_retries: int,
 ) -> None:
-    env_instance = _load_environment(env, network_host=network_host, basilica=basilica)
+    env_instance = _load_environment(
+        env,
+        network_host=network_host,
+        basilica=basilica,
+        pull_image=pull_image,
+    )
     try:
         if task_id_range is not None:
             start, end = task_id_range
@@ -132,7 +142,13 @@ async def _run(
     _write_summary(env, base_url, model, temperature, seed, results, output)
 
 
-def _load_environment(env_name: str, *, network_host: bool, basilica: bool):
+def _load_environment(
+    env_name: str,
+    *,
+    network_host: bool,
+    basilica: bool,
+    pull_image: bool = True,
+):
     """Bring up one affinetes env container and return a thin wrapper that
     forwards ``evaluate(**)`` plus the env's per-call timeout."""
     import affinetes as af_env
@@ -169,7 +185,7 @@ def _load_environment(env_name: str, *, network_host: bool, basilica: bool):
             "replicas": 1,
             "hosts": ["localhost"],
             "container_name": config.name.replace(":", "-") + "-eval",
-            "pull": True,
+            "pull": pull_image,
             "force_recreate": True,
         })
         if config.volumes:
@@ -232,7 +248,7 @@ async def _evaluate_one(
                 out = {"raw": str(result)}
             out["latency_seconds"] = latency
             out["task_id"] = eval_kwargs.get("task_id")
-            out["success"] = True
+            out.setdefault("success", True)
             return out
         except Exception as e:
             last_error = e
