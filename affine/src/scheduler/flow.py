@@ -132,8 +132,8 @@ def _format_cause_chain(exc: BaseException, *, max_depth: int = 8) -> str:
 import math
 import time
 
-WINDOW_BLOCKS = 14400
-"""How often the per-env task_id pool is regenerated."""
+WINDOW_BLOCKS = 7200
+"""How often the per-env task_id pool is regenerated (7200 blocks ≈ 1 day)."""
 
 DEFAULT_MARGIN = 0.03
 """Per-env additive margin the challenger must clear to be ``dominant``."""
