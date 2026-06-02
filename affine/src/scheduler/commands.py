@@ -17,27 +17,25 @@ from affine.src.scorer.window_state import (
 from affine.utils.subtensor import get_subtensor
 
 
-async def rotate_champion_command(
-    *,
-    commit: bool = False,
-    force: bool = False,
-    full_rotate: bool = False,
-) -> None:
-    """Manually stale the active task pool so the scheduler rotates it.
+async def rotate_window_command(*, commit: bool = False) -> None:
+    """Manually rotate the champion task window.
 
-    Default mode is stale-only: it rewrites
-    ``current_task_ids.refreshed_at_block`` to an old block. The scheduler
-    then performs its normal between-battles refresh on the next tick. With
-    ``--full-rotate``, the command also releases the active challenger claim
-    and clears ``current_battle`` so the next scheduler tick rotates
-    immediately.
+    Always performs a full rotation: it releases the active challenger
+    claim (``in_progress`` -> ``sampling``), stales
+    ``current_task_ids.refreshed_at_block`` to an old block, and clears
+    ``current_battle`` so the next scheduler tick rotates immediately.
+
+    Default mode is dry-run; pass ``commit=True`` to write. Because
+    in-flight sample writes would otherwise land on the stale pool, the
+    command asks the operator to confirm the sampling service is stopped
+    before it writes anything.
     """
     await init_client()
     try:
         state = StateStore(
             SystemConfigKVAdapter(
                 SystemConfigDAO(),
-                updated_by="cli:rotate-champion",
+                updated_by="cli:rotate-window",
             )
         )
 
@@ -87,39 +85,7 @@ async def rotate_champion_command(
             for env, ids in sorted(task_state.task_ids.items()):
                 click.echo(f"    {env:<14} {len(ids)} task_ids")
 
-        if not full_rotate:
-            if task_state is None:
-                click.echo("\nNothing to stale.")
-                return
-            if current_block - task_state.refreshed_at_block >= WINDOW_BLOCKS:
-                click.echo(
-                    "\nAlready past the window threshold - a no-battle tick "
-                    "rotates on its own."
-                )
-                return
-            click.echo(
-                f"\nwould set refreshed_at_block: "
-                f"{task_state.refreshed_at_block} -> {stale_block}"
-            )
-            if battle is not None and not force:
-                click.echo(
-                    "\nREFUSING: battle in flight. Use --full-rotate to "
-                    "rotate anyway, or --force to just stale."
-                )
-                return
-            if not commit:
-                click.echo("\n(dry-run) re-run with --commit to write.")
-                return
-            await state.set_task_state(
-                TaskIdState(
-                    task_ids=task_state.task_ids,
-                    refreshed_at_block=stale_block,
-                )
-            )
-            click.echo("\ncommitted (stale-only).")
-            return
-
-        click.echo("\n=== FULL ROTATE plan ===")
+        click.echo("\n=== ROTATE plan ===")
         if battle is not None:
             click.echo(
                 f"  1. release uid={battle.challenger.uid} claim: "
@@ -135,6 +101,14 @@ async def rotate_champion_command(
 
         if not commit:
             click.echo("\n(dry-run) re-run with --commit to perform the rotation.")
+            return
+
+        click.echo(
+            "\n⚠  Stop the sampling service first. In-flight sample writes "
+            "would otherwise land on the stale task pool."
+        )
+        if not click.confirm("Has the sampling service been stopped?", default=False):
+            click.echo("Aborted.")
             return
 
         if battle is not None:
@@ -158,6 +132,6 @@ async def rotate_champion_command(
 
         await state.clear_battle()
         click.echo("  3. current_battle cleared")
-        click.echo("\nfull rotation armed - scheduler rotates on its next tick.")
+        click.echo("\nrotation armed - scheduler rotates on its next tick.")
     finally:
         await close_client()
