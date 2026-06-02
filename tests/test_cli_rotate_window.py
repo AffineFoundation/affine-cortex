@@ -1,4 +1,4 @@
-"""CLI parsing and command behavior for manual champion rotation."""
+"""CLI parsing and command behavior for manual window rotation."""
 
 from __future__ import annotations
 
@@ -14,25 +14,40 @@ from affine.src.scorer.window_state import (
 )
 
 
-def test_rotate_champion_forwards_flags(monkeypatch):
+def test_rotate_window_forwards_commit_flag(monkeypatch):
     calls = []
 
-    async def fake_rotate_champion_command(*, commit, force, full_rotate):
-        calls.append((commit, force, full_rotate))
+    async def fake_rotate_window_command(*, commit):
+        calls.append(commit)
 
     monkeypatch.setattr(
         scheduler_commands,
-        "rotate_champion_command",
-        fake_rotate_champion_command,
+        "rotate_window_command",
+        fake_rotate_window_command,
     )
 
-    result = CliRunner().invoke(
-        cli,
-        ["rotate-champion", "--commit", "--force", "--full-rotate"],
-    )
+    result = CliRunner().invoke(cli, ["db", "rotate-window", "--commit"])
 
     assert result.exit_code == 0
-    assert calls == [(True, True, True)]
+    assert calls == [True]
+
+
+def test_rotate_window_dry_run_default(monkeypatch):
+    calls = []
+
+    async def fake_rotate_window_command(*, commit):
+        calls.append(commit)
+
+    monkeypatch.setattr(
+        scheduler_commands,
+        "rotate_window_command",
+        fake_rotate_window_command,
+    )
+
+    result = CliRunner().invoke(cli, ["db", "rotate-window"])
+
+    assert result.exit_code == 0
+    assert calls == [False]
 
 
 def _install_command_fakes(monkeypatch, store, *, current_block=1000):
@@ -103,18 +118,31 @@ def _battle():
     )
 
 
-def test_rotate_champion_stale_only_refuses_active_battle(monkeypatch):
+def test_rotate_window_dry_run_shows_plan_without_writing(monkeypatch):
     store = _Store(battle=_battle())
     _install_command_fakes(monkeypatch, store, current_block=1000)
 
-    result = CliRunner().invoke(cli, ["rotate-champion", "--commit"])
+    result = CliRunner().invoke(cli, ["db", "rotate-window"])
 
     assert result.exit_code == 0
-    assert "REFUSING: battle in flight" in result.output
+    assert "=== ROTATE plan ===" in result.output
+    assert "(dry-run)" in result.output
     assert store.ops == []
 
 
-def test_rotate_champion_full_rotate_releases_stales_then_clears(monkeypatch):
+def test_rotate_window_commit_aborts_without_sampling_confirm(monkeypatch):
+    store = _Store(battle=_battle())
+    _install_command_fakes(monkeypatch, store, current_block=1000)
+
+    # Decline the "sampling service stopped?" confirmation.
+    result = CliRunner().invoke(cli, ["db", "rotate-window", "--commit"], input="n\n")
+
+    assert result.exit_code == 0
+    assert "Aborted." in result.output
+    assert store.ops == []
+
+
+def test_rotate_window_commit_releases_stales_then_clears(monkeypatch):
     store = _Store(battle=_battle())
     _install_command_fakes(monkeypatch, store, current_block=1000)
 
@@ -126,10 +154,8 @@ def test_rotate_champion_full_rotate_releases_stales_then_clears(monkeypatch):
     monkeypatch.setattr(scheduler_commands, "MinersQueueAdapter", lambda: object())
     monkeypatch.setattr(scheduler_commands, "ChallengerQueue", lambda adapter: _Queue())
 
-    result = CliRunner().invoke(
-        cli,
-        ["rotate-champion", "--commit", "--full-rotate"],
-    )
+    # Confirm the sampling service is stopped.
+    result = CliRunner().invoke(cli, ["db", "rotate-window", "--commit"], input="y\n")
 
     stale_block = 1000 - scheduler_commands.WINDOW_BLOCKS - 1
     assert result.exit_code == 0
