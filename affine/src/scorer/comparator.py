@@ -54,6 +54,36 @@ DEFAULT_NOT_WORSE_TOLERANCE: float = 0.02
 #: least one env and stay not_worse in the rest.
 WIN_MIN_DOMINANT_ENVS: int = 1
 
+#: Envs whose score is an unbounded, sign-crossing quantity (e.g. distill's
+#: advantage-weighted CE: roughly [-0.7, +0.6], mean near 0, can go negative)
+#: rather than a natural [0, 1] success rate. For these the multiplicative
+#: not_worse band (``champ * (1 - tol)``) is meaningless — when ``champ`` is
+#: near 0 the band collapses, and when ``champ`` is negative the inequality
+#: flips. They use an ADDITIVE not_worse band (``champ - margin``) instead.
+ADDITIVE_MARGIN_ENVS: frozenset = frozenset({"DISTILL-V2"})
+
+#: Additive not_worse margin for ``ADDITIVE_MARGIN_ENVS``. Calibrated from
+#: distill-v2 data (2026-06): the true champion-vs-challenger improvement that
+#: matters (~0.05) sits well above this, the same-lineage noise floor (33-cell
+#: mean jitter ~0.001) and within-cohort spread (~0.017) sit well below, so
+#: 0.02 cleanly separates a real improvement from sampling noise.
+DEFAULT_ADDITIVE_MARGIN: float = 0.02
+
+
+def not_worse_lower_bound(
+    champ_basis: float, env: str, *, tolerance: float, additive_margin: float,
+) -> float:
+    """Lower score below which the challenger regresses (becomes ENV_WORSE).
+
+    Additive for ``ADDITIVE_MARGIN_ENVS`` (sign-crossing scores), multiplicative
+    otherwise (natural [0, 1] success rates). Single source of truth shared by
+    the comparator, the scheduler's early-regression pre-check, and the rank UI
+    so all three stay bit-consistent.
+    """
+    if env in ADDITIVE_MARGIN_ENVS:
+        return champ_basis - additive_margin
+    return champ_basis * (1.0 - tolerance)
+
 
 @dataclass(frozen=True)
 class EnvComparisonConfig:
@@ -62,8 +92,12 @@ class EnvComparisonConfig:
     min_tasks_per_env: int
     # Multiplicative tolerance: challenger is "not_worse" iff
     # ``chal_avg >= champ_avg * (1 - not_worse_tolerance)``. 0.0 (default)
-    # means any regression at all flips the env to "worse".
+    # means any regression at all flips the env to "worse". Used only for
+    # natural [0,1] envs; ``ADDITIVE_MARGIN_ENVS`` ignore it.
     not_worse_tolerance: float = 0.0
+    # Additive not_worse band (``champ - additive_margin``) for sign-crossing
+    # envs in ``ADDITIVE_MARGIN_ENVS``; ignored by multiplicative envs.
+    additive_margin: float = DEFAULT_ADDITIVE_MARGIN
 
 
 # Per-env classification.
@@ -156,12 +190,14 @@ class WindowComparator:
                 verdict = ENV_DOMINANT
                 reason = "challenger_better"
             else:
-                # not_worse threshold is multiplicative against champion's
-                # score: chal_avg >= champ * (1 - tol). When champ_basis is
-                # negative (some envs allow negative scores), keep the same
-                # formula — the caller picks ``not_worse_tolerance`` per env
-                # and is responsible for the score scale.
-                not_worse_threshold = champ_basis * (1.0 - cfg.not_worse_tolerance)
+                # not_worse threshold: additive band for sign-crossing envs
+                # (distill), multiplicative for natural [0,1] success-rate envs.
+                # See ``not_worse_lower_bound``.
+                not_worse_threshold = not_worse_lower_bound(
+                    champ_basis, env,
+                    tolerance=cfg.not_worse_tolerance,
+                    additive_margin=cfg.additive_margin,
+                )
                 if chal_avg >= not_worse_threshold - 1e-9:
                     verdict = ENV_NOT_WORSE
                     reason = "tie_within_tolerance"

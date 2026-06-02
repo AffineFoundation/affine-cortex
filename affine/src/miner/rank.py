@@ -70,6 +70,7 @@ def _env_cell(
     live_count: Optional[int] = None,
     live_avg: Optional[float] = None,
     *,
+    env: Optional[str] = None,
     champion_live_avg: Optional[float] = None,
     terminal_entry: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -99,14 +100,21 @@ def _env_cell(
     termination.
     """
     from affine.src.scorer.comparator import (
-        DEFAULT_MARGIN, DEFAULT_NOT_WORSE_TOLERANCE,
+        ADDITIVE_MARGIN_ENVS, DEFAULT_ADDITIVE_MARGIN,
+        DEFAULT_MARGIN, DEFAULT_NOT_WORSE_TOLERANCE, not_worse_lower_bound,
     )
+    additive = env in ADDITIVE_MARGIN_ENVS
+    upper_margin = DEFAULT_ADDITIVE_MARGIN if additive else DEFAULT_MARGIN
 
     if live_avg is not None and live_count is not None and live_count > 0:
         if champion_live_avg is None:
             return f"{live_avg * 100:.2f}/{live_count}"
-        lower = champion_live_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
-        upper = champion_live_avg + DEFAULT_MARGIN
+        lower = not_worse_lower_bound(
+            champion_live_avg, env or "",
+            tolerance=DEFAULT_NOT_WORSE_TOLERANCE,
+            additive_margin=DEFAULT_ADDITIVE_MARGIN,
+        )
+        upper = champion_live_avg + upper_margin
         return (
             f"{live_avg * 100:.2f}"
             f"[{lower * 100:.2f},{upper * 100:.2f}]"
@@ -122,8 +130,12 @@ def _env_cell(
         if t_count > 0:
             basis = terminal_entry.get("champion_overlap_avg")
             if isinstance(basis, (int, float)):
-                lower = float(basis) * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
-                upper = float(basis) + DEFAULT_MARGIN
+                lower = not_worse_lower_bound(
+                    float(basis), env or "",
+                    tolerance=DEFAULT_NOT_WORSE_TOLERANCE,
+                    additive_margin=DEFAULT_ADDITIVE_MARGIN,
+                )
+                upper = float(basis) + upper_margin
                 return (
                     f"{t_avg * 100:.2f}"
                     f"[{lower * 100:.2f},{upper * 100:.2f}]"
@@ -450,7 +462,7 @@ def _print_rank_table(
                 if champ_live is None:
                     champ_live = champion_live_avgs.get(env)
             row_parts.append(
-                f"{_env_cell(scores_by_env.get(env), live_count, live_avg, champion_live_avg=champ_live, terminal_entry=row_terminal.get(env)):>24}"
+                f"{_env_cell(scores_by_env.get(env), live_count, live_avg, env=env, champion_live_avg=champ_live, terminal_entry=row_terminal.get(env)):>24}"
             )
         row_parts.append(
             _colored_status(status, is_invalid=(row.get("is_valid") is False))
