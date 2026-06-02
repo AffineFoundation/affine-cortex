@@ -45,8 +45,11 @@ from affine.src.scorer.challenger_queue import (
     OUTCOME_WON,
 )
 from affine.src.scorer.comparator import (
+    ADDITIVE_MARGIN_ENVS,
+    DEFAULT_ADDITIVE_MARGIN,
     EnvComparisonConfig,
     WindowComparator,
+    not_worse_lower_bound,
 )
 from affine.src.scorer.sampler import EnvSamplingConfig, WindowSampler
 from affine.src.scorer.sampling_thresholds import (
@@ -701,8 +704,10 @@ class FlowScheduler:
             # bit-identical to what the full pass would emit; without
             # it a ``chal_avg`` sitting exactly on the threshold would
             # tip WORSE here but NOT_WORSE later.
-            not_worse_threshold = (
-                champ_overlap_avg * (1.0 - DEFAULT_NOT_WORSE_TOLERANCE)
+            not_worse_threshold = not_worse_lower_bound(
+                champ_overlap_avg, env,
+                tolerance=DEFAULT_NOT_WORSE_TOLERANCE,
+                additive_margin=DEFAULT_ADDITIVE_MARGIN,
             )
             if (
                 regression_env is None
@@ -1324,13 +1329,20 @@ class FlowScheduler:
         env_configs = {
             env: EnvComparisonConfig(
                 env=env,
-                margin=DEFAULT_MARGIN,
+                # Sign-crossing envs (distill) use the additive margin for
+                # both dominant and not_worse; natural [0,1] envs use the
+                # default additive dominant margin + multiplicative not_worse.
+                margin=(
+                    DEFAULT_ADDITIVE_MARGIN if env in ADDITIVE_MARGIN_ENVS
+                    else DEFAULT_MARGIN
+                ),
                 # Comparator's per-env sample-count gate. Aligned with
                 # ``_battle_overlap_ready`` (which requires overlap ≥
                 # ``sampling_count``) so the two gates can't disagree:
                 # SWE=200, MEMORY=100, etc. — full coverage required.
                 min_tasks_per_env=max(1, int(cfg.sampling_count)),
                 not_worse_tolerance=DEFAULT_NOT_WORSE_TOLERANCE,
+                additive_margin=DEFAULT_ADDITIVE_MARGIN,
             )
             for env, cfg in envs.items()
         }
@@ -1819,7 +1831,11 @@ def _comparison_scores_by_env(result: Any, *, role: str) -> Dict[str, Dict[str, 
                 "score_on_common": challenger_avg,
                 "sample_count": common_tasks,
                 "common_tasks": common_tasks,
-                "not_worse_threshold": champion_basis * (1.0 - tolerance),
+                "not_worse_threshold": not_worse_lower_bound(
+                    champion_basis, str(env),
+                    tolerance=tolerance,
+                    additive_margin=DEFAULT_ADDITIVE_MARGIN,
+                ),
                 "dethrone_threshold": champion_basis + margin,
                 "verdict": getattr(env_result, "verdict", ""),
                 "reason": getattr(env_result, "reason", ""),
