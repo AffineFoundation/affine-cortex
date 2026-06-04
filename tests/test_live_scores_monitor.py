@@ -144,6 +144,9 @@ class _FakeStateStore:
     async def get_task_state(self):
         return self._task_state
 
+    async def get_environments(self):
+        return self._envs
+
     async def get_scoring_environments(self):
         return self._envs
 
