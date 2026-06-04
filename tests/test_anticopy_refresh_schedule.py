@@ -14,8 +14,6 @@ from __future__ import annotations
 import datetime as dt
 from unittest.mock import patch
 
-import pytest
-
 from affine.src.anticopy.refresh import RolloutRefreshService, _LAST_REFRESH_FIELD
 from affine.src.anticopy.threshold import AntiCopyConfig
 
@@ -67,8 +65,7 @@ def _run_at(svc, when_utc):
         asyncio.run(svc._maybe_tick())
 
 
-@pytest.mark.asyncio
-async def test_disabled_config_short_circuits():
+def test_disabled_config_short_circuits():
     svc = _build_service(
         AntiCopyConfig(enabled=False), state={},
     )

@@ -74,6 +74,8 @@ class _InMemoryMinerStore:
         revision: str | None = None,
         model: str = "",
         scores_by_env: dict | None = None,
+        opponent_scores_by_env: dict | None = None,
+        battle_task_ids: dict | None = None,
         scores_refresh_block: int | None = None,
         terminated_at_block: int | None = None,
     ) -> None:
@@ -87,6 +89,10 @@ class _InMemoryMinerStore:
             self.rows[uid]["model"] = model
         if scores_by_env is not None:
             self.rows[uid]["scores_by_env"] = scores_by_env
+        if opponent_scores_by_env is not None:
+            self.rows[uid]["opponent_scores_by_env"] = opponent_scores_by_env
+        if battle_task_ids is not None:
+            self.rows[uid]["battle_task_ids"] = battle_task_ids
         if scores_refresh_block is not None:
             self.rows[uid]["scores_refresh_block"] = scores_refresh_block
         if terminated_at_block is not None:
@@ -714,7 +720,7 @@ async def test_deploy_failure_forgets_invalidated_champion_deployment():
 
 
 @pytest.mark.asyncio
-async def test_invalid_champion_dropped_and_workload_torn_down():
+async def test_deregistered_champion_retained_as_burn_sentinel():
     kv = _seed_state()
     # Champion uid=1 in system_config, but NOT in valid miners list.
     miner_store = _InMemoryMinerStore([
@@ -730,12 +736,15 @@ async def test_invalid_champion_dropped_and_workload_torn_down():
     )
 
     await scheduler.tick(current_block=50)   # refresh
-    await scheduler.tick(current_block=51)   # validation drops champion + cold-starts to next valid
-    # The stale champion's Targon was torn down.
-    assert "wrk-old" in deployer.teardowns
-    # Cold-start path took over: uid=2 promoted as new champion.
-    new_champ = await state.get_champion()
-    assert new_champ is not None and new_champ.uid == 2
+    await scheduler.tick(current_block=51)   # champion remains offline
+    # Offline champions are retained by hotkey/revision/model identity and
+    # use uid=-1 as the burn sentinel until the hotkey re-registers.
+    assert deployer.teardowns == []
+    champ = await state.get_champion()
+    assert champ is not None
+    assert champ.uid == -1
+    assert champ.hotkey == "champ_hk"
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
 
 
 @pytest.mark.asyncio
@@ -1032,6 +1041,8 @@ async def test_cold_start_set_champion_writes_before_mark_terminated():
         revision=None,
         model="",
         scores_by_env=None,
+        opponent_scores_by_env=None,
+        battle_task_ids=None,
         scores_refresh_block=None,
         terminated_at_block=None,
     ):
@@ -1041,6 +1052,8 @@ async def test_cold_start_set_champion_writes_before_mark_terminated():
             uid, status, reason=reason,
             hotkey=hotkey, revision=revision, model=model,
             scores_by_env=scores_by_env,
+            opponent_scores_by_env=opponent_scores_by_env,
+            battle_task_ids=battle_task_ids,
             scores_refresh_block=scores_refresh_block,
             terminated_at_block=terminated_at_block,
         )
@@ -2258,14 +2271,14 @@ async def test_in_decide_invalidation_guard_catches_concurrent_flip():
         )
 
     # Patch _list_valid_miners to flip ``is_valid`` on uid=2 after the
-    # first two calls — step 3 + step 4.5 see the challenger valid,
-    # in-decide sees them invalid.
+    # step-4.5 read sees the challenger valid; the in-decide guard sees
+    # them invalid.
     call_count = [0]
     orig_fn = scheduler._list_valid_miners
 
     async def flipping_fn():
         call_count[0] += 1
-        if call_count[0] >= 3:
+        if call_count[0] >= 2:
             miner_store.rows[2]["is_valid"] = "false"
         return await orig_fn()
 

@@ -67,6 +67,7 @@ class MinerInfo:
     hf_revision: str = ""
     template_check_result: Optional[str] = None  # "safe" | "unsafe:<reason>" | None
     tokenizer_sig: str = ""
+    model_type: str = ""
 
     def key(self) -> str:
         return f"{self.hotkey}#{self.revision}"
@@ -321,6 +322,7 @@ class MinersMonitor:
 
         if uid != 0 and uid <= 1000:
             size_result = await check_model_size(model, revision)
+            info.model_type = str(size_result.get("model_type") or "")
             if not size_result.get("pass"):
                 info.mark_invalid(
                     f"model_check:{size_result.get('reason')}",
@@ -670,6 +672,7 @@ class MinersMonitor:
                 invalid_reason=miner.invalid_reason,
                 block_number=current_block,
                 first_block=miner.block,
+                model_type=miner.model_type,
             )
             if miner.hotkey and miner.revision:
                 await self.stats_dao.update_miner_info(
@@ -682,6 +685,7 @@ class MinersMonitor:
                     is_valid=miner.is_valid,
                     invalid_reason=miner.invalid_reason,
                     model_hash=miner.model_hash,
+                    model_type=miner.model_type,
                     is_online=True,
                 )
                 await self._maybe_terminate_stats(miner)
@@ -741,6 +745,7 @@ class MinersMonitor:
                 block=int(r.get("first_block", 0) or 0),
                 is_valid=True,
                 model_hash=r.get("model_hash", ""),
+                model_type=r.get("model_type", ""),
                 template_check_result=r.get("template_check_result"),
             )
             out[info.key()] = info

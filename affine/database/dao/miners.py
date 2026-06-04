@@ -70,6 +70,7 @@ class MinersDAO(BaseDAO):
         invalid_reason: Optional[str],
         block_number: int,
         first_block: int,
+        model_type: str = "",
     ) -> Dict[str, Any]:
         """Save or update miner validation state.
 
@@ -86,6 +87,7 @@ class MinersDAO(BaseDAO):
             invalid_reason: Reason if invalid.
             block_number: Current block when this record was updated.
             first_block: Block when this (hotkey, revision) was first committed.
+            model_type: Raw HuggingFace config ``model_type`` when known.
         """
         item = {
             'pk': self._make_pk(uid),
@@ -93,6 +95,7 @@ class MinersDAO(BaseDAO):
             'hotkey': hotkey,
             'model': model,
             'revision': revision,
+            'model_type': model_type,
             'model_hash': model_hash,
             'is_valid': 'true' if is_valid else 'false',  # Stored as string for GSI
             'invalid_reason': invalid_reason,

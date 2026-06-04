@@ -331,7 +331,8 @@ class FlowScheduler:
         if battle is None and (not champion.deployment_id or not champion.base_url):
             if self.cfg.single_instance_provider and await self._samples_complete(
                 MinerSnapshot(uid=champion.uid, hotkey=champion.hotkey,
-                              revision=champion.revision, model=champion.model),
+                              revision=champion.revision, model=champion.model,
+                              model_type=champion.model_type),
                 envs=envs, task_state=task_state,
             ):
                 await self._start_battle(champion, current_block)
@@ -345,7 +346,8 @@ class FlowScheduler:
         # 6. Champion samples not yet full.
         if not await self._samples_complete(
             MinerSnapshot(uid=champion.uid, hotkey=champion.hotkey,
-                          revision=champion.revision, model=champion.model),
+                          revision=champion.revision, model=champion.model,
+                          model_type=champion.model_type),
             envs=envs, task_state=task_state,
         ):
             return
@@ -528,6 +530,7 @@ class FlowScheduler:
         new_champ = ChampionRecord(
             uid=candidate.uid, hotkey=candidate.hotkey,
             revision=candidate.revision, model=candidate.model,
+            model_type=candidate.model_type,
             since_block=current_block,
         )
         await self.state.set_champion(new_champ)
@@ -1122,6 +1125,7 @@ class FlowScheduler:
                 challenger=MinerSnapshot(
                     uid=cand.uid, hotkey=cand.hotkey,
                     revision=cand.revision, model=cand.model,
+                    model_type=cand.model_type,
                 ),
                 deployment_id=result.deployment_id,
                 base_url=result.base_url,
@@ -1195,6 +1199,7 @@ class FlowScheduler:
             challenger=MinerSnapshot(
                 uid=candidate.uid, hotkey=candidate.hotkey,
                 revision=candidate.revision, model=candidate.model,
+                model_type=candidate.model_type,
             ),
             deployment_id=result.deployment_id,
             base_url=result.base_url,
@@ -1206,6 +1211,7 @@ class FlowScheduler:
             previous_champion=MinerSnapshot(
                 uid=champion.uid, hotkey=champion.hotkey,
                 revision=champion.revision, model=champion.model,
+                model_type=champion.model_type,
             ),
         )
         await self.state.set_battle(battle)
@@ -1382,6 +1388,7 @@ class FlowScheduler:
                 hotkey=battle.challenger.hotkey,
                 revision=battle.challenger.revision,
                 model=battle.challenger.model,
+                model_type=battle.challenger.model_type,
                 deployment_id=battle.deployment_id,
                 base_url=battle.base_url,
                 deployments=list(battle.deployments),
@@ -1614,6 +1621,7 @@ class FlowScheduler:
                         )
                     ),
                     total_samples=int(m.get("total_samples", 0)),
+                    model_type=str(m.get("model_type") or ""),
                 )
             )
         if not any(s.is_champion for s in subjects):
@@ -1623,6 +1631,7 @@ class FlowScheduler:
                     revision=champion.revision, model=champion.model,
                     first_block=0, is_champion=True,
                     scores_by_env=champion_env_scores, total_samples=0,
+                    model_type=champion.model_type,
                 )
             )
         await self.weight_writer.write(

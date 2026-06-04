@@ -156,6 +156,7 @@ async def test_miners_router_returns_basic_public_metadata_by_uid(monkeypatch):
             "hotkey": "hk",
             "model": "org/model",
             "revision": "abc",
+            "model_type": "qwen3",
             "is_valid": "true",
             "first_block": 100,
             "block_number": 120,
@@ -170,6 +171,7 @@ async def test_miners_router_returns_basic_public_metadata_by_uid(monkeypatch):
     assert response.hotkey == "hk"
     assert response.model == "org/model"
     assert response.revision == "abc"
+    assert response.model_type == "qwen3"
     assert response.is_valid is True
     assert response.challenge_status == "sampling"
     assert response.model_hash == "hash"
@@ -297,6 +299,7 @@ async def test_scores_latest_filters_to_current_miners(monkeypatch):
                 "uid": 7,
                 "hotkey": "current-hk",
                 "revision": "current-rev",
+                "model_type": "qwen3",
                 "is_valid": "true",
             },
         }),
@@ -353,6 +356,7 @@ async def test_scores_latest_filters_to_current_miners(monkeypatch):
     )
 
     assert [row.uid for row in response.scores] == [7]
+    assert response.scores[0].model_type == "qwen3"
     assert response.scores[0].challenge_status == "terminated"
     assert response.scores[0].termination_reason == "lost_to_champion:abc"
 
@@ -442,6 +446,7 @@ async def test_scores_latest_includes_miners_missing_from_snapshot(monkeypatch):
                 "revision": "rev-old",
                 "is_valid": "true",
                 "model": "org/old",
+                "model_type": "qwen3",
                 "first_block": 100,
             },
             ("uid", 99): {
@@ -450,6 +455,7 @@ async def test_scores_latest_includes_miners_missing_from_snapshot(monkeypatch):
                 "revision": "rev-new",
                 "is_valid": "true",
                 "model": "org/new",
+                "model_type": "qwen3_5_moe",
                 "first_block": 500,
             },
         }),
@@ -523,6 +529,7 @@ async def test_scores_latest_includes_miners_missing_from_snapshot(monkeypatch):
     # New miner's per-env score comes from sample_results aggregation.
     assert by_uid[99].scores_by_env["SWE"]["score"] == pytest.approx(0.775)
     assert by_uid[99].scores_by_env["SWE"]["sample_count"] == 4
+    assert by_uid[99].model_type == "qwen3_5_moe"
     # Sort order: champion (overall=1.0) above new miner (overall=0.0).
     assert response.scores[0].uid == 7
 
@@ -749,6 +756,7 @@ async def test_score_by_uid_for_miner_missing_from_snapshot(monkeypatch):
         "hotkey": "new-hk",
         "revision": "rev-new",
         "model": "org/new",
+        "model_type": "qwen3_5_moe",
         "first_block": 500,
         "is_valid": "true",
     }
@@ -797,6 +805,7 @@ async def test_score_by_uid_for_miner_missing_from_snapshot(monkeypatch):
 
     assert response.uid == 99
     assert response.miner_hotkey == "new-hk"
+    assert response.model_type == "qwen3_5_moe"
     assert response.scores_by_env["SWE"]["score"] == pytest.approx(0.5)
     assert response.scores_by_env["SWE"]["sample_count"] == 2
 

@@ -267,6 +267,7 @@ async def _build_score_rows_from_validity(
             "uid": int(uid_value),
             "model": str(meta.get("model") or snap.get("model") or ""),
             "model_revision": str(revision or ""),
+            "model_type": str(meta.get("model_type") or snap.get("model_type") or ""),
             "first_block": int(first_block),
             "overall_score": float(overall),
             "average_score": float(avg_score),
@@ -354,6 +355,7 @@ async def get_latest_scores(
                 uid=s.get("uid"),
                 model_revision=s.get("model_revision"),
                 model=s.get("model"),
+                model_type=s.get("model_type") or None,
                 first_block=s.get("first_block"),
                 overall_score=s.get("overall_score"),
                 average_score=s.get("average_score"),
@@ -459,6 +461,10 @@ async def get_score_by_uid(
             uid=snap.get("uid") if isinstance(snap.get("uid"), int) else uid,
             model_revision=str(snap.get("model_revision") or revision or ""),
             model=str(snap.get("model") or miner.get("model") or ""),
+            model_type=(
+                str(miner.get("model_type") or snap.get("model_type") or "")
+                or None
+            ),
             first_block=int(first_block),
             overall_score=float(overall),
             average_score=float(avg_score),

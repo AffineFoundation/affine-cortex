@@ -102,6 +102,7 @@ class MinerStatsDAO(BaseDAO):
         is_valid: Optional[bool] = None,
         invalid_reason: Optional[str] = None,
         model_hash: str = "",
+        model_type: str = "",
         is_online: bool = True,
     ) -> None:
         """Persist current miner metadata without overwriting lifecycle state.
@@ -125,11 +126,13 @@ class MinerStatsDAO(BaseDAO):
             ":empty": {"S": ""},
             ":zero": {"N": "0"},
             ":model_hash": {"S": model_hash or ""},
+            ":model_type": {"S": model_type or ""},
         }
         update_parts = [
             "hotkey = :hotkey",
             "revision = :revision",
             "model = :model",
+            "model_type = :model_type",
             "last_updated_at = :now",
             "first_seen_at = if_not_exists(first_seen_at, :now)",
             "is_currently_online = :online",

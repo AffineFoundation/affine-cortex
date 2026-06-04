@@ -474,6 +474,7 @@ async def test_monitor_persists_current_metadata_to_miner_stats(monkeypatch):
                 is_valid=False,
                 invalid_reason="model_check:too_large",
                 model_hash="hash",
+                model_type="qwen3",
             ),
             MinerInfo(uid=8, hotkey="no-rev", model="", revision="", block=101),
         ],
@@ -492,6 +493,7 @@ async def test_monitor_persists_current_metadata_to_miner_stats(monkeypatch):
             "is_valid": False,
             "invalid_reason": "model_check:too_large",
             "model_hash": "hash",
+            "model_type": "qwen3",
             "is_online": True,
         }
     ]

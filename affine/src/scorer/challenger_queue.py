@@ -47,6 +47,7 @@ class MinerCandidate:
     model: str
     revision: str
     first_block: int
+    model_type: str = ""
 
 
 class MinerQueueStore(Protocol):
@@ -140,6 +141,7 @@ class ChallengerQueue:
                     model=row.get("model", ""),
                     revision=row.get("revision", ""),
                     first_block=int(row.get("first_block", 0)),
+                    model_type=str(row.get("model_type") or ""),
                 )
         return None
 
@@ -185,6 +187,7 @@ class ChallengerQueue:
                 model=row.get("model", ""),
                 revision=row.get("revision", ""),
                 first_block=int(row.get("first_block", 0)),
+                model_type=str(row.get("model_type") or ""),
             ))
             if len(out) >= n:
                 break

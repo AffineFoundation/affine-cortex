@@ -44,6 +44,7 @@ async def _miner_info(row: Dict[str, Any]) -> MinerInfo:
         hotkey=row["hotkey"],
         model=row.get("model"),
         revision=row.get("revision"),
+        model_type=row.get("model_type"),
         is_valid=_bool_or_none(row.get("is_valid")),
         challenge_status=state.get("challenge_status"),
         termination_reason=state.get("termination_reason"),

@@ -7,7 +7,7 @@ import io
 from contextlib import redirect_stderr, redirect_stdout
 
 import affine.src.miner.rank as rank
-from affine.src.miner.rank import _print_rank_table
+from affine.src.miner.rank import _model_label, _print_rank_table
 
 
 def _render_rank(window, queue, scores, *, show_reason=False):
@@ -112,7 +112,8 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     assert "Champion:   UID 1" in out
     assert "Battle:     UID 2" in out
     assert "Hotkey" in out
-    assert "⚡| Model" in out
+    assert "⚡| model" in out
+    assert "Repo" in out
     assert "Reason" not in out
     assert " Valid " not in out
     assert "CHAMPION" in out
@@ -126,10 +127,21 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     # [0.784, 0.830], score is challenger's live_avg, count is its
     # live_count from sample_counts.
     assert "70.00[78.40,83.00]/77" in out
-    assert out.count("⚡| org/") == 2
-    assert "  | org/q" in out
+    assert out.count("⚡| ") == 3  # header + two live rows
+    assert "champion        | org/champion" in out
+    assert "challenger      | org/challenger" in out
+    assert "q               | org/q" in out
     assert "Sampling: ⚡ marks miners with a live inference deployment" in out
     assert "Queue: #1 UID 3" not in out
+
+
+def test_model_label_prefers_model_type_then_repo_tail():
+    assert _model_label({"model_type": "qwen3"}) == "Qwen3-32B"
+    assert _model_label({"model_type": "qwen3_5_moe"}) == "Qwen3.6-35B"
+    assert _model_label({"model_type": "custom_arch"}) == "custom_arch"
+    assert _model_label({"model": "Qwen/Qwen3-30B-A22B"}) == "Qwen3-30B-A22B"
+    assert _model_label({"model": "org/affine-model-hotkey"}) == "affine-model-hotkey"
+    assert _model_label({}) == "-"
 
 
 def test_rank_table_renders_empty_scores_safely():

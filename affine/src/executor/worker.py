@@ -390,6 +390,7 @@ class ExecutorWorker:
             champ_snap = MinerSnapshot(
                 uid=champion.uid, hotkey=champion.hotkey,
                 revision=champion.revision, model=champion.model,
+                model_type=champion.model_type,
             )
             for idx, tid in enumerate(task_ids):
                 tid_int = int(tid)
