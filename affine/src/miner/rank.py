@@ -71,12 +71,25 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def _env_names(scores: List[Dict[str, Any]]) -> List[str]:
+def _env_names(
+    scores: List[Dict[str, Any]],
+    *live_env_maps: Optional[Dict[str, Any]],
+) -> List[str]:
+    """Union of envs seen in the DECIDE ``scores_by_env`` snapshot and in any
+    live per-(uid, env) maps. Sampling-only envs (e.g. distill-v2, scoring
+    disabled) never appear in ``scores_by_env`` but do have live samples, so
+    feeding the live maps here lets them surface as their own rank column.
+    """
     envs: set[str] = set()
     for row in scores:
         scores_by_env = row.get("scores_by_env") or {}
         if isinstance(scores_by_env, dict):
             envs.update(str(k) for k in scores_by_env.keys())
+    for m in live_env_maps:
+        if isinstance(m, dict):
+            for per_uid in m.values():
+                if isinstance(per_uid, dict):
+                    envs.update(str(k) for k in per_uid.keys())
     return sorted(envs)
 
 
@@ -298,7 +311,8 @@ def _print_rank_table(
         return
 
     scores = list(scores_resp.get("scores") or [])
-    envs = _env_names(scores)
+    # ``envs`` also folds in live sample maps below (after they're loaded) so
+    # sampling-only envs without a scores_by_env snapshot still get a column.
     champion = (window or {}).get("champion") or {}
     battle = ((window or {}).get("battle") or {}).get("challenger") or {}
     live_champion_uid = champion.get("uid")
@@ -329,6 +343,9 @@ def _print_rank_table(
     # last-decided snapshot's 0.00 placeholder. None for miners not
     # currently in the sampling set.
     live_sample_averages = (window or {}).get("sample_averages") or {}
+    # Build the env column set now that live maps are loaded, so sampling-only
+    # envs (distill-v2: scoring disabled, absent from scores_by_env) still show.
+    envs = _env_names(scores, live_sample_averages, live_sample_counts)
     # Per-row threshold basis. Prefer the comparator's decide-time
     # value (champion avg over (champion ∩ row) overlap), fall back
     # to the champion's full-set avg when overlap isn't recorded.
