@@ -240,16 +240,36 @@ class MinerStatsDAO(BaseDAO):
         return self._extract_challenge_state(direct)
 
     async def build_challenge_state_map(
-        self, miners: Iterable[Dict[str, Any]],
+        self,
+        miners: Iterable[Dict[str, Any]],
+        *,
+        concurrency: int = 32,
     ) -> Dict[tuple[str, str], Dict[str, Any]]:
+        """Return lifecycle state for current miners keyed by (hotkey, revision).
+
+        The rank API calls this on every request. Keep the reads bounded but
+        parallel so the endpoint is not gated by 256 sequential DynamoDB gets.
+        """
+        import asyncio
+
         out: Dict[tuple[str, str], Dict[str, Any]] = {}
-        for miner in miners:
-            hotkey = miner.get("hotkey")
-            revision = miner.get("revision")
-            if hotkey and revision:
-                out[(str(hotkey), str(revision))] = await self.get_challenge_state(
-                    str(hotkey), str(revision),
-                )
+        pairs = [
+            (str(miner["hotkey"]), str(miner["revision"]))
+            for miner in miners
+            if miner.get("hotkey") and miner.get("revision")
+        ]
+        sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+        async def _one(hotkey: str, revision: str):
+            async with sem:
+                state = await self.get_challenge_state(hotkey, revision)
+            return (hotkey, revision), state
+
+        results = await asyncio.gather(
+            *(_one(hotkey, revision) for hotkey, revision in pairs)
+        )
+        for key, state in results:
+            out[key] = state
         return out
 
     async def claim_for_challenge(
