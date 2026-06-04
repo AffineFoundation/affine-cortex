@@ -134,11 +134,16 @@ class LiveScoresMonitor:
             )
             return None
 
-        env_configs = await self._state.get_scoring_environments()
+        # Use sampling-enabled envs (not only scoring-enabled) so sampling-only
+        # envs like distill-v2 (enabled_for_scoring=false) still get live
+        # per-(uid, env) averages computed for ``af get-rank`` display. The
+        # comparator/DECIDE path keeps using ``get_scoring_environments`` and is
+        # unaffected — this is display data only.
+        env_configs = await self._state.get_environments()
         scoring_envs = [env for env in env_configs if task_state.task_ids.get(env)]
         if not scoring_envs:
             logger.info(
-                "[LiveScoresMonitor] no scoring envs with task_ids; skipping"
+                "[LiveScoresMonitor] no sampling envs with task_ids; skipping"
             )
             return None
 
