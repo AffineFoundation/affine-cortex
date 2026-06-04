@@ -35,6 +35,7 @@ class WeightSubject:
     is_champion: bool
     scores_by_env: Dict[str, Any]
     total_samples: int
+    model_type: str = ""
 
 
 class ScoresWriter(Protocol):
@@ -50,6 +51,7 @@ class ScoresWriter(Protocol):
         average_score: float,
         scores_by_env: Dict[str, Any],
         total_samples: int,
+        model_type: str = "",
     ) -> Dict[str, Any]: ...
 
 
@@ -121,6 +123,7 @@ class WeightWriter:
                 average_score=average,
                 scores_by_env=subject.scores_by_env,
                 total_samples=subject.total_samples,
+                model_type=subject.model_type,
             )
 
         statistics = {
@@ -129,6 +132,7 @@ class WeightWriter:
             "winner_hotkey": champions[0].hotkey,
             "winner_revision": champions[0].revision,
             "winner_model": champions[0].model,
+            "winner_model_type": champions[0].model_type,
             "final_weights": {
                 str(s.uid): "1.0" if s.is_champion else "0.0" for s in subjects
             },

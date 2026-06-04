@@ -21,6 +21,11 @@ _RANK_FETCH_LIMIT = 256
 # even in the (unrealistic) edge case where all 256 UIDs are sampling.
 _QUEUE_PREVIEW = _RANK_FETCH_LIMIT
 
+_MODEL_TYPE_LABELS = {
+    "qwen3": "Qwen3-32B",
+    "qwen3_5_moe": "Qwen3.6-35B",
+}
+
 
 def _is_color_tty() -> bool:
     try:
@@ -47,6 +52,16 @@ async def _fetch_rank_payload(client) -> Dict[str, Any]:
 def _short(value: Any, n: int) -> str:
     text = "" if value is None else str(value)
     return text[:n]
+
+
+def _model_label(row: Dict[str, Any]) -> str:
+    """Return a compact model label for rank display."""
+    model_type = str(row.get("model_type") or "")
+    if model_type:
+        return _MODEL_TYPE_LABELS.get(model_type, model_type)
+
+    model = str(row.get("model") or "")
+    return model.split("/")[-1] if model else "-"
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -360,7 +375,7 @@ def _print_rank_table(
             continue
         co_champion_shares[uid] = share
 
-    header_parts = ["Hotkey  ", " UID", "⚡| Model                    "]
+    header_parts = ["Hotkey  ", " UID", "⚡| model          ", "Repo                     "]
     header_parts.extend(f"{env[:24]:>24}" for env in envs)
     header_parts.append("  Status   ")
     if show_reason:
@@ -439,6 +454,7 @@ def _print_rank_table(
             f"{_short(row.get('miner_hotkey'), 8):8s}",
             f"{int(row.get('uid') or -1):4d}",
             f"{_sampling_mark(row.get('uid'), live_sampling_uids)}| "
+            f"{_short(_model_label(row), 15):15s}",
             f"{_short(row.get('model'), 25):25s}",
         ]
         scores_by_env = row.get("scores_by_env") or {}

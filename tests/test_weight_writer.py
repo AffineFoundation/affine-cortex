@@ -23,7 +23,10 @@ class _FakeSnapshots:
         return kwargs
 
 
-def _subject(uid, hotkey, *, is_champion, scores_by_env=None, samples=200):
+def _subject(
+    uid, hotkey, *, is_champion, scores_by_env=None, samples=200,
+    model_type="",
+):
     return WeightSubject(
         uid=uid,
         hotkey=hotkey,
@@ -33,6 +36,7 @@ def _subject(uid, hotkey, *, is_champion, scores_by_env=None, samples=200):
         is_champion=is_champion,
         scores_by_env=scores_by_env or {},
         total_samples=samples,
+        model_type=model_type,
     )
 
 
@@ -142,3 +146,24 @@ async def test_payload_carries_revision_model_first_block():
     assert row["model"] == "org/m7"
     assert row["first_block"] == 700
     assert row["total_samples"] == 200
+
+
+@pytest.mark.asyncio
+async def test_payload_carries_model_type_to_score_and_snapshot():
+    scores, snaps = _FakeScores(), _FakeSnapshots()
+    w = WeightWriter(scores, snaps)
+    await w.write(
+        window_id=1,
+        block_number=1,
+        scorer_hotkey="s",
+        subjects=[
+            _subject(
+                7, "h7", is_champion=True,
+                model_type="qwen3_5_moe",
+            ),
+        ],
+        outcome={"winner": "champion"},
+    )
+
+    assert scores.rows[0]["model_type"] == "qwen3_5_moe"
+    assert snaps.rows[0]["statistics"]["winner_model_type"] == "qwen3_5_moe"

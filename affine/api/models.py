@@ -22,6 +22,7 @@ class MinerScore(BaseModel):
     uid: int
     model_revision: str
     model: str
+    model_type: Optional[str] = None
     first_block: int
     overall_score: float
     average_score: float
@@ -54,6 +55,7 @@ class MinerInfo(BaseModel):
     hotkey: str
     model: Optional[str] = None
     revision: Optional[str] = None
+    model_type: Optional[str] = None
     is_valid: Optional[bool] = None
     challenge_status: Optional[str] = None
     # Why the miner was terminated. Stored in miner_stats alongside

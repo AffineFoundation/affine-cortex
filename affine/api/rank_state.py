@@ -29,6 +29,7 @@ def _miner_summary(snapshot) -> Optional[Dict[str, Any]]:
         "hotkey": snapshot.hotkey,
         "revision": snapshot.revision,
         "model": snapshot.model,
+        "model_type": getattr(snapshot, "model_type", None),
         # ``since_block`` is on ``ChampionRecord`` (the canonical champion
         # in system_config) but not on the snapshot-inferred fallback
         # (``_infer_champion_from_scores`` builds a synthetic record
@@ -60,6 +61,7 @@ async def _infer_champion_from_scores() -> Optional[ChampionRecord]:
         hotkey=str(hotkey),
         revision=str(revision),
         model=str(model),
+        model_type=str(row.get("model_type") or ""),
         since_block=int(latest.get("block_number") or 0),
     )
 
@@ -241,6 +243,7 @@ async def get_current_state() -> Dict[str, Any]:
             "hotkey": champion.hotkey,
             "revision": champion.revision,
             "model": champion.model,
+            "model_type": getattr(champion, "model_type", ""),
             "first_block": champion.since_block,
             "is_valid": "false",
             "invalid_reason": "deregistered",
@@ -318,6 +321,7 @@ async def get_queue(limit: int = 256) -> List[Dict[str, Any]]:
                 "hotkey": m.get("hotkey", ""),
                 "revision": m.get("revision", ""),
                 "model": m.get("model", ""),
+                "model_type": m.get("model_type", ""),
                 "first_block": m.get("first_block"),
                 "enqueued_at": m.get("enqueued_at"),
                 "challenge_status": m.get("challenge_status"),

@@ -39,6 +39,7 @@ class MinerSnapshot:
     hotkey: str
     revision: str
     model: str
+    model_type: str = ""
 
 
 @dataclass
@@ -57,6 +58,7 @@ class ChampionRecord:
     hotkey: str
     revision: str
     model: str
+    model_type: str = ""
     deployment_id: Optional[str] = None
     base_url: Optional[str] = None
     deployments: List[DeploymentRecord] = field(default_factory=list)
@@ -321,11 +323,6 @@ class SystemConfigKVAdapter:
 # ---- internal codecs ------------------------------------------------------
 
 
-def _from_dict(cls, raw: Dict[str, Any]):
-    fields = {f for f in cls.__dataclass_fields__}
-    return cls(**{k: v for k, v in raw.items() if k in fields})
-
-
 def _deployment_list(raw: Dict[str, Any]) -> List[DeploymentRecord]:
     deployments = []
     for item in raw.get("deployments") or []:
@@ -376,6 +373,7 @@ def _champion_from_dict(raw: Dict[str, Any]) -> ChampionRecord:
         hotkey=str(raw["hotkey"]),
         revision=str(raw["revision"]),
         model=str(raw["model"]),
+        model_type=str(raw.get("model_type") or ""),
         deployment_id=str(deployment_id) if deployment_id else None,
         base_url=str(base_url) if base_url else None,
         deployments=deployments,
@@ -409,12 +407,14 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
     previous_champion: Optional[MinerSnapshot] = None
     if isinstance(prev_raw, dict) and prev_raw.get("hotkey"):
         previous_champion = MinerSnapshot(**{
-            k: prev_raw[k] for k in ("uid", "hotkey", "revision", "model")
+            k: prev_raw[k]
+            for k in ("uid", "hotkey", "revision", "model", "model_type")
             if k in prev_raw
         })
     return BattleRecord(
         challenger=MinerSnapshot(**{
-            k: chal_raw[k] for k in ("uid", "hotkey", "revision", "model")
+            k: chal_raw[k]
+            for k in ("uid", "hotkey", "revision", "model", "model_type")
             if k in chal_raw
         }),
         deployment_id=deployment_id,

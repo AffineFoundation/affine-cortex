@@ -82,8 +82,8 @@ def _check_against(config: dict, expected: dict) -> Optional[str]:
     return None
 
 
-def _check_allowed_models(config: dict) -> Optional[str]:
-    """Try each allowed config; pass if any matches, else describe the failure.
+def _match_allowed_model(config: dict) -> tuple[Optional[str], Optional[str]]:
+    """Return the matching allow-list model_type, or a mismatch description.
 
     Picks the mismatch from the entry that agreed on ``model_type`` (best signal
     that the miner *intended* that architecture); falls back to listing the
@@ -94,16 +94,16 @@ def _check_allowed_models(config: dict) -> Optional[str]:
     for expected in ALLOWED_MODEL_CONFIGS:
         mismatch = _check_against(config, expected)
         if mismatch is None:
-            return None
+            return str(expected.get("model_type") or ""), None
         if expected.get("model_type") == actual_type and type_match_mismatch is None:
             type_match_mismatch = mismatch
 
     if type_match_mismatch is not None:
-        return type_match_mismatch
+        return None, type_match_mismatch
     allowed_types = ", ".join(
         sorted({str(e.get("model_type")) for e in ALLOWED_MODEL_CONFIGS})
     )
-    return f"model_type={actual_type} (expected one of: {allowed_types})"
+    return None, f"model_type={actual_type} (expected one of: {allowed_types})"
 
 
 class ModelSizeChecker:
@@ -146,18 +146,30 @@ class ModelSizeChecker:
         """
         config = await self._fetch_config(model_id, revision)
         if config is None:
-            return {"pass": False, "reason": "config_fetch_failed"}
+            return {
+                "pass": False,
+                "reason": "config_fetch_failed",
+                "model_type": "",
+            }
 
-        mismatch = _check_allowed_models(config)
+        matched_model_type, mismatch = _match_allowed_model(config)
+        model_type = str(config.get("model_type") or "")
         if mismatch is not None:
-            model_type = config.get("model_type", "<missing>")
             logger.info(
                 f"[ModelSizeChecker] Model not allowed: "
-                f"{model_id} model_type={model_type} mismatch={mismatch}"
+                f"{model_id} model_type={model_type or '<missing>'} mismatch={mismatch}"
             )
-            return {"pass": False, "reason": f"model_not_allowed:{mismatch}"}
+            return {
+                "pass": False,
+                "reason": f"model_not_allowed:{mismatch}",
+                "model_type": model_type,
+            }
 
-        return {"pass": True, "reason": "ok"}
+        return {
+            "pass": True,
+            "reason": "ok",
+            "model_type": matched_model_type or model_type,
+        }
 
 
 async def check_model_size(model_id: str, revision: str) -> Dict[str, Any]:

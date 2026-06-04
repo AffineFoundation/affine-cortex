@@ -61,6 +61,8 @@ class InMemoryStore:
         revision: str | None = None,
         model: str = "",
         scores_by_env: dict | None = None,
+        opponent_scores_by_env: dict | None = None,
+        battle_task_ids: dict | None = None,
         scores_refresh_block: int | None = None,
         terminated_at_block: int | None = None,
     ) -> None:
@@ -76,6 +78,10 @@ class InMemoryStore:
             row["model"] = model
         if scores_by_env is not None:
             row["scores_by_env"] = scores_by_env
+        if opponent_scores_by_env is not None:
+            row["opponent_scores_by_env"] = opponent_scores_by_env
+        if battle_task_ids is not None:
+            row["battle_task_ids"] = battle_task_ids
         if scores_refresh_block is not None:
             row["scores_refresh_block"] = scores_refresh_block
         if terminated_at_block is not None:

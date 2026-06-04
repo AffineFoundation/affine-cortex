@@ -43,6 +43,7 @@ class ScoresDAO(BaseDAO):
         average_score: float,
         scores_by_env: Dict[str, Any],
         total_samples: int,
+        model_type: str = "",
     ) -> Dict[str, Any]:
         """Save a per-miner row for a given block's score snapshot.
 
@@ -58,6 +59,7 @@ class ScoresDAO(BaseDAO):
             'uid': uid,
             'model_revision': model_revision,
             'model': model,
+            'model_type': model_type or '',
             'first_block': first_block,
             'calculated_at': int(time.time()),
             'overall_score': overall_score,

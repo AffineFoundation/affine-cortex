@@ -75,10 +75,12 @@ async def test_current_state_with_champion_only(monkeypatch):
     store = StateStore(kv)
     await store.set_champion(ChampionRecord(
         uid=12, hotkey="X", revision="r", model="org/m",
+        model_type="qwen3",
         deployment_id="wrk-1", base_url="https://t/w1", since_block=99,
     ))
     resp = await _render_current(monkeypatch, store)
     assert resp["champion"]["uid"] == 12
+    assert resp["champion"]["model_type"] == "qwen3"
     assert "champion_base_url" not in resp
     assert resp["battle"] is None
     assert resp["task_refresh_block"] is None
@@ -92,7 +94,10 @@ async def test_current_state_with_battle_in_flight(monkeypatch):
         deployment_id="wrk-A", base_url="https://t/A", since_block=0,
     ))
     await store.set_battle(BattleRecord(
-        challenger=MinerSnapshot(uid=2, hotkey="B", revision="r2", model="org/b"),
+        challenger=MinerSnapshot(
+            uid=2, hotkey="B", revision="r2", model="org/b",
+            model_type="qwen3_5_moe",
+        ),
         deployment_id="wrk-B", base_url="https://t/B", started_at_block=42,
     ))
     await store.set_task_state(TaskIdState(
@@ -101,6 +106,7 @@ async def test_current_state_with_battle_in_flight(monkeypatch):
     resp = await _render_current(monkeypatch, store)
     assert resp["champion"]["uid"] == 1
     assert resp["battle"]["challenger"]["uid"] == 2
+    assert resp["battle"]["challenger"]["model_type"] == "qwen3_5_moe"
     assert resp["battle"]["started_at_block"] == 42
     assert resp["task_refresh_block"] == 42
 
@@ -341,6 +347,7 @@ async def test_infer_champion_from_latest_weight_snapshot(monkeypatch):
                     "miner_hotkey": "hk",
                     "model_revision": "rev",
                     "model": "org/model",
+                    "model_type": "qwen3",
                     "overall_score": 1.0,
                 },
                 {
@@ -359,4 +366,5 @@ async def test_infer_champion_from_latest_weight_snapshot(monkeypatch):
     assert champ.uid == 7
     assert champ.hotkey == "hk"
     assert champ.revision == "rev"
+    assert champ.model_type == "qwen3"
     assert champ.since_block == 123
