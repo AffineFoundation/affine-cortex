@@ -4,6 +4,7 @@ Affine API Server
 FastAPI application entry point.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
@@ -17,6 +18,7 @@ from affine.api.routers import (
     rank_router,
     scores_router,
 )
+from affine.api.routers import rank as rank_cache
 from affine.core.setup import logger
 from affine.database import close_client, init_client
 
@@ -33,14 +35,34 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize database client: {e}")
         raise
 
-    yield
-
-    logger.info("Shutting down Affine API server...")
     try:
-        await close_client()
-        logger.info("Database client closed")
+        await rank_cache.refresh_rank_cache_once()
+        logger.info("Rank cache warmed")
     except Exception as e:
-        logger.error(f"Error closing database client: {e}")
+        logger.error(f"Failed to warm rank cache: {e}")
+        try:
+            await close_client()
+        except Exception as close_error:
+            logger.error(f"Error closing database client: {close_error}")
+        raise
+
+    rank_cache_task = asyncio.create_task(rank_cache.run_rank_cache_refresher())
+
+    try:
+        yield
+    finally:
+        rank_cache_task.cancel()
+        try:
+            await rank_cache_task
+        except asyncio.CancelledError:
+            pass
+
+        logger.info("Shutting down Affine API server...")
+        try:
+            await close_client()
+            logger.info("Database client closed")
+        except Exception as e:
+            logger.error(f"Error closing database client: {e}")
 
 
 app = FastAPI(

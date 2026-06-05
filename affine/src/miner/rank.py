@@ -303,6 +303,7 @@ def _print_rank_table(
     scores_resp: Optional[Dict[str, Any]],
     *,
     show_reason: bool = False,
+    meta: Optional[Dict[str, Any]] = None,
 ) -> None:
     if not scores_resp or not scores_resp.get("scores"):
         print("No scores found")
@@ -543,6 +544,14 @@ def _print_rank_table(
         f"  |  Battle: {battle_uid if battle_uid is not None else '-'}"
         f"  |  Queue head: {queue_count}  |  Valid: {valid}  |  Invalid: {invalid}"
     )
+    if isinstance(meta, dict):
+        db_ms = meta.get("database_query_time_ms")
+        try:
+            db_s = float(db_ms) / 1000
+        except (TypeError, ValueError):
+            db_s = None
+        if db_s is not None:
+            print(f"DB query: {db_s:.2f}s")
     print(f"Sampling: {_ansi('⚡', '1;92')} marks miners with a live inference deployment")
     print(_ansi("=" * width, "2"))
 
@@ -559,4 +568,5 @@ async def get_rank_command(*, show_reason: bool = False) -> None:
         payload.get("queue") if isinstance(payload.get("queue"), list) else None,
         payload.get("scores") if isinstance(payload.get("scores"), dict) else None,
         show_reason=show_reason,
+        meta=payload.get("meta") if isinstance(payload.get("meta"), dict) else None,
     )
