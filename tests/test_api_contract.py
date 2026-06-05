@@ -14,6 +14,13 @@ from affine.api.routers.scores import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _clear_rank_cache():
+    rank_router._reset_rank_cache_for_test()
+    yield
+    rank_router._reset_rank_cache_for_test()
+
+
 class _FakeMinersDAO:
     def __init__(self, rows):
         self.rows = rows
@@ -267,6 +274,8 @@ async def test_config_router_blocks_internal_config_keys(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_rank_router_aggregates_rank_payload(monkeypatch):
+    rank_router._reset_rank_cache_for_test()
+
     async def fake_current_state():
         return {"champion": {"uid": 7}, "sample_counts": {"7": {"SWE": 300}}}
 
@@ -280,13 +289,179 @@ async def test_rank_router_aggregates_rank_payload(monkeypatch):
     monkeypatch.setattr(rank_router, "get_queue", fake_queue)
     monkeypatch.setattr(rank_router, "get_latest_scores", fake_scores)
 
+    await rank_router.refresh_rank_cache_once()
     response = await rank_router.get_current_rank(top=32, queue_limit=5)
 
-    assert response == {
-        "window": {"champion": {"uid": 7}, "sample_counts": {"7": {"SWE": 300}}},
-        "queue": [{"position": 1, "uid": 8, "limit_seen": 5}],
-        "scores": {"scores": [{"uid": 7}], "top_seen": 32},
+    assert response["window"] == {
+        "champion": {"uid": 7},
+        "sample_counts": {"7": {"SWE": 300}},
     }
+    assert response["queue"] == [{"position": 1, "uid": 8, "limit_seen": 256}]
+    assert response["scores"] == {"scores": [{"uid": 7}], "top_seen": 32}
+    assert response["meta"]["cache_status"] == "hit"
+    assert isinstance(response["meta"]["database_query_time_ms"], float)
+
+
+def test_rank_router_cache_defaults_to_five_minutes_refresh_thirty_minutes_expiry():
+    assert rank_router._RANK_CACHE_REFRESH_S == 300
+    assert rank_router._RANK_CACHE_TTL_S == 1800
+
+
+@pytest.mark.asyncio
+async def test_rank_router_requires_warmed_cache(monkeypatch):
+    rank_router._reset_rank_cache_for_test()
+    calls = {"state": 0}
+
+    async def fake_current_state():
+        calls["state"] += 1
+        return {}
+
+    monkeypatch.setattr(rank_router, "get_current_state", fake_current_state)
+
+    with pytest.raises(rank_router.HTTPException) as exc:
+        await rank_router.get_current_rank(top=32, queue_limit=5)
+
+    assert exc.value.status_code == 503
+    assert calls["state"] == 0
+
+
+@pytest.mark.asyncio
+async def test_rank_router_caches_current_payload(monkeypatch):
+    rank_router._reset_rank_cache_for_test()
+    calls = {"state": 0, "queue": 0, "scores": 0}
+
+    async def fake_current_state():
+        calls["state"] += 1
+        return {"call": calls["state"]}
+
+    async def fake_queue(limit):
+        calls["queue"] += 1
+        return [{"limit": limit, "call": calls["queue"]}]
+
+    async def fake_scores(top, dao):
+        calls["scores"] += 1
+        return {"top": top, "call": calls["scores"]}
+
+    monkeypatch.setattr(rank_router, "get_current_state", fake_current_state)
+    monkeypatch.setattr(rank_router, "get_queue", fake_queue)
+    monkeypatch.setattr(rank_router, "get_latest_scores", fake_scores)
+
+    await rank_router.refresh_rank_cache_once()
+    first = await rank_router.get_current_rank(top=32, queue_limit=5)
+    second = await rank_router.get_current_rank(top=32, queue_limit=5)
+
+    assert first["window"] == second["window"]
+    assert first["queue"] == second["queue"]
+    assert first["scores"] == second["scores"]
+    assert first["meta"]["cache_status"] == "hit"
+    assert second["meta"]["cache_status"] == "hit"
+    assert "database_query_time_ms" in second["meta"]
+    assert calls == {"state": 1, "queue": 1, "scores": 1}
+
+
+@pytest.mark.asyncio
+async def test_rank_router_slices_canonical_cache_for_limits(monkeypatch):
+    rank_router._reset_rank_cache_for_test()
+    calls = {"state": 0}
+
+    async def fake_current_state():
+        calls["state"] += 1
+        return {"call": calls["state"]}
+
+    async def fake_queue(limit):
+        return [{"position": i + 1, "uid": i, "limit": limit} for i in range(limit)]
+
+    async def fake_scores(top, dao):
+        return {
+            "scores": [{"rank": i} for i in range(top)],
+            "top_seen": top,
+        }
+
+    monkeypatch.setattr(rank_router, "get_current_state", fake_current_state)
+    monkeypatch.setattr(rank_router, "get_queue", fake_queue)
+    monkeypatch.setattr(rank_router, "get_latest_scores", fake_scores)
+
+    await rank_router.refresh_rank_cache_once()
+    first = await rank_router.get_current_rank(top=32, queue_limit=5)
+    second = await rank_router.get_current_rank(top=64, queue_limit=7)
+
+    assert len(first["scores"]["scores"]) == 32
+    assert len(first["queue"]) == 5
+    assert first["scores"]["top_seen"] == 32
+    assert len(second["scores"]["scores"]) == 64
+    assert len(second["queue"]) == 7
+    assert second["scores"]["top_seen"] == 64
+    assert calls["state"] == 1
+
+
+@pytest.mark.asyncio
+async def test_rank_router_serves_stale_cache_without_request_refresh(monkeypatch):
+    rank_router._reset_rank_cache_for_test()
+    monkeypatch.setattr(rank_router, "_RANK_CACHE_REFRESH_S", 0.01)
+    monkeypatch.setattr(rank_router, "_RANK_CACHE_TTL_S", 60)
+    calls = {"state": 0}
+
+    async def fake_current_state():
+        calls["state"] += 1
+        return {"call": calls["state"]}
+
+    async def fake_queue(limit):
+        return []
+
+    async def fake_scores(top, dao):
+        return {"scores": []}
+
+    monkeypatch.setattr(rank_router, "get_current_state", fake_current_state)
+    monkeypatch.setattr(rank_router, "get_queue", fake_queue)
+    monkeypatch.setattr(rank_router, "get_latest_scores", fake_scores)
+
+    await rank_router.refresh_rank_cache_once()
+    first = await rank_router.get_current_rank(top=32, queue_limit=5)
+    await rank_router.asyncio.sleep(0.02)
+    second = await rank_router.get_current_rank(top=32, queue_limit=5)
+
+    assert first["window"]["call"] == 1
+    assert second["window"]["call"] == 1
+    assert second["meta"]["cache_status"] == "stale"
+    assert calls["state"] == 1
+
+    await rank_router.refresh_rank_cache_once()
+    third = await rank_router.get_current_rank(top=32, queue_limit=5)
+
+    assert third["window"]["call"] == 2
+    assert third["meta"]["cache_status"] == "hit"
+
+
+@pytest.mark.asyncio
+async def test_rank_router_rejects_expired_cache_without_request_refresh(monkeypatch):
+    rank_router._reset_rank_cache_for_test()
+    monkeypatch.setattr(rank_router, "_RANK_CACHE_REFRESH_S", 0.01)
+    monkeypatch.setattr(rank_router, "_RANK_CACHE_TTL_S", 0.02)
+    calls = {"state": 0}
+
+    async def fake_current_state():
+        calls["state"] += 1
+        return {"call": calls["state"]}
+
+    async def fake_queue(limit):
+        return []
+
+    async def fake_scores(top, dao):
+        return {"scores": []}
+
+    monkeypatch.setattr(rank_router, "get_current_state", fake_current_state)
+    monkeypatch.setattr(rank_router, "get_queue", fake_queue)
+    monkeypatch.setattr(rank_router, "get_latest_scores", fake_scores)
+
+    await rank_router.refresh_rank_cache_once()
+    first = await rank_router.get_current_rank(top=32, queue_limit=5)
+    await rank_router.asyncio.sleep(0.04)
+    with pytest.raises(rank_router.HTTPException) as exc:
+        await rank_router.get_current_rank(top=32, queue_limit=5)
+
+    assert first["window"]["call"] == 1
+    assert calls["state"] == 1
+    assert exc.value.status_code == 503
 
 
 @pytest.mark.asyncio

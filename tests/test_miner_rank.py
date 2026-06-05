@@ -10,10 +10,10 @@ import affine.src.miner.rank as rank
 from affine.src.miner.rank import _model_type_label, _print_rank_table
 
 
-def _render_rank(window, queue, scores, *, show_reason=False):
+def _render_rank(window, queue, scores, *, show_reason=False, meta=None):
     buf = io.StringIO()
     with redirect_stdout(buf):
-        _print_rank_table(window, queue, scores, show_reason=show_reason)
+        _print_rank_table(window, queue, scores, show_reason=show_reason, meta=meta)
     return buf.getvalue()
 
 
@@ -136,6 +136,38 @@ def test_rank_table_renders_old_single_table_shape_with_sampling_marks():
     assert "org/q                     | -" in out
     assert "Sampling: ⚡ marks miners with a live inference deployment" in out
     assert "Queue: #1 UID 3" not in out
+
+
+def test_rank_table_renders_database_query_time():
+    scores = {
+        "block_number": 100,
+        "calculated_at": 0,
+        "scores": [
+            {
+                "uid": 1,
+                "miner_hotkey": "champ_hotkey",
+                "model": "org/champion",
+                "overall_score": 1.0,
+                "is_valid": True,
+                "scores_by_env": {},
+            },
+        ],
+    }
+
+    out = _render_rank(
+        {"champion": {"uid": 1, "hotkey": "champ_hotkey", "model": "org/champion"}},
+        [],
+        scores,
+        meta={
+            "database_query_time_ms": 1234.56,
+            "cache_status": "hit",
+            "cache_age_seconds": 42.1,
+        },
+    )
+
+    assert "DB query: 1.23s" in out
+    assert "cache:" not in out
+    assert "age:" not in out
 
 
 def test_model_type_label_prefers_model_type_without_repo_fallback():
