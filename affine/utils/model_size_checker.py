@@ -5,9 +5,14 @@ Validates that miners use one of the allowed model architectures.
 Checks config.json architecture fields from HuggingFace.
 
 Key properties:
-- Quantization-proof: checks architecture fields, not file size
+- Size-proof: matches architecture fields, not file size, so a miner can't
+  shrink a model (e.g. by quantizing) to dodge a size limit.
 - Manipulation-resistant: faking config fields breaks vLLM loading
 - Fail-closed: any mismatch → rejected
+- Unquantized-only: miners submit standard-precision fine-tunes of the allowed
+  architectures. Any pre-quantized config (a ``quantization_config`` block) is
+  rejected — it changes serving requirements (e.g. bitsandbytes 4-bit can't be
+  loaded by the sglang image and traps the scheduler in a deploy-retry loop).
 """
 
 import os
@@ -162,6 +167,19 @@ class ModelSizeChecker:
             return {
                 "pass": False,
                 "reason": f"model_not_allowed:{mismatch}",
+                "model_type": model_type,
+            }
+
+        quant = config.get("quantization_config")
+        if isinstance(quant, dict):
+            method = str(quant.get("quant_method") or "unknown")
+            logger.info(
+                f"[ModelSizeChecker] Quantized model rejected: {model_id} "
+                f"model_type={model_type} quant_method={method}"
+            )
+            return {
+                "pass": False,
+                "reason": f"quantized_model:{method}",
                 "model_type": model_type,
             }
 
