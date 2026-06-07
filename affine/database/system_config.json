@@ -42,7 +42,7 @@
         "sampling_mode": "latest",
         "dataset_range_source": {
           "url": "https://pub-f6e8aaa82d31450daad5b16e3ca040b1.r2.dev/metadata.json",
-          "field": "tasks.completed_up_to",
+          "field": "tasks.staged_up_to",
           "range_type": "zero_to_value"
         }
       }
