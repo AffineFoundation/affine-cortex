@@ -44,6 +44,10 @@ class DeployTarget:
     hotkey: str
     model: str
     revision: str
+    # HuggingFace config.json ``model_type`` (e.g. "qwen3", "qwen3_5_moe").
+    # Drives model-specific sglang launch flags; empty falls back to the
+    # legacy defaults.
+    model_type: str = ""
 
 
 @dataclass
@@ -185,6 +189,7 @@ async def deploy(
             uid=target.uid,
             hotkey=target.hotkey,
             gpu_count=gpus,
+            model_type=target.model_type,
         )
         if not created:
             raise RuntimeError(

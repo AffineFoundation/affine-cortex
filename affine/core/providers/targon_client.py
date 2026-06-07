@@ -81,6 +81,24 @@ def fixed_gpu_count() -> Optional[int]:
 DEFAULT_SGLANG_TOOL_CALL_PARSER = "qwen"
 
 
+# Qwen3.6-35B-A3B (MoE) profile.
+#
+# config.json reports ``model_type == "qwen3_5_moe"`` — distinct from the
+# dense Qwen3-32B (``qwen3``). Qwen3.6 is a hybrid reasoning + tool model:
+# without ``--reasoning-parser`` sglang leaves raw ``<think>`` blocks in the
+# content, and its tool calls use the ``qwen3_coder`` schema rather than the
+# legacy ``qwen`` one. Dense ``qwen3`` keeps the original flags untouched.
+QWEN36_MODEL_TYPE = "qwen3_5_moe"
+QWEN36_TOOL_CALL_PARSER = "qwen3_coder"
+QWEN36_REASONING_PARSER = "qwen3"
+
+
+def is_qwen36(model_type: str) -> bool:
+    """True iff ``model_type`` identifies Qwen3.6 (the MoE variant that needs
+    the reasoning parser + qwen3_coder tool parser + explicit context-length)."""
+    return (model_type or "").strip().lower() == QWEN36_MODEL_TYPE
+
+
 class TargonClient:
     def __init__(
         self,
@@ -248,6 +266,7 @@ class TargonClient:
         tensor_parallel: Optional[int] = None,
         data_parallel: Optional[int] = None,
         engine: Optional[str] = None,
+        model_type: str = "",
     ) -> Optional[str]:
         """Create + deploy a Targon RENTAL workload for `model_hf_repo`@`revision`.
 
@@ -327,6 +346,12 @@ class TargonClient:
                 "--mem-fraction-static", mem_fraction,
                 "--chunked-prefill-size", chunked_prefill_size,
             ]
+            # Qwen3.6 (qwen3_5_moe) needs a reasoning parser and the qwen3_coder
+            # tool-call schema, or it serves unparsed <think> blocks and broken
+            # tool calls. Dense qwen3 and everything else keep the legacy flags.
+            if is_qwen36(model_type):
+                args += ["--reasoning-parser", QWEN36_REASONING_PARSER]
+                tool_call_parser = QWEN36_TOOL_CALL_PARSER
             if tool_call_parser and tool_call_parser.lower() != "none":
                 args += ["--tool-call-parser", tool_call_parser]
             # Use --tp / --dp (sglang accepts both --tp/--tp-size and --dp).
