@@ -373,6 +373,30 @@ def test_dp_disabled_when_one():
     assert "--dp" not in args
 
 
+def _qwen36_target():
+    return DeployTarget(
+        uid=7, hotkey="qwen36hot", model="Qwen/Qwen3.6-35B-A3B",
+        revision="deadbeef0011", model_type="qwen3_5_moe",
+    )
+
+
+def test_qwen36_adds_reasoning_and_coder_parser():
+    """Qwen3.6 (qwen3_5_moe) needs reasoning-parser and the qwen3_coder tool
+    parser, or it serves broken output. Context-length stays auto-derived."""
+    args = _build_sglang_args(_qwen36_target(), _config())
+    assert args[args.index("--reasoning-parser") + 1] == "qwen3"
+    assert args[args.index("--tool-call-parser") + 1] == "qwen3_coder"
+    assert "--context-length" not in args
+
+
+def test_dense_qwen3_keeps_legacy_flags():
+    """Dense qwen3 (and unknown model_type) must NOT get the qwen3.6 flags."""
+    args = _build_sglang_args(_target(), _config())  # _target() has no model_type
+    assert "--reasoning-parser" not in args
+    assert "--context-length" not in args
+    assert args[args.index("--tool-call-parser") + 1] == "qwen"
+
+
 def test_config_from_endpoint_overrides_module_defaults():
     """Per-endpoint sglang settings flow through into the docker command."""
     ep = Endpoint(

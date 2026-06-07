@@ -551,6 +551,7 @@ class FlowScheduler:
         target = targon_lifecycle.DeployTarget(
             uid=champion.uid, hotkey=champion.hotkey,
             model=champion.model, revision=champion.revision,
+            model_type=champion.model_type,
         )
         try:
             result = await self._deploy(target, "champion")
@@ -1088,6 +1089,7 @@ class FlowScheduler:
             target = targon_lifecycle.DeployTarget(
                 uid=cand.uid, hotkey=cand.hotkey,
                 model=cand.model, revision=cand.revision,
+                model_type=cand.model_type,
             )
             try:
                 result = await self._deploy(target, "pre_challenger")
@@ -1153,6 +1155,7 @@ class FlowScheduler:
         target = targon_lifecycle.DeployTarget(
             uid=candidate.uid, hotkey=candidate.hotkey,
             model=candidate.model, revision=candidate.revision,
+            model_type=candidate.model_type,
         )
         try:
             result = await self._deploy(target, "challenger")

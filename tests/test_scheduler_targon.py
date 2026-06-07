@@ -134,3 +134,47 @@ async def test_orphan_sweep_noop_when_client_unconfigured():
     deleted = await orphan_sweep(client, known_workload_ids=set())
     assert deleted == 0
     assert client.deleted == []
+
+
+# ---- create_deployment sglang args (model-type-aware flags) -----------------
+
+
+async def _capture_create_deployment_args(monkeypatch, **kwargs) -> List[str]:
+    """Run TargonClient.create_deployment with _request stubbed; return the
+    sglang args list sent in the POST /workloads body."""
+    from affine.core.providers import targon_client as tc
+
+    client = tc.TargonClient(api_key="k", api_url="http://targon.test", default_engine="sglang")
+    captured: Dict[str, Any] = {}
+
+    async def fake_request(method, path, *, json=None, params=None, timeout=None, expect_json=True):
+        if path == "/workloads":
+            captured["body"] = json
+            return {"uid": "wrk-1"}
+        return {"ok": True}  # the /deploy call
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    await client.create_deployment(
+        "Qwen/Some-Model", "rev1234567890", uid=1, hotkey="hk", **kwargs
+    )
+    return captured["body"]["args"]
+
+
+@pytest.mark.asyncio
+async def test_create_deployment_qwen36_flags(monkeypatch):
+    """Qwen3.6 (qwen3_5_moe) gets reasoning-parser and the qwen3_coder tool
+    parser. Context-length stays auto-derived."""
+    args = await _capture_create_deployment_args(monkeypatch, model_type="qwen3_5_moe")
+    assert args[args.index("--reasoning-parser") + 1] == "qwen3"
+    assert args[args.index("--tool-call-parser") + 1] == "qwen3_coder"
+    assert "--context-length" not in args
+
+
+@pytest.mark.asyncio
+async def test_create_deployment_dense_qwen3_keeps_legacy(monkeypatch):
+    """Dense qwen3 keeps the legacy flags: no reasoning-parser, no
+    context-length, tool parser stays ``qwen``."""
+    args = await _capture_create_deployment_args(monkeypatch, model_type="qwen3")
+    assert "--reasoning-parser" not in args
+    assert "--context-length" not in args
+    assert args[args.index("--tool-call-parser") + 1] == "qwen"

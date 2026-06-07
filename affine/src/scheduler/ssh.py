@@ -41,6 +41,11 @@ from typing import List, Optional, Tuple
 import aiohttp
 import paramiko
 
+from affine.core.providers.targon_client import (
+    QWEN36_REASONING_PARSER,
+    QWEN36_TOOL_CALL_PARSER,
+    is_qwen36,
+)
 from affine.core.setup import logger
 
 from .flow import TransientDeployError
@@ -179,7 +184,7 @@ class SSHConfig:
 
 
 def _build_sglang_args(target: DeployTarget, config: "SSHConfig") -> List[str]:
-    """sglang launch args. Mirrors targon_client.py:382-403 verbatim."""
+    """sglang launch args. Mirrors targon_client.create_deployment."""
     args = [
         "--model-path", target.model,
         "--revision", target.revision,
@@ -191,6 +196,12 @@ def _build_sglang_args(target: DeployTarget, config: "SSHConfig") -> List[str]:
         "--chunked-prefill-size", str(config.sglang_chunked_prefill),
     ]
     parser = config.sglang_tool_call_parser
+    # Qwen3.6 (qwen3_5_moe) needs a reasoning parser and the qwen3_coder
+    # tool-call schema, or it serves unparsed <think> blocks and broken tool
+    # calls. Dense qwen3 and everything else keep the legacy flags.
+    if is_qwen36(target.model_type):
+        args += ["--reasoning-parser", QWEN36_REASONING_PARSER]
+        parser = QWEN36_TOOL_CALL_PARSER
     if parser and parser.lower() != "none":
         args += ["--tool-call-parser", parser]
     if config.sglang_dp > 1:
