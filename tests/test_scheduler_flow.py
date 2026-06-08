@@ -636,6 +636,60 @@ async def test_losing_challenger_carries_final_scores_to_miner_stats():
 
 
 @pytest.mark.asyncio
+async def test_losing_challenger_freezes_sampling_only_env():
+    """Sampling-only envs (``enabled_for_scoring=false`` — distill-v2)
+    never enter the comparator, so the frozen ``scores_by_env`` would
+    otherwise drop them and ``af get-rank`` would show the column blank
+    for every terminated miner. The decide path must read the loser's
+    own sampling-only samples and freeze them alongside the scoring
+    envs, with the champion's overlap avg as the threshold basis."""
+    kv = _seed_state()
+    # Add a sampling-only env (sampled but not scored).
+    kv.data["environments"]["ENV_S"] = {
+        "display_name": "S", "enabled_for_sampling": True,
+        "enabled_for_scoring": False,
+        "sampling": {"sampling_count": 4, "dataset_range": [[0, 1000]],
+                     "sampling_mode": "random"},
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    rb = task_state.refreshed_at_block
+    # Champion fills every sampling env (scoring + sampling-only) so the
+    # battle reaches the decide step (overlap readiness checks all envs).
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("champ_hk", "champ_rev", env, task_state.task_ids[env], score=0.9, refresh_block=rb)
+    samples.set_samples("champ_hk", "champ_rev", "ENV_S", task_state.task_ids["ENV_S"], score=0.7, refresh_block=rb)
+    await scheduler.tick(current_block=52)
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples("chal_hk", "chal_rev", env, task_state.task_ids[env], score=0.3, refresh_block=rb)
+    samples.set_samples("chal_hk", "chal_rev", "ENV_S", task_state.task_ids["ENV_S"], score=0.4, refresh_block=rb)
+    await scheduler.tick(current_block=77)
+
+    loser_row = miner_store.rows[2]
+    assert loser_row["challenge_status"] == STATUS_TERMINATED
+    final = loser_row["scores_by_env"]
+    # Scoring envs frozen as before, plus the sampling-only env.
+    assert set(final.keys()) == {"ENV_A", "ENV_B", "ENV_S"}
+    assert final["ENV_S"]["avg"] == pytest.approx(0.4)        # loser's own avg
+    assert final["ENV_S"]["count"] > 0
+    assert final["ENV_S"]["champion_overlap_avg"] == pytest.approx(0.7)  # basis
+    # Opponent (champion) view also carries the sampling-only env.
+    assert loser_row["opponent_scores_by_env"]["ENV_S"]["avg"] == pytest.approx(0.7)
+
+
+@pytest.mark.asyncio
 async def test_deploy_failure_keeps_challenger_in_queue():
     """A deploy failure (host crash / sglang OSError / HF transient)
     must not mark the miner FAILED. ``pick_next`` already flipped the

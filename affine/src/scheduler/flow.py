@@ -724,6 +724,71 @@ class FlowScheduler:
             return None
         return regression_env, per_env_data, overlap_task_ids
 
+    async def _sampling_only_freeze_scores(
+        self,
+        *,
+        subject_hotkey: str,
+        subject_revision: str,
+        basis_hotkey: str,
+        basis_revision: str,
+        task_state: TaskIdState,
+    ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+        """Freeze sampling-only envs onto a terminating miner.
+
+        Sampling-only envs (``enabled_for_sampling=true,
+        enabled_for_scoring=false`` — distill-v2) never enter the
+        comparator, so ``_final_scores_from_result`` / the early-loss
+        ``per_env_data`` omit them. The blind ``scores_by_env`` overwrite
+        at termination would then drop the live distill entry
+        :class:`LiveScoresMonitor` had parked on the row, leaving the env
+        column blank for every terminated miner in ``af get-rank``.
+
+        Reading the subject's samples here and merging them into the
+        frozen payload keeps these envs visible after the live cache
+        forgets the row — the same guarantee scoring envs already get.
+        The subject's own full-set avg is frozen (matching the live
+        display's basis, so a battling miner's number doesn't jump when
+        it terminates); ``champion_overlap_avg`` is added as the
+        threshold basis when a (subject ∩ basis) overlap exists.
+
+        Returns ``(subject_scores, basis_scores)`` in the same shapes the
+        scoring-env freeze produces (``{env: {count, avg,
+        champion_overlap_avg?}}`` and ``{env: {count, avg}}``).
+        """
+        all_envs = await self.state.get_environments()
+        scoring_envs = await self.state.get_scoring_environments()
+        sampling_only = [e for e in all_envs if e not in scoring_envs]
+        if not sampling_only:
+            return {}, {}
+
+        subject_out: Dict[str, Dict[str, float]] = {}
+        basis_out: Dict[str, Dict[str, float]] = {}
+        for env in sampling_only:
+            tasks = task_state.task_ids.get(env, [])
+            if not tasks:
+                continue
+            subj = await self._scores_reader(
+                subject_hotkey, subject_revision, env, tasks,
+                task_state.refreshed_at_block,
+            )
+            if not subj:
+                continue
+            entry: Dict[str, float] = {
+                "count": len(subj),
+                "avg": sum(subj.values()) / len(subj),
+            }
+            basis = await self._scores_reader(
+                basis_hotkey, basis_revision, env, tasks,
+                task_state.refreshed_at_block,
+            )
+            overlap = sorted(set(subj) & set(basis))
+            if overlap:
+                basis_avg = sum(basis[t] for t in overlap) / len(overlap)
+                entry["champion_overlap_avg"] = basis_avg
+                basis_out[env] = {"count": len(overlap), "avg": basis_avg}
+            subject_out[env] = entry
+        return subject_out, basis_out
+
     async def _decide_early_lost(
         self,
         champion: ChampionRecord,
@@ -750,6 +815,13 @@ class FlowScheduler:
         normal-path LOST.
         """
         await self._teardown_record(battle)
+        chal_so, chal_so_basis = await self._sampling_only_freeze_scores(
+            subject_hotkey=battle.challenger.hotkey,
+            subject_revision=battle.challenger.revision,
+            basis_hotkey=champion.hotkey,
+            basis_revision=champion.revision,
+            task_state=task_state,
+        )
         await self.queue.mark_terminated(
             battle.challenger.uid,
             OUTCOME_LOST,
@@ -760,8 +832,11 @@ class FlowScheduler:
             hotkey=battle.challenger.hotkey,
             revision=battle.challenger.revision,
             model=battle.challenger.model,
-            scores_by_env=per_env_data,
-            opponent_scores_by_env=_opponent_scores_from_early_lost(per_env_data),
+            scores_by_env={**chal_so, **per_env_data},
+            opponent_scores_by_env={
+                **chal_so_basis,
+                **_opponent_scores_from_early_lost(per_env_data),
+            },
             battle_task_ids=overlap_task_ids,
             scores_refresh_block=task_state.refreshed_at_block,
             terminated_at_block=current_block,
@@ -1047,6 +1122,13 @@ class FlowScheduler:
         battle teardown or champion cleanup, just LOST + free the slot.
         ``reason`` carries ``:predeploy`` for rank-UI provenance."""
         await self._teardown_record(record)
+        chal_so, chal_so_basis = await self._sampling_only_freeze_scores(
+            subject_hotkey=record.challenger.hotkey,
+            subject_revision=record.challenger.revision,
+            basis_hotkey=champion.hotkey,
+            basis_revision=champion.revision,
+            task_state=task_state,
+        )
         await self.queue.mark_terminated(
             record.challenger.uid,
             OUTCOME_LOST,
@@ -1057,8 +1139,11 @@ class FlowScheduler:
             hotkey=record.challenger.hotkey,
             revision=record.challenger.revision,
             model=record.challenger.model,
-            scores_by_env=per_env_data,
-            opponent_scores_by_env=_opponent_scores_from_early_lost(per_env_data),
+            scores_by_env={**chal_so, **per_env_data},
+            opponent_scores_by_env={
+                **chal_so_basis,
+                **_opponent_scores_from_early_lost(per_env_data),
+            },
             battle_task_ids=overlap_task_ids,
             scores_refresh_block=task_state.refreshed_at_block,
             terminated_at_block=current_block,
@@ -1408,6 +1493,14 @@ class FlowScheduler:
                 revision=battle.challenger.revision,
                 model=battle.challenger.model,
             )
+            # Old champion is being displaced — its basis is the winner.
+            champ_so, champ_so_basis = await self._sampling_only_freeze_scores(
+                subject_hotkey=champion.hotkey,
+                subject_revision=champion.revision,
+                basis_hotkey=battle.challenger.hotkey,
+                basis_revision=battle.challenger.revision,
+                task_state=task_state,
+            )
             await self.queue.mark_terminated(
                 champion.uid,
                 OUTCOME_LOST,
@@ -1415,12 +1508,14 @@ class FlowScheduler:
                 hotkey=champion.hotkey,
                 revision=champion.revision,
                 model=champion.model,
-                scores_by_env=_final_scores_from_result(
-                    result, role="champion",
-                ),
-                opponent_scores_by_env=_opponent_scores_from_result(
-                    result, role="champion",
-                ),
+                scores_by_env={
+                    **champ_so,
+                    **_final_scores_from_result(result, role="champion"),
+                },
+                opponent_scores_by_env={
+                    **champ_so_basis,
+                    **_opponent_scores_from_result(result, role="champion"),
+                },
                 battle_task_ids=overlap_task_ids,
                 scores_refresh_block=task_state.refreshed_at_block,
                 terminated_at_block=current_block,
@@ -1437,6 +1532,13 @@ class FlowScheduler:
             )
         else:
             await self._teardown_record(battle)
+            chal_so, chal_so_basis = await self._sampling_only_freeze_scores(
+                subject_hotkey=battle.challenger.hotkey,
+                subject_revision=battle.challenger.revision,
+                basis_hotkey=champion.hotkey,
+                basis_revision=champion.revision,
+                task_state=task_state,
+            )
             await self.queue.mark_terminated(
                 battle.challenger.uid,
                 OUTCOME_LOST,
@@ -1444,12 +1546,14 @@ class FlowScheduler:
                 hotkey=battle.challenger.hotkey,
                 revision=battle.challenger.revision,
                 model=battle.challenger.model,
-                scores_by_env=_final_scores_from_result(
-                    result, role="challenger",
-                ),
-                opponent_scores_by_env=_opponent_scores_from_result(
-                    result, role="challenger",
-                ),
+                scores_by_env={
+                    **chal_so,
+                    **_final_scores_from_result(result, role="challenger"),
+                },
+                opponent_scores_by_env={
+                    **chal_so_basis,
+                    **_opponent_scores_from_result(result, role="challenger"),
+                },
                 battle_task_ids=overlap_task_ids,
                 scores_refresh_block=task_state.refreshed_at_block,
                 terminated_at_block=current_block,
