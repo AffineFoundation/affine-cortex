@@ -25,6 +25,7 @@ from affine.src.scheduler.ssh import (
     _cleanup_stale_caches,
     _hf_cache_dir_name,
     _is_valid_hf_model_id,
+    _parse_container_exit_status,
     deploy,
 )
 from affine.src.scheduler.targon import DeployTarget
@@ -358,6 +359,17 @@ def test_docker_cmd_omits_hf_token_when_env_unset(monkeypatch):
     assert "-e HUGGING_FACE_HUB_TOKEN=" not in cmd
 
 
+def test_parse_container_exit_status_tolerates_targon_banner():
+    assert _parse_container_exit_status("exited 1\n") == 1
+    assert _parse_container_exit_status(
+        "Connecting to container wrk-abc...\nexited 1\n"
+    ) == 1
+    assert _parse_container_exit_status(
+        "Connecting to container wrk-abc...\nrunning 0\n"
+    ) is None
+    assert _parse_container_exit_status("Connecting to container wrk-abc...\n") is None
+
+
 def test_tool_call_parser_none_omits_flag():
     """Endpoint config can set parser='none' so non-Qwen models don't get
     a spurious parser."""
@@ -480,7 +492,7 @@ async def test_wait_ready_raises_early_on_container_exit(monkeypatch):
 
     async def fake_ssh_exec(config, command):
         if command.startswith("docker inspect"):
-            return 0, "exited 1\n", ""
+            return 0, "Connecting to container wrk-abc...\nexited 1\n", ""
         raise AssertionError(f"unexpected: {command}")
 
     monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)

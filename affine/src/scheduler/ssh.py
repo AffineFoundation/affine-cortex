@@ -426,13 +426,33 @@ async def _container_exit_status(config: "SSHConfig") -> Optional[int]:
     rc, out, _ = await _ssh_exec(config, cmd)
     if rc != 0:
         return None
-    parts = out.strip().split()
-    if len(parts) != 2 or parts[0] == "running":
-        return None
-    try:
-        return int(parts[1])
-    except ValueError:
-        return None
+    return _parse_container_exit_status(out)
+
+
+def _parse_container_exit_status(output: str) -> Optional[int]:
+    """Parse ``docker inspect`` status from noisy SSH stdout.
+
+    Targon's SSH wrapper prefixes stdout with lines such as
+    ``Connecting to container ...``. Scan from the bottom so those banners don't
+    hide the actual ``running 0`` / ``exited 1`` line.
+    """
+    for line in reversed((output or "").splitlines()):
+        parts = line.strip().split()
+        if len(parts) != 2:
+            continue
+        status, exit_code_s = parts
+        if status not in {
+            "created", "restarting", "running", "removing",
+            "paused", "exited", "dead",
+        }:
+            continue
+        if status == "running":
+            return None
+        try:
+            return int(exit_code_s)
+        except ValueError:
+            return None
+    return None
 
 
 async def _wait_ready(
