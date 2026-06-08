@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_url
 from huggingface_hub.errors import (
     DisabledRepoError,
     GatedRepoError,
@@ -509,6 +509,8 @@ class MinersMonitor:
                     repo_id=model_id, repo_type="model", revision=revision, files_metadata=True,
                 )
             )
+            if getattr(info, "gated", False):
+                await self._assert_gated_downloadable(model_id, revision)
             hf_revision = getattr(info, "sha", None)
             siblings = getattr(info, "siblings", None) or []
             shas = {
@@ -554,6 +556,12 @@ class MinersMonitor:
             result = (model_hash, hf_revision, duplicate_source)
             self._weights_cache[key] = (result, now)
             return result
+        except HFRepoUnavailable:
+            # Raised by the gated-access probe below; propagate to the caller's
+            # permanent-reject handler instead of being swallowed as a soft
+            # fetch failure by the generic ``except Exception``.
+            self._weights_cache.pop(key, None)
+            raise
         except DisabledRepoError as e:
             self._weights_cache.pop(key, None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_disabled", e)
@@ -569,6 +577,35 @@ class MinersMonitor:
                 f"{type(e).__name__}: {e}"
             )
             return None
+
+    async def _assert_gated_downloadable(self, model_id: str, revision: str) -> None:
+        """Miner models must be fully public. A gated repo still returns full
+        metadata via ``repo_info`` even when the validator isn't on its
+        allow-list, so ``_get_model_info`` (which hashes weights from metadata)
+        and a cached ``config.json`` both pass — yet the scheduler can't
+        download the weights to serve it (403 at deploy). Probe one real file
+        resolve so that 403 surfaces here.
+
+        Only a deterministic ``GatedRepoError`` (HTTP 403 + gated marker) is a
+        permanent, miner-attributable reject. Everything else — rate limiting
+        (429), 5xx, timeouts, DNS — is swallowed, so transient HF pressure can
+        never wrongly terminate a good miner. Runs only on the 30-min
+        weight-cache miss (gated repos only), so it adds no high-frequency load.
+        """
+        try:
+            await asyncio.to_thread(
+                lambda: get_hf_file_metadata(
+                    hf_hub_url(model_id, "config.json", revision=revision),
+                    token=os.getenv("HF_TOKEN"),
+                )
+            )
+        except GatedRepoError as e:
+            self._raise_repo_unavailable(model_id, revision, "hf_repo_gated", e)
+        except Exception as e:
+            logger.warning(
+                f"[MinersMonitor] gated-access probe inconclusive "
+                f"{model_id}@{revision[:8]}: {type(e).__name__}: {e}"
+            )
 
     async def _verify_repo_accessible(
         self, api: HfApi, model_id: str, revision: str
