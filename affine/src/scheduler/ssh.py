@@ -217,6 +217,8 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
         "-e HF_HOME=/data "
         "-e HF_HUB_CACHE=/data "
         "-e TRANSFORMERS_CACHE=/data "
+        "-e HF_HUB_DISABLE_XET=1 "
+        "-e HF_HUB_DOWNLOAD_TIMEOUT=60 "
     )
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
