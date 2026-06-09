@@ -140,6 +140,8 @@ def _pick_origin(
             and is_copy_verdict(
                 pair,
                 nll_threshold=cfg.nll_threshold,
+                per_env_nll_thresholds=cfg.per_env_nll_thresholds,
+                per_env_min_envs=cfg.per_env_min_envs,
                 agreement_ratio=cfg.agreement_ratio,
             )
         ):

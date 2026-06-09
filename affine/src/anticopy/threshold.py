@@ -86,6 +86,19 @@ DEFAULT_GC_KEEP_RECENT = 3
 # ``conversation`` field, so rollouts can't be derived from it.
 DEFAULT_ENABLED_ENVS = ("MEMORY", "TERMINAL", "SWE-INFINITE", "NAVWORLD", "LIVEWEB")
 
+# Per-env decision-median ceilings. When this dict is non-empty the
+# verdict uses a per-env rule instead of pooling envs into one combined
+# median: a candidate is a copy iff **every** env with data sits below
+# its own threshold. A single env above the bar is enough to call the
+# candidate independent ("有一个差距大就不是 copy"). Empty dict ->
+# legacy combined-median behaviour via ``nll_threshold``.
+DEFAULT_PER_ENV_NLL_THRESHOLDS: Dict[str, float] = {}
+
+# Floor for the per-env rule: with fewer than this many envs carrying
+# decision tokens, fall back to legacy combined-median — a single-env
+# overlap is too thin to make an "all envs agree" claim.
+DEFAULT_PER_ENV_MIN_ENVS = 3
+
 
 @dataclass
 class AntiCopyConfig:
@@ -102,6 +115,10 @@ class AntiCopyConfig:
     enabled_envs: List[str] = field(default_factory=lambda: list(DEFAULT_ENABLED_ENVS))
     gc_keep_recent: int = DEFAULT_GC_KEEP_RECENT
     verdict_lookback_days: int = DEFAULT_VERDICT_LOOKBACK_DAYS
+    per_env_nll_thresholds: Dict[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_PER_ENV_NLL_THRESHOLDS)
+    )
+    per_env_min_envs: int = DEFAULT_PER_ENV_MIN_ENVS
 
 
 async def load_anticopy_config(
@@ -135,6 +152,21 @@ async def load_anticopy_config(
     else:
         enabled_envs = list(DEFAULT_ENABLED_ENVS)
 
+    # Per-env thresholds: dict[env_name -> float]. Garbage entries
+    # (non-numeric) are dropped silently rather than crashing the
+    # service on a typo; empty result means "stick with combined
+    # median".
+    per_env_raw = raw.get("per_env_nll_thresholds")
+    per_env_thresholds: Dict[str, float] = {}
+    if isinstance(per_env_raw, dict):
+        for k, v in per_env_raw.items():
+            try:
+                per_env_thresholds[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+    if not per_env_thresholds:
+        per_env_thresholds = dict(DEFAULT_PER_ENV_NLL_THRESHOLDS)
+
     return AntiCopyConfig(
         enabled=bool(raw.get("enabled", False)),
         nll_threshold=_f("nll_threshold", DEFAULT_NLL_THRESHOLD),
@@ -150,5 +182,9 @@ async def load_anticopy_config(
         gc_keep_recent=max(2, _i("gc_keep_recent", DEFAULT_GC_KEEP_RECENT)),
         verdict_lookback_days=max(
             0, _i("verdict_lookback_days", DEFAULT_VERDICT_LOOKBACK_DAYS)
+        ),
+        per_env_nll_thresholds=per_env_thresholds,
+        per_env_min_envs=max(
+            1, _i("per_env_min_envs", DEFAULT_PER_ENV_MIN_ENVS)
         ),
     )

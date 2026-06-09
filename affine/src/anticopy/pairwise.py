@@ -232,22 +232,50 @@ def is_copy_verdict(
     pair: PairResult,
     *,
     nll_threshold: float,
+    per_env_nll_thresholds: Optional[Dict[str, float]] = None,
+    per_env_min_envs: int = 3,
     agreement_ratio: float = 1.0,  # noqa: ARG001 — accepted for back-compat
 ) -> bool:
-    """Final verdict: ``copy`` iff the combined decision-position
-    median (every env's decision positions pooled into one bag)
-    lands below ``nll_threshold``.
+    """Final verdict logic.
 
-    Pooling across envs lets high-signal envs (NAVWORLD / TERMINAL
-    with thousands of decision tokens) anchor the verdict while
-    low-signal envs (MEMORY) blend in by their share of the union —
-    they can't single-handedly veto a copy call the way per-env voting
-    did.
+    Two modes, selected by whether ``per_env_nll_thresholds`` is set:
+
+    * **Per-env mode** (dict non-empty): a candidate is a copy iff
+      every env that has decision tokens lands below its own per-env
+      threshold. A single env above the bar acquits the candidate
+      ("有一个差距大就不是 copy"). Requires at least
+      ``per_env_min_envs`` envs in the comparison to call a verdict;
+      thinner overlaps fall back to combined-median mode below.
+    * **Combined-median mode** (legacy, dict empty): the pooled
+      ``decision_median_combined`` is compared against
+      ``nll_threshold``. Pooling across envs lets high-signal envs
+      (NAVWORLD / TERMINAL with thousands of decision tokens) anchor
+      the verdict while low-signal envs (MEMORY) blend in by their
+      share of the union — they can't single-handedly veto a copy
+      call the way per-env voting did.
 
     ``agreement_ratio`` is accepted for backward-compat with callers
-    that still pass it; the verdict comes from a single number now,
-    not a per-env vote, so the ratio has no effect.
+    that still pass it; the per-env rule already supersedes the
+    earlier ``X-of-Y env votes`` style of agreement gate.
     """
+    if per_env_nll_thresholds:
+        # Walk every configured env first so ``present`` reflects the
+        # full count (early-break would skew the floor check).
+        configured = []
+        for env, ec in pair.per_env.items():
+            if ec.decision_n <= 0:
+                continue
+            threshold = per_env_nll_thresholds.get(env)
+            if threshold is None:
+                # Env isn't in the per-env config — don't let an
+                # unconfigured env veto or trigger a verdict.
+                continue
+            configured.append((ec.decision_median, threshold))
+        if len(configured) >= per_env_min_envs:
+            return all(med < t for med, t in configured)
+        # Too few envs with data — fall through to combined median
+        # so a thin comparison still gets a verdict rather than
+        # silently defaulting to "clean".
     return (
         pair.decision_median_combined >= 0
         and pair.decision_median_combined < nll_threshold
