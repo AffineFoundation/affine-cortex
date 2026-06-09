@@ -95,6 +95,14 @@ def _pick_origin(
 
     ``peer_cache`` is keyed by ``(hotkey, revision)`` and contains
     score blobs with ``first_block`` already attached.
+
+    Peers already judged a copy of someone else (``verdict_copy_of``
+    set on the blob) are skipped as comparison targets: their own
+    origin committed earlier and is already in the peer set, so it
+    would always win the earliest-committer tie-break before its copy
+    could — comparing against the copy is pure wasted CPU. For an
+    independent candidate (no winner, so every peer is scanned) this
+    prunes the bulk of the ``compare_scores`` calls.
     """
     lookback_blocks = cfg.verdict_lookback_days * BLOCKS_PER_DAY
     ref_hk = ref_score.get("hotkey", "")
@@ -120,6 +128,8 @@ def _pick_origin(
     for fb, hk, peer in items:
         if not hk or hk == ref_hk:
             continue
+        if peer.get("verdict_copy_of"):
+            continue                      # known copy → origin covers it
         if (fb, hk) >= (ref_first_block, ref_hk):
             continue
         if (
@@ -242,6 +252,10 @@ class VerdictBackfillService:
                 continue
             _normalize_blob_for_cache(blob)
             blob["first_block"] = int(row.get("first_block", 0) or 0)
+            # Carry the existing verdict so _pick_origin can skip peers
+            # already known to be copies (their origin is a better,
+            # earlier comparison target).
+            blob["verdict_copy_of"] = row.get("verdict_copy_of", "") or ""
             peer_cache[(row.get("hotkey", ""), row.get("revision", ""))] = blob
 
         logger.info(
@@ -273,6 +287,10 @@ class VerdictBackfillService:
                     stats = None
                 if stats and stats.get("challenge_status") == MinerStatsDAO.STATUS_CHAMPION:
                     decision = CopyDecision()
+            # Reflect the resolved verdict back into the cache so the
+            # remaining pending rows this tick skip it if it's a copy.
+            if ref is not None:
+                ref["verdict_copy_of"] = decision.copy_of_hotkey or ""
             try:
                 await self.scores_dao.update_verdict(
                     hk, rev,
