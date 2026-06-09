@@ -136,6 +136,43 @@ def test_pick_origin_lookback_excludes_ancient():
     assert dec.copy_of_hotkey == "B"
 
 
+def test_pick_origin_skips_known_copy_peers():
+    """A peer already flagged as a copy is not used as a comparison
+    target — its earlier origin wins the attribution instead."""
+    cfg = AntiCopyConfig(
+        enabled=True, nll_threshold=0.05, min_overlap=10,
+        agreement_ratio=0.5, verdict_lookback_days=0,
+    )
+    ref = _blob("Z", "rz", 1000, [-0.7] * 60)
+    origin = _blob("A", "ra", 200, [-0.7] * 60)
+    copy_peer = _blob("B", "rb", 500, [-0.7] * 60)
+    copy_peer["verdict_copy_of"] = "A"     # B is a known copy of A
+    peers = {("A", "ra"): origin, ("B", "rb"): copy_peer}
+    dec = _pick_origin(
+        cfg=cfg, ref_score=ref, ref_first_block=1000, peer_cache=peers,
+    )
+    # Origin A wins (it would anyway via earliest-committer); B is skipped.
+    assert dec.copy_of_hotkey == "A"
+
+
+def test_pick_origin_only_copy_peers_yields_independent():
+    """When every threshold-crossing peer is itself a known copy and is
+    skipped, the candidate is reported independent rather than attributed
+    to a copy."""
+    cfg = AntiCopyConfig(
+        enabled=True, nll_threshold=0.05, min_overlap=10,
+        agreement_ratio=0.5, verdict_lookback_days=0,
+    )
+    ref = _blob("Z", "rz", 1000, [-0.7] * 60)
+    copy_peer = _blob("B", "rb", 500, [-0.7] * 60)
+    copy_peer["verdict_copy_of"] = "A"     # only peer, and it's a copy
+    peers = {("B", "rb"): copy_peer}
+    dec = _pick_origin(
+        cfg=cfg, ref_score=ref, ref_first_block=1000, peer_cache=peers,
+    )
+    assert dec.copy_of_hotkey == ""
+
+
 # ---------- VerdictBackfillService.tick -----------------------------
 
 
