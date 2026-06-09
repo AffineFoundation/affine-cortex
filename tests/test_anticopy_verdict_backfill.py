@@ -213,3 +213,74 @@ async def test_backfill_noop_when_no_pending_rows():
     await svc._tick()
     assert scores.updates == []
     assert r2.fetch_log == []
+
+
+@pytest.mark.asyncio
+async def test_peer_cache_skips_rows_outside_lookback_window():
+    """Peers whose ``first_block`` is older than the earliest pending
+    candidate's lookback window are never fetched from R2 — they can't
+    influence any verdict this tick anyway. Memory + latency win since
+    ``scores_index`` has no TTL and accumulates dereg history.
+    """
+    # lookback_days=1 → 7200 blocks. Pending candidate at fb=120000 →
+    # peer_fb_floor = 120000 - 7200 = 112800. Anything below that is
+    # skipped at the cache-build step.
+    blobs = {
+        "ANCIENT/r0.json.gz":  _blob("ANCIENT",  "r0",  10_000, [-0.7] * 60),
+        "OLD/r1.json.gz":      _blob("OLD",      "r1", 100_000, [-0.7] * 60),
+        "EDGE/r2.json.gz":     _blob("EDGE",     "r2", 112_800, [-0.7] * 60),
+        "FRESH/r3.json.gz":    _blob("FRESH",    "r3", 115_000, [-0.7] * 60),
+        "PENDING/r4.json.gz":  _blob("PENDING",  "r4", 120_000, [-0.7] * 60),
+    }
+    rows = [
+        _row("ANCIENT",  "r0",  10_000, verdict_at=1700000000),  # done, far outside window
+        _row("OLD",      "r1", 100_000, verdict_at=1700000001),  # done, outside
+        _row("EDGE",     "r2", 112_800, verdict_at=1700000002),  # done, on boundary
+        _row("FRESH",    "r3", 115_000, verdict_at=1700000003),  # done, inside
+        _row("PENDING",  "r4", 120_000),                          # pending
+    ]
+    r2 = _FakeR2(blobs)
+    scores = _FakeScoresDAO(rows)
+    cfg_dao = _FakeConfigDAO({
+        "enabled": True, "nll_threshold": 0.05, "min_overlap": 10,
+        "agreement_ratio": 0.5, "verdict_lookback_days": 1,
+    })
+    svc = VerdictBackfillService(
+        scores_dao=scores, config_dao=cfg_dao, r2=r2,
+    )
+    await svc._tick()
+
+    fetched = set(r2.fetch_log)
+    assert "ANCIENT/r0.json.gz" not in fetched
+    assert "OLD/r1.json.gz" not in fetched
+    assert "EDGE/r2.json.gz" in fetched
+    assert "FRESH/r3.json.gz" in fetched
+    assert "PENDING/r4.json.gz" in fetched
+
+
+@pytest.mark.asyncio
+async def test_peer_cache_lookback_zero_disables_filter():
+    """``verdict_lookback_days=0`` means no time-based pruning — every
+    row's blob is loaded. Keeps backward compatibility with the
+    original behaviour expected by older fixtures in this file.
+    """
+    blobs = {
+        "VERY_OLD/r0.json.gz": _blob("VERY_OLD", "r0",   1_000, [-0.7] * 60),
+        "PENDING/r1.json.gz":  _blob("PENDING",  "r1", 500_000, [-0.7] * 60),
+    }
+    rows = [
+        _row("VERY_OLD", "r0",   1_000, verdict_at=1700000000),
+        _row("PENDING",  "r1", 500_000),
+    ]
+    r2 = _FakeR2(blobs)
+    scores = _FakeScoresDAO(rows)
+    cfg_dao = _FakeConfigDAO({
+        "enabled": True, "nll_threshold": 0.05, "min_overlap": 10,
+        "agreement_ratio": 0.5, "verdict_lookback_days": 0,
+    })
+    svc = VerdictBackfillService(
+        scores_dao=scores, config_dao=cfg_dao, r2=r2,
+    )
+    await svc._tick()
+
+    assert sorted(r2.fetch_log) == sorted(blobs.keys())

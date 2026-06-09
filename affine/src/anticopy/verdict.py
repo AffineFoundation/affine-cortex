@@ -219,13 +219,38 @@ class VerdictBackfillService:
             f"[anticopy.verdict] tick: {len(pending)}/{len(rows)} rows pending"
         )
 
-        # Build peer cache (load every row's blob once). Rows without an
-        # R2 key or with an unreadable blob are skipped — they can't
-        # contribute to anyone's verdict anyway.
+        # Build peer cache, limited to the lookback window. ``_pick_origin``
+        # already filters peers older than ``verdict_lookback_days`` so
+        # pulling their blobs from R2 just inflates the cache build (~4 MB
+        # per row × table size) without affecting any verdict — observed:
+        # scores_index has no TTL, so ~70 % of rows are outside the window
+        # at any given moment but were still being downloaded on every
+        # restart. The floor is set off the *earliest* pending candidate's
+        # ``first_block`` so it remains valid for every pending row this
+        # tick will judge.
+        lookback_blocks = (
+            cfg.verdict_lookback_days * BLOCKS_PER_DAY
+            if cfg.verdict_lookback_days > 0 else 0
+        )
+        pending_min_fb = min(
+            (int(r.get("first_block", 0) or 0) for r in pending),
+            default=0,
+        )
+        peer_fb_floor = (
+            pending_min_fb - lookback_blocks
+            if (pending_min_fb > 0 and lookback_blocks > 0)
+            else 0
+        )
+
         peer_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        skipped_outside_window = 0
         for row in rows:
             r2_key = row.get("r2_key")
             if not r2_key:
+                continue
+            fb = int(row.get("first_block", 0) or 0)
+            if peer_fb_floor > 0 and fb > 0 and fb < peer_fb_floor:
+                skipped_outside_window += 1
                 continue
             try:
                 blob = await asyncio.to_thread(
@@ -239,11 +264,13 @@ class VerdictBackfillService:
             if not blob:
                 continue
             _normalize_blob_for_cache(blob)
-            blob["first_block"] = int(row.get("first_block", 0) or 0)
+            blob["first_block"] = fb
             peer_cache[(row.get("hotkey", ""), row.get("revision", ""))] = blob
 
         logger.info(
-            f"[anticopy.verdict] peer cache built: {len(peer_cache)} blobs"
+            f"[anticopy.verdict] peer cache built: {len(peer_cache)} blobs "
+            f"(skipped {skipped_outside_window} outside "
+            f"{cfg.verdict_lookback_days}d lookback)"
         )
 
         # Process pending rows. For each, ref_score is the same blob we
