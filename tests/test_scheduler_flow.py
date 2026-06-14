@@ -2302,6 +2302,69 @@ async def test_invalid_retry_storm_ignores_infra_retryable_dominance():
     assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
 
 
+@pytest.mark.asyncio
+async def test_invalid_retry_storm_ignores_legacy_stream_invalid_dominance():
+    """Old workers reported SSE/stream transport errors as stream_invalid.
+    Treat those as retryable so rolling deploys do not blame the miner."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+
+    async def ready(_base_url):
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        weight_writer=_WeightWriterFake(), model_ready_probe_fn=ready,
+    )
+    task_state = await _drive_through_start_of_battle(scheduler, state, samples)
+    kv.data["worker_status_ENV_A"] = _invalid_subject_status(
+        refresh_block=task_state.refreshed_at_block,
+        category="stream_invalid",
+    )
+
+    await scheduler.tick(current_block=80)
+
+    assert (await state.get_battle()) is not None
+    assert "wrk-002" not in deployer.teardowns
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_invalid_retry_storm_requires_model_invalid_dominance():
+    """Unknown/env failures are not enough to blame the model."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+
+    async def ready(_base_url):
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        weight_writer=_WeightWriterFake(), model_ready_probe_fn=ready,
+    )
+    task_state = await _drive_through_start_of_battle(scheduler, state, samples)
+    kv.data["worker_status_ENV_A"] = _invalid_subject_status(
+        refresh_block=task_state.refreshed_at_block,
+        category="env_invalid",
+    )
+
+    await scheduler.tick(current_block=80)
+
+    assert (await state.get_battle()) is not None
+    assert "wrk-002" not in deployer.teardowns
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+
 # ---- early-invalidation guard ----------------------------------------------
 #
 # Step 4.5 runs the mid-battle invalidation check BEFORE the

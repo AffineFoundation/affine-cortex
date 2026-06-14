@@ -164,8 +164,8 @@ INVALID_STORM_MIN_AGE_SECONDS = 600
 INVALID_STORM_RECENT_SECONDS = 120
 """Last invalid attempt must be recent; stale worker_status should not fire."""
 
-INVALID_STORM_MAX_INFRA_FRACTION = 0.5
-"""If infra_retryable dominates, treat it as infrastructure, not miner loss."""
+INVALID_STORM_MIN_MODEL_INVALID_FRACTION = 0.5
+"""model_invalid must dominate historical invalid attempts before stopping."""
 
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
@@ -780,7 +780,7 @@ class FlowScheduler:
 
         * the env still lacks enough valid challenger samples,
         * the invalid streak is large, old enough, and still active,
-        * infra_retryable errors are not the dominant category, and
+        * model-invalid errors dominate historical invalid attempts, and
         * the model endpoint still answers ``/models``.
         """
         if not battle.base_url and not battle.deployments:
@@ -837,8 +837,11 @@ class FlowScheduler:
                 continue
             categories = stats.get("categories") or {}
             total = max(1, int(stats.get("invalid_total") or streak))
-            infra = int(categories.get("infra_retryable") or 0)
-            if infra / total > INVALID_STORM_MAX_INFRA_FRACTION:
+            model_invalid = int(categories.get("model_invalid") or 0)
+            if (
+                model_invalid / total
+                <= INVALID_STORM_MIN_MODEL_INVALID_FRACTION
+            ):
                 continue
             if endpoint_ready is None:
                 endpoint_ready = await self._battle_endpoint_ready(battle)

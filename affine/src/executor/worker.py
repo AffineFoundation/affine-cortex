@@ -1099,7 +1099,7 @@ _MODEL_INVALID_ERROR_PATTERNS = (
     "malformed",
 )
 
-_STREAM_INVALID_ERROR_PATTERNS = (
+_STREAM_RETRYABLE_ERROR_PATTERNS = (
     "llm_stream",
     "incomplete sse",
     "timed out after",
@@ -1130,8 +1130,12 @@ def _classify_invalid_attempt(message: str) -> str:
     msg = str(message or "").lower()
     if any(p in msg for p in _MODEL_INVALID_ERROR_PATTERNS):
         return "model_invalid"
-    if any(p in msg for p in _STREAM_INVALID_ERROR_PATTERNS):
-        return "stream_invalid"
+    # Streaming/transport failures can happen while /models remains healthy:
+    # container restarts, tunnel drops, load spikes, and SSE truncation all
+    # show up here. They are retryable unless there is stronger model-protocol
+    # evidence above (bad JSON/tool call/parser failure).
+    if any(p in msg for p in _STREAM_RETRYABLE_ERROR_PATTERNS):
+        return "infra_retryable"
     if any(p in msg for p in _INFRA_RETRYABLE_ERROR_PATTERNS):
         return "infra_retryable"
     return "env_invalid"

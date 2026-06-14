@@ -186,8 +186,9 @@ def test_invalid_attempt_classifier_groups_model_and_stream_errors():
     assert _classify_invalid_attempt("harness_failure") == "model_invalid"
     assert (
         _classify_invalid_attempt("LLM llm_stream ended with an incomplete SSE stream")
-        == "stream_invalid"
+        == "infra_retryable"
     )
+    assert _classify_invalid_attempt("use of closed network connection") == "infra_retryable"
     assert _classify_invalid_attempt("HTTP 503 service unavailable") == "infra_retryable"
 
 
