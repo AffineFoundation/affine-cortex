@@ -1,5 +1,6 @@
 from affine.src.executor.worker import (
     _base_urls,
+    _classify_invalid_attempt,
     _is_zero_score_error,
     _pick_url,
     _resolve_deployment_id,
@@ -173,6 +174,21 @@ def test_executor_does_not_persist_structured_error_results():
     _asyncio.run(_drive())
 
     assert samples.persist_calls == []
+    key = "10:hk:rev:NAVWORLD"
+    summary = worker.metrics.invalid_subjects[key]
+    assert summary["uid"] == 213
+    assert summary["invalid_total"] == 1
+    assert summary["invalid_streak"] == 1
+    assert summary["categories"]["env_invalid"] == 1
+
+
+def test_invalid_attempt_classifier_groups_model_and_stream_errors():
+    assert _classify_invalid_attempt("harness_failure") == "model_invalid"
+    assert (
+        _classify_invalid_attempt("LLM llm_stream ended with an incomplete SSE stream")
+        == "stream_invalid"
+    )
+    assert _classify_invalid_attempt("HTTP 503 service unavailable") == "infra_retryable"
 
 
 def test_executor_persists_structured_context_overflow_as_zero():

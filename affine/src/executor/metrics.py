@@ -6,7 +6,7 @@ The old fetch_count / total_fetch_time / pending_tasks columns are gone —
 no HTTP fetch loop in the DB-poll design.
 """
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import time
 from typing import Any, Dict, Optional
 
@@ -24,6 +24,10 @@ class WorkerMetrics:
     # the miner exited the subject role) mid-evaluate, so persisting
     # would attribute new-model output to the old miner.
     tasks_dropped_drift: int = 0
+    # Per-(refresh_block, miner, revision, env) invalid-attempt summaries.
+    # These are reported through worker_status_<env> so the scheduler can
+    # detect retry storms without writing invalid rows into sample_results.
+    invalid_subjects: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     total_execution_ms: int = 0
     last_task_at: Optional[float] = None
 

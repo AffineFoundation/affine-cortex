@@ -232,6 +232,12 @@ class StateStore:
     async def set_task_state(self, state: TaskIdState) -> None:
         await self._kv.set(self.KEY_TASK_IDS, asdict(state))
 
+    # -- worker status ------------------------------------------------------
+
+    async def get_worker_status(self, env: str) -> Dict[str, Any]:
+        raw = await self._kv.get(f"worker_status_{env}", default={}) or {}
+        return raw if isinstance(raw, dict) else {}
+
     # -- env config ---------------------------------------------------------
 
     async def get_environments(self) -> Dict[str, EnvConfig]:

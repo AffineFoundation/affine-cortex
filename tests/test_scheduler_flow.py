@@ -8,6 +8,7 @@ production wiring uses.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import time
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pytest
@@ -307,7 +308,7 @@ def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
 
 def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
-    window_blocks=WINDOW_BLOCKS,
+    window_blocks=WINDOW_BLOCKS, model_ready_probe_fn=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -334,6 +335,7 @@ def _build_scheduler(
         sample_count_fn=samples.count_samples_for_tasks,
         scores_reader=samples.read_scores_for_tasks,
         list_valid_miners_fn=list_valid_miners_fn,
+        model_ready_probe_fn=model_ready_probe_fn,
     )
     return scheduler, state, weight_writer
 
@@ -1794,6 +1796,39 @@ async def _drive_through_start_of_battle(scheduler, state, samples,
     return ts
 
 
+def _invalid_subject_status(
+    *,
+    refresh_block: int,
+    hotkey: str = "chal_hk",
+    revision: str = "chal_rev",
+    env: str = "ENV_A",
+    invalid_streak: int = 120,
+    category: str = "model_invalid",
+):
+    now = time.time()
+    return {
+        "invalid_subjects": {
+            f"{refresh_block}:{hotkey}:{revision}:{env}": {
+                "uid": 2,
+                "hotkey": hotkey,
+                "revision": revision,
+                "model": "org/m2",
+                "env": env,
+                "refresh_block": refresh_block,
+                "first_invalid_at": now - 700,
+                "last_invalid_at": now - 10,
+                "invalid_total": invalid_streak,
+                "invalid_streak": invalid_streak,
+                "streak_started_at": now - 700,
+                "success_total": 0,
+                "categories": {category: invalid_streak},
+                "last_category": category,
+                "last_error": category,
+            }
+        }
+    }
+
+
 @pytest.mark.asyncio
 async def test_early_regression_triggers_lost_before_overlap_ready():
     """One env at sampling_count overlap + regression → challenger LOST
@@ -2193,6 +2228,78 @@ async def test_early_regression_reason_format_pins_hotkey_prefix():
 
     reason = miner_store.rows[2]["termination_reason"]
     assert reason == "lost_to_champion:champ_long:early_regression_in_ENV_A"
+
+
+# ---- invalid retry storm fast-terminate ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_invalid_retry_storm_terminates_before_overlap_ready():
+    """A healthy endpoint plus a long invalid streak means the model is
+    burning retries without producing comparable samples. Terminate it
+    before waiting forever for overlap."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+
+    async def ready(_base_url):
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        weight_writer=_WeightWriterFake(), model_ready_probe_fn=ready,
+    )
+    task_state = await _drive_through_start_of_battle(scheduler, state, samples)
+    kv.data["worker_status_ENV_A"] = _invalid_subject_status(
+        refresh_block=task_state.refreshed_at_block,
+    )
+
+    await scheduler.tick(current_block=80)
+
+    assert (await state.get_battle()) is None
+    assert "wrk-002" in deployer.teardowns
+    row = miner_store.rows[2]
+    assert row["challenge_status"] == STATUS_TERMINATED
+    assert row["termination_reason"] == (
+        "lost_to_champion:champ_hk:"
+        "invalid_retry_storm_in_ENV_A:model_invalid:n=120"
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_retry_storm_ignores_infra_retryable_dominance():
+    """Transport/infra-looking failure storms should remain retryable;
+    endpoint health alone is not enough to blame the miner."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+
+    async def ready(_base_url):
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        weight_writer=_WeightWriterFake(), model_ready_probe_fn=ready,
+    )
+    task_state = await _drive_through_start_of_battle(scheduler, state, samples)
+    kv.data["worker_status_ENV_A"] = _invalid_subject_status(
+        refresh_block=task_state.refreshed_at_block,
+        category="infra_retryable",
+    )
+
+    await scheduler.tick(current_block=80)
+
+    assert (await state.get_battle()) is not None
+    assert "wrk-002" not in deployer.teardowns
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
 
 
 # ---- early-invalidation guard ----------------------------------------------

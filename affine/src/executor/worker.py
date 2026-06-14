@@ -761,6 +761,103 @@ class ExecutorWorker:
         )
         return False
 
+    def _invalid_subject_key(
+        self, *, miner: MinerSnapshot, refresh_block: int,
+    ) -> str:
+        return (
+            f"{int(refresh_block)}:{miner.hotkey}:"
+            f"{miner.revision}:{self.env}"
+        )
+
+    def _record_invalid_attempt(
+        self, *, miner: MinerSnapshot, task_id: int,
+        refresh_block: int, error_brief: str, latency_ms: int,
+    ) -> None:
+        """Update the worker-status invalid-attempt summary.
+
+        Invalid attempts are intentionally not written as sample_results:
+        they are not valid comparison samples. The scheduler still needs
+        enough signal to stop a deterministic retry storm, so each worker
+        publishes a compact per-subject streak in worker_status_<env>.
+        """
+        now = time.time()
+        key = self._invalid_subject_key(
+            miner=miner, refresh_block=refresh_block,
+        )
+        subjects = self.metrics.invalid_subjects
+        item = subjects.setdefault(
+            key,
+            {
+                "uid": miner.uid,
+                "hotkey": miner.hotkey,
+                "revision": miner.revision,
+                "model": miner.model,
+                "env": self.env,
+                "refresh_block": int(refresh_block),
+                "first_invalid_at": now,
+                "last_invalid_at": now,
+                "invalid_total": 0,
+                "invalid_streak": 0,
+                "streak_started_at": now,
+                "success_total": 0,
+                "last_success_at": None,
+                "categories": {},
+                "task_attempts": {},
+                "repeated_task_ids": {},
+                "last_error": "",
+                "last_category": "",
+                "last_latency_ms": 0,
+            },
+        )
+        item["uid"] = miner.uid
+        item["model"] = miner.model
+        item["last_invalid_at"] = now
+        item["invalid_total"] = int(item.get("invalid_total") or 0) + 1
+        if int(item.get("invalid_streak") or 0) == 0:
+            item["streak_started_at"] = now
+        item["invalid_streak"] = int(item.get("invalid_streak") or 0) + 1
+
+        category = _classify_invalid_attempt(error_brief)
+        categories = item.setdefault("categories", {})
+        categories[category] = int(categories.get(category) or 0) + 1
+        item["last_category"] = category
+        item["last_error"] = str(error_brief)[:240]
+        item["last_latency_ms"] = int(latency_ms)
+
+        task_key = str(int(task_id))
+        attempts = item.setdefault("task_attempts", {})
+        attempts[task_key] = int(attempts.get(task_key) or 0) + 1
+        if len(attempts) > 64:
+            kept = sorted(
+                attempts.items(), key=lambda kv: kv[1], reverse=True,
+            )[:64]
+            attempts.clear()
+            attempts.update(dict(kept))
+        item["repeated_task_ids"] = {
+            tid: count for tid, count in attempts.items() if int(count) >= 3
+        }
+
+        if len(subjects) > 32:
+            stale = sorted(
+                subjects.items(),
+                key=lambda kv: float(kv[1].get("last_invalid_at") or 0),
+            )
+            for old_key, _ in stale[: len(subjects) - 32]:
+                subjects.pop(old_key, None)
+
+    def _record_valid_attempt(
+        self, *, miner: MinerSnapshot, refresh_block: int,
+    ) -> None:
+        item = self.metrics.invalid_subjects.get(
+            self._invalid_subject_key(miner=miner, refresh_block=refresh_block)
+        )
+        if not item:
+            return
+        item["success_total"] = int(item.get("success_total") or 0) + 1
+        item["last_success_at"] = time.time()
+        item["invalid_streak"] = 0
+        item["streak_started_at"] = None
+
     async def _evaluate_and_persist_gated(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, miner_obj: "_Miner",
@@ -809,6 +906,16 @@ class ExecutorWorker:
                         block_number=0,
                         refresh_block=refresh_block,
                     )
+                    self._record_valid_attempt(
+                        miner=miner, refresh_block=refresh_block,
+                    )
+                else:
+                    self._record_invalid_attempt(
+                        miner=miner, task_id=task_id,
+                        refresh_block=refresh_block,
+                        error_brief=error_brief,
+                        latency_ms=latency_ms,
+                    )
                 self.metrics.record_completion(success=False, latency_ms=latency_ms)
                 return
         finally:
@@ -845,11 +952,20 @@ class ExecutorWorker:
                     block_number=0,
                     refresh_block=refresh_block,
                 )
+                self._record_valid_attempt(
+                    miner=miner, refresh_block=refresh_block,
+                )
                 self.metrics.record_completion(success=False, latency_ms=latency_ms)
                 return
             logger.info(
                 f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
                 f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {error_brief}"
+            )
+            self._record_invalid_attempt(
+                miner=miner, task_id=task_id,
+                refresh_block=refresh_block,
+                error_brief=error_brief,
+                latency_ms=latency_ms,
             )
             self.metrics.record_completion(success=False, latency_ms=latency_ms)
             return
@@ -871,6 +987,7 @@ class ExecutorWorker:
             block_number=0,  # block tracking moved to scheduler/snapshot side
             refresh_block=refresh_block,
         )
+        self._record_valid_attempt(miner=miner, refresh_block=refresh_block)
         self.metrics.record_completion(success=success, latency_ms=latency_ms)
         # Observable success signal in the legacy executor's line format:
         # [RESULT] U<uid> │ <env>           │      0.500 │ task_id=12345 │   1.234s
@@ -968,6 +1085,56 @@ _ZERO_SCORE_ERROR_PATTERNS = (
     "exceeds the maximum allowed length",
     "exceeds the maximum context length",
 )
+
+_MODEL_INVALID_ERROR_PATTERNS = (
+    "harness_failure",
+    "invalid json",
+    "json parse",
+    "parse_streaming_increment",
+    "tool_call",
+    "tool call",
+    "function call",
+    "command is required",
+    "path is required",
+    "malformed",
+)
+
+_STREAM_INVALID_ERROR_PATTERNS = (
+    "llm_stream",
+    "incomplete sse",
+    "timed out after",
+    "use of closed network connection",
+    "stream read",
+)
+
+_INFRA_RETRYABLE_ERROR_PATTERNS = (
+    "readerror",
+    "connection reset",
+    "connection refused",
+    "http 5",
+    "503",
+    "service unavailable",
+    "docker daemon",
+    "worker crashed",
+)
+
+
+def _classify_invalid_attempt(message: str) -> str:
+    """Coarse invalid-attempt category for scheduler storm detection.
+
+    The category is diagnostic; the scheduler still requires a long
+    streak and a healthy /models probe before terminating a miner. Keep
+    the buckets broad so env-specific wording changes don't make the
+    storm detector blind.
+    """
+    msg = str(message or "").lower()
+    if any(p in msg for p in _MODEL_INVALID_ERROR_PATTERNS):
+        return "model_invalid"
+    if any(p in msg for p in _STREAM_INVALID_ERROR_PATTERNS):
+        return "stream_invalid"
+    if any(p in msg for p in _INFRA_RETRYABLE_ERROR_PATTERNS):
+        return "infra_retryable"
+    return "env_invalid"
 
 
 def _is_zero_score_error(exc: BaseException) -> bool:

@@ -155,6 +155,18 @@ ORPHAN_GRACE_SECONDS = 120
 """Minimum age of an ``in_progress`` row, missing from all in-flight
 roles, before the reaper terminates it."""
 
+INVALID_STORM_MIN_STREAK = 100
+"""Minimum consecutive invalid attempts before a battle can be stopped."""
+
+INVALID_STORM_MIN_AGE_SECONDS = 600
+"""Invalid streak must span at least this many seconds."""
+
+INVALID_STORM_RECENT_SECONDS = 120
+"""Last invalid attempt must be recent; stale worker_status should not fire."""
+
+INVALID_STORM_MAX_INFRA_FRACTION = 0.5
+"""If infra_retryable dominates, treat it as infrastructure, not miner loss."""
+
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
 
@@ -180,6 +192,14 @@ ListCurrentMinersFn = Callable[[], Awaitable[List[Dict[str, Any]]]]
 DeployFn = Callable[[targon_lifecycle.DeployTarget, str],
                     Awaitable[targon_lifecycle.DeployResult]]
 TeardownFn = Callable[[Optional[str]], Awaitable[None]]
+
+ModelReadyProbeFn = Callable[[Optional[str]], Awaitable[bool]]
+
+
+async def _default_model_ready_probe(base_url: Optional[str]) -> bool:
+    return await targon_lifecycle.probe_model_ready(
+        base_url, timeout_sec=2.0,
+    )
 
 ListActiveEndpointNamesFn = Callable[[], Awaitable[set]]
 """Return the set of currently-active endpoint names. Used by the
@@ -224,6 +244,7 @@ class FlowScheduler:
         list_valid_miners_fn: ListValidMinersFn,
         list_current_miners_fn: Optional[ListCurrentMinersFn] = None,
         list_active_endpoint_names_fn: Optional[ListActiveEndpointNamesFn] = None,
+        model_ready_probe_fn: Optional[ModelReadyProbeFn] = None,
     ):
         self.cfg = config
         self.state = state
@@ -238,6 +259,9 @@ class FlowScheduler:
         self._list_valid_miners = list_valid_miners_fn
         self._list_current_miners = list_current_miners_fn or list_valid_miners_fn
         self._list_active_endpoint_names = list_active_endpoint_names_fn
+        self._model_ready_probe = (
+            model_ready_probe_fn or _default_model_ready_probe
+        )
 
     # ---- entry point ------------------------------------------------------
 
@@ -380,6 +404,19 @@ class FlowScheduler:
                 overlap_task_ids=overlap_task_ids,
                 task_state=task_state,
                 current_block=current_block,
+            )
+            return
+
+        invalid_storm = await self._check_invalid_retry_storm(
+            champion, battle,
+            scoring_envs=scoring_envs, task_state=task_state,
+        )
+        if invalid_storm is not None:
+            storm_env, storm_stats = invalid_storm
+            await self._decide_invalid_retry_storm_lost(
+                champion, battle,
+                storm_env=storm_env,
+                storm_stats=storm_stats,
             )
             return
 
@@ -724,6 +761,101 @@ class FlowScheduler:
             return None
         return regression_env, per_env_data, overlap_task_ids
 
+    async def _check_invalid_retry_storm(
+        self,
+        champion: ChampionRecord,
+        battle: BattleRecord,
+        *,
+        scoring_envs: Mapping[str, EnvConfig],
+        task_state: TaskIdState,
+    ) -> Optional[Tuple[str, Dict[str, Any]]]:
+        """Detect a challenger that is stuck generating invalid attempts.
+
+        Executor workers do not persist invalid attempts into
+        sample_results, which is correct for comparison integrity, but it
+        means a model that repeatedly emits malformed tool calls can keep
+        the same task_ids hot forever. Workers publish a compact
+        invalid-streak summary in ``worker_status_<env>``; this guard
+        terminates the battle only when:
+
+        * the env still lacks enough valid challenger samples,
+        * the invalid streak is large, old enough, and still active,
+        * infra_retryable errors are not the dominant category, and
+        * the model endpoint still answers ``/models``.
+        """
+        if not battle.base_url and not battle.deployments:
+            return None
+
+        now = time.time()
+        endpoint_ready: Optional[bool] = None
+        subject_key = (
+            f"{int(task_state.refreshed_at_block)}:"
+            f"{battle.challenger.hotkey}:{battle.challenger.revision}:"
+        )
+        for env, env_cfg in scoring_envs.items():
+            tasks = task_state.task_ids.get(env, [])
+            if not tasks:
+                continue
+            chal_scores = await self._scores_reader(
+                battle.challenger.hotkey,
+                battle.challenger.revision,
+                env,
+                tasks,
+                task_state.refreshed_at_block,
+            )
+            if len(chal_scores) >= int(env_cfg.sampling_count):
+                continue
+
+            status = await self.state.get_worker_status(env)
+            subjects = status.get("invalid_subjects") or {}
+            if not isinstance(subjects, dict):
+                continue
+            stats = subjects.get(subject_key + env)
+            if not isinstance(stats, dict):
+                continue
+            if int(stats.get("refresh_block") or -1) != int(
+                task_state.refreshed_at_block
+            ):
+                continue
+            if str(stats.get("hotkey") or "") != battle.challenger.hotkey:
+                continue
+            if str(stats.get("revision") or "") != battle.challenger.revision:
+                continue
+
+            streak = int(stats.get("invalid_streak") or 0)
+            if streak < INVALID_STORM_MIN_STREAK:
+                continue
+            started_at = _as_float_or_none(
+                stats.get("streak_started_at")
+            ) or _as_float_or_none(stats.get("first_invalid_at"))
+            last_at = _as_float_or_none(stats.get("last_invalid_at"))
+            if started_at is None or last_at is None:
+                continue
+            if now - started_at < INVALID_STORM_MIN_AGE_SECONDS:
+                continue
+            if now - last_at > INVALID_STORM_RECENT_SECONDS:
+                continue
+            categories = stats.get("categories") or {}
+            total = max(1, int(stats.get("invalid_total") or streak))
+            infra = int(categories.get("infra_retryable") or 0)
+            if infra / total > INVALID_STORM_MAX_INFRA_FRACTION:
+                continue
+            if endpoint_ready is None:
+                endpoint_ready = await self._battle_endpoint_ready(battle)
+            if not endpoint_ready:
+                continue
+            enriched = dict(stats)
+            enriched["valid_count"] = len(chal_scores)
+            enriched["sampling_count"] = int(env_cfg.sampling_count)
+            return env, enriched
+        return None
+
+    async def _battle_endpoint_ready(self, battle: BattleRecord) -> bool:
+        for base_url in _record_base_urls(battle):
+            if await self._model_ready_probe(base_url):
+                return True
+        return False
+
     async def _sampling_only_freeze_scores(
         self,
         *,
@@ -879,6 +1011,40 @@ class FlowScheduler:
             battle.challenger.uid,
             OUTCOME_LOST,
             reason=f"invalidated_mid_battle:{battle.challenger.hotkey[:10]}",
+            hotkey=battle.challenger.hotkey,
+            revision=battle.challenger.revision,
+            model=battle.challenger.model,
+        )
+        await self._teardown_record(battle)
+        if self.cfg.single_instance_provider:
+            champion.deployment_id = None
+            champion.base_url = None
+            champion.deployments = []
+            await self.state.set_champion(champion)
+        await self.state.clear_battle()
+
+    async def _decide_invalid_retry_storm_lost(
+        self,
+        champion: ChampionRecord,
+        battle: BattleRecord,
+        *,
+        storm_env: str,
+        storm_stats: Dict[str, Any],
+    ) -> None:
+        streak = int(storm_stats.get("invalid_streak") or 0)
+        category = str(storm_stats.get("last_category") or "invalid")
+        logger.warning(
+            f"FlowScheduler: challenger uid={battle.challenger.uid} "
+            f"invalid retry storm in {storm_env}; "
+            f"streak={streak} category={category}; terminating lifecycle"
+        )
+        await self.queue.mark_terminated(
+            battle.challenger.uid,
+            OUTCOME_LOST,
+            reason=(
+                f"lost_to_champion:{champion.hotkey[:10]}:"
+                f"invalid_retry_storm_in_{storm_env}:{category}:n={streak}"
+            ),
             hotkey=battle.challenger.hotkey,
             revision=battle.challenger.revision,
             model=battle.challenger.model,
@@ -1770,6 +1936,18 @@ def _deployments_from_result(result: targon_lifecycle.DeployResult) -> List[Depl
             )
         )
     return out
+
+
+def _record_base_urls(record: Any) -> List[str]:
+    urls = [
+        dep.base_url
+        for dep in (getattr(record, "deployments", []) or [])
+        if getattr(dep, "base_url", None)
+    ]
+    fallback = getattr(record, "base_url", None)
+    if not urls and fallback:
+        urls.append(fallback)
+    return list(dict.fromkeys(urls))
 
 
 def _as_float_or_none(v: Any) -> Optional[float]:
