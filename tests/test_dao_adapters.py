@@ -249,6 +249,38 @@ async def test_terminate_if_sampling_writes_terminated_at(monkeypatch):
     assert "terminated_at = if_not_exists(terminated_at, :now)" in expr
 
 
+@pytest.mark.asyncio
+async def test_update_miner_info_preserves_permanent_invalid_reason(monkeypatch):
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+    dao = MinerStatsDAO()
+    await dao.update_miner_info(
+        hotkey="hk",
+        revision="rev",
+        model="org/model",
+        is_valid=False,
+        invalid_reason="plagiarism:duplicate_of_uid=38",
+        permanent_invalid=True,
+        permanent_invalid_reason="plagiarism:duplicate_of_uid=38",
+    )
+
+    call = client.update_calls[0]
+    expr = call["UpdateExpression"]
+    values = call["ExpressionAttributeValues"]
+    assert (
+        "permanent_invalid_reason = "
+        "if_not_exists(permanent_invalid_reason, :permanent_invalid_reason)"
+    ) in expr
+    assert "permanent_invalid = :permanent_invalid" in expr
+    assert values[":permanent_invalid"] == {"BOOL": True}
+    assert values[":permanent_invalid_reason"] == {
+        "S": "plagiarism:duplicate_of_uid=38",
+    }
+
+
 class _StubMinerStatsForMap(MinerStatsDAO):
     def __init__(self, rows):
         super().__init__()
@@ -440,20 +472,28 @@ async def test_miner_stats_hotkey_fallback_blocks_later_revision_claim():
 
 
 class _FakeMinersDAO:
-    def __init__(self):
+    def __init__(self, by_uid=None):
         self.saved = []
         self.table_name = "miners"
+        self.by_uid = by_uid or {}
 
     async def save_miner(self, **kwargs):
         self.saved.append(kwargs)
 
+    async def get_miner_by_uid(self, uid):
+        return self.by_uid.get(uid)
+
 
 class _FakeMinerStatsDAO:
-    def __init__(self):
+    def __init__(self, by_key=None):
         self.updated = []
+        self.by_key = by_key or {}
 
     async def update_miner_info(self, **kwargs):
         self.updated.append(kwargs)
+
+    async def get_miner_stats(self, hotkey, revision):
+        return self.by_key.get((hotkey, revision))
 
 
 @pytest.mark.asyncio
@@ -497,3 +537,100 @@ async def test_monitor_persists_current_metadata_to_miner_stats(monkeypatch):
             "is_online": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_monitor_persists_nonrecoverable_invalid_reason(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = MinersMonitor()
+    monitor.dao = _FakeMinersDAO()
+    monitor.stats_dao = _FakeMinerStatsDAO()
+
+    await monitor._persist_miners(
+        [
+            MinerInfo(
+                uid=50,
+                hotkey="hk-copy",
+                model="org/model",
+                revision="rev",
+                block=100,
+                is_valid=False,
+                invalid_reason="model_check:quantized_model:bitsandbytes",
+                permanent_invalid=True,
+                model_hash="hash",
+            ),
+        ],
+        current_block=200,
+    )
+
+    assert monitor.stats_dao.updated[0]["permanent_invalid_reason"] == (
+        "model_check:quantized_model:bitsandbytes"
+    )
+    assert monitor.stats_dao.updated[0]["permanent_invalid"] is True
+
+
+@pytest.mark.asyncio
+async def test_monitor_keeps_historical_nonrecoverable_invalid():
+    monitor = MinersMonitor()
+    monitor.dao = _FakeMinersDAO({
+        50: {
+            "hotkey": "hk-copy",
+            "model": "org/affine-model-hk-copy",
+            "revision": "rev",
+            "template_check_result": "safe",
+            "model_hash": "hash",
+        },
+    })
+    monitor.stats_dao = _FakeMinerStatsDAO({
+        ("hk-copy", "rev"): {
+            "permanent_invalid": True,
+            "permanent_invalid_reason": "model_check:quantized_model:bitsandbytes",
+            "model_hash": "hash",
+        },
+    })
+
+    async def _unexpected_model_info(*_args, **_kwargs):
+        raise AssertionError(
+            "historical nonrecoverable invalid should short-circuit HF lookup"
+        )
+
+    monitor._get_model_info = _unexpected_model_info
+
+    info = await monitor._validate_miner(
+        uid=50,
+        hotkey="hk-copy",
+        model="org/affine-model-hk-copy",
+        revision="rev",
+        block=8406925,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.permanent_invalid is True
+    assert info.invalid_reason == "model_check:quantized_model:bitsandbytes"
+
+
+@pytest.mark.asyncio
+async def test_monitor_does_not_lock_recoverable_invalid_reason(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = MinersMonitor()
+    monitor.dao = _FakeMinersDAO()
+    monitor.stats_dao = _FakeMinerStatsDAO()
+
+    await monitor._persist_miners(
+        [
+            MinerInfo(
+                uid=51,
+                hotkey="hk-fetch",
+                model="org/model",
+                revision="rev",
+                block=100,
+                is_valid=False,
+                invalid_reason="hf_model_fetch_failed",
+                permanent_invalid=False,
+            ),
+        ],
+        current_block=200,
+    )
+
+    assert "permanent_invalid_reason" not in monitor.stats_dao.updated[0]

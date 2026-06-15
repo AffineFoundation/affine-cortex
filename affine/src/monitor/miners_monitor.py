@@ -27,8 +27,10 @@ from typing import Dict, Optional, Tuple
 from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_url
 from huggingface_hub.errors import (
     DisabledRepoError,
+    EntryNotFoundError,
     GatedRepoError,
     RepositoryNotFoundError,
+    RevisionNotFoundError,
 )
 
 from affine.core.setup import logger
@@ -50,6 +52,20 @@ NETUID = int(os.getenv("AFFINE_NETUID", "120"))
 
 MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
 REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
+
+
+def _permanent_invalid_reason_from_row(
+    row: Optional[Dict[str, object]],
+) -> Optional[str]:
+    if not row:
+        return None
+    reason = row.get("permanent_invalid_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    if row.get("permanent_invalid") is True:
+        reason = row.get("invalid_reason")
+        return str(reason) if reason else "permanent_invalid"
+    return None
 
 
 @dataclass
@@ -82,6 +98,12 @@ class MinerInfo:
 
 
 class HFRepoUnavailable(Exception):
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+class HFModelMetadataInvalid(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
         self.reason = reason
@@ -258,12 +280,38 @@ class MinersMonitor:
 
         # Inherit prior template_check_result so a one-cycle HF blip doesn't
         # nuke the cached safety verdict.
+        existing = None
+        is_existing_current = False
         try:
             existing = await self.dao.get_miner_by_uid(uid)
-            if existing and existing.get("model") == model and existing.get("revision") == revision:
+            is_existing_current = bool(
+                existing
+                and existing.get("hotkey") == hotkey
+                and existing.get("model") == model
+                and existing.get("revision") == revision
+            )
+            if is_existing_current:
                 info.template_check_result = existing.get("template_check_result")
+                info.model_hash = str(existing.get("model_hash") or "")
+                info.model_type = str(existing.get("model_type") or "")
         except Exception:
             pass
+
+        historical_invalid = await self._get_historical_permanent_invalid(
+            hotkey=hotkey,
+            revision=revision,
+            current_row=existing if is_existing_current else None,
+        )
+        if historical_invalid:
+            reason, historical_row = historical_invalid
+            info.model_hash = str(
+                historical_row.get("model_hash") or info.model_hash or ""
+            )
+            info.model_type = str(
+                historical_row.get("model_type") or info.model_type or ""
+            )
+            info.mark_invalid(reason, permanent=True)
+            return info
 
         # Multi-commit rule: a hotkey is only allowed one commit on this subnet.
         if uid != 0 and commit_count > 1 and block >= MULTI_COMMIT_ENFORCE_BLOCK:
@@ -299,6 +347,13 @@ class MinersMonitor:
         try:
             model_info = await self._get_model_info(model, revision)
         except HFRepoUnavailable as e:
+            info.mark_invalid(
+                e.reason,
+                permanent=True,
+                terminate_stats=True,
+            )
+            return info
+        except HFModelMetadataInvalid as e:
             info.mark_invalid(
                 e.reason,
                 permanent=True,
@@ -407,12 +462,9 @@ class MinersMonitor:
 
         # CEAC step 8.1: if anticopy backfill flagged this miner as a
         # copy of an earlier model, mark it invalid here so downstream
-        # weight-setting drops it. Lookup is keyed by (hotkey, revision)
-        # so a re-uploaded ckpt is re-evaluated fresh — we don't carry
-        # over a stale verdict.
-        # permanent=False so that if backfill re-runs (threshold change,
-        # origin deregistration, etc.) and the verdict clears, the next
-        # monitor cycle picks the miner back up.
+        # weight-setting drops it. The verdict is durable for this exact
+        # hotkey/revision; a miner must submit a new revision to be
+        # evaluated fresh.
         if (
             uid != 0
             and anticopy_cfg is not None
@@ -439,7 +491,7 @@ class MinersMonitor:
                     dm_str = "?"
                 info.mark_invalid(
                     f"anticopy_copy:copied_from={origin_model},dm={dm_str}",
-                    permanent=False,
+                    permanent=True,
                 )
                 return info
 
@@ -463,6 +515,36 @@ class MinersMonitor:
         except Exception as e:
             logger.debug(f"[MinersMonitor] load_anticopy_config failed: {e}")
             return None
+
+    async def _get_historical_permanent_invalid(
+        self,
+        *,
+        hotkey: str,
+        revision: str,
+        current_row: Optional[Dict[str, object]] = None,
+    ) -> Optional[Tuple[str, Dict[str, object]]]:
+        """Return a durable non-recoverable reject for this model revision.
+
+        ``miners`` is UID-keyed and can be overwritten by later refreshes.
+        ``miner_stats`` is keyed by (hotkey, revision), so it is the durable
+        place to remember that this model was once rejected for a
+        miner-attributable reason.
+        """
+        reason = _permanent_invalid_reason_from_row(current_row)
+        if reason:
+            return reason, current_row or {}
+        try:
+            stats = await self.stats_dao.get_miner_stats(hotkey, revision)
+        except Exception as e:
+            logger.debug(
+                f"[MinersMonitor] miner_stats invalid-history lookup failed "
+                f"{hotkey[:10]}@{revision[:8]}: {e}"
+            )
+            return None
+        reason = _permanent_invalid_reason_from_row(stats)
+        if not reason:
+            return None
+        return reason, stats or {}
 
     async def _get_tokenizer_sig(self, model_id: str, revision: str) -> str:
         """Cached sha256 of the candidate's ``tokenizer.json``. Empty
@@ -524,9 +606,12 @@ class MinersMonitor:
                     and "sha256" in getattr(s, "lfs", {})
                 )
             }
-            if not shas or not hf_revision:
-                self._weights_cache[key] = (None, now)
-                return None
+            if not hf_revision:
+                self._weights_cache.pop(key, None)
+                raise HFModelMetadataInvalid("hf_revision_missing")
+            if not shas:
+                self._weights_cache.pop(key, None)
+                raise HFModelMetadataInvalid("hf_model_missing_weights")
             import hashlib
             model_hash = hashlib.sha256("".join(sorted(shas)).encode()).hexdigest()
 
@@ -562,15 +647,26 @@ class MinersMonitor:
             # fetch failure by the generic ``except Exception``.
             self._weights_cache.pop(key, None)
             raise
+        except HFModelMetadataInvalid:
+            # Deterministic bad model metadata (for example no weight shards at
+            # the resolved revision) is miner-attributable, not a network blip.
+            self._weights_cache.pop(key, None)
+            raise
         except DisabledRepoError as e:
             self._weights_cache.pop(key, None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_disabled", e)
         except GatedRepoError as e:
             self._weights_cache.pop(key, None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_private", e)
+        except RevisionNotFoundError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_revision_not_found", e)
         except RepositoryNotFoundError as e:
             self._weights_cache.pop(key, None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
+        except EntryNotFoundError as e:
+            self._weights_cache.pop(key, None)
+            raise HFModelMetadataInvalid("hf_model_metadata_missing") from e
         except Exception as e:
             logger.warning(
                 f"[MinersMonitor] HF fetch failed {model_id}@{revision[:8]}: "
@@ -631,6 +727,11 @@ class MinersMonitor:
         except GatedRepoError as e:
             self._weights_cache.pop((model_id, revision), None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_private", e)
+        except RevisionNotFoundError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(
+                model_id, revision, "hf_revision_not_found", e
+            )
         except RepositoryNotFoundError as e:
             self._weights_cache.pop((model_id, revision), None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
@@ -713,17 +814,9 @@ class MinersMonitor:
             )
             if miner.hotkey and miner.revision:
                 await self.stats_dao.update_miner_info(
-                    hotkey=miner.hotkey,
-                    revision=miner.revision,
-                    model=miner.model,
-                    uid=miner.uid,
-                    first_block=miner.block,
-                    block_number=current_block,
-                    is_valid=miner.is_valid,
-                    invalid_reason=miner.invalid_reason,
-                    model_hash=miner.model_hash,
-                    model_type=miner.model_type,
-                    is_online=True,
+                    **self._miner_stats_update_payload(
+                        miner, current_block=current_block,
+                    ),
                 )
                 await self._maybe_terminate_stats(miner)
             # template_check_result is a non-key attr we still want to keep
@@ -744,6 +837,27 @@ class MinersMonitor:
                         f"[MinersMonitor] template_check_result write failed "
                         f"uid={miner.uid}: {e}"
                     )
+
+    def _miner_stats_update_payload(
+        self, miner: MinerInfo, *, current_block: int,
+    ) -> Dict[str, object]:
+        payload: Dict[str, object] = {
+            "hotkey": miner.hotkey,
+            "revision": miner.revision,
+            "model": miner.model,
+            "uid": miner.uid,
+            "first_block": miner.block,
+            "block_number": current_block,
+            "is_valid": miner.is_valid,
+            "invalid_reason": miner.invalid_reason,
+            "model_hash": miner.model_hash,
+            "model_type": miner.model_type,
+            "is_online": True,
+        }
+        if miner.permanent_invalid and miner.invalid_reason:
+            payload["permanent_invalid"] = True
+            payload["permanent_invalid_reason"] = miner.invalid_reason
+        return payload
 
     async def _maybe_terminate_stats(self, miner: MinerInfo) -> None:
         if not (miner.permanent_invalid and miner.terminate_stats):

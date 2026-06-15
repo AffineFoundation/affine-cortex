@@ -194,10 +194,9 @@ async def test_anticopy_copy_verdict_marks_invalid(monkeypatch):
         commit_count=1,
     )
     assert info.is_valid is False
-    # Not permanent — if the verdict gets re-evaluated and clears
-    # (origin deregisters, threshold change, etc.) the next monitor
-    # cycle should pick it back up.
-    assert info.permanent_invalid is False
+    # A copy verdict is miner-attributable, not infrastructure-driven; keep it
+    # invalid for this hotkey/revision even if a later backfill result changes.
+    assert info.permanent_invalid is True
     assert info.invalid_reason.startswith("anticopy_copy:")
     assert "victim-org/Affine-original" in info.invalid_reason
     assert "dm=0.0123" in info.invalid_reason

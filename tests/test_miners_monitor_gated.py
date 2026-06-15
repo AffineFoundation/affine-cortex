@@ -10,16 +10,24 @@ blips must never terminate a good miner.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 
-from affine.src.monitor.miners_monitor import HFRepoUnavailable, MinersMonitor
+from affine.src.monitor.miners_monitor import (
+    HFModelMetadataInvalid,
+    HFRepoUnavailable,
+    MinersMonitor,
+)
 
 
 def _monitor():
     # The probe uses no instance state; skip the real __init__.
-    return MinersMonitor.__new__(MinersMonitor)
+    monitor = MinersMonitor.__new__(MinersMonitor)
+    monitor._weights_cache = {}
+    monitor._weights_ttl_sec = 1800
+    return monitor
 
 
 def _run(monkeypatch, raises=None):
@@ -54,3 +62,32 @@ def test_rate_limit_is_swallowed(monkeypatch):
 def test_network_error_is_swallowed(monkeypatch):
     # Transient connection blip → must not terminate the miner.
     _run(monkeypatch, raises=ConnectionError("temporary"))
+
+
+def test_missing_weight_metadata_is_permanent_model_invalid(monkeypatch):
+    class _FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def repo_info(self, **kwargs):
+            return SimpleNamespace(sha="abc1234", siblings=[])
+
+    monkeypatch.setattr("affine.src.monitor.miners_monitor.HfApi", _FakeHfApi)
+
+    with pytest.raises(HFModelMetadataInvalid) as exc:
+        asyncio.run(_monitor()._get_model_info("owner/model", "abc1234"))
+    assert exc.value.reason == "hf_model_missing_weights"
+
+
+def test_generic_hf_fetch_failure_is_transient(monkeypatch):
+    class _FakeHfApi:
+        def __init__(self, token=None):
+            pass
+
+        def repo_info(self, **kwargs):
+            raise ConnectionError("temporary")
+
+    monkeypatch.setattr("affine.src.monitor.miners_monitor.HfApi", _FakeHfApi)
+
+    result = asyncio.run(_monitor()._get_model_info("owner/model", "abc1234"))
+    assert result is None

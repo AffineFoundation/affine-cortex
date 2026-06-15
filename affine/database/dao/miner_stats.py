@@ -103,6 +103,8 @@ class MinerStatsDAO(BaseDAO):
         invalid_reason: Optional[str] = None,
         model_hash: str = "",
         model_type: str = "",
+        permanent_invalid: Optional[bool] = None,
+        permanent_invalid_reason: Optional[str] = None,
         is_online: bool = True,
     ) -> None:
         """Persist current miner metadata without overwriting lifecycle state.
@@ -163,6 +165,17 @@ class MinerStatsDAO(BaseDAO):
             else {"NULL": True}
         )
         update_parts.append("invalid_reason = :invalid_reason")
+        if permanent_invalid is True:
+            values[":permanent_invalid"] = {"BOOL": True}
+            update_parts.append("permanent_invalid = :permanent_invalid")
+        if permanent_invalid_reason:
+            values[":permanent_invalid_reason"] = {
+                "S": str(permanent_invalid_reason),
+            }
+            update_parts.append(
+                "permanent_invalid_reason = "
+                "if_not_exists(permanent_invalid_reason, :permanent_invalid_reason)"
+            )
 
         params = {
             "TableName": self.table_name,
