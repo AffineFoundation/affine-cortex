@@ -2,7 +2,12 @@
 
 import asyncio
 
-from affine.utils.model_size_checker import ModelSizeChecker, _match_allowed_model
+from affine.utils.model_size_checker import (
+    ModelSizeChecker,
+    _WeightShapeCheckUnavailable,
+    _match_allowed_model,
+    _select_vocab_tensor_names,
+)
 
 
 # A valid Qwen3-32B fine-tune architecture, reused across tests.
@@ -21,6 +26,9 @@ def _check_config(config: dict) -> dict:
     """Drive ModelSizeChecker.check() against an in-memory config."""
     checker = ModelSizeChecker()
     checker._fetch_config = lambda model_id, revision: _async(config)
+    checker._check_safetensors_weight_shapes = (
+        lambda model_id, revision, cfg: _async(None)
+    )
     return asyncio.run(checker.check("some/model", "rev"))
 
 
@@ -85,3 +93,64 @@ def test_quantized_config_without_method_still_rejected():
     result = _check_config(config)
     assert result["pass"] is False
     assert result["reason"] == "quantized_model:unknown"
+
+
+def test_safetensors_vocab_shape_mismatch_rejected():
+    checker = ModelSizeChecker()
+    checker._fetch_config = lambda model_id, revision: _async(dict(_QWEN3_32B))
+    checker._fetch_safetensors_index_sync = lambda model_id, revision: {
+        "weight_map": {
+            "model.embed_tokens.weight": "model-00001-of-00014.safetensors",
+            "lm_head.weight": "model-00014-of-00014.safetensors",
+        }
+    }
+    checker._fetch_safetensors_header_sync = lambda model_id, revision, filename: {
+        "model.embed_tokens.weight": {
+            "dtype": "BF16",
+            "shape": [151669, 5120],
+            "data_offsets": [0, 0],
+        },
+        "lm_head.weight": {
+            "dtype": "BF16",
+            "shape": [151669, 5120],
+            "data_offsets": [0, 0],
+        },
+    }
+
+    result = asyncio.run(checker.check("some/model", "rev-shape-mismatch"))
+
+    assert result["pass"] is False
+    assert result["reason"] == (
+        "weight_shape_mismatch:model.embed_tokens.weight.dim0=151669 "
+        "expected_vocab=151936"
+    )
+    assert result["model_type"] == "qwen3"
+
+
+def test_safetensors_shape_check_unavailable_does_not_reject():
+    checker = ModelSizeChecker()
+    checker._fetch_config = lambda model_id, revision: _async(dict(_QWEN3_32B))
+    checker._fetch_safetensors_index_sync = lambda model_id, revision: None
+
+    def _raise(*args, **kwargs):
+        raise _WeightShapeCheckUnavailable("network timeout")
+
+    checker._fetch_safetensors_header_sync = _raise
+
+    result = asyncio.run(checker.check("some/model", "rev-unavailable"))
+
+    assert result["pass"] is True
+    assert result["reason"] == "ok"
+
+
+def test_select_vocab_tensor_names_prefers_known_language_tensors():
+    names = {
+        "vision_tower.embed_tokens.weight",
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+    }
+
+    assert _select_vocab_tensor_names(names) == [
+        "model.embed_tokens.weight",
+        "lm_head.weight",
+    ]
