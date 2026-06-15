@@ -321,6 +321,14 @@ def test_docker_cmd_passes_gpus_all_and_mounts_cache():
     assert "python -m sglang.launch_server" in cmd
 
 
+def test_docker_cmd_allows_hf_xet_downloads():
+    cmd = _build_docker_run_cmd(_target(), _config())
+    assert "-e HF_HOME=/data" in cmd
+    assert "-e HF_HUB_CACHE=/data" in cmd
+    assert "-e TRANSFORMERS_CACHE=/data" in cmd
+    assert "HF_HUB_DISABLE_XET" not in cmd
+
+
 def test_docker_cmd_labels_current_machine_assignment():
     cmd = _build_docker_run_cmd(
         _target(), _config(endpoint_name="ssh_b300")
