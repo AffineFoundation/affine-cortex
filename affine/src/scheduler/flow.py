@@ -68,6 +68,7 @@ from affine.src.scorer.window_state import (
 )
 
 from . import targon as targon_lifecycle
+from .champion_mirror import ChampionMirror
 
 
 # ---- deploy_fn contract: signaling exception -------------------------------
@@ -238,6 +239,7 @@ class FlowScheduler:
         self._list_valid_miners = list_valid_miners_fn
         self._list_current_miners = list_current_miners_fn or list_valid_miners_fn
         self._list_active_endpoint_names = list_active_endpoint_names_fn
+        self._champion_mirror = ChampionMirror()
 
     # ---- entry point ------------------------------------------------------
 
@@ -430,7 +432,7 @@ class FlowScheduler:
                     f"FlowScheduler: champion hotkey={champ.hotkey[:10]} "
                     f"uid synced {old_uid} -> {current_uid}"
                 )
-            return champ
+            return await self._ensure_champion_mirrored(champ)
 
         if champ.uid != -1:
             old_uid = champ.uid
@@ -442,7 +444,15 @@ class FlowScheduler:
                 f"and burning weight until it re-registers "
                 f"(old_uid={old_uid})"
             )
-        return champ
+        return await self._ensure_champion_mirrored(champ)
+
+    async def _ensure_champion_mirrored(
+        self, champ: ChampionRecord,
+    ) -> ChampionRecord:
+        mirrored = await self._champion_mirror.ensure_mirrored(champ)
+        if mirrored.model != champ.model or mirrored.revision != champ.revision:
+            await self.state.set_champion(mirrored)
+        return mirrored
 
     async def _refresh_task_ids(
         self, current_block: int, envs: Mapping[str, EnvConfig],
@@ -533,6 +543,7 @@ class FlowScheduler:
             model_type=candidate.model_type,
             since_block=current_block,
         )
+        new_champ = await self._champion_mirror.ensure_mirrored(new_champ)
         await self.state.set_champion(new_champ)
         await self.queue.mark_terminated(
             candidate.uid,
@@ -1481,6 +1492,9 @@ class FlowScheduler:
                 base_url=battle.base_url,
                 deployments=list(battle.deployments),
                 since_block=current_block,
+            )
+            new_champion = await self._champion_mirror.ensure_mirrored(
+                new_champion
             )
             # Order: write the canonical champion record FIRST so any
             # concurrent reader sees the new identity before either miners
