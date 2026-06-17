@@ -1851,6 +1851,52 @@ async def test_early_regression_triggers_lost_before_overlap_ready():
 
 
 @pytest.mark.asyncio
+async def test_system_miner_skips_early_regression_short_circuit():
+    """System miners are evaluation probes: collect full metrics before
+    final DECIDE instead of early-LOSTing on one regressed env."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(
+            2000,
+            "SYSTEM-1000",
+            0,
+            revision="sys_rev",
+            model="Qwen/Qwen3.6-35B-A3B",
+        ),
+    ])
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=samples,
+        weight_writer=_WeightWriterFake(),
+    )
+    task_state = await _drive_through_start_of_battle(scheduler, state, samples)
+    battle = await state.get_battle()
+    assert battle is not None
+    assert battle.challenger.uid == 2000
+
+    # ENV_A would be a definitive early regression for a normal miner.
+    samples.set_samples(
+        "SYSTEM-1000", "sys_rev", "ENV_A", task_state.task_ids["ENV_A"],
+        score=0.5, refresh_block=task_state.refreshed_at_block,
+    )
+    # ENV_B is still below sampling_count, so without early-stop the
+    # full comparator is not ready and the battle must remain active.
+    samples.set_samples(
+        "SYSTEM-1000", "sys_rev", "ENV_B", task_state.task_ids["ENV_B"][:1],
+        score=0.5, refresh_block=task_state.refreshed_at_block,
+    )
+
+    await scheduler.tick(current_block=77)
+
+    assert (await state.get_battle()) is not None
+    assert miner_store.rows[2000]["challenge_status"] == STATUS_IN_PROGRESS
+    assert "terminated_at_block" not in miner_store.rows[2000]
+    assert "termination_reason" not in miner_store.rows[2000]
+
+
+@pytest.mark.asyncio
 async def test_no_early_decision_when_no_env_meets_sampling_count():
     """Every scoring env has overlap < sampling_count, even though the
     visible avg is far below threshold → must NOT short-circuit; tick
