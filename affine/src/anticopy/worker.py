@@ -135,14 +135,15 @@ SGLANG_EXTRA_ARGS = os.getenv(
 # empty score row at job claim time and is dropped — we don't download
 # weights, don't swap sglang, don't burn anti-copy GPU time.
 #
-# Currently single-value: only Qwen3-dense (``qwen3``) is supported by
-# the rollout pool (champion-keyed by tokenizer_sig, which differs per
-# architecture). Adding ``qwen3_5_moe`` here is necessary but not
-# sufficient — refresh service has to grow multi-tokenizer pools and
-# sglang would need cross-arch kill+restart (see closed PR #520) first.
+# Currently single-value: new submissions are restricted to
+# Qwen3.6-35B-A3B (``qwen3_5_moe``). The rollout pool is still
+# champion-keyed by tokenizer_sig; operators can override this during
+# rollback. If monitor stages the Qwen3.6-only cutoff for a future block
+# while legacy Qwen3 miners still need anticopy, set
+# ``ANTICOPY_ALLOWED_MODEL_TYPES=qwen3,qwen3_5_moe``.
 ALLOWED_MODEL_TYPES = {
     t.strip() for t in os.getenv(
-        "ANTICOPY_ALLOWED_MODEL_TYPES", "qwen3"
+        "ANTICOPY_ALLOWED_MODEL_TYPES", "qwen3_5_moe"
     ).split(",") if t.strip()
 }
 

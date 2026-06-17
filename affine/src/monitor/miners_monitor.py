@@ -41,7 +41,10 @@ from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.anticopy.threshold import load_anticopy_config
 from affine.src.anticopy.tokenizer_sig import compute_tokenizer_signature
-from affine.utils.model_size_checker import check_model_size
+from affine.utils.model_size_checker import (
+    QWEN36_ONLY_MODEL_TYPES,
+    check_model_size,
+)
 from affine.utils.subtensor import get_subtensor
 from affine.utils.template_checker import check_template_safety
 
@@ -50,6 +53,9 @@ NETUID = int(os.getenv("AFFINE_NETUID", "120"))
 
 MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
 REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
+QWEN36_ONLY_ENFORCE_BLOCK = int(
+    os.getenv("AFFINE_QWEN36_ONLY_ENFORCE_BLOCK", "0")
+)
 
 
 @dataclass
@@ -329,7 +335,16 @@ class MinersMonitor:
             return info
 
         if uid != 0 and uid <= 1000:
-            size_result = await check_model_size(model, revision)
+            allowed_model_types = (
+                QWEN36_ONLY_MODEL_TYPES
+                if block >= QWEN36_ONLY_ENFORCE_BLOCK
+                else None
+            )
+            size_result = await check_model_size(
+                model,
+                revision,
+                allowed_model_types=allowed_model_types,
+            )
             info.model_type = str(size_result.get("model_type") or "")
             if not size_result.get("pass"):
                 info.mark_invalid(
