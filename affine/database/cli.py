@@ -449,12 +449,23 @@ async def _cmd_list_system_miners() -> None:
             print("(empty)")
             return
         for uid_str, payload in sorted(rows.items(), key=lambda x: int(x[0])):
-            print(f"  UID {uid_str:<6} → {payload.get('model', '?')}")
+            extra = []
+            if payload.get("revision"):
+                extra.append(f"revision={payload['revision']}")
+            if payload.get("model_type"):
+                extra.append(f"model_type={payload['model_type']}")
+            suffix = f" ({', '.join(extra)})" if extra else ""
+            print(f"  UID {uid_str:<6} → {payload.get('model', '?')}{suffix}")
     finally:
         await close_client()
 
 
-async def _cmd_set_miner(uid: int, model: str) -> None:
+async def _cmd_set_miner(
+    uid: int,
+    model: str,
+    revision: Optional[str],
+    model_type: Optional[str],
+) -> None:
     """Register a system miner (UID > 1000)."""
     if uid <= 1000:
         # Auto-shift small UIDs into the system range — matches the old
@@ -463,8 +474,20 @@ async def _cmd_set_miner(uid: int, model: str) -> None:
         print(f"(auto-shifted UID into system range: {uid})")
     await init_client()
     try:
-        await SystemConfigDAO().set_system_miner(uid=uid, model=model, updated_by="cli")
-        print(f"✓ System miner UID={uid} set to model={model}")
+        await SystemConfigDAO().set_system_miner(
+            uid=uid,
+            model=model,
+            revision=revision or "",
+            model_type=model_type or "",
+            updated_by="cli",
+        )
+        extra = []
+        if revision:
+            extra.append(f"revision={revision}")
+        if model_type:
+            extra.append(f"model_type={model_type}")
+        suffix = f" ({', '.join(extra)})" if extra else ""
+        print(f"✓ System miner UID={uid} set to model={model}{suffix}")
     finally:
         await close_client()
 
@@ -613,9 +636,19 @@ def list_system_miners():
 @db.command("set-miner")
 @click.option("--uid", type=int, required=True)
 @click.option("--model", required=True)
-def set_miner(uid, model):
+@click.option(
+    "--revision",
+    default=None,
+    help="Optional HF revision/branch for deployable system miners",
+)
+@click.option(
+    "--model-type",
+    default=None,
+    help='Optional HF config model_type, e.g. "qwen3_5_moe"',
+)
+def set_miner(uid, model, revision, model_type):
     """Register or update a system miner."""
-    asyncio.run(_cmd_set_miner(uid, model))
+    asyncio.run(_cmd_set_miner(uid, model, revision, model_type))
 
 
 @db.command("delete-miner")

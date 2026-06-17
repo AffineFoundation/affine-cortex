@@ -81,6 +81,27 @@ class MinerInfo:
         self.terminate_stats = terminate_stats
 
 
+def _system_miner_info(uid: int, payload: Dict[str, object]) -> Optional[MinerInfo]:
+    """Build the synthetic miner row for a configured system miner."""
+    if uid <= 1000:
+        return None
+    suffix = uid - 1000
+    revision = str(payload.get("revision") or f"SYSTEM-{suffix}")
+    return MinerInfo(
+        uid=uid,
+        hotkey=f"SYSTEM-{suffix}",
+        model=str(payload.get("model") or ""),
+        revision=revision,
+        block=0,
+        is_valid=True,
+        invalid_reason=None,
+        model_hash="",
+        hf_revision=revision,
+        template_check_result="safe",
+        model_type=str(payload.get("model_type") or ""),
+    )
+
+
 class HFRepoUnavailable(Exception):
     def __init__(self, reason: str):
         super().__init__(reason)
@@ -213,22 +234,9 @@ class MinersMonitor:
         system_miners = await self.config_dao.get_system_miners()
         for uid_str, payload in system_miners.items():
             uid = int(uid_str)
-            if uid <= 1000:
-                continue
-            miners.append(
-                MinerInfo(
-                    uid=uid,
-                    hotkey=f"SYSTEM-{uid - 1000}",
-                    model=payload.get("model", ""),
-                    revision=f"SYSTEM-{uid - 1000}",
-                    block=0,
-                    is_valid=True,
-                    invalid_reason=None,
-                    model_hash="",
-                    hf_revision=f"SYSTEM-{uid - 1000}",
-                    template_check_result="safe",
-                )
-            )
+            info = _system_miner_info(uid, payload)
+            if info is not None:
+                miners.append(info)
 
         # Persist current online snapshot. Historical challenge state lives
         # in miner_stats, keyed by (hotkey, revision).
