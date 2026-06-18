@@ -41,7 +41,10 @@ from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.anticopy.threshold import load_anticopy_config
 from affine.src.anticopy.tokenizer_sig import compute_tokenizer_signature
-from affine.utils.model_size_checker import check_model_size
+from affine.utils.model_size_checker import (
+    QWEN36_ONLY_MODEL_TYPES,
+    check_model_size,
+)
 from affine.utils.subtensor import get_subtensor
 from affine.utils.template_checker import check_template_safety
 
@@ -50,6 +53,9 @@ NETUID = int(os.getenv("AFFINE_NETUID", "120"))
 
 MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
 REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
+QWEN36_ONLY_ENFORCE_BLOCK = int(
+    os.getenv("AFFINE_QWEN36_ONLY_ENFORCE_BLOCK", "0")
+)
 
 
 @dataclass
@@ -79,6 +85,27 @@ class MinerInfo:
         self.invalid_reason = reason
         self.permanent_invalid = permanent
         self.terminate_stats = terminate_stats
+
+
+def _system_miner_info(uid: int, payload: Dict[str, object]) -> Optional[MinerInfo]:
+    """Build the synthetic miner row for a configured system miner."""
+    if uid <= 1000:
+        return None
+    suffix = uid - 1000
+    revision = str(payload.get("revision") or f"SYSTEM-{suffix}")
+    return MinerInfo(
+        uid=uid,
+        hotkey=f"SYSTEM-{suffix}",
+        model=str(payload.get("model") or ""),
+        revision=revision,
+        block=0,
+        is_valid=True,
+        invalid_reason=None,
+        model_hash="",
+        hf_revision=revision,
+        template_check_result="safe",
+        model_type=str(payload.get("model_type") or ""),
+    )
 
 
 class HFRepoUnavailable(Exception):
@@ -213,22 +240,9 @@ class MinersMonitor:
         system_miners = await self.config_dao.get_system_miners()
         for uid_str, payload in system_miners.items():
             uid = int(uid_str)
-            if uid <= 1000:
-                continue
-            miners.append(
-                MinerInfo(
-                    uid=uid,
-                    hotkey=f"SYSTEM-{uid - 1000}",
-                    model=payload.get("model", ""),
-                    revision=f"SYSTEM-{uid - 1000}",
-                    block=0,
-                    is_valid=True,
-                    invalid_reason=None,
-                    model_hash="",
-                    hf_revision=f"SYSTEM-{uid - 1000}",
-                    template_check_result="safe",
-                )
-            )
+            info = _system_miner_info(uid, payload)
+            if info is not None:
+                miners.append(info)
 
         # Persist current online snapshot. Historical challenge state lives
         # in miner_stats, keyed by (hotkey, revision).
@@ -321,7 +335,16 @@ class MinersMonitor:
             return info
 
         if uid != 0 and uid <= 1000:
-            size_result = await check_model_size(model, revision)
+            allowed_model_types = (
+                QWEN36_ONLY_MODEL_TYPES
+                if block >= QWEN36_ONLY_ENFORCE_BLOCK
+                else None
+            )
+            size_result = await check_model_size(
+                model,
+                revision,
+                allowed_model_types=allowed_model_types,
+            )
             info.model_type = str(size_result.get("model_type") or "")
             if not size_result.get("pass"):
                 info.mark_invalid(

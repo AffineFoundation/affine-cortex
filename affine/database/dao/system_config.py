@@ -214,8 +214,12 @@ class SystemConfigDAO(BaseDAO):
 
         Storage format (param_name="system_miners"):
         {
-            "1001": {"model": "openai/gpt-4o"},
-            "1002": {"model": "anthropic/claude-3.5-sonnet"}
+            "1001": {
+                "model": "Qwen/Qwen3.6-35B-A3B",
+                "revision": "main",
+                "model_type": "qwen3_5_moe"
+            },
+            "1002": {"model": "openai/gpt-4o"}
         }
 
         Returns:
@@ -224,7 +228,12 @@ class SystemConfigDAO(BaseDAO):
         return await self.get_param_value("system_miners", default={})
 
     async def set_system_miner(
-        self, uid: int, model: str, updated_by: str = "cli"
+        self,
+        uid: int,
+        model: str,
+        revision: str = "",
+        model_type: str = "",
+        updated_by: str = "cli",
     ) -> Dict[str, Any]:
         """Set a system miner configuration.
 
@@ -233,7 +242,12 @@ class SystemConfigDAO(BaseDAO):
 
         Args:
             uid: System miner UID (must be > 1000)
-            model: Model identifier (e.g., "openai/gpt-4o")
+            model: Model identifier (e.g., "Qwen/Qwen3.6-35B-A3B")
+            revision: Optional HF revision/branch. When omitted, monitor uses
+                the historical synthetic ``SYSTEM-*`` revision.
+            model_type: Optional HF config model_type. Required for Qwen3.6
+                system-miner tests so scheduler launches SGLang with the
+                qwen3_coder tool parser.
             updated_by: Who updated the parameter
 
         Returns:
@@ -245,8 +259,14 @@ class SystemConfigDAO(BaseDAO):
         if uid <= 1000:
             raise ValueError("System miner UID must be > 1000")
 
+        payload = {"model": model}
+        if revision:
+            payload["revision"] = revision
+        if model_type:
+            payload["model_type"] = model_type
+
         current = await self.get_system_miners()
-        current[str(uid)] = {"model": model}
+        current[str(uid)] = payload
 
         return await self.set_param(
             param_name="system_miners",

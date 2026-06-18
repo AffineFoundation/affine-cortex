@@ -15,11 +15,11 @@ Key properties:
   loaded by the sglang image and traps the scheduler in a deploy-retry loop).
 """
 
-import os
 import json
 import asyncio
 import logging
-from typing import Dict, Any, Optional
+import os
+from typing import Any, Collection, Dict, Optional
 
 from huggingface_hub import hf_hub_download
 
@@ -28,14 +28,20 @@ logger = logging.getLogger("affine")
 
 
 # ---------------------------------------------------------------------------
-# Allowed model architectures
+# Known model architectures
 # ---------------------------------------------------------------------------
-# A miner's config.json must match exactly one entry in this list.
+# A miner's config.json must match exactly one entry in this list. Monitor
+# submission policy can filter this further, but the checker keeps legacy
+# architectures here so older rows can still be interpreted consistently.
 # Fine-tunes of the same base model share these fields (weights differ,
 # architecture stays the same), so this correctly permits fine-tuned variants.
 #
 # Keys may be dotted paths to reach nested fields (e.g. ``text_config.hidden_size``
 # for multimodal configs where the language-model fields live under text_config).
+
+QWEN36_MODEL_TYPE = "qwen3_5_moe"
+QWEN36_ONLY_MODEL_TYPES = frozenset({QWEN36_MODEL_TYPE})
+
 
 ALLOWED_MODEL_CONFIGS = [
     # Qwen3-32B (dense, text-only)
@@ -50,7 +56,7 @@ ALLOWED_MODEL_CONFIGS = [
     },
     # Qwen3.6-35B-A3B (MoE, multimodal — language fields nested under text_config)
     {
-        "model_type": "qwen3_5_moe",
+        "model_type": QWEN36_MODEL_TYPE,
         "text_config.hidden_size": 2048,
         "text_config.num_hidden_layers": 40,
         "text_config.num_attention_heads": 16,
@@ -87,35 +93,71 @@ def _check_against(config: dict, expected: dict) -> Optional[str]:
     return None
 
 
-def _match_allowed_model(config: dict) -> tuple[Optional[str], Optional[str]]:
+def _normalize_model_types(
+    allowed_model_types: Optional[Collection[str]],
+) -> Optional[frozenset[str]]:
+    if allowed_model_types is None:
+        return None
+    return frozenset(
+        str(model_type).strip()
+        for model_type in allowed_model_types
+        if str(model_type).strip()
+    )
+
+
+def _format_model_types(model_types: Collection[str]) -> str:
+    return ", ".join(sorted(model_types))
+
+
+def _match_allowed_model(
+    config: dict,
+    allowed_model_types: Optional[Collection[str]] = None,
+) -> tuple[Optional[str], Optional[str]]:
     """Return the matching allow-list model_type, or a mismatch description.
 
     Picks the mismatch from the entry that agreed on ``model_type`` (best signal
     that the miner *intended* that architecture); falls back to listing the
     permitted model_types when no entry's model_type matches.
     """
+    policy_model_types = _normalize_model_types(allowed_model_types)
     actual_type = config.get("model_type")
     type_match_mismatch: Optional[str] = None
     for expected in ALLOWED_MODEL_CONFIGS:
         mismatch = _check_against(config, expected)
         if mismatch is None:
-            return str(expected.get("model_type") or ""), None
+            matched_type = str(expected.get("model_type") or "")
+            if policy_model_types is not None and matched_type not in policy_model_types:
+                return (
+                    None,
+                    f"model_type={matched_type} "
+                    f"(expected one of: {_format_model_types(policy_model_types)})",
+                )
+            return matched_type, None
         if expected.get("model_type") == actual_type and type_match_mismatch is None:
             type_match_mismatch = mismatch
 
     if type_match_mismatch is not None:
         return None, type_match_mismatch
-    allowed_types = ", ".join(
-        sorted({str(e.get("model_type")) for e in ALLOWED_MODEL_CONFIGS})
+    expected_types = policy_model_types or {
+        str(e.get("model_type")) for e in ALLOWED_MODEL_CONFIGS
+    }
+    return (
+        None,
+        f"model_type={actual_type} "
+        f"(expected one of: {_format_model_types(expected_types)})",
     )
-    return None, f"model_type={actual_type} (expected one of: {allowed_types})"
 
 
 class ModelSizeChecker:
     """Check model architecture against the allowed model whitelist."""
 
-    def __init__(self, hf_token: Optional[str] = None):
+    def __init__(
+        self,
+        hf_token: Optional[str] = None,
+        allowed_model_types: Optional[Collection[str]] = None,
+    ):
         self.hf_token = hf_token or os.getenv("HF_TOKEN")
+        self.allowed_model_types = _normalize_model_types(allowed_model_types)
 
     async def _fetch_config(self, model_id: str, revision: str) -> Optional[dict]:
         """Fetch config.json from HuggingFace repo.
@@ -157,7 +199,10 @@ class ModelSizeChecker:
                 "model_type": "",
             }
 
-        matched_model_type, mismatch = _match_allowed_model(config)
+        matched_model_type, mismatch = _match_allowed_model(
+            config,
+            allowed_model_types=self.allowed_model_types,
+        )
         model_type = str(config.get("model_type") or "")
         if mismatch is not None:
             logger.info(
@@ -190,17 +235,22 @@ class ModelSizeChecker:
         }
 
 
-async def check_model_size(model_id: str, revision: str) -> Dict[str, Any]:
+async def check_model_size(
+    model_id: str,
+    revision: str,
+    *,
+    allowed_model_types: Optional[Collection[str]] = None,
+) -> Dict[str, Any]:
     """Check if a model matches one of the allowed architectures.
 
     This is the main entry point for model validation.
 
     Args:
-        model_id: HuggingFace model repo (e.g., "Qwen/Qwen3-32B")
+        model_id: HuggingFace model repo (e.g., "Qwen/Qwen3.6-35B-A3B")
         revision: Git commit hash
 
     Returns:
         Dict with 'pass' boolean and 'reason' string
     """
-    checker = ModelSizeChecker()
+    checker = ModelSizeChecker(allowed_model_types=allowed_model_types)
     return await checker.check(model_id, revision)

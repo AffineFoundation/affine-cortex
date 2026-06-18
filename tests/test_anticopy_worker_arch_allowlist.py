@@ -13,10 +13,10 @@ from affine.src.anticopy.worker import (
 )
 
 
-def test_default_allowlist_is_qwen3_only():
-    # Pinned: anything else (Qwen3.6 MoE, future architectures) hits
-    # the skip path until refresh + sglang gain multi-arch support.
-    assert ALLOWED_MODEL_TYPES == {"qwen3"}
+def test_default_allowlist_is_qwen36_only():
+    # Pinned to current submission policy. Operators can still override
+    # ANTICOPY_ALLOWED_MODEL_TYPES during emergency rollback.
+    assert ALLOWED_MODEL_TYPES == {"qwen3_5_moe"}
 
 
 def test_fetch_hf_model_type_returns_field(tmp_path):

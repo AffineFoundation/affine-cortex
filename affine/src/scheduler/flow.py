@@ -18,10 +18,11 @@ One block tick:
   6. Champion samples for the current task_ids not yet full → return
      (executors are filling them).
   7. No in-flight battle → pick next challenger, deploy, record battle.
-  7.5. Any scoring env reached ``sampling_count`` overlap AND the
-       challenger is already worse on it under the not_worse rule →
-       short-circuit LOST, freeing the host without waiting for slower
-       envs to finish buffering.
+  7.5. For non-system miners, any scoring env reached ``sampling_count``
+       overlap AND the challenger is already worse on it under the
+       not_worse rule → short-circuit LOST, freeing the host without
+       waiting for slower envs to finish buffering. System miners skip
+       this so test runs collect full metrics before the final decision.
   8. Battle challenger samples not yet full → return.
   9. Both subjects done → run comparator, transition champion (or drop
      challenger), write weights when the champion changes, clear battle.
@@ -103,6 +104,17 @@ class DeploymentStateInvalidatedError(RuntimeError):
         self.invalidated_deployment_ids = tuple(
             did for did in deployment_ids if did
         )
+
+
+SYSTEM_MINER_MIN_UID = 1000
+SYSTEM_MINER_HOTKEY_PREFIX = "SYSTEM-"
+
+
+def _is_system_miner(miner: MinerSnapshot) -> bool:
+    return (
+        miner.uid >= SYSTEM_MINER_MIN_UID
+        or miner.hotkey.startswith(SYSTEM_MINER_HOTKEY_PREFIX)
+    )
 
 
 def _format_cause_chain(exc: BaseException, *, max_depth: int = 8) -> str:
@@ -367,21 +379,22 @@ class FlowScheduler:
         # single env that's both fully sampled AND showing a definitive
         # regression is enough to lose — no need to wait for the slower
         # envs to buffer their last samples.
-        early = await self._check_early_regression(
-            champion, battle.challenger,
-            scoring_envs=scoring_envs, task_state=task_state,
-        )
-        if early is not None:
-            regression_env, per_env_data, overlap_task_ids = early
-            await self._decide_early_lost(
-                champion, battle,
-                regression_env=regression_env,
-                per_env_data=per_env_data,
-                overlap_task_ids=overlap_task_ids,
-                task_state=task_state,
-                current_block=current_block,
+        if not _is_system_miner(battle.challenger):
+            early = await self._check_early_regression(
+                champion, battle.challenger,
+                scoring_envs=scoring_envs, task_state=task_state,
             )
-            return
+            if early is not None:
+                regression_env, per_env_data, overlap_task_ids = early
+                await self._decide_early_lost(
+                    champion, battle,
+                    regression_env=regression_env,
+                    per_env_data=per_env_data,
+                    overlap_task_ids=overlap_task_ids,
+                    task_state=task_state,
+                    current_block=current_block,
+                )
+                return
 
         # 8. Battle overlap not yet sufficient — wait for both miners to
         # have ≥ sampling_count current-refresh task_ids in common per env.
@@ -1074,6 +1087,9 @@ class FlowScheduler:
         kept: List[BattleRecord] = []
         changed = False
         for record in records:
+            if _is_system_miner(record.challenger):
+                kept.append(record)
+                continue
             early = await self._check_early_regression(
                 champion, record.challenger,
                 scoring_envs=scoring_envs, task_state=task_state,

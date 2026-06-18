@@ -155,9 +155,11 @@ If you need to try a different model, register a fresh hotkey.
   your HF repo `affine-model-<hotkey-suffix>`.
 - **Repo must be public** when you commit — the validator pulls weights
   via the public HuggingFace API.
-- **Model size** is checked by the monitor (`check_model_size`). Stick
-  with Qwen3-32B-class models; oversized models are rejected at
-  validation time.
+- **Base model** is checked by the monitor (`check_model_size`). New
+  submissions must be Qwen3.6-35B-A3B fine-tunes; other architectures
+  are rejected at validation time. Validators can set
+  `AFFINE_QWEN36_ONLY_ENFORCE_BLOCK` to apply this rule only from a
+  specific on-chain commit block.
 - **Chat template safety** is also checked (`check_template_safety`).
   Don't ship chat templates with arbitrary code execution; they will
   trip the `malicious_template:*` invalidation.
