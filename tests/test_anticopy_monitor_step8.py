@@ -28,12 +28,44 @@ class _FakeDynamoClient:
 
 
 class _FakeStateDAO:
-    """Stubs the anticopy_state DAO; only the tokenizer-sig getter
-    matters for the monitor step 8.0 path."""
-    def __init__(self, champion_sig=""):
+    """Stubs the anticopy_state DAO for the monitor step 8.0 path."""
+    def __init__(self, champion_sig="", state=None):
         self.champion_sig = champion_sig
+        self.state = state
     async def get_champion_tokenizer_sig(self):
         return self.champion_sig
+    async def get_state(self):
+        if self.state is not None:
+            return dict(self.state)
+        return {
+            "active_champion_uid": 7,
+            "active_champion_hotkey": "champ_hk",
+            "active_champion_model": "champ/model",
+            "active_champion_revision": "champ_rev",
+            "champion_tokenizer_sig": self.champion_sig,
+        }
+
+
+class _FakeConfigDAO:
+    def __init__(self, champion=None, legacy_sig=""):
+        self.champion = (
+            champion
+            if champion is not None
+            else {
+                "uid": 7,
+                "hotkey": "champ_hk",
+                "model": "champ/model",
+                "revision": "champ_rev",
+            }
+        )
+        self.legacy_sig = legacy_sig
+
+    async def get_param_value(self, name, default=None):
+        if name == "champion":
+            return self.champion
+        if name == "anticopy_champion_tokenizer_sig":
+            return self.legacy_sig
+        return default
 
 
 class _FakeScoresDAO:
@@ -54,10 +86,18 @@ def _build_monitor(
     champion_sig="champion_sig",
     cand_sig="champion_sig",
     score_row=None,
+    state=None,
+    champion=None,
+    legacy_sig="",
 ):
     """Wire a MinersMonitor with anticopy state/scores stubs."""
     monitor = MinersMonitor()
-    monitor.anticopy_state_dao = _FakeStateDAO(champion_sig=champion_sig)
+    monitor.config_dao = _FakeConfigDAO(
+        champion=champion, legacy_sig=legacy_sig,
+    )
+    monitor.anticopy_state_dao = _FakeStateDAO(
+        champion_sig=champion_sig, state=state,
+    )
     monitor.anticopy_scores_dao = _FakeScoresDAO(return_row=score_row)
 
     async def _fake_load(_dao):
@@ -101,6 +141,53 @@ async def test_tokenizer_mismatch_marks_permanent_invalid(monkeypatch):
     assert info.is_valid is False
     assert info.permanent_invalid is True
     assert info.invalid_reason.startswith("tokenizer_sig_mismatch:")
+
+
+@pytest.mark.asyncio
+async def test_tokenizer_mismatch_skipped_when_anticopy_state_is_stale(monkeypatch):
+    """A stale CEAC rollout anchor must not reject candidates for the
+    live champion's tokenizer. The refresh cadence intentionally keeps
+    rollout pools stable, so the monitor has to verify the anchor before
+    using its signature as an early-reject gate."""
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(
+        champion_sig="A" * 64,
+        cand_sig="B" * 64,
+        cfg_enabled=True,
+        state={
+            "active_champion_uid": 83,
+            "active_champion_hotkey": "old_hk",
+            "active_champion_model": "old/model",
+            "active_champion_revision": "old_rev",
+            "champion_tokenizer_sig": "A" * 64,
+        },
+        champion={
+            "uid": 2000,
+            "hotkey": "SYSTEM-1000",
+            "model": "Qwen/Qwen3.6-35B-A3B",
+            "revision": "995ad96eacd98c81ed38be0c5b274b04031597b0",
+        },
+        legacy_sig="A" * 64,
+    )
+    monitor._get_model_info = _hot_get_model_info
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_model_size",
+        _async_pass_size,
+    )
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_template_safety",
+        _async_safe,
+    )
+
+    info = await monitor._validate_miner(
+        uid=42, hotkey="hk_stale_xyz",
+        model="org/affine-model-hk_stale_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+    assert info.is_valid is True
+    assert info.invalid_reason is None
 
 
 @pytest.mark.asyncio

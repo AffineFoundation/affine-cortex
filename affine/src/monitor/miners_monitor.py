@@ -58,6 +58,51 @@ QWEN36_ONLY_ENFORCE_BLOCK = int(
 )
 
 
+def _as_int_or_none(value: object) -> Optional[int]:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_str(value: object) -> str:
+    return str(value or "")
+
+
+def _anticopy_state_matches_champion(
+    state: Dict[str, object],
+    champion: Optional[Dict[str, object]],
+) -> bool:
+    """Return whether the CEAC rollout anchor belongs to the live champion.
+
+    Older deployments may have only ``champion_tokenizer_sig`` and no
+    ``active_champion_*`` fields. Treat those as matchable so the legacy
+    fallback keeps working; only a clear mismatch disables the tokenizer
+    early-reject gate.
+    """
+    if not state or not champion:
+        return True
+
+    checks = []
+    if "active_champion_uid" in state and "uid" in champion:
+        checks.append(
+            _as_int_or_none(state.get("active_champion_uid"))
+            == _as_int_or_none(champion.get("uid"))
+        )
+    for state_key, champion_key in (
+        ("active_champion_hotkey", "hotkey"),
+        ("active_champion_model", "model"),
+        ("active_champion_revision", "revision"),
+    ):
+        if state_key in state and champion_key in champion:
+            checks.append(
+                _as_str(state.get(state_key))
+                == _as_str(champion.get(champion_key))
+            )
+
+    return all(checks) if checks else True
+
+
 @dataclass
 class MinerInfo:
     uid: int
@@ -403,12 +448,37 @@ class MinersMonitor:
         champion_sig = ""
         if anticopy_cfg is not None and anticopy_cfg.enabled:
             try:
-                champion_sig = await self.anticopy_state_dao.get_champion_tokenizer_sig() or ""
+                state_matches_current_champion = True
+                state = await self.anticopy_state_dao.get_state()
+                state = state if isinstance(state, dict) else {}
+                champion_sig = str(state.get("champion_tokenizer_sig") or "")
+                if champion_sig:
+                    current_champion = await self.config_dao.get_param_value(
+                        "champion", default=None,
+                    )
+                    current_champion = (
+                        current_champion
+                        if isinstance(current_champion, dict)
+                        else None
+                    )
+                    if not _anticopy_state_matches_champion(
+                        state, current_champion,
+                    ):
+                        state_matches_current_champion = False
+                        logger.info(
+                            "[MinersMonitor] skipping anticopy tokenizer "
+                            "early reject because anticopy_state champion "
+                            f"is stale: state_uid={state.get('active_champion_uid')} "
+                            f"state_rev={state.get('active_champion_revision')} "
+                            f"current_uid={(current_champion or {}).get('uid')} "
+                            f"current_rev={(current_champion or {}).get('revision')}"
+                        )
+                        champion_sig = ""
                 # legacy: fall back to system_config for backward-compat
                 # in case ``anticopy_state`` hasn't been populated yet on
                 # an older deployment. Drop this branch once all live
                 # validators have rolled past the migration.
-                if not champion_sig:
+                if not champion_sig and state_matches_current_champion:
                     champion_sig = await self.config_dao.get_param_value(
                         "anticopy_champion_tokenizer_sig", default="",
                     ) or ""
