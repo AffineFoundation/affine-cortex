@@ -1070,29 +1070,38 @@ def _miners_by_hotkey(*rows):
       * ``(hotkey, uid)`` — registered, valid.
       * ``(hotkey, None)`` — deregistered.
       * ``(hotkey, uid, is_valid_bool)`` — explicit validity flag.
+      * ``(hotkey, uid, is_valid_bool, first_block)`` — explicit commit block.
     """
     seeded = {}
     for row in rows:
         if len(row) == 2:
             hotkey, uid = row
             is_valid = True
-        else:
+            first_block = 500
+        elif len(row) == 3:
             hotkey, uid, is_valid = row
+            first_block = 500
+        else:
+            hotkey, uid, is_valid, first_block = row
         if uid is None:
             continue
         seeded[("hotkey", hotkey)] = {
             "hotkey": hotkey,
             "uid": uid,
             "is_valid": "true" if is_valid else "false",
+            "first_block": first_block,
         }
     return _FakeMinersDAO(seeded)
 
 
-def _split_config(after_block=0, count=3):
-    return _FakeSystemConfigDAO({
+def _split_config(after_block=0, count=3, champion=None):
+    rows = {
         "weights_split_after_block": after_block,
         "weights_split_champion_count": count,
-    })
+    }
+    if champion is not None:
+        rows["champion"] = champion
+    return _FakeSystemConfigDAO(rows)
 
 
 @pytest.mark.asyncio
@@ -1352,6 +1361,141 @@ async def test_weights_endpoint_skips_currently_invalid_hotkey_and_backfills():
             "8": {"weight": share},
             "42": {"weight": share},
             "5": {"weight": share},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_skips_champions_uploaded_before_split_block():
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+        {
+            "block_number": 400,
+            "statistics": {"winner_uid": 7, "winner_hotkey": "hk-old"},
+        },
+        {
+            "block_number": 300,
+            "statistics": {"winner_uid": 42, "winner_hotkey": "hk-x"},
+        },
+        {
+            "block_number": 200,
+            "statistics": {"winner_uid": 5, "winner_hotkey": "hk-e"},
+        },
+    ]
+
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(
+            ("hk-h", 8),
+            ("hk-old", 7, True, 299),
+            ("hk-x", 42),
+            ("hk-e", 5),
+        ),
+        config_dao=_split_config(after_block=300, count=3),
+    )
+
+    share = pytest.approx(1.0 / 3)
+    assert response == {
+        "block_number": 500,
+        "config": {},
+        "weights": {
+            "8": {"weight": share},
+            "42": {"weight": share},
+            "5": {"weight": share},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_skips_system_non_champion_and_backfills():
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+        {
+            "block_number": 400,
+            "statistics": {"winner_uid": 2000, "winner_hotkey": "SYSTEM-1000"},
+        },
+        {
+            "block_number": 300,
+            "statistics": {"winner_uid": 42, "winner_hotkey": "hk-x"},
+        },
+        {
+            "block_number": 200,
+            "statistics": {"winner_uid": 5, "winner_hotkey": "hk-e"},
+        },
+    ]
+
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(
+            ("hk-h", 8),
+            ("SYSTEM-1000", 2000),
+            ("hk-x", 42),
+            ("hk-e", 5),
+        ),
+        config_dao=_split_config(
+            after_block=300,
+            count=3,
+            champion={"uid": 8, "hotkey": "hk-h"},
+        ),
+    )
+
+    share = pytest.approx(1.0 / 3)
+    assert response == {
+        "block_number": 500,
+        "config": {},
+        "weights": {
+            "8": {"weight": share},
+            "42": {"weight": share},
+            "5": {"weight": share},
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_weights_endpoint_keeps_system_miner_when_current_champion():
+    snapshots = [
+        {
+            "block_number": 500,
+            "statistics": {"winner_uid": 2000, "winner_hotkey": "SYSTEM-1000"},
+        },
+        {
+            "block_number": 400,
+            "statistics": {"winner_uid": 8, "winner_hotkey": "hk-h"},
+        },
+        {
+            "block_number": 300,
+            "statistics": {"winner_uid": 7, "winner_hotkey": "hk-g"},
+        },
+    ]
+
+    response = await get_latest_weights(
+        snapshots_dao=_FakeScoreSnapshotsDAO(snapshots=snapshots),
+        miners_dao=_miners_by_hotkey(
+            ("SYSTEM-1000", 2000),
+            ("hk-h", 8),
+            ("hk-g", 7),
+        ),
+        config_dao=_split_config(
+            after_block=300,
+            count=3,
+            champion={"uid": 2000, "hotkey": "SYSTEM-1000"},
+        ),
+    )
+
+    share = pytest.approx(1.0 / 3)
+    assert response == {
+        "block_number": 500,
+        "config": {},
+        "weights": {
+            "2000": {"weight": share},
+            "8": {"weight": share},
+            "7": {"weight": share},
         },
     }
 

@@ -504,6 +504,10 @@ BURN_UID = -1
 _SPLIT_SNAPSHOT_SCAN_LIMIT = 500
 
 
+def _is_system_miner_uid(uid: int) -> bool:
+    return uid > 1000
+
+
 def _winner_uid_from_snapshot(snapshot: Dict[str, Any]) -> Optional[int]:
     """Extract the integer winner uid from a snapshot, tolerating three
     historical shapes: the current ``statistics.winner_uid`` field, the
@@ -580,7 +584,9 @@ async def _resolve_split_payees(
     miners_dao: MinersDAO,
     *,
     needed: int,
+    min_first_block: int,
     seed_hotkeys: Optional[List[str]] = None,
+    allowed_system_hotkeys: Optional[set[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Resolve active split payees by champion hotkey.
 
@@ -590,8 +596,8 @@ async def _resolve_split_payees(
     (for example after a promotion before the next snapshot write).
     We then walk ``snapshots`` (newest-first), dedupe champions by
     hotkey, look up each hotkey's *current* miner row in the miners
-    table, and keep the first ``needed`` whose miner is still registered
-    AND currently valid.
+    table, and keep the first ``needed`` whose miner is still registered,
+    currently valid, and first committed at or after ``min_first_block``.
 
     Two filters are applied at resolution time:
 
@@ -601,6 +607,13 @@ async def _resolve_split_payees(
       mismatch, anticopy, multi-commit, …) are skipped. They may still be
       the benchmark identity until beaten, but they should not receive an
       on-chain split share while flagged invalid.
+    * **Earlier committed champions** are skipped. Reward split follows
+      the configured activation/upload block instead of model architecture,
+      so older champions do not draw a co-champion share after a rollout.
+    * **System miners** are skipped unless that system miner is the live
+      champion. When a system miner is champion, the API may return its
+      uid; the validator folds that share into UID 0 rather than paying
+      the synthetic uid on chain.
 
     Either filter outcome causes us to walk further back in history to
     backfill the count, so churn at the top of the leaderboard doesn't
@@ -612,6 +625,7 @@ async def _resolve_split_payees(
     """
     seen_hotkeys: set = set()
     out: List[Dict[str, Any]] = []
+    allowed_system_hotkeys = allowed_system_hotkeys or set()
 
     async def _append_hotkey(hotkey: Optional[str]) -> None:
         if len(out) >= needed:
@@ -630,6 +644,16 @@ async def _resolve_split_payees(
             uid = int(miner.get("uid"))
         except (TypeError, ValueError):
             return
+        if _is_system_miner_uid(uid):
+            if hotkey not in allowed_system_hotkeys:
+                return
+        else:
+            try:
+                first_block = int(miner.get("first_block") or 0)
+            except (TypeError, ValueError):
+                first_block = 0
+            if first_block < min_first_block:
+                return
         out.append({
             "uid": uid,
             "hotkey": hotkey,
@@ -688,11 +712,21 @@ async def compute_split_payees(
     )
     champion_cfg = await config_dao.get_param_value("champion", default=None)
     seed_hotkeys = []
+    allowed_system_hotkeys: set[str] = set()
     if isinstance(champion_cfg, dict) and champion_cfg.get("hotkey"):
-        seed_hotkeys.append(str(champion_cfg["hotkey"]))
+        champion_hotkey = str(champion_cfg["hotkey"])
+        seed_hotkeys.append(champion_hotkey)
+        try:
+            champion_uid = int(champion_cfg.get("uid"))
+        except (TypeError, ValueError):
+            champion_uid = None
+        if champion_uid is not None and _is_system_miner_uid(champion_uid):
+            allowed_system_hotkeys.add(champion_hotkey)
     payees = await _resolve_split_payees(
         snapshots, miners_dao, needed=champion_count,
+        min_first_block=activation_block,
         seed_hotkeys=seed_hotkeys,
+        allowed_system_hotkeys=allowed_system_hotkeys,
     )
     if not payees:
         return []
