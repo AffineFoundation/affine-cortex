@@ -42,6 +42,7 @@ from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.anticopy.threshold import load_anticopy_config
 from affine.src.anticopy.tokenizer_sig import compute_tokenizer_signature
 from affine.utils.model_size_checker import (
+    QWEN36_MODEL_TYPE,
     QWEN36_ONLY_MODEL_TYPES,
     check_model_size,
 )
@@ -53,9 +54,9 @@ NETUID = int(os.getenv("AFFINE_NETUID", "120"))
 
 MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
 REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
-QWEN36_ONLY_ENFORCE_BLOCK = int(
-    os.getenv("AFFINE_QWEN36_ONLY_ENFORCE_BLOCK", "0")
-)
+# 8431035 = 2026-06-18 03:00:00 UTC / 2026-06-18 11:00:00 Beijing.
+QWEN36_ONLY_ENFORCE_BLOCK = 8_431_035
+QWEN36_ALLOWED_FROM_BLOCK = 8_432_280
 
 
 @dataclass
@@ -349,6 +350,18 @@ class MinersMonitor:
             if not size_result.get("pass"):
                 info.mark_invalid(
                     f"model_check:{size_result.get('reason')}",
+                    permanent=True,
+                    terminate_stats=True,
+                )
+                return info
+            if (
+                info.model_type == QWEN36_MODEL_TYPE
+                and block < QWEN36_ALLOWED_FROM_BLOCK
+            ):
+                info.mark_invalid(
+                    "model_check:"
+                    f"qwen36_not_allowed_until_block:{QWEN36_ALLOWED_FROM_BLOCK}"
+                    f":commit_block={block}",
                     permanent=True,
                     terminate_stats=True,
                 )
