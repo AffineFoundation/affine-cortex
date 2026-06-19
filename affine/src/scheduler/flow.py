@@ -69,6 +69,10 @@ from affine.src.scorer.window_state import (
 )
 
 from . import targon as targon_lifecycle
+from .deploy_failures import (
+    DeployFailureClassification,
+    classify_deploy_preflight_failure,
+)
 
 
 # ---- deploy_fn contract: signaling exception -------------------------------
@@ -139,6 +143,16 @@ def _format_cause_chain(exc: BaseException, *, max_depth: int = 8) -> str:
     if inner is not None:
         parts.append(" -> ...")
     return "".join(parts)
+
+
+async def _classify_deploy_preflight_failure(
+    target: targon_lifecycle.DeployTarget,
+) -> Optional[DeployFailureClassification]:
+    return await classify_deploy_preflight_failure(
+        model=target.model,
+        revision=target.revision,
+        model_type=target.model_type,
+    )
 
 
 # ---- constants (no longer in system_config) --------------------------------
@@ -1192,22 +1206,34 @@ class FlowScheduler:
                 model=cand.model, revision=cand.revision,
                 model_type=cand.model_type,
             )
+            failure = await _classify_deploy_preflight_failure(target)
+            if failure:
+                await self.queue.mark_terminated(
+                    cand.uid,
+                    OUTCOME_FAILED,
+                    reason=failure.reason,
+                    hotkey=cand.hotkey,
+                    revision=cand.revision,
+                    model=cand.model,
+                    terminated_at_block=current_block,
+                )
+                logger.error(
+                    f"FlowScheduler: pre-deploy preflight model fault for "
+                    f"uid={cand.uid}; marked terminated: "
+                    f"{failure.reason} (rule={failure.rule_name})"
+                )
+                continue
             try:
                 result = await self._deploy(target, "pre_challenger")
             except NoSpareEndpoint:
                 return
             except Exception as e:
                 await self._forget_invalidated_deployments_from_error(e)
-                # Any non-NoSpareEndpoint deploy failure (transient
-                # transport, sglang container crash on startup, HF
-                # 5xx, ``_wait_ready`` timeout) leaves the miner in
-                # queue. Scheduler can't tell a true model fault apart
-                # from infra noise; the monitor's ``hf_model_fetch``
-                # check is the authoritative signal for "this model
-                # is broken" — it flips ``is_valid=false`` and the
-                # invalidation sweep tears the record down. Marking
-                # FAILED here burns a miner's queue slot on every
-                # infra blip.
+                # Any deploy failure after preflight (transient transport,
+                # generic sglang startup crash, HF 5xx, ``_wait_ready``
+                # timeout) leaves the miner in queue. The qwen3.6
+                # preprocessor check above is the only scheduler-side
+                # model-fault termination before deployment.
                 kind = (
                     "transport" if isinstance(e, TransientDeployError)
                     else "deploy"
@@ -1258,22 +1284,32 @@ class FlowScheduler:
             model=candidate.model, revision=candidate.revision,
             model_type=candidate.model_type,
         )
+        failure = await _classify_deploy_preflight_failure(target)
+        if failure:
+            logger.error(
+                f"FlowScheduler: challenger preflight model fault "
+                f"uid={candidate.uid}; marked terminated: "
+                f"{failure.reason} (rule={failure.rule_name})"
+            )
+            await self.queue.mark_terminated(
+                candidate.uid,
+                OUTCOME_FAILED,
+                reason=failure.reason,
+                hotkey=candidate.hotkey,
+                revision=candidate.revision,
+                model=candidate.model,
+                terminated_at_block=current_block,
+            )
+            return
         try:
             result = await self._deploy(target, "challenger")
         except Exception as e:
             await self._forget_invalidated_deployments_from_error(e)
-            # Any deploy failure (transient transport, sglang container
-            # crash on startup, HF 5xx, ``_wait_ready`` timeout) leaves
-            # the miner in queue. ``pick_next`` already flipped the row
-            # to ``in_progress``; release it back so the same uid stays
-            # re-pickable on the next tick (and may land on a healed
-            # host). Pre-sample work, if any, was already torn down by
-            # ``_adopt_predeployed_if_present`` — that work is lost,
-            # but we'd rather lose pre-samples than a miner's queue
-            # entry to an infra blip. The monitor's ``hf_model_fetch``
-            # check is the authoritative signal for "model is broken";
-            # scheduler doesn't have enough info to judge from a single
-            # deploy failure.
+            # Any deploy failure after preflight (transient transport,
+            # generic sglang startup crash, HF 5xx, ``_wait_ready`` timeout)
+            # leaves the miner in queue. ``pick_next`` already flipped the
+            # row to ``in_progress``; release it back so the same uid stays
+            # re-pickable on the next tick and may land on a healed host.
             kind = (
                 "transport" if isinstance(e, TransientDeployError)
                 else "deploy"

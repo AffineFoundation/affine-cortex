@@ -17,6 +17,10 @@ from affine.src.scheduler.flow import (
     FlowConfig,
     FlowScheduler,
 )
+from affine.src.scheduler.deploy_failures import (
+    DeployFailureClassification,
+    MISSING_PREPROCESSOR_CONFIG_REASON,
+)
 from affine.src.scheduler.targon import (
     DeployResult,
     DeployTarget,
@@ -130,8 +134,8 @@ class _DeployTracker:
     next_deployment_id: int = 0
     predeploys: List[DeployTarget] = field(default_factory=list)
     # uids that should raise a non-NoSpareEndpoint error on pre-deploy
-    # (simulates a real ssh / docker failure). The fill loop must
-    # ``mark_terminated(FAILED)`` and advance to the next candidate.
+    # (simulates a real ssh / docker failure). Generic failures stay in
+    # queue; only classified model faults are marked terminated.
     predeploy_failures: set = field(default_factory=set)
     # Optional endpoint-name pool. Index 0 → champion/active deploys;
     # index 1.. → successive pre-deploys. Empty (default) keeps the
@@ -267,8 +271,8 @@ class _WeightWriterFake:
 
 
 def _make_miner(uid, hotkey, first_block, *, status=STATUS_SAMPLING, valid=True,
-                revision=None, model=None):
-    return {
+                revision=None, model=None, model_type=""):
+    row = {
         "uid": uid,
         "hotkey": hotkey,
         "model": model or f"org/m{uid}",
@@ -277,6 +281,9 @@ def _make_miner(uid, hotkey, first_block, *, status=STATUS_SAMPLING, valid=True,
         "is_valid": "true" if valid else "false",
         "challenge_status": status,
     }
+    if model_type:
+        row["model_type"] = model_type
+    return row
 
 
 def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
@@ -724,6 +731,57 @@ async def test_deploy_failure_keeps_challenger_in_queue():
     assert miner_store.rows[2]["challenge_status"] != STATUS_TERMINATED
     assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
     assert miner_store.rows[2].get("termination_reason") in (None, "")
+    assert await state.get_battle() is None
+
+
+@pytest.mark.asyncio
+async def test_qwen36_missing_preprocessor_preflight_terminates_before_deploy(
+    monkeypatch,
+):
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(
+            2, "chal_hk", 200, revision="chal_rev",
+            model_type="qwen3_5_moe",
+        ),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            refresh_block=task_state.refreshed_at_block,
+        )
+
+    deployed_before = len(deployer.deploys)
+
+    async def preflight(target):
+        assert target.uid == 2
+        return DeployFailureClassification(
+            rule_name="qwen36_missing_preprocessor_config",
+            reason=MISSING_PREPROCESSOR_CONFIG_REASON,
+        )
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.flow._classify_deploy_preflight_failure",
+        preflight,
+    )
+
+    await scheduler.tick(current_block=52)
+
+    row = miner_store.rows[2]
+    assert row["challenge_status"] == STATUS_TERMINATED
+    assert row["termination_reason"] == MISSING_PREPROCESSOR_CONFIG_REASON
+    assert row["terminated_at_block"] == 52
+    assert len(deployer.deploys) == deployed_before
     assert await state.get_battle() is None
 
 
@@ -2796,6 +2854,49 @@ async def test_predeploy_deploy_failure_keeps_candidate_and_advances():
     assert pre_uids == [7, 9], (
         f"expected uid=5 failure not to starve later candidates, got {pre_uids}"
     )
+
+
+@pytest.mark.asyncio
+async def test_predeploy_qwen36_missing_preprocessor_preflight_skips_deploy(
+    monkeypatch,
+):
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(
+            5, "bad_processor", 50, revision="r5",
+            model_type="qwen3_5_moe",
+        ),
+        _make_miner(7, "fine", 200, revision="r7"),
+        _make_miner(9, "alsofine", 300, revision="r9"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=3)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+    )
+
+    async def preflight(target):
+        if target.uid == 5:
+            return DeployFailureClassification(
+                rule_name="qwen36_missing_preprocessor_config",
+                reason=MISSING_PREPROCESSOR_CONFIG_REASON,
+            )
+        return None
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.flow._classify_deploy_preflight_failure",
+        preflight,
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+
+    bad = miner_store.rows[5]
+    assert bad["challenge_status"] == STATUS_TERMINATED
+    assert bad["termination_reason"] == MISSING_PREPROCESSOR_CONFIG_REASON
+    assert bad["terminated_at_block"] == 50
+    assert [p.uid for p in deployer.predeploys] == [7, 9]
 
 
 @pytest.mark.asyncio
