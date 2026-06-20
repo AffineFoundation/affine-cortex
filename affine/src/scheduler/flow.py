@@ -200,6 +200,11 @@ removed from ``inference_endpoints`` while the scheduler was down
 (``af db set-endpoint --no-active`` or row deletion). Optional —
 non-ssh providers don't need it."""
 
+DeploymentHealthFn = Callable[[ChampionRecord], Awaitable[bool]]
+"""Return whether a persisted champion deployment is still serving the
+saved champion identity. Optional; providers that cannot cheaply check
+runtime health can leave it unset."""
+
 
 @dataclass
 class FlowConfig:
@@ -236,6 +241,7 @@ class FlowScheduler:
         list_valid_miners_fn: ListValidMinersFn,
         list_current_miners_fn: Optional[ListCurrentMinersFn] = None,
         list_active_endpoint_names_fn: Optional[ListActiveEndpointNamesFn] = None,
+        deployment_health_fn: Optional[DeploymentHealthFn] = None,
     ):
         self.cfg = config
         self.state = state
@@ -250,6 +256,7 @@ class FlowScheduler:
         self._list_valid_miners = list_valid_miners_fn
         self._list_current_miners = list_current_miners_fn or list_valid_miners_fn
         self._list_active_endpoint_names = list_active_endpoint_names_fn
+        self._deployment_health = deployment_health_fn
 
     # ---- entry point ------------------------------------------------------
 
@@ -327,6 +334,16 @@ class FlowScheduler:
             }
             if battle.challenger.uid not in valid_uids:
                 await self._decide_invalidation_lost(champion, battle)
+                return
+
+        # Runtime health reconciliation. The deployment_id/base_url pair
+        # says what the scheduler last *successfully* started, but not
+        # whether that process is still alive. Only check while no battle
+        # is in flight: on single-instance SSH hosts the primary machine
+        # intentionally serves the challenger during a battle and the
+        # champion deployment is cleared when the challenger is started.
+        if battle is None:
+            if not await self._recover_unhealthy_champion_deployment(champion):
                 return
 
         # 5. Champion needs inference. During a single-instance battle the
@@ -583,6 +600,47 @@ class FlowScheduler:
         logger.info(
             f"FlowScheduler: champion uid={champion.uid} deployed at {result.base_url}"
         )
+
+    async def _recover_unhealthy_champion_deployment(
+        self, champion: ChampionRecord,
+    ) -> bool:
+        """Redeploy champion if its persisted runtime has gone stale.
+
+        Returns ``True`` when the caller can continue the normal flow, or
+        ``False`` when this tick performed/attempted a recovery deployment
+        and should stop just like the ordinary champion deploy path.
+        """
+        if self._deployment_health is None:
+            return True
+        if not champion.deployment_id or not champion.base_url:
+            return True
+
+        try:
+            healthy = await self._deployment_health(champion)
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: champion deployment health check raised "
+                f"for uid={champion.uid} deployment_id="
+                f"{champion.deployment_id!r}; leaving state unchanged "
+                f"this tick: {type(e).__name__}: {e}"
+            )
+            return True
+        if healthy:
+            return True
+
+        stale_deployment_id = champion.deployment_id
+        stale_base_url = champion.base_url
+        champion.deployment_id = None
+        champion.base_url = None
+        champion.deployments = []
+        await self.state.set_champion(champion)
+        logger.warning(
+            f"FlowScheduler: champion uid={champion.uid} deployment "
+            f"{stale_deployment_id!r} at {stale_base_url!r} is unhealthy; "
+            f"cleared stale state and redeploying"
+        )
+        await self._deploy_champion(champion)
+        return False
 
     async def _samples_complete(
         self, miner: MinerSnapshot, *,

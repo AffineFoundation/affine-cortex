@@ -309,6 +309,28 @@ async def _run() -> None:
             finally:
                 await endpoints_dao.clear_assignment(name)
 
+        async def deployment_health_fn(champion):
+            if not champion.deployment_id:
+                return False
+            _name, cfg = await _resolve_ssh_cfg(champion.deployment_id)
+            if cfg is None:
+                logger.warning(
+                    f"scheduler: no ssh endpoint owns champion "
+                    f"deployment_id={champion.deployment_id!r}; "
+                    f"treating deployment as unhealthy"
+                )
+                return False
+            target = targon_lifecycle.DeployTarget(
+                uid=champion.uid,
+                hotkey=champion.hotkey,
+                model=champion.model,
+                revision=champion.revision,
+                model_type=champion.model_type,
+            )
+            return await ssh_lifecycle.deployment_healthy(
+                cfg, target, base_url=champion.base_url,
+            )
+
         async def list_active_ssh_endpoint_names():
             return {
                 ep.name for ep in await endpoints_dao.list_active(kind="ssh")
@@ -345,6 +367,7 @@ async def _run() -> None:
         async def teardown_fn(deployment_id):
             await targon_lifecycle.teardown(targon_client, deployment_id)
 
+        deployment_health_fn = None
         list_active_ssh_endpoint_names = None
         flow_config = FlowConfig()
         logger.info(
@@ -366,6 +389,7 @@ async def _run() -> None:
         list_valid_miners_fn=list_valid_miners_fn,
         list_current_miners_fn=list_current_miners_fn,
         list_active_endpoint_names_fn=list_active_ssh_endpoint_names,
+        deployment_health_fn=deployment_health_fn,
     )
 
     stop_event = asyncio.Event()

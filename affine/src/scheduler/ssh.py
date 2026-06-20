@@ -32,11 +32,12 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import paramiko
@@ -84,6 +85,7 @@ DEFAULT_POLL_INTERVAL_SEC = 15.0
 # Single container name — single-instance host means only one ever exists.
 # ``docker rm -f`` is idempotent so start() always kicks off a fresh state.
 CONTAINER_NAME = "affine-sglang-current"
+RESTART_POLICY = "unless-stopped"
 
 # HuggingFace snapshot cache layout: model "<owner>/<name>" lives at
 # ``<cache>/models--<owner>--<name>/``. Both the prefix and the org/name
@@ -248,6 +250,7 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
     return (
         f"docker rm -f {CONTAINER_NAME} 2>/dev/null; "
         f"docker run -d --name {CONTAINER_NAME} --gpus all "
+        f"--restart {RESTART_POLICY} "
         f"--network host --ipc=host --shm-size=32g "
         f"--security-opt label=disable "
         f"{label_flags} "
@@ -452,6 +455,100 @@ def _parse_container_exit_status(output: str) -> Optional[int]:
         except ValueError:
             return None
     return None
+
+
+def _parse_container_inspect_json(output: str) -> Optional[Dict[str, Any]]:
+    """Parse ``docker inspect --format '{{json .}}'`` from noisy stdout."""
+    for line in reversed((output or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+async def _container_inspect(config: "SSHConfig") -> Optional[Dict[str, Any]]:
+    fmt = "{{json .}}"
+    cmd = f"docker inspect --format {shlex.quote(fmt)} {CONTAINER_NAME}"
+    rc, out, err = await _ssh_exec(config, cmd)
+    if rc != 0:
+        logger.warning(
+            f"ssh-provider: docker inspect {CONTAINER_NAME!r} failed "
+            f"on {config.host}: rc={rc} stderr={err!r}"
+        )
+        return None
+    return _parse_container_inspect_json(out)
+
+
+async def deployment_healthy(
+    config: "SSHConfig",
+    target: DeployTarget,
+    *,
+    base_url: Optional[str] = None,
+) -> bool:
+    """Return whether the remote container is still serving ``target``.
+
+    This is a runtime reconcile check for the flow scheduler. ``/v1/models``
+    alone is not enough on a single-instance host because the stable URL may
+    be serving a different miner after manual intervention or a crash window;
+    require both Docker labels and the OpenAI readiness probe to match.
+    """
+    probe_url = base_url or config.inference_url()
+    try:
+        info = await _container_inspect(config)
+    except Exception as e:
+        logger.warning(
+            f"ssh-provider: docker inspect health check raised on "
+            f"{config.host}; falling back to /v1/models only: "
+            f"{type(e).__name__}: {e}"
+        )
+        return await _probe_ready(probe_url)
+    if info is None:
+        return False
+
+    state = info.get("State") if isinstance(info.get("State"), dict) else {}
+    status = str(state.get("Status") or "")
+    if status != "running":
+        logger.warning(
+            f"ssh-provider: {CONTAINER_NAME} is not running on {config.host} "
+            f"(status={status!r}, exit={state.get('ExitCode')!r})"
+        )
+        return False
+
+    container_cfg = (
+        info.get("Config") if isinstance(info.get("Config"), dict) else {}
+    )
+    labels = container_cfg.get("Labels") or {}
+    if not isinstance(labels, dict):
+        labels = {}
+    expected_labels = {
+        "io.affine.endpoint": config.endpoint_name or config.host,
+        "io.affine.uid": str(target.uid),
+        "io.affine.hotkey": target.hotkey,
+        "io.affine.model": target.model,
+        "io.affine.revision": target.revision,
+    }
+    for key, expected in expected_labels.items():
+        actual = str(labels.get(key) or "")
+        if actual != str(expected):
+            logger.warning(
+                f"ssh-provider: {CONTAINER_NAME} label mismatch on "
+                f"{config.host}: {key}={actual!r}, expected={expected!r}"
+            )
+            return False
+
+    if not await _probe_ready(probe_url):
+        logger.warning(
+            f"ssh-provider: {CONTAINER_NAME} labels match uid={target.uid} "
+            f"but {probe_url}/models is not ready"
+        )
+        return False
+    return True
 
 
 async def _wait_ready(

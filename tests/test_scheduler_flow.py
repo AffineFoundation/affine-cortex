@@ -307,7 +307,7 @@ def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
 
 def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
-    window_blocks=WINDOW_BLOCKS,
+    window_blocks=WINDOW_BLOCKS, deployment_health_fn=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -334,6 +334,7 @@ def _build_scheduler(
         sample_count_fn=samples.count_samples_for_tasks,
         scores_reader=samples.read_scores_for_tasks,
         list_valid_miners_fn=list_valid_miners_fn,
+        deployment_health_fn=deployment_health_fn,
     )
     return scheduler, state, weight_writer
 
@@ -436,6 +437,80 @@ async def test_champion_targon_deployed_on_second_tick():
     assert champ.deployment_id == "wrk-001"
     assert champ.base_url == "https://t/wrk-001"
     assert len(deployer.deploys) == 1
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_champion_deployment_is_cleared_and_redeployed():
+    """A persisted deployment_id/base_url is only a scheduler record; the
+    underlying sglang process can exit later. A failed runtime health check
+    must clear that stale state and run the normal champion deploy path so
+    executor stops sampling a dead URL."""
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-stale"
+    kv.data["champion"]["base_url"] = "https://t/stale"
+    kv.data["champion"]["deployments"] = [
+        {
+            "endpoint_name": "primary",
+            "deployment_id": "wrk-stale",
+            "base_url": "https://t/stale",
+        }
+    ]
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+    ])
+    deployer = _DeployTracker()
+    health_checks = []
+
+    async def deployment_health_fn(champion):
+        health_checks.append((champion.uid, champion.deployment_id))
+        return False
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer,
+        samples=_SamplesFake(), deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    assert health_checks == [(1, "wrk-stale")]
+    assert [d.uid for d in deployer.deploys] == [1]
+    champ = await state.get_champion()
+    assert champ.deployment_id == "wrk-001"
+    assert champ.base_url == "https://t/wrk-001"
+
+
+@pytest.mark.asyncio
+async def test_healthy_champion_deployment_is_not_redeployed():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-live"
+    kv.data["champion"]["base_url"] = "https://t/live"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+    ])
+    deployer = _DeployTracker()
+
+    async def deployment_health_fn(champion):
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer,
+        samples=_SamplesFake(), deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    champ = await state.get_champion()
+    assert champ.deployment_id == "wrk-live"
+    assert champ.base_url == "https://t/live"
+    assert deployer.deploys == []
 
 
 @pytest.mark.asyncio
