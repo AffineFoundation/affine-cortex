@@ -336,6 +336,12 @@ async def _run() -> None:
                 ep.name for ep in await endpoints_dao.list_active(kind="ssh")
             }
 
+        async def list_active_ssh_endpoint_activations():
+            return {
+                ep.name: int(ep.activated_at or 0)
+                for ep in await endpoints_dao.list_active(kind="ssh")
+            }
+
         # SSH primary always time-shares champion + current challenger,
         # so the flag is True regardless of endpoint count.
         flow_config = FlowConfig(single_instance_provider=True)
@@ -369,6 +375,7 @@ async def _run() -> None:
 
         deployment_health_fn = None
         list_active_ssh_endpoint_names = None
+        list_active_ssh_endpoint_activations = None
         flow_config = FlowConfig()
         logger.info(
             f"scheduler: provider=targon endpoint={primary.name!r} "
@@ -389,6 +396,9 @@ async def _run() -> None:
         list_valid_miners_fn=list_valid_miners_fn,
         list_current_miners_fn=list_current_miners_fn,
         list_active_endpoint_names_fn=list_active_ssh_endpoint_names,
+        list_active_endpoint_activations_fn=(
+            list_active_ssh_endpoint_activations
+        ),
         deployment_health_fn=deployment_health_fn,
     )
 

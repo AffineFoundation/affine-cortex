@@ -69,6 +69,13 @@ class Endpoint:
     # targon-kind extras
     targon_api_url: Optional[str] = None
 
+    # Endpoint lifecycle identity. ``updated_at`` also changes for runtime
+    # assignment churn, so scheduler recovery must not use it as "host became
+    # active". ``generation`` and ``activated_at`` advance only when the
+    # endpoint is enabled or its deployment-relevant config changes.
+    generation: int = 0
+    activated_at: int = 0
+
     updated_at: int = 0
     updated_by: str = ""
 
@@ -80,6 +87,26 @@ class Endpoint:
         fields = {f.name for f in cls.__dataclass_fields__.values()}
         kw = {k: v for k, v in row.items() if k in fields and k != "name"}
         return cls(name=name, **kw)
+
+
+_ENDPOINT_RUNTIME_IDENTITY_FIELDS = (
+    "kind",
+    "public_inference_url",
+    "role",
+    "ssh_url",
+    "ssh_key_path",
+    "sglang_port",
+    "sglang_dp",
+    "sglang_image",
+    "sglang_cache_dir",
+    "sglang_context_len",
+    "sglang_mem_fraction",
+    "sglang_chunked_prefill",
+    "sglang_tool_call_parser",
+    "ready_timeout_sec",
+    "poll_interval_sec",
+    "targon_api_url",
+)
 
 
 class InferenceEndpointsDAO(BaseDAO):
@@ -95,12 +122,38 @@ class InferenceEndpointsDAO(BaseDAO):
 
     async def upsert(self, endpoint: Endpoint, *, updated_by: str = "operator") -> Dict[str, Any]:
         """Insert or overwrite the named endpoint row."""
+        now = int(time.time())
+        previous = await self.get(endpoint.name)
+        generation = int((previous.generation if previous else 0) or 0)
+        activated_at = int((previous.activated_at if previous else 0) or 0)
+        if self._activation_bump_required(previous, endpoint):
+            generation += 1
+            activated_at = now
+
         payload = asdict(endpoint)
         payload.pop("name", None)
         payload["pk"] = self._make_pk(endpoint.name)
-        payload["updated_at"] = int(time.time())
+        payload["generation"] = generation
+        payload["activated_at"] = activated_at
+        payload["updated_at"] = now
         payload["updated_by"] = updated_by
         return await self.put(payload)
+
+    @staticmethod
+    def _activation_bump_required(
+        previous: Optional[Endpoint],
+        endpoint: Endpoint,
+    ) -> bool:
+        if not endpoint.active:
+            return False
+        if previous is None or not previous.active:
+            return True
+        if not previous.generation or not previous.activated_at:
+            return True
+        return any(
+            getattr(previous, field) != getattr(endpoint, field)
+            for field in _ENDPOINT_RUNTIME_IDENTITY_FIELDS
+        )
 
     async def get(self, name: str) -> Optional[Endpoint]:
         row = await super().get(self._make_pk(name))

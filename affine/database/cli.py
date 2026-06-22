@@ -674,6 +674,12 @@ async def _cmd_list_endpoints() -> None:
                 print(f"  ssh_url             : {ep.ssh_url}")
             if ep.public_inference_url:
                 print(f"  public_inference_url: {ep.public_inference_url}")
+            if ep.generation or ep.activated_at:
+                print(
+                    "  lifecycle           : "
+                    f"generation={ep.generation} "
+                    f"activated_at={ep.activated_at or '-'}"
+                )
             if ep.kind == "ssh":
                 print(f"  sglang              : port={ep.sglang_port} dp={ep.sglang_dp} image={ep.sglang_image}")
                 print(

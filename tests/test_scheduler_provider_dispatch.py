@@ -61,6 +61,64 @@ def test_unknown_kinds_raises():
         _resolve_provider_kind(eps)
 
 
+def test_endpoint_activation_bumps_on_enable_or_runtime_config_change():
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    disabled = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=False,
+        ssh_url="ssh://old-host",
+    )
+    enabled = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+    )
+    moved = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://new-host",
+    )
+    legacy_active = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+        generation=0,
+        activated_at=0,
+    )
+    current_active = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+        generation=1,
+        activated_at=100,
+    )
+    assigned = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+        assigned_uid=123,
+    )
+
+    assert InferenceEndpointsDAO._activation_bump_required(None, enabled)
+    assert InferenceEndpointsDAO._activation_bump_required(disabled, enabled)
+    assert InferenceEndpointsDAO._activation_bump_required(legacy_active, enabled)
+    assert InferenceEndpointsDAO._activation_bump_required(enabled, moved)
+    assert not InferenceEndpointsDAO._activation_bump_required(current_active, assigned)
+    assert not InferenceEndpointsDAO._activation_bump_required(current_active, Endpoint(
+        name="b300",
+        kind="ssh",
+        active=False,
+        ssh_url="ssh://old-host",
+    ))
+
+
 class _EndpointsDAOFake:
     def __init__(self, endpoints):
         self.endpoints = endpoints

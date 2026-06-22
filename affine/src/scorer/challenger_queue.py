@@ -20,6 +20,7 @@ from typing import Optional, Protocol
 #
 # Lifecycle:
 #   sampling ─[claim_pending]→ in_progress
+#   in_progress ─[release_claim]→ sampling
 #   in_progress ─[mark_terminated(WON)]→  champion
 #               ─[mark_terminated(LOST/FAILED)]→ terminated
 #   champion ─[mark_terminated(LOST)]→ terminated

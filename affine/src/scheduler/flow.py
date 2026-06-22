@@ -165,7 +165,7 @@ _PREDEPLOY_PEEK_LIMIT = 32
 
 ORPHAN_GRACE_SECONDS = 120
 """Minimum age of an ``in_progress`` row, missing from all in-flight
-roles, before the reaper terminates it."""
+roles, before the reaper releases it back to the queue."""
 
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
@@ -199,6 +199,12 @@ pre-deploy invalidation sweep to drop records whose endpoint has been
 removed from ``inference_endpoints`` while the scheduler was down
 (``af db set-endpoint --no-active`` or row deletion). Optional —
 non-ssh providers don't need it."""
+
+ListActiveEndpointActivationsFn = Callable[[], Awaitable[Dict[str, int]]]
+"""Return currently-active endpoint names mapped to ``activated_at`` unix
+seconds. Used by the orphan reaper to tell whether an ``in_progress`` claim
+belongs to an older endpoint generation. Optional for providers without
+endpoint lifecycle metadata."""
 
 DeploymentHealthFn = Callable[[ChampionRecord], Awaitable[bool]]
 """Return whether a persisted champion deployment is still serving the
@@ -241,6 +247,9 @@ class FlowScheduler:
         list_valid_miners_fn: ListValidMinersFn,
         list_current_miners_fn: Optional[ListCurrentMinersFn] = None,
         list_active_endpoint_names_fn: Optional[ListActiveEndpointNamesFn] = None,
+        list_active_endpoint_activations_fn: Optional[
+            ListActiveEndpointActivationsFn
+        ] = None,
         deployment_health_fn: Optional[DeploymentHealthFn] = None,
     ):
         self.cfg = config
@@ -256,6 +265,9 @@ class FlowScheduler:
         self._list_valid_miners = list_valid_miners_fn
         self._list_current_miners = list_current_miners_fn or list_valid_miners_fn
         self._list_active_endpoint_names = list_active_endpoint_names_fn
+        self._list_active_endpoint_activations = (
+            list_active_endpoint_activations_fn
+        )
         self._deployment_health = deployment_health_fn
 
     # ---- entry point ------------------------------------------------------
@@ -965,7 +977,7 @@ class FlowScheduler:
     # ---- invariant reaper -------------------------------------------------
 
     async def _reap_in_progress_orphans(self) -> None:
-        """Terminate ``in_progress`` rows that don't match any in-flight
+        """Release ``in_progress`` rows that don't match any in-flight
         role (active battle challenger, current champion, predeployed
         challenger) and are older than :data:`ORPHAN_GRACE_SECONDS`.
 
@@ -986,6 +998,18 @@ class FlowScheduler:
         rows = await self.queue.list_in_progress()
         if not rows:
             return
+        endpoint_activations: Optional[Dict[str, int]] = None
+        if self._list_active_endpoint_activations is not None:
+            try:
+                endpoint_activations = (
+                    await self._list_active_endpoint_activations()
+                )
+            except Exception as e:
+                logger.warning(
+                    f"FlowScheduler: active endpoint lifecycle lookup "
+                    f"failed; orphan reaper will use claim age only this "
+                    f"tick: {type(e).__name__}: {e}"
+                )
         now = int(time.time())
         for row in rows:
             uid = row.get("uid")
@@ -998,25 +1022,49 @@ class FlowScheduler:
             age = now - claimed_at if claimed_at > 0 else now
             if age < ORPHAN_GRACE_SECONDS:
                 continue
+            release_reason = self._orphan_release_reason(
+                claimed_at=claimed_at,
+                endpoint_activations=endpoint_activations,
+            )
             try:
-                await self.queue.mark_terminated(
+                released = await self.queue.release_claim(
                     int(uid),
-                    OUTCOME_FAILED,
-                    reason=f"claim_orphan_reaped:age={age}s",
                     hotkey=str(row.get("hotkey") or ""),
                     revision=str(row.get("revision") or ""),
-                    model=str(row.get("model") or ""),
                 )
             except Exception as e:
                 logger.warning(
-                    f"FlowScheduler: orphan reaper failed to terminate "
+                    f"FlowScheduler: orphan reaper failed to release "
                     f"uid={uid}: {type(e).__name__}: {e}"
                 )
                 continue
+            if not released:
+                logger.warning(
+                    f"FlowScheduler: orphan reaper lost release race "
+                    f"uid={uid} (age={age}s, "
+                    f"protected_uids={sorted(protected)})"
+                )
+                continue
             logger.warning(
-                f"FlowScheduler: reaped orphan in_progress uid={uid} "
-                f"(age={age}s, protected_uids={sorted(protected)})"
+                f"FlowScheduler: released orphan in_progress uid={uid} "
+                f"(age={age}s, reason={release_reason}, "
+                f"protected_uids={sorted(protected)})"
             )
+
+    @staticmethod
+    def _orphan_release_reason(
+        *,
+        claimed_at: int,
+        endpoint_activations: Optional[Dict[str, int]],
+    ) -> str:
+        if endpoint_activations is None:
+            return "stale_claim_no_endpoint_snapshot"
+        if not endpoint_activations:
+            return "no_active_endpoint"
+        latest = max(int(ts or 0) for ts in endpoint_activations.values())
+        if claimed_at > 0 and latest > claimed_at:
+            return f"endpoint_reactivated_after_claim:activated_at={latest}"
+        return "stale_claim_endpoint_stable"
 
     # ---- pre-sample phase -------------------------------------------------
 

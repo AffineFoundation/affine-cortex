@@ -308,6 +308,7 @@ def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
 def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
     window_blocks=WINDOW_BLOCKS, deployment_health_fn=None,
+    list_active_endpoint_activations_fn=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -334,6 +335,9 @@ def _build_scheduler(
         sample_count_fn=samples.count_samples_for_tasks,
         scores_reader=samples.read_scores_for_tasks,
         list_valid_miners_fn=list_valid_miners_fn,
+        list_active_endpoint_activations_fn=(
+            list_active_endpoint_activations_fn
+        ),
         deployment_health_fn=deployment_health_fn,
     )
     return scheduler, state, weight_writer
@@ -2904,9 +2908,13 @@ async def test_predeploy_no_spare_does_not_mark_failed():
 
 
 @pytest.mark.asyncio
-async def test_reaper_terminates_old_orphan_in_progress():
+async def test_reaper_releases_old_orphan_in_progress():
     """Pre-existing in_progress row with no matching battle/champion and
-    age > grace gets terminated with claim_orphan_reaped reason."""
+    age > grace gets released back to sampling.
+
+    Orphans are scheduler/infra leftovers, not model failures. They must stay
+    re-pickable instead of being marked permanently terminated.
+    """
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -2922,10 +2930,52 @@ async def test_reaper_terminates_old_orphan_in_progress():
 
     await scheduler.tick(current_block=50)
 
-    assert miner_store.rows[99]["challenge_status"] == STATUS_TERMINATED
-    assert miner_store.rows[99]["termination_reason"].startswith(
-        "claim_orphan_reaped:age="
+    assert miner_store.rows[99]["challenge_status"] == STATUS_SAMPLING
+    assert miner_store.rows[99].get("termination_reason") in (None, "")
+
+
+def test_orphan_release_reason_uses_endpoint_lifecycle():
+    assert FlowScheduler._orphan_release_reason(
+        claimed_at=100,
+        endpoint_activations={"primary": 200},
+    ).startswith("endpoint_reactivated_after_claim:")
+    assert FlowScheduler._orphan_release_reason(
+        claimed_at=100,
+        endpoint_activations={},
+    ) == "no_active_endpoint"
+    assert FlowScheduler._orphan_release_reason(
+        claimed_at=200,
+        endpoint_activations={"primary": 100},
+    ) == "stale_claim_endpoint_stable"
+    assert FlowScheduler._orphan_release_reason(
+        claimed_at=200,
+        endpoint_activations=None,
+    ) == "stale_claim_no_endpoint_snapshot"
+
+
+@pytest.mark.asyncio
+async def test_reaper_releases_orphan_after_endpoint_reactivation():
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(99, "orphan_hk", 50, status=STATUS_IN_PROGRESS,
+                    revision="orphan_rev"),
+    ])
+    miner_store.rows[99]["challenge_claimed_at"] = 100
+
+    async def endpoint_activations():
+        return {"primary": 200}
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+        list_active_endpoint_activations_fn=endpoint_activations,
     )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[99]["challenge_status"] == STATUS_SAMPLING
+    assert (await state.get_battle()) is None
 
 
 @pytest.mark.asyncio
