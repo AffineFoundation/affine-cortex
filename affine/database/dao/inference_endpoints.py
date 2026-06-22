@@ -69,6 +69,15 @@ class Endpoint:
     # targon-kind extras
     targon_api_url: Optional[str] = None
 
+    # Autoscaler metadata. These fields describe the outer GPU instance
+    # lifecycle (Lium/Targon/etc.) for operator-managed SSH endpoints; they
+    # are intentionally separate from scheduler assignment fields.
+    autoscale_managed: bool = False
+    autoscale_provider: Optional[str] = None
+    autoscale_instance_id: Optional[str] = None
+    autoscale_created_at: int = 0
+    autoscale_updated_at: int = 0
+
     # Endpoint lifecycle identity. ``updated_at`` also changes for runtime
     # assignment churn, so scheduler recovery must not use it as "host became
     # active". ``generation`` and ``activated_at`` advance only when the

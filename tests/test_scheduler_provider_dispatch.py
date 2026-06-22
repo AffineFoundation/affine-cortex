@@ -33,6 +33,13 @@ def test_empty_active_raises():
         _resolve_provider_kind([])
 
 
+def test_empty_active_can_resolve_to_ssh_for_autoscaler():
+    kind, ssh, targon = _resolve_provider_kind([], empty_provider_kind="ssh")
+    assert kind == "ssh"
+    assert ssh == []
+    assert targon == []
+
+
 def test_all_ssh_resolves_to_ssh():
     eps = [_Ep("b300", "ssh"), _Ep("b300-2", "ssh")]
     kind, ssh, targon = _resolve_provider_kind(eps)

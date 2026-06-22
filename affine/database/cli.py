@@ -680,6 +680,13 @@ async def _cmd_list_endpoints() -> None:
                     f"generation={ep.generation} "
                     f"activated_at={ep.activated_at or '-'}"
                 )
+            if ep.autoscale_managed:
+                print(
+                    "  autoscale           : "
+                    f"provider={ep.autoscale_provider or '-'} "
+                    f"instance={ep.autoscale_instance_id or '-'} "
+                    f"created_at={ep.autoscale_created_at or '-'}"
+                )
             if ep.kind == "ssh":
                 print(f"  sglang              : port={ep.sglang_port} dp={ep.sglang_dp} image={ep.sglang_image}")
                 print(

@@ -71,7 +71,11 @@ def _endpoint_matches_target(endpoint, target) -> bool:
     )
 
 
-def _resolve_provider_kind(active: List[object]) -> tuple:
+def _resolve_provider_kind(
+    active: List[object],
+    *,
+    empty_provider_kind: Optional[str] = None,
+) -> tuple:
     """Decide provider lifecycle from the active ``inference_endpoints``.
 
     Returns ``(kind, ssh_active, targon_active)`` where ``kind`` is
@@ -80,6 +84,8 @@ def _resolve_provider_kind(active: List[object]) -> tuple:
       - mixed ssh+targon kinds (not yet supported)
       - rows present but none of a known kind
     """
+    if not active and empty_provider_kind == "ssh":
+        return "ssh", [], []
     if not active:
         raise RuntimeError(
             "no active inference endpoints registered; configure one with "
@@ -236,7 +242,20 @@ async def _run() -> None:
     from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
     endpoints_dao = InferenceEndpointsDAO()
     active = await endpoints_dao.list_active()
-    provider_kind, ssh_active, targon_active = _resolve_provider_kind(active)
+    empty_provider_kind = None
+    if os.getenv("AFFINE_GPU_AUTOSCALER_ENABLED", "").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        empty_provider_kind = os.getenv(
+            "AFFINE_GPU_AUTOSCALER_EMPTY_PROVIDER_KIND", "ssh",
+        ).strip().lower()
+    provider_kind, ssh_active, targon_active = _resolve_provider_kind(
+        active,
+        empty_provider_kind=empty_provider_kind,
+    )
 
     if provider_kind == "ssh":
         active = sorted(ssh_active, key=lambda ep: ep.name)

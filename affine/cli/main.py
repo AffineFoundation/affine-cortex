@@ -8,6 +8,7 @@ Server Services (af servers):
 - af servers api       : Start API server
 - af servers monitor   : Start monitor service (miners monitoring)
 - af servers scheduler : Start flow scheduler (block-tick contest driver)
+- af servers gpu-autoscaler : Start GPU endpoint autoscaler
 - af servers executor  : Start per-env executor manager (subprocess per env)
 - af servers teacher   : Start teacher rollout worker + R2 mover (DISTILL)
 - af servers validator : Start validator service
@@ -109,6 +110,19 @@ def scheduler(ctx):
 
     sys.argv = ["scheduler"] + ctx.args
     scheduler_main.main(standalone_mode=False)
+
+
+@servers.command(
+    "gpu-autoscaler",
+    context_settings={"ignore_unknown_options": True, "allow_extra_args": True},
+)
+@click.pass_context
+def gpu_autoscaler(ctx):
+    """Start the GPU endpoint autoscaler."""
+    from affine.src.scheduler.gpu_autoscaler import main as autoscaler_main
+
+    sys.argv = ["gpu-autoscaler"] + ctx.args
+    autoscaler_main.main(standalone_mode=False)
 
 
 @servers.command(context_settings={"ignore_unknown_options": True, "allow_extra_args": True})
