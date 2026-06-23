@@ -77,6 +77,7 @@ class Endpoint:
     autoscale_instance_id: Optional[str] = None
     autoscale_created_at: int = 0
     autoscale_updated_at: int = 0
+    autoscale_lease_expires_at: int = 0
 
     # Endpoint lifecycle identity. ``updated_at`` also changes for runtime
     # assignment churn, so scheduler recovery must not use it as "host became

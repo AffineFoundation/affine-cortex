@@ -28,6 +28,7 @@ class InstanceHandle:
     instance_id: str
     ssh_url: str = ""
     public_inference_url: str = ""
+    lease_expires_at: int = 0
     raw: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -44,6 +45,9 @@ class InstanceAPIConfig:
     create_path: str = ""
     delete_method: str = "DELETE"
     delete_path: str = ""
+    renew_method: str = "POST"
+    renew_path: str = ""
+    renew_payload: Dict[str, Any] = field(default_factory=dict)
     status_method: str = "GET"
     status_path: str = ""
     create_payload: Dict[str, Any] = field(default_factory=dict)
@@ -77,6 +81,13 @@ class InstanceAPIConfig:
             create_path=str(data.get("create_path") or ""),
             delete_method=str(data.get("delete_method") or "DELETE").upper(),
             delete_path=str(data.get("delete_path") or ""),
+            renew_method=str(data.get("renew_method") or "POST").upper(),
+            renew_path=str(data.get("renew_path") or ""),
+            renew_payload=(
+                dict(data.get("renew_payload"))
+                if isinstance(data.get("renew_payload"), Mapping)
+                else {}
+            ),
             status_method=str(data.get("status_method") or "GET").upper(),
             status_path=str(data.get("status_path") or ""),
             create_payload=(
@@ -116,6 +127,12 @@ class InstanceAPIClient:
             "inference_url",
             "public_url",
             "data.public_inference_url",
+        ),
+        "lease_expires_at": (
+            "lease_expires_at",
+            "expires_at",
+            "lease.expires_at",
+            "data.lease_expires_at",
         ),
     }
 
@@ -167,6 +184,7 @@ class InstanceAPIClient:
             public_inference_url=(
                 self._extract(result, "public_inference_url") or ""
             ),
+            lease_expires_at=_int_value(self._extract(result, "lease_expires_at")),
             raw=dict(result),
         )
 
@@ -190,6 +208,37 @@ class InstanceAPIClient:
             expect_json=False,
         )
         return result is not None
+
+    async def renew(self, instance_id: str) -> Optional[InstanceHandle]:
+        if not instance_id:
+            return None
+        if not self.config.resolved_api_url or not self.config.renew_path:
+            logger.warning(
+                "gpu-autoscaler: provider=%s missing api_url/renew_path",
+                self.config.provider,
+            )
+            return None
+        variables = {"instance_id": instance_id}
+        path = _render_template(self.config.renew_path, variables)
+        payload = _render_template(self.config.renew_payload, variables)
+        result = await self._request(
+            self.config.renew_method,
+            path,
+            json=payload,
+            timeout=self.config.timeout_sec,
+        )
+        if not isinstance(result, Mapping):
+            return None
+        return InstanceHandle(
+            provider=self.config.provider,
+            instance_id=self._extract(result, "instance_id") or instance_id,
+            ssh_url=self._extract(result, "ssh_url") or "",
+            public_inference_url=(
+                self._extract(result, "public_inference_url") or ""
+            ),
+            lease_expires_at=_int_value(self._extract(result, "lease_expires_at")),
+            raw=dict(result),
+        )
 
     async def status(self, instance_id: str) -> Optional[Dict[str, Any]]:
         if not instance_id or not self.config.status_path:
@@ -285,6 +334,13 @@ def _coerce_paths(value: Any) -> tuple[str, ...]:
     if isinstance(value, Iterable):
         return tuple(str(v) for v in value)
     return ()
+
+
+def _int_value(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _json_path(payload: Mapping[str, Any], path: str) -> Any:

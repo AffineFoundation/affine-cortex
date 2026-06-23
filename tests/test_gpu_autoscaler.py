@@ -69,6 +69,9 @@ class _Samples:
 
 class _Client:
     deleted = []
+    renewed = []
+    create_lease_expires_at = 1500
+    renew_expires_at = 0
 
     def __init__(self, config):
         self.config = config
@@ -80,11 +83,28 @@ class _Client:
             instance_id=f"inst-{name}",
             ssh_url=f"ssh://root@{name}.example.com:22",
             public_inference_url=f"http://{name}.example.com:10001/v1",
+            lease_expires_at=self.create_lease_expires_at,
         )
 
     async def delete(self, instance_id):
         self.deleted.append(instance_id)
         return True
+
+    async def renew(self, instance_id):
+        self.renewed.append(instance_id)
+        return InstanceHandle(
+            provider=self.config.provider,
+            instance_id=instance_id,
+            lease_expires_at=self.renew_expires_at,
+        )
+
+
+@pytest.fixture(autouse=True)
+def _reset_client_state():
+    _Client.deleted = []
+    _Client.renewed = []
+    _Client.create_lease_expires_at = 1500
+    _Client.renew_expires_at = 0
 
 
 def _config(
@@ -93,12 +113,19 @@ def _config(
     threshold=1,
     idle_seconds=0,
     max_gpu_down_wait_seconds=0,
+    lease_duration_seconds=0,
+    lease_renew_margin_seconds=3600,
+    lease_renew_cooldown_seconds=300,
+    renew_path="/instances/{instance_id}/renew",
 ):
     return GPUAutoscalerConfig(
         enabled=enabled,
         pending_threshold_per_instance=threshold,
         max_gpu_down_wait_seconds=max_gpu_down_wait_seconds,
         idle_seconds=idle_seconds,
+        lease_duration_seconds=lease_duration_seconds,
+        lease_renew_margin_seconds=lease_renew_margin_seconds,
+        lease_renew_cooldown_seconds=lease_renew_cooldown_seconds,
         min_instances=0,
         max_instances=2,
         providers={
@@ -107,6 +134,7 @@ def _config(
                 api_url="https://lium.example.com",
                 create_path="/instances",
                 delete_path="/instances/{instance_id}",
+                renew_path=renew_path,
             )
         },
         slots=[
@@ -157,8 +185,37 @@ async def test_scales_up_when_pending_exceeds_threshold():
     assert ep.autoscale_managed is True
     assert ep.autoscale_provider == "lium"
     assert ep.autoscale_instance_id == "inst-lium-b200-1"
+    assert ep.autoscale_lease_expires_at == 1500
     assert ep.ssh_key_path == "/root/.ssh/affine_validator_server"
     assert ep.ssh_url == "ssh://root@lium-b200-1.example.com:22"
+
+
+@pytest.mark.asyncio
+async def test_scale_up_does_not_reuse_stale_lease_from_inactive_endpoint():
+    _Client.create_lease_expires_at = 0
+    kv = InMemoryConfigStore()
+    endpoints = _Endpoints([
+        Endpoint(
+            name="lium-b200-1",
+            kind="ssh",
+            active=False,
+            autoscale_managed=True,
+            autoscale_provider="lium",
+            autoscale_lease_expires_at=9999,
+        )
+    ])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+    )
+
+    result = await autoscaler.tick(_config(threshold=1))
+
+    assert result.action == "scale-up:1"
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.autoscale_instance_id == "inst-lium-b200-1"
+    assert ep.autoscale_lease_expires_at == 0
 
 
 @pytest.mark.asyncio
@@ -285,6 +342,7 @@ async def test_scales_down_idle_managed_endpoint_and_clears_champion_deployment(
         autoscale_managed=True,
         autoscale_provider="lium",
         autoscale_instance_id="inst-lium-b200-1",
+        autoscale_lease_expires_at=1500,
     )
     endpoints = _Endpoints([endpoint])
     autoscaler = _autoscaler(
@@ -303,6 +361,7 @@ async def test_scales_down_idle_managed_endpoint_and_clears_champion_deployment(
     assert ep.active is False
     assert ep.ssh_url is None
     assert ep.autoscale_instance_id is None
+    assert ep.autoscale_lease_expires_at == 0
     champion = await state.get_champion()
     assert champion.deployment_id is None
     assert champion.base_url is None
@@ -363,3 +422,119 @@ async def test_does_not_scale_down_while_champion_samples_are_incomplete():
     assert result.idle is False
     assert _Client.deleted == []
     assert endpoints.endpoints["lium-b200-1"].active is True
+
+
+@pytest.mark.asyncio
+async def test_renews_busy_managed_endpoint_near_lease_expiry():
+    _Client.renewed = []
+    _Client.renew_expires_at = 5000
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="inst-lium-b200-1",
+        autoscale_created_at=100,
+        autoscale_updated_at=100,
+        autoscale_lease_expires_at=1050,
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    result = await autoscaler.tick(
+        _config(
+            threshold=5,
+            idle_seconds=3600,
+            lease_renew_margin_seconds=60,
+        )
+    )
+
+    assert result.action == "renew-lease:1"
+    assert result.lease_renewed_count == 1
+    assert _Client.renewed == ["inst-lium-b200-1"]
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.autoscale_updated_at == 1000
+    assert ep.autoscale_lease_expires_at == 5000
+    state = await kv.get(STATE_KEY)
+    assert "lease_renew_attempted_at" not in state
+
+
+@pytest.mark.asyncio
+async def test_does_not_renew_idle_endpoint_even_if_lease_is_near_expiry():
+    _Client.renewed = []
+    kv = InMemoryConfigStore()
+    await kv.set(STATE_KEY, {"last_busy_at": 1000})
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="inst-lium-b200-1",
+        autoscale_lease_expires_at=1050,
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(
+        _Queue(pending=0),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    result = await autoscaler.tick(
+        _config(
+            idle_seconds=3600,
+            lease_renew_margin_seconds=60,
+        )
+    )
+
+    assert result.action == "none"
+    assert result.idle is True
+    assert result.lease_renewed_count == 0
+    assert _Client.renewed == []
+    assert endpoints.endpoints["lium-b200-1"].autoscale_lease_expires_at == 1050
+
+
+@pytest.mark.asyncio
+async def test_renews_legacy_endpoint_using_configured_lease_duration():
+    _Client.renewed = []
+    _Client.renew_expires_at = 0
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="inst-lium-b200-1",
+        autoscale_created_at=100,
+        autoscale_updated_at=100,
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(
+        _Queue(in_progress=1),
+        endpoints,
+        kv,
+        now=1050,
+    )
+
+    result = await autoscaler.tick(
+        _config(
+            idle_seconds=3600,
+            lease_duration_seconds=1000,
+            lease_renew_margin_seconds=60,
+        )
+    )
+
+    assert result.action == "renew-lease:1"
+    assert _Client.renewed == ["inst-lium-b200-1"]
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.autoscale_updated_at == 1050
+    assert ep.autoscale_lease_expires_at == 2050
