@@ -856,13 +856,24 @@ class GPUAutoscaler:
         if not champion:
             return
         deployment_id = endpoint.deployment_id or ""
+        base_url = endpoint.base_url or endpoint.public_inference_url or ""
+
+        def _matches_endpoint(dep) -> bool:
+            return (
+                dep.endpoint_name == endpoint.name
+                or (deployment_id and dep.deployment_id == deployment_id)
+                or (base_url and dep.base_url == base_url)
+            )
+
         deployments = [
             dep for dep in (champion.deployments or [])
-            if dep.endpoint_name != endpoint.name
-            and (not deployment_id or dep.deployment_id != deployment_id)
+            if not _matches_endpoint(dep)
         ]
         changed = len(deployments) != len(champion.deployments or [])
-        primary_removed = deployment_id and champion.deployment_id == deployment_id
+        primary_removed = (
+            (deployment_id and champion.deployment_id == deployment_id)
+            or (base_url and champion.base_url == base_url)
+        )
         if not changed and not primary_removed:
             return
         champion.deployments = deployments

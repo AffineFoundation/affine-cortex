@@ -359,17 +359,23 @@ class ExecutorWorker:
             battle.base_url if battle else None,
         )
 
-        # Single-instance providers deliberately clear champion.deployment_id
-        # at battle start (the host is now serving the challenger). In that
-        # state we still need to dispatch challenger samples — bail out
-        # only when nobody has a serving URL.
-        if not champion_urls and not battle_urls:
-            return 0
-
         predeployed = await self._state.get_predeployed_challengers()
         self._cancel_stale_dispatches(
             _collect_current_deployment_ids(champion, battle, predeployed)
         )
+
+        # Single-instance providers deliberately clear champion.deployment_id
+        # at battle start (the host is now serving the challenger). In that
+        # state we still need to dispatch challenger samples. Still run the
+        # stale-dispatch sweep first so endpoint scale-down can cancel
+        # already-launched work before there are any new serving URLs.
+        predeployed_urls = [
+            url
+            for record in predeployed
+            for url in _base_urls(record.deployments, record.base_url)
+        ]
+        if not champion_urls and not battle_urls and not predeployed_urls:
+            return 0
 
         # Read champion's current sample set once; both branches use it
         # (champion early-stop check + challenger candidate filter).

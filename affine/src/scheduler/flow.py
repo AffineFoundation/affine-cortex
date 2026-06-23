@@ -536,7 +536,11 @@ class FlowScheduler:
         # base_url.
         if self.cfg.single_instance_provider:
             champ = await self.state.get_champion()
-            if champ is not None and champ.deployment_id is not None:
+            if champ is not None and (
+                champ.deployment_id
+                or champ.base_url
+                or champ.deployments
+            ):
                 champ.deployment_id = None
                 champ.base_url = None
                 champ.deployments = []

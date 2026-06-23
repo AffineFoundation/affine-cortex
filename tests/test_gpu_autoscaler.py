@@ -369,6 +369,57 @@ async def test_scales_down_idle_managed_endpoint_and_clears_champion_deployment(
 
 
 @pytest.mark.asyncio
+async def test_scale_down_clears_champion_deployment_by_base_url_fallback():
+    _Client.deleted = []
+    kv = InMemoryConfigStore()
+    state = StateStore(kv)
+    await state.set_champion(
+        ChampionRecord(
+            uid=7,
+            hotkey="hk7",
+            revision="rev7",
+            model="repo/model",
+            deployment_id=None,
+            base_url="http://lium-b200-1.example.com:10001/v1",
+            deployments=[
+                DeploymentRecord(
+                    endpoint_name="",
+                    deployment_id="ssh:lium-b200-1:affine-sglang-current",
+                    base_url="http://lium-b200-1.example.com:10001/v1",
+                )
+            ],
+        )
+    )
+    await kv.set(STATE_KEY, {"last_busy_at": 900})
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        assigned_uid=7,
+        deployment_id=None,
+        base_url="http://lium-b200-1.example.com:10001/v1",
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="inst-lium-b200-1",
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(
+        _Queue(pending=0),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    result = await autoscaler.tick(_config(idle_seconds=60))
+
+    assert result.action == "scale-down:1"
+    champion = await state.get_champion()
+    assert champion.deployment_id is None
+    assert champion.base_url is None
+    assert champion.deployments == []
+
+
+@pytest.mark.asyncio
 async def test_does_not_scale_down_while_champion_samples_are_incomplete():
     _Client.deleted = []
     kv = InMemoryConfigStore()

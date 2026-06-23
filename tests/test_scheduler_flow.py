@@ -309,6 +309,7 @@ def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
     window_blocks=WINDOW_BLOCKS, deployment_health_fn=None,
     list_active_endpoint_activations_fn=None,
+    config=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -324,7 +325,7 @@ def _build_scheduler(
         ]
 
     scheduler = FlowScheduler(
-        config=FlowConfig(window_blocks=window_blocks),
+        config=config or FlowConfig(window_blocks=window_blocks),
         state=state,
         queue=queue,
         sampler=sampler,
@@ -363,6 +364,43 @@ async def test_first_tick_refreshes_task_ids_then_returns():
     assert task_state is not None
     assert set(task_state.task_ids.keys()) == {"ENV_A", "ENV_B"}
     assert task_state.refreshed_at_block == 50
+
+
+@pytest.mark.asyncio
+async def test_single_instance_refresh_clears_champion_base_url_without_deployment_id():
+    kv = _seed_state()
+    kv.data["champion"]["deployment_id"] = None
+    kv.data["champion"]["base_url"] = "http://old-endpoint/v1"
+    kv.data["champion"]["deployments"] = [
+        {
+            "endpoint_name": "lium-b200-1",
+            "deployment_id": "ssh:lium-b200-1:affine-sglang-current",
+            "base_url": "http://old-endpoint/v1",
+        }
+    ]
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+    ])
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=_DeployTracker(),
+        samples=_SamplesFake(),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    champ = await state.get_champion()
+    assert champ.deployment_id is None
+    assert champ.base_url is None
+    assert champ.deployments == []
 
 
 @pytest.mark.asyncio
