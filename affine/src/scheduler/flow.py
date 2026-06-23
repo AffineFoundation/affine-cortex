@@ -269,6 +269,7 @@ class FlowScheduler:
             list_active_endpoint_activations_fn
         )
         self._deployment_health = deployment_health_fn
+        self._last_no_endpoint_log_at = 0.0
 
     # ---- entry point ------------------------------------------------------
 
@@ -594,6 +595,8 @@ class FlowScheduler:
     async def _deploy_champion(self, champion: ChampionRecord) -> None:
         """Bring up the champion's Targon workload. Adopt an existing one
         if it matches the naming convention (idempotent across restarts)."""
+        if not await self._deployment_capacity_available("champion"):
+            return
         target = targon_lifecycle.DeployTarget(
             uid=champion.uid, hotkey=champion.hotkey,
             model=champion.model, revision=champion.revision,
@@ -1286,6 +1289,8 @@ class FlowScheduler:
         """Deploy queued miners on free non-primary endpoints, FIFO.
         Deploy failures leave the miner in queue and advance to the next
         candidate; ``NoSpareEndpoint`` ends the loop cleanly."""
+        if not await self._deployment_capacity_available("predeploy"):
+            return
         battle = await self.state.get_battle()
         records = await self.state.get_predeployed_challengers()
         exclude = {p.challenger.uid for p in records}
@@ -1356,6 +1361,8 @@ class FlowScheduler:
         self, champion: ChampionRecord, current_block: int,
     ) -> None:
         """Pick the next pending miner and stand up its Targon workload."""
+        if not await self._deployment_capacity_available("challenger"):
+            return
         candidate = await self.queue.pick_next(
             window_id=current_block // self.cfg.window_blocks,
             champion_uid=champion.uid,
@@ -1433,6 +1440,41 @@ class FlowScheduler:
             f"FlowScheduler: battle started — challenger uid={candidate.uid} "
             f"vs champion uid={champion.uid}"
         )
+
+    async def _deployment_capacity_available(self, role: str) -> bool:
+        """Return whether an SSH/single-instance deployment can start now.
+
+        Autoscaler-managed SSH endpoints legitimately disappear while the
+        queue is idle. In that state scheduler should leave champion and
+        challenger state untouched and wait for autoscaler to create a host,
+        instead of calling deploy_fn every tick and logging the same
+        ``no active ssh endpoints`` exception.
+        """
+        if (
+            not self.cfg.single_instance_provider
+            or self._list_active_endpoint_names is None
+        ):
+            return True
+        try:
+            active_endpoints = await self._list_active_endpoint_names()
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: active endpoint lookup failed before "
+                f"{role} deploy; proceeding with deploy attempt: "
+                f"{type(e).__name__}: {e}"
+            )
+            return True
+        if active_endpoints:
+            self._last_no_endpoint_log_at = 0.0
+            return True
+        now = time.time()
+        if now - self._last_no_endpoint_log_at >= 60:
+            logger.info(
+                f"FlowScheduler: no active ssh endpoints for {role} deploy; "
+                f"waiting for autoscaler"
+            )
+            self._last_no_endpoint_log_at = now
+        return False
 
     async def _decide(
         self,

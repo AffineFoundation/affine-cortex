@@ -308,6 +308,7 @@ def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
 def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
     window_blocks=WINDOW_BLOCKS, deployment_health_fn=None,
+    list_active_endpoint_names_fn=None,
     list_active_endpoint_activations_fn=None,
     config=None,
 ):
@@ -336,6 +337,7 @@ def _build_scheduler(
         sample_count_fn=samples.count_samples_for_tasks,
         scores_reader=samples.read_scores_for_tasks,
         list_valid_miners_fn=list_valid_miners_fn,
+        list_active_endpoint_names_fn=list_active_endpoint_names_fn,
         list_active_endpoint_activations_fn=(
             list_active_endpoint_activations_fn
         ),
@@ -553,6 +555,84 @@ async def test_healthy_champion_deployment_is_not_redeployed():
     assert champ.deployment_id == "wrk-live"
     assert champ.base_url == "https://t/live"
     assert deployer.deploys == []
+
+
+@pytest.mark.asyncio
+async def test_no_active_endpoint_waits_without_deploying_or_predeploying():
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100, status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=1)
+    samples = _SamplesFake()
+
+    async def no_active_endpoints():
+        return set()
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+        list_active_endpoint_names_fn=no_active_endpoints,
+    )
+
+    await scheduler.tick(current_block=50)   # refresh, then predeploy skips
+    await scheduler.tick(current_block=51)   # champion deploy skips
+
+    assert deployer.deploys == []
+    assert deployer.predeploys == []
+    assert await state.get_battle() is None
+    assert (await state.get_predeployed_challengers()) == []
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
+
+
+@pytest.mark.asyncio
+async def test_no_active_endpoint_does_not_claim_challenger():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-live"
+    kv.data["champion"]["base_url"] = "https://t/live"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100, status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+    for env, task_ids in kv.data["current_task_ids"]["task_ids"].items():
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_ids,
+            refresh_block=50,
+        )
+
+    async def no_active_endpoints():
+        return set()
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+        list_active_endpoint_names_fn=no_active_endpoints,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    assert deployer.deploys == []
+    assert await state.get_battle() is None
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
 
 
 @pytest.mark.asyncio
