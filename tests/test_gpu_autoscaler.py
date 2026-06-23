@@ -295,6 +295,36 @@ async def test_restart_without_gpu_down_state_scales_up_immediately_when_pending
 
 
 @pytest.mark.asyncio
+async def test_restart_force_start_is_one_shot_after_failed_create():
+    kv = InMemoryConfigStore()
+    endpoints = _Endpoints()
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+    cfg = GPUAutoscalerConfig(
+        enabled=True,
+        pending_threshold_per_instance=5,
+        max_gpu_down_wait_seconds=12 * 60 * 60,
+        min_instances=0,
+        max_instances=1,
+        providers={},
+        slots=[ManagedEndpointSlot(name="lium-b200-1", provider="lium")],
+    )
+
+    first = await autoscaler.tick(cfg)
+    second = await autoscaler.tick(cfg)
+
+    assert first.desired_instances == 1
+    assert first.action == "none"
+    assert second.desired_instances == 0
+    assert second.action == "none"
+    assert endpoints.endpoints == {}
+
+
+@pytest.mark.asyncio
 async def test_restart_without_pending_does_not_scale_up():
     kv = InMemoryConfigStore()
     endpoints = _Endpoints()

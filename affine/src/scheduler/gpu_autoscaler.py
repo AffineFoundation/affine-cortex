@@ -431,11 +431,14 @@ class GPUAutoscaler:
         if snapshot.pending_count <= 0:
             self._force_start_after_restart = False
             return False
-        return (
+        should_force = (
             snapshot.in_progress_count == 0
             and not snapshot.battle_active
             and snapshot.predeployed_count == 0
         )
+        if should_force:
+            self._force_start_after_restart = False
+        return should_force
 
     def _update_gpu_down_state(
         self,
