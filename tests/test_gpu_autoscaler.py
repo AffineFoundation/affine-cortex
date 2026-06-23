@@ -160,6 +160,11 @@ def _autoscaler(queue, endpoints, kv, *, now=1000, samples=None):
     )
 
 
+def test_default_gpu_down_wait_is_twelve_hours():
+    cfg = GPUAutoscalerConfig.from_mapping({})
+    assert cfg.max_gpu_down_wait_seconds == 12 * 60 * 60
+
+
 def test_instance_api_url_falls_back_to_provider_api_url(monkeypatch):
     monkeypatch.setenv("LIUM_API_URL", "https://lium.example.com/")
     cfg = InstanceAPIConfig.from_mapping("lium", {"create_path": "/instances"})
