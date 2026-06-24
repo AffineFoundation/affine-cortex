@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -96,6 +97,14 @@ NAME_PREFIX = _env("TARGON_WORKLOAD_NAME_PREFIX", "affine-autoscale")
 PUBLIC_INFERENCE_URL = _env("TARGON_PUBLIC_INFERENCE_URL")
 REQUIRE_SSH_PROBE = _env_bool("TARGON_REQUIRE_SSH_PROBE", "true")
 REQUIRE_DOCKER = _env_bool("TARGON_REQUIRE_DOCKER", "true")
+REQUIRE_DOCKER_GPU = _env_bool("TARGON_REQUIRE_DOCKER_GPU", "true")
+FIX_NVIDIA_NO_CGROUPS = _env_bool("TARGON_FIX_NVIDIA_NO_CGROUPS", "true")
+DOCKER_GPU_TEST_IMAGE = _env(
+    "TARGON_DOCKER_GPU_TEST_IMAGE",
+    "nvidia/cuda:12.4.1-base-ubuntu22.04",
+)
+SSH_CONNECT_TIMEOUT = int(_env("TARGON_SSH_CONNECT_TIMEOUT_SEC", "10") or "10")
+SSH_PROBE_TIMEOUT = int(_env("TARGON_SSH_PROBE_TIMEOUT_SEC", "300") or "300")
 REQUEST_TIMEOUT = int(_env("TARGON_API_TIMEOUT_SEC", "60") or "60")
 RENEW_METHOD = _env("TARGON_RENEW_METHOD", "POST").upper()
 RENEW_PATH_TEMPLATE = _env(
@@ -308,13 +317,6 @@ class TargonAutoscaleClient:
         if not REQUIRE_SSH_PROBE:
             return True
         user, host, port = _parse_ssh_url(_ssh_url(uid))
-        probe = "echo ready"
-        if REQUIRE_DOCKER:
-            probe = (
-                "command -v docker >/dev/null "
-                "&& docker version >/dev/null 2>&1 "
-                "&& echo ready"
-            )
         cmd = [
             "ssh",
             "-i",
@@ -322,22 +324,31 @@ class TargonAutoscaleClient:
             "-o",
             "StrictHostKeyChecking=no",
             "-o",
-            "ConnectTimeout=10",
+            f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
             "-p",
             str(port),
             f"{user}@{host}",
-            probe,
+            _ssh_probe_command(),
         ]
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=20,
+                timeout=SSH_PROBE_TIMEOUT,
             )
         except Exception:
             return False
-        return result.returncode == 0 and "ready" in result.stdout
+        ok = result.returncode == 0 and "ready" in result.stdout
+        if not ok:
+            print(
+                "warning: Targon SSH preflight failed for "
+                f"{uid}: rc={result.returncode} "
+                f"stdout={result.stdout[-500:]!r} "
+                f"stderr={result.stderr[-1000:]!r}",
+                flush=True,
+            )
+        return ok
 
     def delete(self, uid: str, *, force: bool = False) -> bool:
         if not force:
@@ -398,6 +409,46 @@ class TargonAutoscaleClient:
             kwargs["json"] = payload
         result = self.request(RENEW_METHOD or "POST", path, **kwargs)
         return result if isinstance(result, dict) else {}
+
+
+def _ssh_probe_command() -> str:
+    parts = ["set -eu", "echo ssh-ready"]
+    if REQUIRE_DOCKER:
+        parts.extend(
+            [
+                "command -v docker >/dev/null",
+                "docker version >/dev/null 2>&1",
+            ]
+        )
+        if REQUIRE_DOCKER_GPU:
+            if FIX_NVIDIA_NO_CGROUPS:
+                parts.append(_nvidia_no_cgroups_fix_command())
+            image = shlex.quote(DOCKER_GPU_TEST_IMAGE)
+            parts.append(
+                "docker run --rm --gpus all "
+                f"{image} "
+                "nvidia-smi --query-gpu=index,name,memory.total "
+                "--format=csv,noheader >/dev/null"
+            )
+    parts.append("echo ready")
+    return "; ".join(parts)
+
+
+def _nvidia_no_cgroups_fix_command() -> str:
+    return (
+        "cfg=/etc/nvidia-container-runtime/config.toml; "
+        "if [ -f \"$cfg\" ]; then "
+        "if grep -qE '^[#[:space:]]*no-cgroups[[:space:]]*=' \"$cfg\"; then "
+        "sed -i 's/^[#[:space:]]*no-cgroups[[:space:]]*=.*/"
+        "no-cgroups = true/' \"$cfg\"; "
+        "elif grep -qE '^\\[nvidia-container-cli\\]' \"$cfg\"; then "
+        "sed -i '/^\\[nvidia-container-cli\\]/a no-cgroups = true' \"$cfg\"; "
+        "else printf '\\n[nvidia-container-cli]\\nno-cgroups = true\\n' "
+        ">> \"$cfg\"; fi; "
+        "elif mkdir -p /etc/nvidia-container-runtime 2>/dev/null; then "
+        "printf '[nvidia-container-cli]\\nno-cgroups = true\\n' > \"$cfg\"; "
+        "fi"
+    )
 
 
 def _json_list_env(name: str) -> Optional[list[str]]:

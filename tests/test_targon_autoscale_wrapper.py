@@ -298,3 +298,53 @@ def test_resolves_ssh_key_by_name(monkeypatch):
     body = wrapper.TargonAutoscaleClient()._create_body("affine-autoscale-a")
 
     assert body["ssh_keys"] == ["shk-online"]
+
+
+def test_ssh_ready_runs_gpu_preflight_and_no_cgroups_fix(monkeypatch):
+    wrapper = _load_wrapper(
+        monkeypatch,
+        TARGON_REQUIRE_SSH_PROBE="true",
+        TARGON_REQUIRE_DOCKER="true",
+        TARGON_REQUIRE_DOCKER_GPU="true",
+        TARGON_FIX_NVIDIA_NO_CGROUPS="true",
+        TARGON_SSH_KEY_PATH="/tmp/test-key",
+        TARGON_SSH_PROBE_TIMEOUT_SEC="123",
+    )
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "ssh-ready\nready\n"
+        stderr = ""
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return Result()
+
+    monkeypatch.setattr(wrapper.subprocess, "run", run)
+
+    assert wrapper.TargonAutoscaleClient()._ssh_ready("wrk-test") is True
+
+    cmd, kwargs = calls[0]
+    probe = cmd[-1]
+    assert cmd[:3] == ["ssh", "-i", "/tmp/test-key"]
+    assert "wrk-test@ssh.deployments.targon.com" in cmd
+    assert kwargs["timeout"] == 123
+    assert "no-cgroups = true" in probe
+    assert "docker run --rm --gpus all" in probe
+    assert "nvidia/cuda:12.4.1-base-ubuntu22.04" in probe
+    assert "nvidia-smi --query-gpu=index,name,memory.total" in probe
+
+
+def test_ssh_probe_can_disable_gpu_preflight(monkeypatch):
+    wrapper = _load_wrapper(
+        monkeypatch,
+        TARGON_REQUIRE_DOCKER="true",
+        TARGON_REQUIRE_DOCKER_GPU="false",
+    )
+
+    probe = wrapper._ssh_probe_command()
+
+    assert "docker version" in probe
+    assert "--gpus all" not in probe
+    assert "no-cgroups" not in probe
