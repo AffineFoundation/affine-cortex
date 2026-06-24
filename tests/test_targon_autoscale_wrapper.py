@@ -106,6 +106,61 @@ def test_create_cleans_up_workload_when_wait_ready_fails(monkeypatch):
     assert ("DELETE", "/workloads/wrk-leaked") in calls
 
 
+def test_create_falls_back_across_resource_names(monkeypatch):
+    wrapper = _load_wrapper(
+        monkeypatch,
+        TARGON_RESOURCE_NAMES="b200-xlarge,b300-xlarge",
+    )
+    resources = []
+
+    def request(self, method, path, **kwargs):
+        if (method, path) == ("POST", "/workloads"):
+            resource = kwargs["json"]["resource_name"]
+            resources.append(resource)
+            if resource == "b200-xlarge":
+                raise wrapper.TargonWrapperError("no b200 capacity")
+            return {"uid": "wrk-b300"}
+        if (method, path) == ("POST", "/workloads/wrk-b300/deploy"):
+            return {"uid": "wrk-b300"}
+        if (method, path) == ("GET", "/workloads/wrk-b300"):
+            return {"uid": "wrk-b300", "name": "affine-autoscale-a"}
+        if (method, path) == ("GET", "/workloads/wrk-b300/state"):
+            return {
+                "status": "RUNNING",
+                "ready_replicas": 1,
+                "urls": [
+                    {
+                        "port": 10001,
+                        "url": "https://wrk-b300-10001.caas.targon.com",
+                    }
+                ],
+            }
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    result = wrapper.TargonAutoscaleClient().create("affine-autoscale-a")
+
+    assert resources == ["b200-xlarge", "b300-xlarge"]
+    assert result["instance_id"] == "wrk-b300"
+    assert result["resource_name"] == "b300-xlarge"
+
+
+def test_create_accepts_json_resource_names(monkeypatch):
+    wrapper = _load_wrapper(
+        monkeypatch,
+        TARGON_RESOURCE_NAMES='["b200-xlarge", "b300-xlarge"]',
+    )
+
+    body = wrapper.TargonAutoscaleClient()._create_body(
+        "affine-autoscale-a",
+        wrapper.RESOURCE_NAMES[0],
+    )
+
+    assert wrapper.RESOURCE_NAMES == ["b200-xlarge", "b300-xlarge"]
+    assert body["resource_name"] == "b200-xlarge"
+
+
 def test_delete_refuses_non_autoscaler_workload(monkeypatch):
     wrapper = _load_wrapper(monkeypatch)
     calls = []

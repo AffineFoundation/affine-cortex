@@ -75,6 +75,22 @@ services:
       - /var/log/affine/gpu_autoscaler:/var/log/affine/gpu_autoscaler
     command: ["-v", "servers", "gpu-autoscaler"]
 
+  # Targon Autoscale Wrapper — adapts Targon RENTAL workloads to the small
+  # provider API consumed by gpu_autoscaler. It creates SSH/Docker-capable
+  # GPU rentals; scheduler still deploys SGLang inside them over SSH.
+  targon_autoscale_wrapper:
+    image: affinefoundation/affine:latest
+    container_name: affine-targon-autoscale-wrapper
+    restart: unless-stopped
+    mem_reservation: "256m"
+    mem_limit: "512m"
+    env_file:
+      - .env
+    volumes:
+      - ~/.ssh:/root/.ssh:ro
+    entrypoint: ["/opt/venv/bin/python3"]
+    command: ["/app/scripts/targon_autoscale_wrapper.py"]
+
   # Executor — per-env subprocess manager. The container forks one
   # subprocess per enabled env; each subprocess owns its own paramiko SSH
   # tunnel to its worker host (via affinetes) and its own asyncio loop.
@@ -156,7 +172,7 @@ services:
     restart: unless-stopped
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
-    command: --interval 30 affine-api affine-monitor affine-scheduler affine-gpu-autoscaler affine-executor affine-anticopy-refresh affine-anticopy-worker
+    command: --interval 30 affine-api affine-monitor affine-scheduler affine-gpu-autoscaler affine-targon-autoscale-wrapper affine-executor affine-anticopy-refresh affine-anticopy-worker
 
 networks:
   default:

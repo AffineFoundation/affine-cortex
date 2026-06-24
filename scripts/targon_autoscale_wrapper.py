@@ -27,6 +27,14 @@ from urllib.parse import urlparse
 import requests
 
 
+class TargonWrapperError(RuntimeError):
+    pass
+
+
+class TargonNotFound(TargonWrapperError):
+    pass
+
+
 def _env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
@@ -36,10 +44,38 @@ def _env_bool(name: str, default: str = "true") -> bool:
     return value not in {"0", "false", "no", "off", "none"}
 
 
+def _env_string_list(name: str) -> list[str]:
+    raw = _env(name)
+    if not raw:
+        return []
+    if raw.startswith("["):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise TargonWrapperError(f"{name} must be a JSON string array: {e}")
+        if not isinstance(parsed, list) or not all(
+            isinstance(value, str) for value in parsed
+        ):
+            raise TargonWrapperError(f"{name} must be a JSON string array")
+        values = parsed
+    else:
+        values = raw.split(",")
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = value.strip()
+        if item and item not in seen:
+            out.append(item)
+            seen.add(item)
+    return out
+
+
 API_BASE = _env("TARGON_API_URL", "https://api.targon.com/tha/v2").rstrip("/")
 API_KEY = _env("TARGON_API_KEY")
 AUTH_TOKEN = _env("AFFINE_GPU_PROVIDER_API_KEY")
 RESOURCE_NAME = _env("TARGON_RESOURCE_NAME", "b200-xlarge")
+RESOURCE_NAMES = _env_string_list("TARGON_RESOURCE_NAMES") or [RESOURCE_NAME]
 RENTAL_IMAGE = _env("TARGON_RENTAL_IMAGE", _env("TARGON_AUTOSCALE_IMAGE"))
 SSH_KEY_UID = _env("TARGON_SSH_KEY_UID")
 SSH_KEY_NAME = _env("TARGON_SSH_KEY_NAME")
@@ -67,14 +103,6 @@ RENEW_PATH_TEMPLATE = _env(
     _env("TARGON_RENEW_PATH", ""),
 )
 RENEW_PAYLOAD_JSON = _env("TARGON_RENEW_PAYLOAD_JSON")
-
-
-class TargonWrapperError(RuntimeError):
-    pass
-
-
-class TargonNotFound(TargonWrapperError):
-    pass
 
 
 class TargonAutoscaleClient:
@@ -114,16 +142,38 @@ class TargonAutoscaleClient:
         return resp.json()
 
     def create(self, name: str) -> dict:
+        errors: list[str] = []
+        for resource_name in RESOURCE_NAMES:
+            try:
+                return self._create_with_resource(name, resource_name)
+            except Exception as e:
+                errors.append(f"{resource_name}: {type(e).__name__}: {e}")
+                print(
+                    f"warning: Targon create failed for resource={resource_name}: "
+                    f"{type(e).__name__}: {e}",
+                    flush=True,
+                )
+        raise TargonWrapperError(
+            "Targon create failed for all resource names: " + "; ".join(errors)
+        )
+
+    def _create_with_resource(self, name: str, resource_name: str) -> dict:
         uid = ""
         try:
-            result = self.request("POST", "/workloads", json=self._create_body(name))
+            result = self.request(
+                "POST",
+                "/workloads",
+                json=self._create_body(name, resource_name),
+            )
             uid = _instance_id(result)
             if not uid:
                 raise TargonWrapperError(
                     f"Targon create response did not include uid: {result}"
                 )
             self.request("POST", f"/workloads/{uid}/deploy")
-            return self.wait_ready(uid)
+            ready = self.wait_ready(uid)
+            ready["resource_name"] = resource_name
+            return ready
         except Exception:
             if uid:
                 try:
@@ -136,7 +186,7 @@ class TargonAutoscaleClient:
                     )
             raise
 
-    def _create_body(self, name: str) -> dict:
+    def _create_body(self, name: str, resource_name: str = "") -> dict:
         if not RENTAL_IMAGE:
             raise TargonWrapperError(
                 "TARGON_RENTAL_IMAGE is required. Use an image with SSH, "
@@ -152,7 +202,7 @@ class TargonAutoscaleClient:
         body: dict[str, Any] = {
             "name": name,
             "image": RENTAL_IMAGE,
-            "resource_name": RESOURCE_NAME,
+            "resource_name": resource_name or RESOURCE_NAME,
             "type": "RENTAL",
             "ports": [
                 {"port": PORT, "protocol": "TCP", "routing": "PROXIED"},
@@ -669,7 +719,7 @@ def main() -> None:
     port = int(_env("TARGON_WRAPPER_PORT", "8902") or "8902")
     print(
         f"targon-autoscale-wrapper listening on {host}:{port} "
-        f"resource={RESOURCE_NAME} port={PORT}",
+        f"resources={','.join(RESOURCE_NAMES)} port={PORT}",
         flush=True,
     )
     ThreadingHTTPServer((host, port), Handler).serve_forever()
