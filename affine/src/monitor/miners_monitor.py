@@ -103,6 +103,22 @@ def _anticopy_state_matches_champion(
     return all(checks) if checks else True
 
 
+def _truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _same_model_revision(
+    row: Optional[Dict[str, object]],
+    model: str,
+    revision: str,
+) -> bool:
+    return bool(
+        row
+        and _as_str(row.get("model")) == model
+        and _as_str(row.get("revision")) == revision
+    )
+
+
 @dataclass
 class MinerInfo:
     uid: int
@@ -317,9 +333,10 @@ class MinersMonitor:
 
         # Inherit prior template_check_result so a one-cycle HF blip doesn't
         # nuke the cached safety verdict.
+        existing: Optional[Dict[str, object]] = None
         try:
             existing = await self.dao.get_miner_by_uid(uid)
-            if existing and existing.get("model") == model and existing.get("revision") == revision:
+            if _same_model_revision(existing, model, revision):
                 info.template_check_result = existing.get("template_check_result")
         except Exception:
             pass
@@ -392,12 +409,28 @@ class MinersMonitor:
             )
             info.model_type = str(size_result.get("model_type") or "")
             if not size_result.get("pass"):
-                info.mark_invalid(
-                    f"model_check:{size_result.get('reason')}",
-                    permanent=True,
-                    terminate_stats=True,
-                )
-                return info
+                retryable = bool(size_result.get("retryable"))
+                if (
+                    retryable
+                    and _same_model_revision(existing, model, revision)
+                    and _truthy(existing.get("is_valid"))
+                ):
+                    info.is_valid = True
+                    info.model_type = str(
+                        existing.get("model_type") or info.model_type or ""
+                    )
+                    logger.warning(
+                        f"[MinersMonitor] preserving prior valid state for "
+                        f"uid={uid} after retryable model check failure: "
+                        f"{size_result.get('reason')}"
+                    )
+                else:
+                    info.mark_invalid(
+                        f"model_check:{size_result.get('reason')}",
+                        permanent=not retryable,
+                        terminate_stats=not retryable,
+                    )
+                    return info
 
         if uid != 0 and duplicate_source:
             info.mark_invalid(
