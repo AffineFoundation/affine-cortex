@@ -19,7 +19,7 @@ import json
 import os
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterable, List, Mapping, Optional
 from urllib.parse import urlparse
@@ -61,6 +61,12 @@ PUBLIC_INFERENCE_URL = _env("TARGON_PUBLIC_INFERENCE_URL")
 REQUIRE_SSH_PROBE = _env_bool("TARGON_REQUIRE_SSH_PROBE", "true")
 REQUIRE_DOCKER = _env_bool("TARGON_REQUIRE_DOCKER", "true")
 REQUEST_TIMEOUT = int(_env("TARGON_API_TIMEOUT_SEC", "60") or "60")
+RENEW_METHOD = _env("TARGON_RENEW_METHOD", "POST").upper()
+RENEW_PATH_TEMPLATE = _env(
+    "TARGON_RENEW_PATH_TEMPLATE",
+    _env("TARGON_RENEW_PATH", ""),
+)
+RENEW_PAYLOAD_JSON = _env("TARGON_RENEW_PAYLOAD_JSON")
 
 
 class TargonWrapperError(RuntimeError):
@@ -303,17 +309,45 @@ class TargonAutoscaleClient:
 
     def renew(self, uid: str) -> dict:
         workload = self.request("GET", f"/workloads/{uid}")
+        name = str(workload.get("name") or "") if isinstance(workload, dict) else ""
+        if name and not _owned_workload_name(name):
+            raise TargonWrapperError(
+                f"Refusing to renew non-autoscaler Targon workload "
+                f"{uid} name={name!r}"
+            )
         state = self._safe_get_state(uid)
         merged = _merge_workload_state(
             workload if isinstance(workload, dict) else {},
             state,
         )
+        renewed_until = _default_lease_expires_at()
+        renewal = self._renew_workload(uid, renewed_until)
+        if isinstance(renewal, dict):
+            merged.update(renewal)
+        if RENEW_PATH_TEMPLATE:
+            state = self._safe_get_state(uid)
+            merged = _merge_workload_state(merged, state)
         return {
             "instance_id": uid,
-            "lease_expires_at": _lease_expires_at(merged),
+            "lease_expires_at": _lease_expires_at(
+                merged,
+                fallback_expires_at=renewed_until,
+            ),
             "status": _status(merged),
             "raw": _redacted(merged),
         }
+
+    def _renew_workload(self, uid: str, expires_at: int) -> dict:
+        if not RENEW_PATH_TEMPLATE:
+            return {}
+        variables = _lease_variables(uid, expires_at)
+        path = _render_template(RENEW_PATH_TEMPLATE, variables)
+        payload = _render_template(_json_payload_env(), variables)
+        kwargs = {}
+        if payload or RENEW_PAYLOAD_JSON:
+            kwargs["json"] = payload
+        result = self.request(RENEW_METHOD or "POST", path, **kwargs)
+        return result if isinstance(result, dict) else {}
 
 
 def _json_list_env(name: str) -> Optional[list[str]]:
@@ -415,7 +449,11 @@ def _openai_endpoint(url: str) -> str:
     return url if url.endswith("/v1") else f"{url}/v1"
 
 
-def _lease_expires_at(data: Mapping[str, Any]) -> int:
+def _lease_expires_at(
+    data: Mapping[str, Any],
+    *,
+    fallback_expires_at: int = 0,
+) -> int:
     for key in (
         "removal_scheduled_at",
         "termination_scheduled_at",
@@ -426,12 +464,75 @@ def _lease_expires_at(data: Mapping[str, Any]) -> int:
         if parsed:
             return parsed
     state = data.get("state") if isinstance(data.get("state"), dict) else {}
-    parsed = _parse_time(state.get("expires_at") or state.get("updated_at"))
-    if parsed and LEASE_HOURS > 0:
-        return parsed + LEASE_HOURS * 60 * 60
-    if LEASE_HOURS > 0:
-        return int(time.time()) + LEASE_HOURS * 60 * 60
+    for key in (
+        "removal_scheduled_at",
+        "termination_scheduled_at",
+        "scheduled_termination_at",
+        "expires_at",
+    ):
+        parsed = _parse_time(state.get(key))
+        if parsed:
+            return parsed
+    if fallback_expires_at > 0:
+        return fallback_expires_at
+    default_expires_at = _default_lease_expires_at()
+    if default_expires_at > 0:
+        return default_expires_at
     return 0
+
+
+def _default_lease_expires_at() -> int:
+    if LEASE_HOURS <= 0:
+        return 0
+    return int(time.time()) + LEASE_HOURS * 60 * 60
+
+
+def _lease_variables(uid: str, expires_at: int) -> dict[str, str]:
+    now = int(time.time())
+    return {
+        "uid": uid,
+        "workload_uid": uid,
+        "lease_hours": str(LEASE_HOURS),
+        "lease_expires_at": str(expires_at),
+        "lease_expires_iso": _iso_utc(expires_at),
+        "now": str(now),
+        "now_iso": _iso_utc(now),
+    }
+
+
+def _iso_utc(timestamp: int) -> str:
+    if timestamp <= 0:
+        return ""
+    return datetime.fromtimestamp(timestamp, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+
+
+def _json_payload_env() -> dict:
+    if not RENEW_PAYLOAD_JSON:
+        return {}
+    try:
+        parsed = json.loads(RENEW_PAYLOAD_JSON)
+    except json.JSONDecodeError as e:
+        raise TargonWrapperError(
+            f"TARGON_RENEW_PAYLOAD_JSON must be a JSON object: {e}"
+        )
+    if not isinstance(parsed, dict):
+        raise TargonWrapperError("TARGON_RENEW_PAYLOAD_JSON must be a JSON object")
+    return parsed
+
+
+def _render_template(value: Any, variables: Mapping[str, str]) -> Any:
+    if isinstance(value, str):
+        try:
+            return value.format(**variables)
+        except (KeyError, IndexError, ValueError):
+            return value
+    if isinstance(value, list):
+        return [_render_template(v, variables) for v in value]
+    if isinstance(value, dict):
+        return {k: _render_template(v, variables) for k, v in value.items()}
+    return value
 
 
 def _parse_time(value: Any) -> int:

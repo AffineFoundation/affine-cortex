@@ -135,6 +135,98 @@ def test_delete_missing_workload_is_idempotent(monkeypatch):
     assert wrapper.TargonAutoscaleClient().delete("wrk-missing") is True
 
 
+def test_renew_extends_configured_logical_lease(monkeypatch):
+    wrapper = _load_wrapper(monkeypatch, TARGON_LEASE_HOURS="8")
+    monkeypatch.setattr(wrapper.time, "time", lambda: 1_000)
+    calls = []
+
+    def request(self, method, path, **kwargs):
+        calls.append((method, path, kwargs.get("json")))
+        if (method, path) == ("GET", "/workloads/wrk-test"):
+            return {"uid": "wrk-test", "name": "affine-autoscale-a"}
+        if (method, path) == ("GET", "/workloads/wrk-test/state"):
+            return {"status": "RUNNING", "ready_replicas": 1}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    result = wrapper.TargonAutoscaleClient().renew("wrk-test")
+
+    assert result["instance_id"] == "wrk-test"
+    assert result["lease_expires_at"] == 1_000 + 8 * 60 * 60
+    assert result["status"] == "running"
+    assert calls == [
+        ("GET", "/workloads/wrk-test", None),
+        ("GET", "/workloads/wrk-test/state", None),
+    ]
+
+
+def test_renew_calls_configured_provider_endpoint(monkeypatch):
+    wrapper = _load_wrapper(
+        monkeypatch,
+        TARGON_LEASE_HOURS="2",
+        TARGON_RENEW_METHOD="PATCH",
+        TARGON_RENEW_PATH_TEMPLATE="/workloads/{uid}",
+        TARGON_RENEW_PAYLOAD_JSON=(
+            '{"envs":[{"name":"AFFINE_RENEW_UNTIL",'
+            '"value":"{lease_expires_iso}"}]}'
+        ),
+    )
+    monkeypatch.setattr(wrapper.time, "time", lambda: 1_000)
+    calls = []
+
+    def request(self, method, path, **kwargs):
+        calls.append((method, path, kwargs.get("json")))
+        if (method, path) == ("GET", "/workloads/wrk-test"):
+            return {"uid": "wrk-test", "name": "affine-autoscale-a"}
+        if (method, path) == ("GET", "/workloads/wrk-test/state"):
+            return {"status": "RUNNING", "ready_replicas": 1}
+        if (method, path) == ("PATCH", "/workloads/wrk-test"):
+            assert kwargs["json"] == {
+                "envs": [
+                    {
+                        "name": "AFFINE_RENEW_UNTIL",
+                        "value": "1970-01-01T02:16:40Z",
+                    }
+                ]
+            }
+            return {"expires_at": "1970-01-01T03:00:00Z"}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    result = wrapper.TargonAutoscaleClient().renew("wrk-test")
+
+    assert result["lease_expires_at"] == 10_800
+    assert calls == [
+        ("GET", "/workloads/wrk-test", None),
+        ("GET", "/workloads/wrk-test/state", None),
+        ("PATCH", "/workloads/wrk-test", {
+            "envs": [
+                {
+                    "name": "AFFINE_RENEW_UNTIL",
+                    "value": "1970-01-01T02:16:40Z",
+                }
+            ]
+        }),
+        ("GET", "/workloads/wrk-test/state", None),
+    ]
+
+
+def test_renew_refuses_non_autoscaler_workload(monkeypatch):
+    wrapper = _load_wrapper(monkeypatch, TARGON_LEASE_HOURS="8")
+
+    def request(self, method, path, **kwargs):
+        if (method, path) == ("GET", "/workloads/wrk-manual"):
+            return {"uid": "wrk-manual", "name": "manual-prod-gpu"}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    with pytest.raises(wrapper.TargonWrapperError, match="Refusing to renew"):
+        wrapper.TargonAutoscaleClient().renew("wrk-manual")
+
+
 def test_resolves_ssh_key_by_name(monkeypatch):
     wrapper = _load_wrapper(
         monkeypatch,
