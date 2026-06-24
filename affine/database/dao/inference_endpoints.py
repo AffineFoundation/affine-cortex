@@ -16,7 +16,7 @@ dataclass below for the typed view.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 from affine.database.base_dao import BaseDAO
@@ -63,6 +63,7 @@ class Endpoint:
     sglang_mem_fraction: float = 0.85
     sglang_chunked_prefill: int = 4096
     sglang_tool_call_parser: str = "qwen"
+    sglang_docker_args: List[str] = field(default_factory=list)
     ready_timeout_sec: int = 1800
     poll_interval_sec: float = 15.0
 
@@ -113,6 +114,7 @@ _ENDPOINT_RUNTIME_IDENTITY_FIELDS = (
     "sglang_mem_fraction",
     "sglang_chunked_prefill",
     "sglang_tool_call_parser",
+    "sglang_docker_args",
     "ready_timeout_sec",
     "poll_interval_sec",
     "targon_api_url",

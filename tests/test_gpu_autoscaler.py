@@ -213,6 +213,16 @@ def test_default_gpu_down_wait_is_twelve_hours():
     assert cfg.max_gpu_down_wait_seconds == 12 * 60 * 60
 
 
+def test_managed_endpoint_slot_accepts_sglang_docker_args_override():
+    slot = ManagedEndpointSlot.from_mapping({
+        "name": "targon-b200-autoscale-1",
+        "provider": "targon",
+        "sglang_docker_args": ["--cgroupns=host"],
+    })
+
+    assert slot.endpoint["sglang_docker_args"] == ["--cgroupns=host"]
+
+
 def test_instance_api_url_falls_back_to_provider_api_url(monkeypatch):
     monkeypatch.setenv("LIUM_API_URL", "https://lium.example.com/")
     cfg = InstanceAPIConfig.from_mapping("lium", {"create_path": "/instances"})

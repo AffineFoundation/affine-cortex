@@ -25,6 +25,7 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
   sglang_mem_fraction     GPU memory fraction passed to sglang (0.85)
   sglang_chunked_prefill  chunked-prefill size (4096)
   sglang_tool_call_parser parser name, "none" to omit (qwen)
+  sglang_docker_args      optional extra docker-run args
   ready_timeout_sec       seconds to wait for /v1/models (1800)
   poll_interval_sec       seconds between readiness probes (15)
 """
@@ -121,6 +122,7 @@ class SSHConfig:
     sglang_mem_fraction: float = DEFAULT_MEM_FRACTION
     sglang_chunked_prefill: int = DEFAULT_CHUNKED_PREFILL
     sglang_tool_call_parser: str = DEFAULT_TOOL_CALL_PARSER
+    sglang_docker_args: Tuple[str, ...] = ()
     ready_timeout_sec: int = DEFAULT_READY_TIMEOUT_SEC
     poll_interval_sec: float = DEFAULT_POLL_INTERVAL_SEC
     connect_timeout: int = 30
@@ -167,6 +169,9 @@ class SSHConfig:
             sglang_mem_fraction=endpoint.sglang_mem_fraction,
             sglang_chunked_prefill=endpoint.sglang_chunked_prefill,
             sglang_tool_call_parser=endpoint.sglang_tool_call_parser,
+            sglang_docker_args=_coerce_docker_args(
+                getattr(endpoint, "sglang_docker_args", None)
+            ),
             ready_timeout_sec=endpoint.ready_timeout_sec,
             poll_interval_sec=endpoint.poll_interval_sec,
         )
@@ -183,6 +188,19 @@ class SSHConfig:
         """
         endpoint = self.endpoint_name or self.host
         return f"ssh:{endpoint}:{CONTAINER_NAME}"
+
+
+def _coerce_docker_args(value: Any) -> Tuple[str, ...]:
+    if not value:
+        return ()
+    if isinstance(value, str):
+        return tuple(shlex.split(value))
+    if isinstance(value, (list, tuple)):
+        return tuple(str(arg) for arg in value if str(arg))
+    raise ValueError(
+        "sglang_docker_args must be a string or list, "
+        f"got {type(value).__name__}"
+    )
 
 
 def _build_sglang_args(target: DeployTarget, config: "SSHConfig") -> List[str]:
@@ -225,6 +243,9 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
         f"--label {shlex.quote(k)}={shlex.quote(v)}"
         for k, v in labels.items()
     )
+    extra_docker_flags = " ".join(
+        shlex.quote(str(arg)) for arg in config.sglang_docker_args
+    )
 
     env_flags = (
         "-e HF_HOME=/data "
@@ -253,6 +274,7 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
         f"--restart {RESTART_POLICY} "
         f"--network host --ipc=host --shm-size=32g "
         f"--security-opt label=disable "
+        f"{extra_docker_flags} "
         f"{label_flags} "
         f"-v {shlex.quote(config.sglang_cache_dir)}:/data "
         f"{env_flags}"

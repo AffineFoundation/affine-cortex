@@ -79,6 +79,16 @@ def test_ssh_config_endpoint_missing_url_raises():
         SSHConfig.from_endpoint(Endpoint(name="b300", kind="ssh"))
 
 
+def test_ssh_config_from_endpoint_keeps_extra_docker_args():
+    cfg = SSHConfig.from_endpoint(Endpoint(
+        name="targon",
+        kind="ssh",
+        ssh_url="ssh://worker@targon.example",
+        sglang_docker_args=["--cgroupns=host"],
+    ))
+    assert cfg.sglang_docker_args == ("--cgroupns=host",)
+
+
 def test_ssh_config_bad_scheme_raises():
     with pytest.raises(ValueError, match="ssh://"):
         SSHConfig.from_endpoint(Endpoint(
@@ -356,6 +366,14 @@ def test_docker_cmd_uses_host_network_and_ipc():
     assert "--ipc=host" in cmd
     assert "--shm-size=" in cmd
     assert "--security-opt label=disable" in cmd
+
+
+def test_docker_cmd_includes_configured_extra_docker_args():
+    cmd = _build_docker_run_cmd(
+        _target(),
+        _config(sglang_docker_args=("--cgroupns=host",)),
+    )
+    assert "--cgroupns=host" in cmd
 
 
 def test_docker_cmd_passes_hf_token_when_env_set(monkeypatch):

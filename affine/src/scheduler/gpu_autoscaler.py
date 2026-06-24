@@ -62,6 +62,7 @@ _ENDPOINT_OVERRIDE_FIELDS = {
     "sglang_mem_fraction",
     "sglang_chunked_prefill",
     "sglang_tool_call_parser",
+    "sglang_docker_args",
     "ready_timeout_sec",
     "poll_interval_sec",
     "notes",
