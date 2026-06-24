@@ -37,6 +37,8 @@ class _Endpoints:
     def __init__(self, endpoints=None):
         self.endpoints = {ep.name: ep for ep in (endpoints or [])}
         self.cleared = []
+        self.fail_activate = False
+        self.now = 1000
 
     async def list_all(self):
         return list(self.endpoints.values())
@@ -52,6 +54,50 @@ class _Endpoints:
 
     async def upsert(self, endpoint, *, updated_by="test"):
         self.endpoints[endpoint.name] = endpoint
+
+    async def activate_autoscaled_endpoint(self, endpoint, *, updated_by="test"):
+        if self.fail_activate:
+            raise RuntimeError("simulated activation failure")
+        existing = self.endpoints.get(endpoint.name)
+        if existing is not None:
+            endpoint.assigned_uid = existing.assigned_uid
+            endpoint.assigned_hotkey = existing.assigned_hotkey
+            endpoint.assigned_model = existing.assigned_model
+            endpoint.assigned_revision = existing.assigned_revision
+            endpoint.deployment_id = existing.deployment_id
+            endpoint.base_url = existing.base_url
+            endpoint.assignment_role = existing.assignment_role
+            endpoint.assigned_at = existing.assigned_at
+        self.endpoints[endpoint.name] = endpoint
+
+    async def update_autoscale_lease(
+        self, name, *, instance_id, lease_expires_at, updated_by="test",
+    ):
+        endpoint = self.endpoints[name]
+        if endpoint.autoscale_instance_id != instance_id:
+            raise RuntimeError("stale instance id")
+        endpoint.autoscale_updated_at = self.now
+        endpoint.autoscale_lease_expires_at = lease_expires_at
+
+    async def deactivate_autoscaled_endpoint(
+        self, name, *, instance_id, updated_by="test",
+    ):
+        endpoint = self.endpoints[name]
+        if endpoint.autoscale_instance_id != instance_id:
+            raise RuntimeError("stale instance id")
+        endpoint.active = False
+        endpoint.ssh_url = None
+        endpoint.public_inference_url = None
+        endpoint.assigned_uid = None
+        endpoint.assigned_hotkey = None
+        endpoint.assigned_model = None
+        endpoint.assigned_revision = None
+        endpoint.deployment_id = None
+        endpoint.base_url = None
+        endpoint.assignment_role = None
+        endpoint.assigned_at = 0
+        endpoint.autoscale_instance_id = None
+        endpoint.autoscale_lease_expires_at = 0
 
     async def clear_assignment(self, name, *, updated_by="test"):
         self.cleared.append(name)
@@ -149,6 +195,8 @@ def _config(
 
 
 def _autoscaler(queue, endpoints, kv, *, now=1000, samples=None):
+    if hasattr(endpoints, "now"):
+        endpoints.now = now
     return GPUAutoscaler(
         queue=queue,
         endpoints_dao=endpoints,
@@ -221,6 +269,64 @@ async def test_scale_up_does_not_reuse_stale_lease_from_inactive_endpoint():
     ep = endpoints.endpoints["lium-b200-1"]
     assert ep.autoscale_instance_id == "inst-lium-b200-1"
     assert ep.autoscale_lease_expires_at == 0
+
+
+@pytest.mark.asyncio
+async def test_scale_up_deletes_instance_when_endpoint_activation_fails():
+    kv = InMemoryConfigStore()
+    endpoints = _Endpoints()
+    endpoints.fail_activate = True
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+    )
+
+    result = await autoscaler.tick(_config(threshold=1))
+
+    assert result.action == "none"
+    assert _Client.deleted == ["inst-lium-b200-1", "inst-lium-b200-2"]
+    assert endpoints.endpoints == {}
+
+
+@pytest.mark.asyncio
+async def test_scale_up_preserves_existing_assignment_fields():
+    kv = InMemoryConfigStore()
+    endpoints = _Endpoints([
+        Endpoint(
+            name="lium-b200-1",
+            kind="ssh",
+            active=False,
+            assigned_uid=42,
+            assigned_hotkey="hk42",
+            assigned_model="org/model42",
+            assigned_revision="rev42",
+            deployment_id="ssh:old",
+            base_url="http://old.example/v1",
+            assignment_role="pre_challenger",
+            assigned_at=900,
+        )
+    ])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+    )
+
+    result = await autoscaler.tick(_config(threshold=1))
+
+    assert result.action == "scale-up:1"
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.active is True
+    assert ep.autoscale_instance_id == "inst-lium-b200-1"
+    assert ep.assigned_uid == 42
+    assert ep.assigned_hotkey == "hk42"
+    assert ep.assigned_model == "org/model42"
+    assert ep.assigned_revision == "rev42"
+    assert ep.deployment_id == "ssh:old"
+    assert ep.base_url == "http://old.example/v1"
+    assert ep.assignment_role == "pre_challenger"
+    assert ep.assigned_at == 900
 
 
 @pytest.mark.asyncio
@@ -391,7 +497,7 @@ async def test_scales_down_idle_managed_endpoint_and_clears_champion_deployment(
 
     assert result.action == "scale-down:1"
     assert _Client.deleted == ["inst-lium-b200-1"]
-    assert endpoints.cleared == ["lium-b200-1"]
+    assert endpoints.cleared == []
     ep = endpoints.endpoints["lium-b200-1"]
     assert ep.active is False
     assert ep.ssh_url is None

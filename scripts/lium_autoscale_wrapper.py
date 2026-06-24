@@ -54,6 +54,17 @@ class LiumWrapperError(RuntimeError):
     pass
 
 
+class LiumHTTPError(LiumWrapperError):
+    def __init__(self, method: str, path: str, status_code: int, text: str):
+        self.method = method
+        self.path = path
+        self.status_code = status_code
+        self.text = text
+        super().__init__(
+            f"{method} {path} -> {status_code}: {text[:500]}"
+        )
+
+
 class LiumClient:
     def __init__(self) -> None:
         if not API_BASE:
@@ -72,9 +83,7 @@ class LiumClient:
         if resp.status_code in (204, 205):
             return {}
         if resp.status_code >= 400:
-            raise LiumWrapperError(
-                f"{method} {path} -> {resp.status_code}: {resp.text[:500]}"
-            )
+            raise LiumHTTPError(method, path, resp.status_code, resp.text)
         if not resp.content:
             return {}
         return resp.json()
@@ -193,7 +202,11 @@ class LiumClient:
             uid = self.find_pod_by_name(name)
         if not uid:
             raise LiumWrapperError(f"Rent response did not include a pod id: {result}")
-        return self.wait_ready(uid)
+        try:
+            return self.wait_ready(uid)
+        except Exception:
+            self._delete_owned_pod(uid)
+            raise
 
     def find_pod_by_name(self, name: str) -> str:
         for _ in range(5):
@@ -234,8 +247,34 @@ class LiumClient:
             f"last={str(_redacted_pod(last or {}))[:800]}"
         )
 
+    def get_pod(self, uid: str) -> Optional[dict]:
+        try:
+            pod = self.request("GET", f"/pods/{uid}")
+        except LiumHTTPError as e:
+            if e.status_code == 404:
+                return None
+            raise
+        return pod if isinstance(pod, dict) else {}
+
     def delete(self, uid: str) -> bool:
-        self.request("DELETE", f"/pods/{uid}")
+        return self._delete_owned_pod(uid)
+
+    def _delete_owned_pod(self, uid: str) -> bool:
+        pod = self.get_pod(uid)
+        if pod is None:
+            return True
+        pod_name = _pod_name(pod)
+        if not pod_name.startswith(NAME_PREFIX):
+            raise LiumWrapperError(
+                f"Refusing to delete pod {uid}: pod_name={pod_name!r} "
+                f"does not start with {NAME_PREFIX!r}"
+            )
+        try:
+            self.request("DELETE", f"/pods/{uid}")
+        except LiumHTTPError as e:
+            if e.status_code == 404:
+                return True
+            raise
         return True
 
     def renew(self, uid: str) -> dict:
@@ -304,6 +343,10 @@ def _instance_id(data: Mapping[str, Any]) -> str:
 def _status(data: Mapping[str, Any]) -> str:
     state = data.get("state") if isinstance(data.get("state"), dict) else {}
     return str(data.get("status") or state.get("status") or "").lower()
+
+
+def _pod_name(data: Mapping[str, Any]) -> str:
+    return str(data.get("pod_name") or data.get("name") or "")
 
 
 def _default_lease_expires_at() -> int:

@@ -367,7 +367,7 @@ _ENV_CONFIGS_CANONICAL = {
         docker_image="affinefoundation/distill-v2:latest",
         env_type="distill",
         env_vars={"UVICORN_WORKERS": "4"},
-        mem_limit="12g",
+        mem_limit="5g",
         eval_params={
             "temperature": 0.0,
             "timeout": 1200,

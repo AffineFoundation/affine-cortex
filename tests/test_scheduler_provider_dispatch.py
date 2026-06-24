@@ -22,6 +22,14 @@ from affine.src.scheduler.main import (
 from affine.src.scheduler.targon import DeployTarget
 
 
+class _UpdateRecordingClient:
+    def __init__(self):
+        self.update_calls = []
+
+    async def update_item(self, **kwargs):
+        self.update_calls.append(kwargs)
+
+
 @dataclass
 class _Ep:
     name: str
@@ -124,6 +132,76 @@ def test_endpoint_activation_bumps_on_enable_or_runtime_config_change():
         active=False,
         ssh_url="ssh://old-host",
     ))
+
+
+@pytest.mark.asyncio
+async def test_activate_autoscaled_endpoint_does_not_write_assignment_fields(
+    monkeypatch,
+):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+    dao = InferenceEndpointsDAO()
+
+    async def fake_get(name):
+        return Endpoint(
+            name=name,
+            kind="ssh",
+            active=False,
+            assigned_uid=42,
+            assigned_hotkey="hk42",
+            generation=3,
+            activated_at=100,
+        )
+
+    dao.get = fake_get
+    await dao.activate_autoscaled_endpoint(
+        Endpoint(
+            name="b300",
+            kind="ssh",
+            active=True,
+            ssh_url="ssh://root@b300",
+            autoscale_instance_id="inst-b300",
+            assigned_uid=99,
+            assigned_hotkey="new",
+        )
+    )
+
+    call = client.update_calls[0]
+    updated_fields = set(call["ExpressionAttributeNames"].values())
+    assert "assigned_uid" not in updated_fields
+    assert "assigned_hotkey" not in updated_fields
+    assert "deployment_id" not in updated_fields
+    assert "autoscale_instance_id" in updated_fields
+    assert call["Key"] == {"pk": {"S": "ENDPOINT#b300"}}
+
+
+@pytest.mark.asyncio
+async def test_deactivate_autoscaled_endpoint_is_conditioned_on_instance(
+    monkeypatch,
+):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+    dao = InferenceEndpointsDAO()
+
+    await dao.deactivate_autoscaled_endpoint(
+        "b300",
+        instance_id="inst-b300",
+    )
+
+    call = client.update_calls[0]
+    removed_fields = set(call["ExpressionAttributeNames"].values())
+    assert call["ConditionExpression"] == "#cond_instance = :cond_instance"
+    assert call["ExpressionAttributeValues"][":cond_instance"] == {
+        "S": "inst-b300"
+    }
+    assert "autoscale_instance_id" in removed_fields
+    assert "assigned_uid" in removed_fields
+    assert "assigned_hotkey" in removed_fields
+    assert "deployment_id" in removed_fields
 
 
 class _EndpointsDAOFake:

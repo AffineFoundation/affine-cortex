@@ -263,9 +263,6 @@ MINER_STATS_SCHEMA = {
 #   assignment_role        "champion" | "challenger" | "active"
 #   assigned_at            assignment timestamp
 #
-#   # autoscaler metadata
-#   autoscale_lease_expires_at unix timestamp for provider-side forced removal
-#
 #   # ssh-kind extras
 #   ssh_url                "ssh://user@host[:port]"
 #   ssh_key_path           optional path to private key
@@ -378,4 +375,5 @@ ANTICOPY_STATE_SCHEMA = {
     ],
     "BillingMode": "PAY_PER_REQUEST",
 }
+
 

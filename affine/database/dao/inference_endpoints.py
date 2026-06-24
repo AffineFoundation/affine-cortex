@@ -119,6 +119,18 @@ _ENDPOINT_RUNTIME_IDENTITY_FIELDS = (
 )
 
 
+_ASSIGNMENT_FIELDS = (
+    "assigned_uid",
+    "assigned_hotkey",
+    "assigned_model",
+    "assigned_revision",
+    "deployment_id",
+    "base_url",
+    "assignment_role",
+    "assigned_at",
+)
+
+
 class InferenceEndpointsDAO(BaseDAO):
     """CRUD over the ``inference_endpoints`` table."""
 
@@ -258,3 +270,133 @@ class InferenceEndpointsDAO(BaseDAO):
                 ":updated_by": {"S": updated_by},
             },
         )
+
+    async def activate_autoscaled_endpoint(
+        self,
+        endpoint: Endpoint,
+        *,
+        updated_by: str = "gpu-autoscaler",
+    ) -> None:
+        """Activate/update an autoscaled endpoint without touching runtime
+        assignment fields the scheduler owns."""
+        now = int(time.time())
+        previous = await self.get(endpoint.name)
+        generation = int((previous.generation if previous else 0) or 0)
+        activated_at = int((previous.activated_at if previous else 0) or 0)
+        if self._activation_bump_required(previous, endpoint):
+            generation += 1
+            activated_at = now
+
+        payload = asdict(endpoint)
+        payload.pop("name", None)
+        for field in _ASSIGNMENT_FIELDS:
+            payload.pop(field, None)
+        payload.update({
+            "active": True,
+            "generation": generation,
+            "activated_at": activated_at,
+            "updated_at": now,
+            "updated_by": updated_by,
+        })
+        await self._update_endpoint_fields(endpoint.name, set_values=payload)
+
+    async def update_autoscale_lease(
+        self,
+        name: str,
+        *,
+        instance_id: str,
+        lease_expires_at: int,
+        updated_by: str = "gpu-autoscaler",
+    ) -> None:
+        now = int(time.time())
+        await self._update_endpoint_fields(
+            name,
+            set_values={
+                "autoscale_updated_at": now,
+                "autoscale_lease_expires_at": lease_expires_at,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            condition_expression="#cond_instance = :cond_instance",
+            condition_names={"#cond_instance": "autoscale_instance_id"},
+            condition_values={":cond_instance": instance_id},
+        )
+
+    async def deactivate_autoscaled_endpoint(
+        self,
+        name: str,
+        *,
+        instance_id: str,
+        updated_by: str = "gpu-autoscaler",
+    ) -> None:
+        now = int(time.time())
+        await self._update_endpoint_fields(
+            name,
+            set_values={
+                "active": False,
+                "autoscale_updated_at": now,
+                "autoscale_lease_expires_at": 0,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            remove_fields=(
+                "ssh_url",
+                "public_inference_url",
+                "autoscale_instance_id",
+                *_ASSIGNMENT_FIELDS,
+            ),
+            condition_expression="#cond_instance = :cond_instance",
+            condition_names={"#cond_instance": "autoscale_instance_id"},
+            condition_values={":cond_instance": instance_id},
+        )
+
+    async def _update_endpoint_fields(
+        self,
+        name: str,
+        *,
+        set_values: Dict[str, Any],
+        remove_fields=(),
+        condition_expression: Optional[str] = None,
+        condition_names: Optional[Dict[str, str]] = None,
+        condition_values: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        from affine.database.client import get_client
+
+        names: Dict[str, str] = {}
+        values: Dict[str, Dict[str, Any]] = {}
+        set_parts = []
+        for idx, (field, value) in enumerate(set_values.items()):
+            name_key = f"#s{idx}"
+            value_key = f":v{idx}"
+            names[name_key] = field
+            values[value_key] = self._serialize({"value": value})["value"]
+            set_parts.append(f"{name_key} = {value_key}")
+
+        remove_parts = []
+        for idx, field in enumerate(remove_fields):
+            name_key = f"#r{idx}"
+            names[name_key] = field
+            remove_parts.append(name_key)
+
+        names.update(condition_names or {})
+        for key, value in (condition_values or {}).items():
+            values[key] = self._serialize({"value": value})["value"]
+
+        update_parts = []
+        if set_parts:
+            update_parts.append("SET " + ", ".join(set_parts))
+        if remove_parts:
+            update_parts.append("REMOVE " + ", ".join(remove_parts))
+
+        params = {
+            "TableName": self.table_name,
+            "Key": {"pk": {"S": self._make_pk(name)}},
+            "UpdateExpression": " ".join(update_parts),
+            "ExpressionAttributeNames": names,
+            "ExpressionAttributeValues": values,
+        }
+        if condition_expression:
+            params["ConditionExpression"] = condition_expression
+
+        client = get_client()
+        await client.update_item(**params)

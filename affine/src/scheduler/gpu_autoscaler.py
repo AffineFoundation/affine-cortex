@@ -594,7 +594,30 @@ class GPUAutoscaler:
             )
             await client.delete(handle.instance_id)
             return False
-        await self._endpoints.upsert(endpoint, updated_by="gpu-autoscaler")
+        try:
+            await self._endpoints.activate_autoscaled_endpoint(
+                endpoint,
+                updated_by="gpu-autoscaler",
+            )
+        except Exception as e:
+            logger.error(
+                "gpu-autoscaler: endpoint activation failed after create "
+                "endpoint=%s provider=%s instance=%s; deleting instance: "
+                "%s: %s",
+                endpoint.name,
+                slot.provider,
+                handle.instance_id,
+                type(e).__name__,
+                e,
+            )
+            deleted = await client.delete(handle.instance_id)
+            if not deleted:
+                logger.error(
+                    "gpu-autoscaler: failed to delete instance=%s after "
+                    "activation failure; manual cleanup may be required",
+                    handle.instance_id,
+                )
+            return False
         logger.info(
             "gpu-autoscaler: activated endpoint=%s provider=%s instance=%s",
             endpoint.name,
@@ -745,12 +768,23 @@ class GPUAutoscaler:
         lease_expires_at = handle.lease_expires_at
         if not lease_expires_at and config.lease_duration_seconds > 0:
             lease_expires_at = now + config.lease_duration_seconds
-        updated = replace(
-            endpoint,
-            autoscale_updated_at=now,
-            autoscale_lease_expires_at=lease_expires_at,
-        )
-        await self._endpoints.upsert(updated, updated_by="gpu-autoscaler")
+        try:
+            await self._endpoints.update_autoscale_lease(
+                endpoint.name,
+                instance_id=instance_id,
+                lease_expires_at=lease_expires_at,
+                updated_by="gpu-autoscaler",
+            )
+        except Exception as e:
+            logger.warning(
+                "gpu-autoscaler: failed to record renewed lease for "
+                "endpoint=%s instance=%s: %s: %s",
+                endpoint.name,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            return False
         logger.info(
             "gpu-autoscaler: renewed endpoint=%s provider=%s instance=%s "
             "lease_expires_at=%s",
@@ -816,36 +850,24 @@ class GPUAutoscaler:
         if not deleted:
             return False
 
+        endpoint_for_refs = replace(endpoint)
         try:
-            await self._endpoints.clear_assignment(
+            await self._endpoints.deactivate_autoscaled_endpoint(
                 endpoint.name,
+                instance_id=instance_id,
                 updated_by="gpu-autoscaler",
             )
         except Exception as e:
             logger.warning(
-                "gpu-autoscaler: clear_assignment endpoint=%s failed: %s",
+                "gpu-autoscaler: deactivate endpoint=%s instance=%s failed: "
+                "%s: %s",
                 endpoint.name,
+                instance_id,
+                type(e).__name__,
                 e,
             )
-        inactive = replace(
-            endpoint,
-            active=False,
-            ssh_url=None,
-            public_inference_url=None,
-            assigned_uid=None,
-            assigned_hotkey=None,
-            assigned_model=None,
-            assigned_revision=None,
-            deployment_id=None,
-            base_url=None,
-            assignment_role=None,
-            assigned_at=0,
-            autoscale_instance_id=None,
-            autoscale_updated_at=int(self._now()),
-            autoscale_lease_expires_at=0,
-        )
-        await self._endpoints.upsert(inactive, updated_by="gpu-autoscaler")
-        await self._clear_deployment_refs(endpoint)
+            return False
+        await self._clear_deployment_refs(endpoint_for_refs)
         logger.info(
             "gpu-autoscaler: deactivated endpoint=%s provider=%s instance=%s",
             endpoint.name,

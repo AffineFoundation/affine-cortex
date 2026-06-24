@@ -12,6 +12,7 @@ can be configured without baking private response schemas into the codebase.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import os
 from dataclasses import dataclass, field
@@ -20,6 +21,30 @@ from typing import Any, Dict, Iterable, Mapping, Optional
 import aiohttp
 
 from affine.core.setup import logger
+
+
+DEFAULT_TIMEOUT_SEC = 20 * 60
+
+
+class InstanceAPIError(RuntimeError):
+    """Base class for provider API failures."""
+
+
+class InstanceAPIHTTPError(InstanceAPIError):
+    def __init__(self, method: str, path: str, status_code: int, text: str):
+        self.method = method
+        self.path = path
+        self.status_code = status_code
+        self.text = text
+        super().__init__(f"{method} {path} -> HTTP {status_code}: {text[:400]}")
+
+
+class InstanceAPITimeoutError(InstanceAPIError):
+    pass
+
+
+class InstanceAPIRequestError(InstanceAPIError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -51,7 +76,7 @@ class InstanceAPIConfig:
     status_method: str = "GET"
     status_path: str = ""
     create_payload: Dict[str, Any] = field(default_factory=dict)
-    timeout_sec: int = 60
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC
     response_paths: Dict[str, Iterable[str]] = field(default_factory=dict)
 
     @classmethod
@@ -95,7 +120,7 @@ class InstanceAPIConfig:
                 if isinstance(data.get("create_payload"), Mapping)
                 else {}
             ),
-            timeout_sec=int(data.get("timeout_sec") or 60),
+            timeout_sec=int(data.get("timeout_sec") or DEFAULT_TIMEOUT_SEC),
             response_paths={
                 str(k): _coerce_paths(v)
                 for k, v in response_paths.items()
@@ -162,12 +187,21 @@ class InstanceAPIClient:
             dict(payload_overrides or {}),
         )
         payload = _render_template(payload, variables)
-        result = await self._request(
-            self.config.create_method,
-            path,
-            json=payload,
-            timeout=self.config.timeout_sec,
-        )
+        try:
+            result = await self._request(
+                self.config.create_method,
+                path,
+                json=payload,
+                timeout=self.config.timeout_sec,
+            )
+        except InstanceAPIError as e:
+            logger.warning(
+                "gpu-autoscaler: provider=%s create failed: %s: %s",
+                self.config.provider,
+                type(e).__name__,
+                e,
+            )
+            return None
         if not isinstance(result, Mapping):
             return None
         instance_id = self._extract(result, "instance_id")
@@ -201,12 +235,38 @@ class InstanceAPIClient:
             self.config.delete_path,
             {"instance_id": instance_id},
         )
-        result = await self._request(
-            self.config.delete_method,
-            path,
-            timeout=self.config.timeout_sec,
-            expect_json=False,
-        )
+        try:
+            result = await self._request(
+                self.config.delete_method,
+                path,
+                timeout=self.config.timeout_sec,
+                expect_json=False,
+            )
+        except InstanceAPIHTTPError as e:
+            if e.status_code == 404:
+                logger.info(
+                    "gpu-autoscaler: provider=%s instance=%s already deleted",
+                    self.config.provider,
+                    instance_id,
+                )
+                return True
+            logger.warning(
+                "gpu-autoscaler: provider=%s delete failed for instance=%s: %s",
+                self.config.provider,
+                instance_id,
+                e,
+            )
+            return False
+        except InstanceAPIError as e:
+            logger.warning(
+                "gpu-autoscaler: provider=%s delete failed for instance=%s: "
+                "%s: %s",
+                self.config.provider,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            return False
         return result is not None
 
     async def renew(self, instance_id: str) -> Optional[InstanceHandle]:
@@ -221,12 +281,23 @@ class InstanceAPIClient:
         variables = {"instance_id": instance_id}
         path = _render_template(self.config.renew_path, variables)
         payload = _render_template(self.config.renew_payload, variables)
-        result = await self._request(
-            self.config.renew_method,
-            path,
-            json=payload,
-            timeout=self.config.timeout_sec,
-        )
+        try:
+            result = await self._request(
+                self.config.renew_method,
+                path,
+                json=payload,
+                timeout=self.config.timeout_sec,
+            )
+        except InstanceAPIError as e:
+            logger.warning(
+                "gpu-autoscaler: provider=%s renew failed for instance=%s: "
+                "%s: %s",
+                self.config.provider,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            return None
         if not isinstance(result, Mapping):
             return None
         return InstanceHandle(
@@ -247,11 +318,22 @@ class InstanceAPIClient:
             self.config.status_path,
             {"instance_id": instance_id},
         )
-        result = await self._request(
-            self.config.status_method,
-            path,
-            timeout=self.config.timeout_sec,
-        )
+        try:
+            result = await self._request(
+                self.config.status_method,
+                path,
+                timeout=self.config.timeout_sec,
+            )
+        except InstanceAPIError as e:
+            logger.warning(
+                "gpu-autoscaler: provider=%s status failed for instance=%s: "
+                "%s: %s",
+                self.config.provider,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            return None
         return dict(result) if isinstance(result, Mapping) else None
 
     def _headers(self) -> Dict[str, str]:
@@ -288,14 +370,9 @@ class InstanceAPIClient:
                 ) as resp:
                     text = await resp.text()
                     if resp.status >= 400:
-                        logger.warning(
-                            "gpu-autoscaler: %s %s -> HTTP %s: %s",
-                            method,
-                            path,
-                            resp.status,
-                            text[:400],
+                        raise InstanceAPIHTTPError(
+                            method, path, resp.status, text,
                         )
-                        return None
                     if resp.status == 204 or not text:
                         return {}
                     if not expect_json:
@@ -304,15 +381,14 @@ class InstanceAPIClient:
                         return await resp.json(content_type=None)
                     except Exception:
                         return {"_raw": text}
-        except Exception as e:
-            logger.warning(
-                "gpu-autoscaler: %s %s failed: %s: %s",
-                method,
-                path,
-                type(e).__name__,
-                e,
-            )
-            return None
+        except asyncio.TimeoutError as e:
+            raise InstanceAPITimeoutError(
+                f"{method} {path} timed out after {timeout}s"
+            ) from e
+        except aiohttp.ClientError as e:
+            raise InstanceAPIRequestError(
+                f"{method} {path} transport failed: {e}"
+            ) from e
 
     def _extract(self, payload: Mapping[str, Any], field: str) -> Optional[str]:
         paths = self.config.response_paths.get(field)
