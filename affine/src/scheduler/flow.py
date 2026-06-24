@@ -4,8 +4,8 @@ Flow scheduler — replaces the old window-state-machine driver.
 One block tick:
 
   1. Bootstrap task_ids if never refreshed.
-  2. Refresh task_ids if 7200 blocks elapsed AND no battle in flight
-     (don't disrupt a contest mid-flow).
+  2. Refresh task_ids if the configured refresh interval elapsed AND no
+     battle is in flight (don't disrupt a contest mid-flow).
   3. Sync champion uid from their hotkey; if the hotkey is offline,
      keep the champion identity and use a burn sentinel uid.
   4. No champion because the system is truly uninitialized →
@@ -33,6 +33,7 @@ record shape itself tells us where we are.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
@@ -148,7 +149,17 @@ import math
 import time
 
 WINDOW_BLOCKS = 7200
-"""How often the per-env task_id pool is regenerated (7200 blocks ≈ 1 day)."""
+"""Logical scheduler window size for window_id bucketing."""
+
+TASK_POOL_REFRESH_BLOCKS_ENV = "SCHEDULER_TASK_POOL_REFRESH_BLOCKS"
+"""Optional env var that controls how often the task_id pool refreshes."""
+
+
+def _task_pool_refresh_blocks_from_env() -> Optional[int]:
+    raw = os.getenv(TASK_POOL_REFRESH_BLOCKS_ENV)
+    if raw is None or raw.strip() == "":
+        return None
+    return max(1, int(raw))
 
 DEFAULT_MARGIN = 0.03
 """Per-env additive margin the challenger must clear to be ``dominant``."""
@@ -204,6 +215,7 @@ non-ssh providers don't need it."""
 @dataclass
 class FlowConfig:
     window_blocks: int = WINDOW_BLOCKS
+    task_pool_refresh_blocks: Optional[int] = None
     scorer_hotkey: str = "scheduler"
     single_instance_provider: bool = False
     """True when the inference provider hosts only one model at a time
@@ -217,6 +229,13 @@ class FlowConfig:
     re-deploys champion fresh. Targon-style multi-instance providers
     leave this False — each deployment is independent and survives
     its sibling's teardown."""
+
+    def __post_init__(self) -> None:
+        if self.task_pool_refresh_blocks is None:
+            self.task_pool_refresh_blocks = _task_pool_refresh_blocks_from_env()
+        if self.task_pool_refresh_blocks is None:
+            self.task_pool_refresh_blocks = self.window_blocks
+        self.task_pool_refresh_blocks = max(1, int(self.task_pool_refresh_blocks))
 
 
 class FlowScheduler:
@@ -287,7 +306,8 @@ class FlowScheduler:
         # 1 + 2. Task-id pool refresh (between battles only).
         if task_state is None or (
             battle is None
-            and current_block - task_state.refreshed_at_block >= self.cfg.window_blocks
+            and current_block - task_state.refreshed_at_block
+            >= self.cfg.task_pool_refresh_blocks
         ):
             task_state = await self._refresh_task_ids(current_block, envs)
             return  # let executors warm up on the new pool

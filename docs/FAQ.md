@@ -33,7 +33,7 @@ The validator pulls your weights from HuggingFace, runs them through its configu
 
 **Q5: How does the queue work?**
 
-Every ~7200 blocks (~24h) the scorer opens a new "window". It picks the earliest-submitted not-yet-challenged miner (ordered by `first_block` on chain) and runs both that challenger and the current champion through every environment in parallel on Targon. After all sampling completes, the comparator applies a strict **all-envs-better** rule:
+By default every ~7200 blocks (~24h), the scorer opens a new "window". It picks the earliest-submitted not-yet-challenged miner (ordered by `first_block` on chain) and runs both that challenger and the current champion through every environment in parallel on Targon. After all sampling completes, the comparator applies a strict **all-envs-better** rule:
 
 - For the challenger to dethrone the champion, **every** environment's mean score must beat the champion's by at least the per-env `margin`, **and** the challenger must have collected at least `min_tasks_per_env` successful samples.
 - Otherwise the challenger is permanently terminated (no second shot on the same hotkey).

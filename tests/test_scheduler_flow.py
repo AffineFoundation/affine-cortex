@@ -307,7 +307,7 @@ def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
 
 def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
-    window_blocks=WINDOW_BLOCKS,
+    window_blocks=WINDOW_BLOCKS, task_pool_refresh_blocks=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -323,7 +323,10 @@ def _build_scheduler(
         ]
 
     scheduler = FlowScheduler(
-        config=FlowConfig(window_blocks=window_blocks),
+        config=FlowConfig(
+            window_blocks=window_blocks,
+            task_pool_refresh_blocks=task_pool_refresh_blocks,
+        ),
         state=state,
         queue=queue,
         sampler=sampler,
@@ -339,6 +342,30 @@ def _build_scheduler(
 
 
 # ---- tests -----------------------------------------------------------------
+
+
+def test_flow_config_task_pool_refresh_defaults_to_window_blocks(monkeypatch):
+    monkeypatch.delenv("SCHEDULER_TASK_POOL_REFRESH_BLOCKS", raising=False)
+
+    cfg = FlowConfig(window_blocks=123)
+
+    assert cfg.task_pool_refresh_blocks == 123
+
+
+def test_flow_config_task_pool_refresh_reads_env(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_TASK_POOL_REFRESH_BLOCKS", "456")
+
+    cfg = FlowConfig(window_blocks=123)
+
+    assert cfg.task_pool_refresh_blocks == 456
+
+
+def test_flow_config_explicit_task_pool_refresh_beats_env(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_TASK_POOL_REFRESH_BLOCKS", "456")
+
+    cfg = FlowConfig(window_blocks=123, task_pool_refresh_blocks=789)
+
+    assert cfg.task_pool_refresh_blocks == 789
 
 
 @pytest.mark.asyncio
@@ -358,6 +385,35 @@ async def test_first_tick_refreshes_task_ids_then_returns():
     assert task_state is not None
     assert set(task_state.task_ids.keys()) == {"ENV_A", "ENV_B"}
     assert task_state.refreshed_at_block == 50
+
+
+@pytest.mark.asyncio
+async def test_task_pool_refresh_interval_is_independent_from_window_id_blocks():
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+    ])
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=_DeployTracker(),
+        samples=_SamplesFake(),
+        window_blocks=WINDOW_BLOCKS,
+        task_pool_refresh_blocks=WINDOW_BLOCKS * 10,
+    )
+
+    await scheduler.tick(current_block=50)
+    first_task = await state.get_task_state()
+    assert first_task.refreshed_at_block == 50
+
+    # window_blocks elapsed, but task_pool_refresh_blocks has not.
+    await scheduler.tick(current_block=50 + WINDOW_BLOCKS + 1)
+    same_task = await state.get_task_state()
+    assert same_task.refreshed_at_block == 50
+
+    await scheduler.tick(current_block=50 + WINDOW_BLOCKS * 10 + 1)
+    refreshed_task = await state.get_task_state()
+    assert refreshed_task.refreshed_at_block == 50 + WINDOW_BLOCKS * 10 + 1
 
 
 @pytest.mark.asyncio
@@ -387,7 +443,7 @@ async def test_task_refresh_blocked_during_battle():
     assert battle is not None and battle.challenger.uid == 2
     first_refresh = task_state.refreshed_at_block
 
-    # Jump forward 7200 blocks while battle still in flight — must NOT refresh.
+    # Jump forward many refresh intervals while battle is in flight — no refresh.
     await scheduler.tick(current_block=52 + WINDOW_BLOCKS * 100)
     new_task = await state.get_task_state()
     assert new_task.refreshed_at_block == first_refresh
@@ -1305,7 +1361,11 @@ async def test_single_instance_clears_champion_deployment_at_refresh():
                 if str(r.get("is_valid", "")).lower() == "true"]
 
     scheduler = FlowScheduler(
-        config=FlowConfig(window_blocks=WINDOW_BLOCKS, single_instance_provider=True),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            task_pool_refresh_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
         state=state, queue=queue, sampler=sampler,
         comparator=comparator, weight_writer=weight_writer,
         deploy_fn=deployer.deploy, teardown_fn=deployer.teardown,
@@ -1319,8 +1379,8 @@ async def test_single_instance_clears_champion_deployment_at_refresh():
     champ_before = await state.get_champion()
     assert champ_before.deployment_id == "wrk-001"
 
-    # Force a refresh by advancing block past window_blocks. Battle is
-    # None, so refresh fires.
+    # Force a refresh by advancing past the default refresh interval.
+    # Battle is None, so refresh fires.
     await scheduler.tick(current_block=50 + WINDOW_BLOCKS + 1)
     champ_after = await state.get_champion()
     assert champ_after.deployment_id is None, (
@@ -1354,7 +1414,11 @@ async def test_single_instance_clears_champion_on_challenger_loss():
                 if str(r.get("is_valid", "")).lower() == "true"]
 
     scheduler = FlowScheduler(
-        config=FlowConfig(window_blocks=WINDOW_BLOCKS, single_instance_provider=True),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            task_pool_refresh_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
         state=state, queue=queue, sampler=sampler,
         comparator=comparator, weight_writer=weight_writer,
         deploy_fn=deployer.deploy, teardown_fn=deployer.teardown,
@@ -1567,7 +1631,11 @@ async def test_single_instance_loss_skips_champion_redeploy_when_queue_nonempty(
                 if str(r.get("is_valid", "")).lower() == "true"]
 
     scheduler = FlowScheduler(
-        config=FlowConfig(window_blocks=WINDOW_BLOCKS, single_instance_provider=True),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            task_pool_refresh_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
         state=state, queue=queue, sampler=sampler,
         comparator=comparator, weight_writer=weight_writer,
         deploy_fn=deployer.deploy, teardown_fn=deployer.teardown,
@@ -1637,7 +1705,11 @@ async def test_single_instance_loss_redeploys_champion_when_queue_empty():
                 if str(r.get("is_valid", "")).lower() == "true"]
 
     scheduler = FlowScheduler(
-        config=FlowConfig(window_blocks=WINDOW_BLOCKS, single_instance_provider=True),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            task_pool_refresh_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
         state=state, queue=queue, sampler=sampler,
         comparator=comparator, weight_writer=weight_writer,
         deploy_fn=deployer.deploy, teardown_fn=deployer.teardown,

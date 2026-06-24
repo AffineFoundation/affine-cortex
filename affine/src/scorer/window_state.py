@@ -100,7 +100,8 @@ class BattleRecord:
 @dataclass
 class TaskIdState:
     """Per-env task_id pool the executor evaluates against. Regenerated
-    every ~7200 blocks (always between battles)."""
+    on the scheduler refresh interval (default ~7200 blocks, always
+    between battles)."""
     task_ids: Dict[str, List[int]] = field(default_factory=dict)
     refreshed_at_block: int = 0
 
