@@ -119,24 +119,18 @@ class MinerStatsDAO(BaseDAO):
         values = {
             ":hotkey": {"S": hotkey},
             ":revision": {"S": revision},
-            ":model": {"S": model},
             ":now": {"N": str(now)},
             ":online": {"BOOL": is_online},
             ":sampling": {"S": self.STATUS_SAMPLING},
             ":empty": {"S": ""},
             ":zero": {"N": "0"},
-            ":model_hash": {"S": model_hash or ""},
-            ":model_type": {"S": model_type or ""},
         }
         update_parts = [
             "hotkey = :hotkey",
             "revision = :revision",
-            "model = :model",
-            "model_type = :model_type",
             "last_updated_at = :now",
             "first_seen_at = if_not_exists(first_seen_at, :now)",
             "is_currently_online = :online",
-            "model_hash = :model_hash",
             "challenge_status = if_not_exists(challenge_status, :sampling)",
             "termination_reason = if_not_exists(termination_reason, :empty)",
             "challenge_consecutive_wins = if_not_exists(challenge_consecutive_wins, :zero)",
@@ -145,12 +139,21 @@ class MinerStatsDAO(BaseDAO):
             "challenge_consecutive_losses = if_not_exists(challenge_consecutive_losses, :zero)",
             "challenge_checkpoints_passed = if_not_exists(challenge_checkpoints_passed, :zero)",
         ]
+        if model:
+            values[":model"] = {"S": model}
+            update_parts.append("model = :model")
+        if model_hash:
+            values[":model_hash"] = {"S": model_hash}
+            update_parts.append("model_hash = :model_hash")
+        if model_type:
+            values[":model_type"] = {"S": model_type}
+            update_parts.append("model_type = :model_type")
         if uid is not None:
             values[":uid"] = {"N": str(uid)}
             update_parts.append("#uid = :uid")
         if first_block is not None:
             values[":first_block"] = {"N": str(first_block)}
-            update_parts.append("first_block = :first_block")
+            update_parts.append("first_block = if_not_exists(first_block, :first_block)")
         if block_number is not None:
             values[":block_number"] = {"N": str(block_number)}
             update_parts.append("block_number = :block_number")
