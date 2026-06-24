@@ -6,7 +6,7 @@ import click
 
 from affine.database import close_client, init_client
 from affine.database.dao.system_config import SystemConfigDAO
-from affine.src.scheduler.flow import WINDOW_BLOCKS
+from affine.src.scheduler.flow import FlowConfig
 from affine.src.scorer.challenger_queue import ChallengerQueue
 from affine.src.scorer.dao_adapters import MinersQueueAdapter
 from affine.src.scorer.window_state import (
@@ -46,7 +46,8 @@ async def rotate_window_command(*, commit: bool = False) -> None:
 
         subtensor = await get_subtensor()
         current_block = int(await subtensor.get_current_block())
-        stale_block = current_block - WINDOW_BLOCKS - 1
+        refresh_blocks = int(FlowConfig().task_pool_refresh_blocks)
+        stale_block = current_block - refresh_blocks - 1
 
         click.echo(f"current_block      = {current_block}")
         click.echo(
@@ -80,7 +81,7 @@ async def rotate_window_command(*, commit: bool = False) -> None:
             elapsed = current_block - task_state.refreshed_at_block
             click.echo(
                 f"refreshed_at_block = {task_state.refreshed_at_block} "
-                f"(elapsed {elapsed} / {WINDOW_BLOCKS} blocks)"
+                f"(elapsed {elapsed} / {refresh_blocks} blocks)"
             )
             for env, ids in sorted(task_state.task_ids.items()):
                 click.echo(f"    {env:<14} {len(ids)} task_ids")

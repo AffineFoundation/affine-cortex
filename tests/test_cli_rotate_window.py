@@ -6,6 +6,7 @@ from click.testing import CliRunner
 
 from affine.cli.main import cli
 import affine.src.scheduler.commands as scheduler_commands
+from affine.src.scheduler.flow import WINDOW_BLOCKS
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
@@ -157,10 +158,33 @@ def test_rotate_window_commit_releases_stales_then_clears(monkeypatch):
     # Confirm the sampling service is stopped.
     result = CliRunner().invoke(cli, ["db", "rotate-window", "--commit"], input="y\n")
 
-    stale_block = 1000 - scheduler_commands.WINDOW_BLOCKS - 1
+    stale_block = 1000 - WINDOW_BLOCKS - 1
     assert result.exit_code == 0
     assert store.ops == [
         ("release_claim", 2, "chal_hk", "chal_rev"),
         ("set_task_state", stale_block),
+        ("clear_battle",),
+    ]
+
+
+def test_rotate_window_uses_configured_task_pool_refresh_blocks(monkeypatch):
+    store = _Store(battle=_battle())
+    _install_command_fakes(monkeypatch, store, current_block=1000)
+    monkeypatch.setenv("SCHEDULER_TASK_POOL_REFRESH_BLOCKS", "123")
+
+    class _Queue:
+        async def release_claim(self, uid, *, hotkey=None, revision=None):
+            store.ops.append(("release_claim", uid, hotkey, revision))
+            return True
+
+    monkeypatch.setattr(scheduler_commands, "MinersQueueAdapter", lambda: object())
+    monkeypatch.setattr(scheduler_commands, "ChallengerQueue", lambda adapter: _Queue())
+
+    result = CliRunner().invoke(cli, ["db", "rotate-window", "--commit"], input="y\n")
+
+    assert result.exit_code == 0
+    assert store.ops == [
+        ("release_claim", 2, "chal_hk", "chal_rev"),
+        ("set_task_state", 876),
         ("clear_battle",),
     ]
