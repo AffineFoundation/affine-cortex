@@ -1136,6 +1136,12 @@ class GPUAutoscaler:
                 slot,
                 updated_by=updated_by,
             )
+            if not new_created:
+                raise RuntimeError(
+                    f"failed to create replacement endpoint from slot "
+                    f"{slot.name!r}; old endpoint {old_endpoint_name!r} "
+                    "was already deleted"
+                )
         else:
             new_created = await self._scale_up_slot(
                 config,

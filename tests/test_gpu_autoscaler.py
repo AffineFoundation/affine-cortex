@@ -1125,6 +1125,39 @@ async def test_replace_same_endpoint_keeps_instance_id_when_delete_fails():
 
 
 @pytest.mark.asyncio
+async def test_replace_same_endpoint_raises_when_new_create_fails():
+    _Client.create_returns_none_for_names = {"lium-b200-1"}
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=2000)
+
+    with pytest.raises(RuntimeError, match="was already deleted"):
+        await autoscaler.replace_endpoint(
+            _config(),
+            old_endpoint_name="lium-b200-1",
+        )
+
+    assert _Client.events == [
+        ("drain", "lium-b200-1", "old-inst"),
+        ("delete", "old-inst"),
+        ("deactivate", "lium-b200-1", "old-inst"),
+        ("create", "lium-b200-1"),
+    ]
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.active is False
+    assert ep.autoscale_instance_id is None
+
+
+@pytest.mark.asyncio
 async def test_replace_refuses_keep_old_with_same_slot():
     kv = InMemoryConfigStore()
     endpoint = Endpoint(
