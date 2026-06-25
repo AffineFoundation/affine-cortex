@@ -317,6 +317,48 @@ async def test_retryable_model_check_preserves_previously_valid_miner(monkeypatc
     assert info.terminate_stats is False
 
 
+@pytest.mark.asyncio
+async def test_retryable_model_check_rejects_cached_type_outside_current_policy(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.QWEN36_ONLY_ENFORCE_BLOCK",
+        0,
+    )
+    monitor = _build_monitor(cfg_enabled=True)
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_retryable_xyz",
+        "revision": "rev",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_type": "qwen3",
+    })
+    monitor._get_model_info = _hot_get_model_info
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_model_size",
+        _async_retryable_size_failure,
+    )
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_template_safety",
+        _async_safe,
+    )
+
+    info = await monitor._validate_miner(
+        uid=42, hotkey="hk_retryable_xyz",
+        model="org/affine-model-hk_retryable_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.invalid_reason == (
+        "model_check:model_type=qwen3 (expected one of: qwen3_5_moe)"
+    )
+    assert info.model_type == "qwen3"
+    assert info.permanent_invalid is True
+    assert info.terminate_stats is True
+
+
 # ---- step 8.1: anticopy verdict → invalid ------------------------------------
 
 

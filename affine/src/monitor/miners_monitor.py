@@ -22,7 +22,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Collection, Dict, Optional, Tuple
 
 from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_url
 from huggingface_hub.errors import (
@@ -117,6 +117,10 @@ def _same_model_revision(
         and _as_str(row.get("model")) == model
         and _as_str(row.get("revision")) == revision
     )
+
+
+def _format_model_types(model_types: Collection[str]) -> str:
+    return ", ".join(sorted(str(model_type) for model_type in model_types))
 
 
 @dataclass
@@ -410,10 +414,37 @@ class MinersMonitor:
             info.model_type = str(size_result.get("model_type") or "")
             if not size_result.get("pass"):
                 retryable = bool(size_result.get("retryable"))
+                same_existing = _same_model_revision(existing, model, revision)
+                existing_model_type = (
+                    str(existing.get("model_type") or "") if same_existing else ""
+                )
+                cached_type_allowed = (
+                    allowed_model_types is None
+                    or (
+                        bool(existing_model_type)
+                        and existing_model_type in allowed_model_types
+                    )
+                )
                 if (
                     retryable
-                    and _same_model_revision(existing, model, revision)
+                    and allowed_model_types is not None
+                    and existing_model_type
+                    and existing_model_type not in allowed_model_types
+                ):
+                    info.model_type = existing_model_type
+                    info.mark_invalid(
+                        "model_check:"
+                        f"model_type={existing_model_type} "
+                        f"(expected one of: {_format_model_types(allowed_model_types)})",
+                        permanent=True,
+                        terminate_stats=True,
+                    )
+                    return info
+                if (
+                    retryable
+                    and same_existing
                     and _truthy(existing.get("is_valid"))
+                    and cached_type_allowed
                 ):
                     info.is_valid = True
                     info.model_type = str(
