@@ -15,6 +15,7 @@ to deploy SGLang via Docker exactly as it does for static SSH endpoints.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -23,7 +24,7 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterable, List, Mapping, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
@@ -167,6 +168,14 @@ class TargonAutoscaleClient:
         )
 
     def _create_with_resource(self, name: str, resource_name: str) -> dict:
+        existing = self._adopt_existing_workload(
+            name,
+            resource_name,
+            attempts=1,
+        )
+        if existing:
+            return existing
+
         uid = ""
         try:
             result = self.request(
@@ -176,6 +185,13 @@ class TargonAutoscaleClient:
             )
             uid = _instance_id(result)
             if not uid:
+                existing = self._adopt_existing_workload(
+                    name,
+                    resource_name,
+                    attempts=5,
+                )
+                if existing:
+                    return existing
                 raise TargonWrapperError(
                     f"Targon create response did not include uid: {result}"
                 )
@@ -184,6 +200,14 @@ class TargonAutoscaleClient:
             ready["resource_name"] = resource_name
             return ready
         except Exception:
+            if not uid:
+                existing = self._adopt_existing_workload(
+                    name,
+                    resource_name,
+                    attempts=5,
+                )
+                if existing:
+                    return existing
             if uid:
                 try:
                     self.delete(uid, force=True)
@@ -261,6 +285,59 @@ class TargonAutoscaleClient:
                 if isinstance(value, list):
                     return [x for x in value if isinstance(x, dict)]
         return []
+
+    def _adopt_existing_workload(
+        self,
+        name: str,
+        resource_name: str,
+        *,
+        attempts: int = 5,
+    ) -> Optional[dict]:
+        uid = self.find_workload_by_name(name, attempts=attempts)
+        if not uid:
+            return None
+        self._ensure_deployed(uid)
+        ready = self.wait_ready(uid)
+        ready["resource_name"] = ready.get("resource_name") or resource_name
+        return ready
+
+    def find_workload_by_name(self, name: str, *, attempts: int = 5) -> str:
+        for _ in range(max(1, attempts)):
+            for workload in self.items(self.request("GET", "/workloads")):
+                if str(workload.get("name") or "") != name:
+                    continue
+                status = _status(workload)
+                if _terminal_status(status):
+                    continue
+                uid = _instance_id(workload)
+                if uid:
+                    return uid
+            time.sleep(1)
+        return ""
+
+    def _ensure_deployed(self, uid: str) -> None:
+        workload = self._safe_get_workload(uid)
+        state = self._safe_get_state(uid)
+        merged = _merge_workload_state(workload, state)
+        status = _status(merged)
+        if status in {
+            "running",
+            "ready",
+            "active",
+            "healthy",
+            "provisioning",
+            "deploying",
+            "rebuilding",
+        }:
+            return
+        try:
+            self.request("POST", f"/workloads/{uid}/deploy")
+        except Exception as e:
+            print(
+                f"warning: failed to deploy adopted Targon workload {uid}: "
+                f"{type(e).__name__}: {e}",
+                flush=True,
+            )
 
     def wait_ready(self, uid: str) -> dict:
         start = time.time()
@@ -350,17 +427,26 @@ class TargonAutoscaleClient:
             )
         return ok
 
-    def delete(self, uid: str, *, force: bool = False) -> bool:
+    def delete(
+        self,
+        uid: str,
+        *,
+        force: bool = False,
+        expected_purpose: str = "",
+    ) -> bool:
         if not force:
             try:
                 workload = self.request("GET", f"/workloads/{uid}")
             except TargonNotFound:
                 return True
             name = str(workload.get("name") or "")
-            if not _owned_workload_name(name):
+            if not _owned_workload_name(
+                name,
+                expected_purpose=expected_purpose,
+            ):
                 raise TargonWrapperError(
                     f"Refusing to delete non-autoscaler Targon workload "
-                    f"{uid} name={name!r}"
+                    f"{uid} name={name!r} purpose={expected_purpose or '*'}"
                 )
         try:
             self.request("DELETE", f"/workloads/{uid}")
@@ -494,6 +580,10 @@ def _instance_id(data: Mapping[str, Any]) -> str:
 def _status(data: Mapping[str, Any]) -> str:
     state = data.get("state") if isinstance(data.get("state"), dict) else {}
     return str(data.get("status") or state.get("status") or "").lower()
+
+
+def _terminal_status(status: str) -> bool:
+    return status in {"failed", "error", "terminated", "deleted"}
 
 
 def _running(data: Mapping[str, Any]) -> bool:
@@ -666,14 +756,39 @@ def _parse_ssh_url(url: str) -> tuple[str, str, int]:
 
 
 def _safe_suffix(value: str) -> str:
-    return "".join(
-        c if c.isalnum() or c == "-" else "-"
-        for c in value.lower()
-    ).strip("-")
+    return _safe_token(value)
 
 
-def _owned_workload_name(name: str) -> bool:
-    return name == NAME_PREFIX or name.startswith(f"{NAME_PREFIX}-")
+def _safe_token(value: Any, *, default: str = "") -> str:
+    text = str(value or "").strip().lower()
+    safe = "".join(c if c.isalnum() or c == "-" else "-" for c in text)
+    safe = "-".join(part for part in safe.split("-") if part)
+    return safe or default
+
+
+def _resource_name(*, purpose: str, suffix: str, max_len: int) -> str:
+    purpose = _safe_token(purpose, default="eval")
+    suffix = _safe_token(suffix, default=str(int(time.time())))
+    raw = f"{NAME_PREFIX}-{purpose}-{suffix}".strip("-")
+    if len(raw) <= max_len:
+        return raw
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
+    fixed_len = len(NAME_PREFIX) + len(purpose) + len(digest) + 3
+    suffix_budget = max(1, max_len - fixed_len)
+    return (
+        f"{NAME_PREFIX}-{purpose}-{suffix[:suffix_budget]}-{digest}"[:max_len]
+        .strip("-")
+    )
+
+
+def _owned_workload_name(name: str, *, expected_purpose: str = "") -> bool:
+    if not (name == NAME_PREFIX or name.startswith(f"{NAME_PREFIX}-")):
+        return False
+    expected = _safe_token(expected_purpose)
+    if not expected:
+        return True
+    purpose_prefix = f"{NAME_PREFIX}-{expected}"
+    return name == purpose_prefix or name.startswith(f"{purpose_prefix}-")
 
 
 def _redacted(payload: Mapping[str, Any]) -> dict:
@@ -734,8 +849,11 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length).decode("utf-8") if length else "{}"
             data = json.loads(raw or "{}")
-            suffix = _safe_suffix(str(data.get("endpoint_name") or int(time.time())))
-            name = f"{NAME_PREFIX}-{suffix}"[:32].strip("-")
+            name = _resource_name(
+                purpose=str(data.get("purpose") or "eval"),
+                suffix=str(data.get("endpoint_name") or int(time.time())),
+                max_len=32,
+            )
             result = TargonAutoscaleClient().create(name)
             self._send(200, result)
         except Exception as e:
@@ -751,7 +869,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
             return
         try:
-            ok = TargonAutoscaleClient().delete(parts[1])
+            expected_purpose = _expected_purpose(self, parsed)
+            ok = TargonAutoscaleClient().delete(
+                parts[1],
+                expected_purpose=expected_purpose,
+            )
             self._send(200, {"ok": ok})
         except Exception as e:
             self._send(500, {"error": type(e).__name__, "message": str(e)})
@@ -763,6 +885,19 @@ class Handler(BaseHTTPRequestHandler):
             fmt % args,
             flush=True,
         )
+
+
+def _expected_purpose(handler: BaseHTTPRequestHandler, parsed) -> str:
+    query = parse_qs(parsed.query)
+    if query.get("purpose"):
+        return _safe_token(query["purpose"][0])
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+        raw = handler.rfile.read(length).decode("utf-8") if length else "{}"
+        data = json.loads(raw or "{}")
+    except Exception:
+        return ""
+    return _safe_token(data.get("purpose"))
 
 
 def main() -> None:

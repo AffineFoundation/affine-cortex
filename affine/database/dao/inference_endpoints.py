@@ -76,6 +76,7 @@ class Endpoint:
     autoscale_managed: bool = False
     autoscale_provider: Optional[str] = None
     autoscale_instance_id: Optional[str] = None
+    autoscale_purpose: Optional[str] = None
     autoscale_created_at: int = 0
     autoscale_updated_at: int = 0
     autoscale_lease_expires_at: int = 0
@@ -345,6 +346,7 @@ class InferenceEndpointsDAO(BaseDAO):
                 "ssh_url",
                 "public_inference_url",
                 "autoscale_instance_id",
+                "autoscale_purpose",
                 *_ASSIGNMENT_FIELDS,
             ),
             condition_expression="#cond_instance = :cond_instance",

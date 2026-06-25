@@ -38,6 +38,110 @@ def test_delete_refuses_pods_without_owned_name_prefix():
     assert calls == []
 
 
+def test_delete_refuses_owned_pod_with_wrong_purpose():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+    calls = []
+
+    def request(method, path, **kwargs):
+        if method == "GET":
+            return {"uid": "pod-1", "pod_name": "affine-autoscale-bench-a"}
+        calls.append((method, path))
+        return {}
+
+    client.request = request
+
+    with pytest.raises(lium.LiumWrapperError, match="purpose=eval"):
+        client.delete("pod-1", expected_purpose="eval")
+
+    assert calls == []
+
+
+def test_delete_allows_matching_purpose_and_legacy_without_expected_purpose():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+    pods = [
+        {"uid": "pod-1", "pod_name": "affine-autoscale-eval-a"},
+        {"uid": "pod-2", "pod_name": "affine-autoscale-a"},
+    ]
+    deleted = []
+
+    def request(method, path, **kwargs):
+        if method == "GET":
+            return pods.pop(0)
+        deleted.append(path)
+        return {}
+
+    client.request = request
+
+    assert client.delete("pod-1", expected_purpose="eval") is True
+    assert client.delete("pod-2") is True
+    assert deleted == ["/pods/pod-1", "/pods/pod-2"]
+
+
+def test_resource_name_includes_purpose_and_keeps_length_limit():
+    lium = _load_wrapper()
+
+    name = lium._resource_name(
+        purpose="Bench",
+        suffix="lium-b200-autoscale-primary-extra-long",
+        max_len=32,
+    )
+
+    assert name.startswith("affine-autoscale-bench-")
+    assert len(name) <= 32
+
+
+def test_create_adopts_existing_pod_by_name_without_renting():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append((method, path))
+        if (method, path) == ("GET", "/pods"):
+            return {
+                "pods": [
+                    {
+                        "uid": "pod-existing",
+                        "pod_name": "affine-autoscale-eval-a",
+                        "status": "running",
+                    }
+                ]
+            }
+        raise AssertionError((method, path))
+
+    client.request = request
+    client.select_executor = lambda: (_ for _ in ()).throw(
+        AssertionError("should not select executor")
+    )
+    client.wait_ready = lambda uid: {"instance_id": uid}
+
+    result = client.create("affine-autoscale-eval-a")
+
+    assert result == {"instance_id": "pod-existing"}
+    assert calls == [("GET", "/pods")]
+
+
+def test_create_adopts_existing_pod_when_rent_response_fails():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+    find_results = ["", "pod-orphan"]
+
+    client.select_executor = lambda: {"id": "exec-1"}
+    client.resolve_template_id = lambda: "template-1"
+    client.resolve_ssh_public_key = lambda: "ssh-rsa test"
+    client.find_pod_by_name = lambda name, **kwargs: find_results.pop(0)
+    client.request = lambda *args, **kwargs: (_ for _ in ()).throw(
+        RuntimeError("provider returned 500 after creating")
+    )
+    client.wait_ready = lambda uid: {"instance_id": uid}
+
+    result = client.create("affine-autoscale-eval-a")
+
+    assert result == {"instance_id": "pod-orphan"}
+
+
 def test_delete_treats_missing_owned_pod_as_success():
     lium = _load_wrapper()
     client = lium.LiumClient.__new__(lium.LiumClient)

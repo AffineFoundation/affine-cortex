@@ -36,6 +36,8 @@ def test_create_registers_deploys_and_returns_provider_handle(monkeypatch):
 
     def request(self, method, path, **kwargs):
         calls.append((method, path, kwargs.get("json")))
+        if (method, path) == ("GET", "/workloads"):
+            return {"workloads": []}
         if (method, path) == ("POST", "/workloads"):
             body = kwargs["json"]
             assert body["name"] == "affine-autoscale-a"
@@ -74,10 +76,149 @@ def test_create_registers_deploys_and_returns_provider_handle(monkeypatch):
         result["public_inference_url"]
         == "https://wrk-test-10001.caas.targon.com/v1"
     )
-    assert calls[:2] == [
-        ("POST", "/workloads", calls[0][2]),
+    assert calls[:3] == [
+        ("GET", "/workloads", None),
+        ("POST", "/workloads", calls[1][2]),
         ("POST", "/workloads/wrk-test/deploy", None),
     ]
+
+
+def test_create_adopts_existing_workload_by_name_without_registering(
+    monkeypatch,
+):
+    wrapper = _load_wrapper(monkeypatch)
+    calls = []
+
+    def request(self, method, path, **kwargs):
+        calls.append((method, path))
+        if (method, path) == ("GET", "/workloads"):
+            return {
+                "workloads": [
+                    {
+                        "uid": "wrk-existing",
+                        "name": "affine-autoscale-eval-a",
+                        "status": "RUNNING",
+                    }
+                ]
+            }
+        if (method, path) == ("GET", "/workloads/wrk-existing"):
+            return {
+                "uid": "wrk-existing",
+                "name": "affine-autoscale-eval-a",
+                "status": "RUNNING",
+            }
+        if (method, path) == ("GET", "/workloads/wrk-existing/state"):
+            return {
+                "status": "RUNNING",
+                "ready_replicas": 1,
+                "urls": [
+                    {
+                        "port": 10001,
+                        "url": "https://wrk-existing-10001.caas.targon.com",
+                    }
+                ],
+            }
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    result = wrapper.TargonAutoscaleClient().create("affine-autoscale-eval-a")
+
+    assert result["instance_id"] == "wrk-existing"
+    assert ("POST", "/workloads") not in calls
+    assert ("POST", "/workloads/wrk-existing/deploy") not in calls
+
+
+def test_create_deploys_adopted_workload_when_left_registered(
+    monkeypatch,
+):
+    wrapper = _load_wrapper(monkeypatch)
+    calls = []
+    state_calls = 0
+
+    def request(self, method, path, **kwargs):
+        nonlocal state_calls
+        calls.append((method, path))
+        if (method, path) == ("GET", "/workloads"):
+            return {
+                "workloads": [
+                    {
+                        "uid": "wrk-existing",
+                        "name": "affine-autoscale-eval-a",
+                        "status": "CREATED",
+                    }
+                ]
+            }
+        if (method, path) == ("GET", "/workloads/wrk-existing"):
+            return {
+                "uid": "wrk-existing",
+                "name": "affine-autoscale-eval-a",
+                "status": "CREATED",
+            }
+        if (method, path) == ("GET", "/workloads/wrk-existing/state"):
+            state_calls += 1
+            if state_calls == 1:
+                return {"status": "CREATED", "ready_replicas": 0}
+            return {
+                "status": "RUNNING",
+                "ready_replicas": 1,
+                "urls": [
+                    {
+                        "port": 10001,
+                        "url": "https://wrk-existing-10001.caas.targon.com",
+                    }
+                ],
+            }
+        if (method, path) == ("POST", "/workloads/wrk-existing/deploy"):
+            return {"uid": "wrk-existing"}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    result = wrapper.TargonAutoscaleClient().create("affine-autoscale-eval-a")
+
+    assert result["instance_id"] == "wrk-existing"
+    assert ("POST", "/workloads") not in calls
+    assert ("POST", "/workloads/wrk-existing/deploy") in calls
+
+
+def test_create_adopts_existing_workload_when_register_response_fails(
+    monkeypatch,
+):
+    wrapper = _load_wrapper(monkeypatch)
+    calls = []
+    listed = False
+
+    def request(self, method, path, **kwargs):
+        nonlocal listed
+        calls.append((method, path))
+        if (method, path) == ("GET", "/workloads") and not listed:
+            listed = True
+            return {"workloads": []}
+        if (method, path) == ("POST", "/workloads"):
+            raise wrapper.TargonWrapperError("500 after creating workload")
+        if (method, path) == ("GET", "/workloads"):
+            return {
+                "workloads": [
+                    {
+                        "uid": "wrk-orphan",
+                        "name": "affine-autoscale-eval-a",
+                        "status": "RUNNING",
+                    }
+                ]
+            }
+        if (method, path) == ("GET", "/workloads/wrk-orphan"):
+            return {"uid": "wrk-orphan", "status": "RUNNING"}
+        if (method, path) == ("GET", "/workloads/wrk-orphan/state"):
+            return {"status": "RUNNING", "ready_replicas": 1}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    result = wrapper.TargonAutoscaleClient().create("affine-autoscale-eval-a")
+
+    assert result["instance_id"] == "wrk-orphan"
+    assert calls.count(("POST", "/workloads")) == 1
 
 
 def test_create_cleans_up_workload_when_wait_ready_fails(monkeypatch):
@@ -86,6 +227,8 @@ def test_create_cleans_up_workload_when_wait_ready_fails(monkeypatch):
 
     def request(self, method, path, **kwargs):
         calls.append((method, path))
+        if (method, path) == ("GET", "/workloads"):
+            return {"workloads": []}
         if (method, path) == ("POST", "/workloads"):
             return {"uid": "wrk-leaked"}
         if (method, path) == ("POST", "/workloads/wrk-leaked/deploy"):
@@ -114,6 +257,8 @@ def test_create_falls_back_across_resource_names(monkeypatch):
     resources = []
 
     def request(self, method, path, **kwargs):
+        if (method, path) == ("GET", "/workloads"):
+            return {"workloads": []}
         if (method, path) == ("POST", "/workloads"):
             resource = kwargs["json"]["resource_name"]
             resources.append(resource)
@@ -177,6 +322,69 @@ def test_delete_refuses_non_autoscaler_workload(monkeypatch):
         wrapper.TargonAutoscaleClient().delete("wrk-manual")
 
     assert ("DELETE", "/workloads/wrk-manual") not in calls
+
+
+def test_delete_refuses_autoscaler_workload_with_wrong_purpose(monkeypatch):
+    wrapper = _load_wrapper(monkeypatch)
+    calls = []
+
+    def request(self, method, path, **kwargs):
+        calls.append((method, path))
+        if (method, path) == ("GET", "/workloads/wrk-bench"):
+            return {"uid": "wrk-bench", "name": "affine-autoscale-bench-a"}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    with pytest.raises(wrapper.TargonWrapperError, match="purpose=eval"):
+        wrapper.TargonAutoscaleClient().delete(
+            "wrk-bench",
+            expected_purpose="eval",
+        )
+
+    assert ("DELETE", "/workloads/wrk-bench") not in calls
+
+
+def test_delete_allows_matching_purpose_and_legacy_without_expected_purpose(
+    monkeypatch,
+):
+    wrapper = _load_wrapper(monkeypatch)
+    calls = []
+
+    def request(self, method, path, **kwargs):
+        calls.append((method, path))
+        if (method, path) == ("GET", "/workloads/wrk-eval"):
+            return {"uid": "wrk-eval", "name": "affine-autoscale-eval-a"}
+        if (method, path) == ("GET", "/workloads/wrk-legacy"):
+            return {"uid": "wrk-legacy", "name": "affine-autoscale-a"}
+        if method == "DELETE":
+            return {}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    assert wrapper.TargonAutoscaleClient().delete(
+        "wrk-eval",
+        expected_purpose="eval",
+    ) is True
+    assert wrapper.TargonAutoscaleClient().delete("wrk-legacy") is True
+    assert ("DELETE", "/workloads/wrk-eval") in calls
+    assert ("DELETE", "/workloads/wrk-legacy") in calls
+
+
+def test_resource_name_includes_purpose_and_keeps_targon_length_limit(
+    monkeypatch,
+):
+    wrapper = _load_wrapper(monkeypatch)
+
+    name = wrapper._resource_name(
+        purpose="Bench",
+        suffix="targon-b200-autoscale-primary-extra-long",
+        max_len=32,
+    )
+
+    assert name.startswith("affine-autoscale-bench-")
+    assert len(name) <= 32
 
 
 def test_delete_missing_workload_is_idempotent(monkeypatch):

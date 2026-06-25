@@ -36,6 +36,36 @@ async def test_delete_treats_provider_404_as_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_delete_renders_variables_and_sends_metadata(monkeypatch):
+    client = InstanceAPIClient(
+        InstanceAPIConfig(
+            provider="lium",
+            api_url="https://lium.example.com",
+            delete_path="/pods/{instance_id}?purpose={purpose}",
+        )
+    )
+    calls = []
+
+    async def fake_request(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    assert await client.delete(
+        "pod-1",
+        variables={"purpose": "eval", "endpoint_name": "lium-b200-1"},
+    ) is True
+
+    args, kwargs = calls[0]
+    assert args[:2] == ("DELETE", "/pods/pod-1?purpose=eval")
+    assert kwargs["json"] == {
+        "purpose": "eval",
+        "endpoint_name": "lium-b200-1",
+    }
+
+
+@pytest.mark.asyncio
 async def test_delete_reports_non_404_provider_errors(monkeypatch):
     client = InstanceAPIClient(
         InstanceAPIConfig(

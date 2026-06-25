@@ -106,6 +106,7 @@ class _Endpoints:
         endpoint.assignment_role = None
         endpoint.assigned_at = 0
         endpoint.autoscale_instance_id = None
+        endpoint.autoscale_purpose = None
         endpoint.autoscale_lease_expires_at = 0
 
     async def clear_assignment(self, name, *, updated_by="test"):
@@ -124,6 +125,8 @@ class _Samples:
 
 class _Client:
     deleted = []
+    delete_calls = []
+    create_calls = []
     renewed = []
     create_lease_expires_at = 1500
     renew_expires_at = 0
@@ -132,6 +135,9 @@ class _Client:
         self.config = config
 
     async def create(self, *, variables=None, payload_overrides=None):
+        self.create_calls.append(
+            (dict(variables or {}), dict(payload_overrides or {}))
+        )
         name = variables["endpoint_name"]
         return InstanceHandle(
             provider=self.config.provider,
@@ -141,8 +147,9 @@ class _Client:
             lease_expires_at=self.create_lease_expires_at,
         )
 
-    async def delete(self, instance_id):
+    async def delete(self, instance_id, *, variables=None):
         self.deleted.append(instance_id)
+        self.delete_calls.append((instance_id, dict(variables or {})))
         return True
 
     async def renew(self, instance_id):
@@ -157,6 +164,8 @@ class _Client:
 @pytest.fixture(autouse=True)
 def _reset_client_state():
     _Client.deleted = []
+    _Client.delete_calls = []
+    _Client.create_calls = []
     _Client.renewed = []
     _Client.create_lease_expires_at = 1500
     _Client.renew_expires_at = 0
@@ -272,6 +281,16 @@ def test_managed_endpoint_slot_accepts_sglang_docker_args_override():
     assert slot.endpoint["sglang_docker_args"] == ["--cgroupns=host"]
 
 
+def test_managed_endpoint_slot_accepts_autoscale_purpose():
+    slot = ManagedEndpointSlot.from_mapping({
+        "name": "bench-b200-1",
+        "provider": "lium",
+        "purpose": "Bench Pool",
+    })
+
+    assert slot.purpose == "bench-pool"
+
+
 def test_instance_api_url_falls_back_to_provider_api_url(monkeypatch):
     monkeypatch.setenv("LIUM_API_URL", "https://lium.example.com/")
     cfg = InstanceAPIConfig.from_mapping("lium", {"create_path": "/instances"})
@@ -297,9 +316,22 @@ async def test_scales_up_when_pending_exceeds_threshold():
     assert ep.autoscale_managed is True
     assert ep.autoscale_provider == "lium"
     assert ep.autoscale_instance_id == "inst-lium-b200-1"
+    assert ep.autoscale_purpose == "eval"
     assert ep.autoscale_lease_expires_at == 1500
     assert ep.ssh_key_path == "/root/.ssh/affine_validator_server"
     assert ep.ssh_url == "ssh://root@lium-b200-1.example.com:22"
+    assert _Client.create_calls[0] == (
+        {
+            "endpoint_name": "lium-b200-1",
+            "provider": "lium",
+            "purpose": "eval",
+        },
+        {
+            "endpoint_name": "lium-b200-1",
+            "provider": "lium",
+            "purpose": "eval",
+        },
+    )
 
 
 @pytest.mark.asyncio
@@ -345,6 +377,24 @@ async def test_scale_up_deletes_instance_when_endpoint_activation_fails():
 
     assert result.action == "none"
     assert _Client.deleted == ["inst-lium-b200-1", "inst-lium-b200-2"]
+    assert _Client.delete_calls == [
+        (
+            "inst-lium-b200-1",
+            {
+                "endpoint_name": "lium-b200-1",
+                "provider": "lium",
+                "purpose": "eval",
+            },
+        ),
+        (
+            "inst-lium-b200-2",
+            {
+                "endpoint_name": "lium-b200-2",
+                "provider": "lium",
+                "purpose": "eval",
+            },
+        ),
+    ]
     assert endpoints.endpoints == {}
 
 
@@ -542,6 +592,7 @@ async def test_scales_down_idle_managed_endpoint_and_clears_champion_deployment(
         autoscale_managed=True,
         autoscale_provider="lium",
         autoscale_instance_id="inst-lium-b200-1",
+        autoscale_purpose="eval",
         autoscale_lease_expires_at=1500,
     )
     endpoints = _Endpoints([endpoint])
@@ -556,11 +607,21 @@ async def test_scales_down_idle_managed_endpoint_and_clears_champion_deployment(
 
     assert result.action == "scale-down:1"
     assert _Client.deleted == ["inst-lium-b200-1"]
+    assert _Client.delete_calls == [
+        (
+            "inst-lium-b200-1",
+            {
+                "endpoint_name": "lium-b200-1",
+                "purpose": "eval",
+            },
+        )
+    ]
     assert endpoints.cleared == []
     ep = endpoints.endpoints["lium-b200-1"]
     assert ep.active is False
     assert ep.ssh_url is None
     assert ep.autoscale_instance_id is None
+    assert ep.autoscale_purpose is None
     assert ep.autoscale_lease_expires_at == 0
     champion = await state.get_champion()
     assert champion.deployment_id is None

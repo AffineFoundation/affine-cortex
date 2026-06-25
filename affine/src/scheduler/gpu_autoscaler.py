@@ -75,6 +75,7 @@ class ManagedEndpointSlot:
     name: str
     provider: str
     role: str = "scoring"
+    purpose: str = "eval"
     endpoint: Dict[str, Any] = field(default_factory=dict)
     create_payload: Dict[str, Any] = field(default_factory=dict)
 
@@ -88,6 +89,7 @@ class ManagedEndpointSlot:
             name=str(payload.get("name") or ""),
             provider=str(payload.get("provider") or "").lower(),
             role=str(payload.get("role") or "scoring"),
+            purpose=_safe_token(payload.get("purpose") or "eval", default="eval"),
             endpoint=endpoint,
             create_payload=(
                 dict(payload.get("create_payload"))
@@ -591,10 +593,17 @@ class GPUAutoscaler:
         variables = {
             "endpoint_name": slot.name,
             "provider": slot.provider,
+            "purpose": slot.purpose,
+        }
+        payload_overrides = {
+            **slot.create_payload,
+            "endpoint_name": slot.name,
+            "provider": slot.provider,
+            "purpose": slot.purpose,
         }
         handle = await client.create(
             variables=variables,
-            payload_overrides=slot.create_payload,
+            payload_overrides=payload_overrides,
         )
         if handle is None:
             return False
@@ -605,7 +614,7 @@ class GPUAutoscaler:
                 slot.provider,
                 handle.instance_id,
             )
-            await client.delete(handle.instance_id)
+            await client.delete(handle.instance_id, variables=variables)
             return False
         try:
             await self._endpoints.activate_autoscaled_endpoint(
@@ -623,7 +632,7 @@ class GPUAutoscaler:
                 type(e).__name__,
                 e,
             )
-            deleted = await client.delete(handle.instance_id)
+            deleted = await client.delete(handle.instance_id, variables=variables)
             if not deleted:
                 logger.error(
                     "gpu-autoscaler: failed to delete instance=%s after "
@@ -660,6 +669,7 @@ class GPUAutoscaler:
             autoscale_managed=True,
             autoscale_provider=slot.provider,
             autoscale_instance_id=handle.instance_id,
+            autoscale_purpose=slot.purpose,
             autoscale_created_at=int(self._now()),
             autoscale_updated_at=int(self._now()),
             autoscale_lease_expires_at=int(handle.lease_expires_at or 0),
@@ -859,7 +869,11 @@ class GPUAutoscaler:
             return True
 
         client = self._client_factory(provider_config)
-        deleted = await client.delete(instance_id)
+        delete_vars = {"endpoint_name": endpoint.name}
+        purpose = getattr(endpoint, "autoscale_purpose", None)
+        if purpose:
+            delete_vars["purpose"] = purpose
+        deleted = await client.delete(instance_id, variables=delete_vars)
         if not deleted:
             return False
 
@@ -1050,6 +1064,13 @@ def _load_env_json(name: str) -> Dict[str, Any]:
         logger.warning("gpu-autoscaler: invalid %s JSON: %s", name, e)
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _safe_token(value: Any, *, default: str) -> str:
+    text = str(value or "").strip().lower()
+    safe = "".join(c if c.isalnum() or c == "-" else "-" for c in text)
+    safe = "-".join(part for part in safe.split("-") if part)
+    return safe or default
 
 
 if __name__ == "__main__":

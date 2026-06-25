@@ -14,6 +14,7 @@ wrapper bridges those shapes without changing the running Affine scheduler.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -177,6 +178,10 @@ class LiumClient:
         return template_id
 
     def create(self, name: str) -> dict:
+        existing_uid = self.find_pod_by_name(name, attempts=1)
+        if existing_uid:
+            return self.wait_ready(existing_uid)
+
         executor = self.select_executor()
         executor_id = _instance_id(executor)
         if not executor_id:
@@ -191,15 +196,21 @@ class LiumClient:
             "initial_port_count": 2,
             "enable_jupyter": False,
         }
-        result = self.request(
-            "POST", f"/executors/{executor_id}/rent", json=payload
-        )
+        try:
+            result = self.request(
+                "POST", f"/executors/{executor_id}/rent", json=payload
+            )
+        except Exception:
+            existing_uid = self.find_pod_by_name(name, attempts=5)
+            if existing_uid:
+                return self.wait_ready(existing_uid)
+            raise
         uid = _instance_id(result)
         pod = result.get("pod") if isinstance(result, dict) else None
         if not uid and isinstance(pod, dict):
             uid = _instance_id(pod)
         if not uid:
-            uid = self.find_pod_by_name(name)
+            uid = self.find_pod_by_name(name, attempts=5)
         if not uid:
             raise LiumWrapperError(f"Rent response did not include a pod id: {result}")
         try:
@@ -208,11 +219,16 @@ class LiumClient:
             self._delete_owned_pod(uid)
             raise
 
-    def find_pod_by_name(self, name: str) -> str:
-        for _ in range(5):
+    def find_pod_by_name(self, name: str, *, attempts: int = 5) -> str:
+        for _ in range(max(1, attempts)):
             for pod in self.items(self.request("GET", "/pods")):
                 if pod.get("pod_name") == name or pod.get("name") == name:
-                    return _instance_id(pod)
+                    status = _status(pod)
+                    if _terminal_status(status):
+                        continue
+                    uid = _instance_id(pod)
+                    if uid:
+                        return uid
             time.sleep(1)
         return ""
 
@@ -256,18 +272,24 @@ class LiumClient:
             raise
         return pod if isinstance(pod, dict) else {}
 
-    def delete(self, uid: str) -> bool:
-        return self._delete_owned_pod(uid)
+    def delete(self, uid: str, *, expected_purpose: str = "") -> bool:
+        return self._delete_owned_pod(uid, expected_purpose=expected_purpose)
 
-    def _delete_owned_pod(self, uid: str) -> bool:
+    def _delete_owned_pod(
+        self,
+        uid: str,
+        *,
+        expected_purpose: str = "",
+    ) -> bool:
         pod = self.get_pod(uid)
         if pod is None:
             return True
         pod_name = _pod_name(pod)
-        if not pod_name.startswith(NAME_PREFIX):
+        if not _owned_pod_name(pod_name, expected_purpose=expected_purpose):
             raise LiumWrapperError(
                 f"Refusing to delete pod {uid}: pod_name={pod_name!r} "
-                f"does not start with {NAME_PREFIX!r}"
+                f"does not match prefix={NAME_PREFIX!r} "
+                f"purpose={expected_purpose or '*'}"
             )
         try:
             self.request("DELETE", f"/pods/{uid}")
@@ -345,8 +367,44 @@ def _status(data: Mapping[str, Any]) -> str:
     return str(data.get("status") or state.get("status") or "").lower()
 
 
+def _terminal_status(status: str) -> bool:
+    return status in {"failed", "error", "terminated", "deleted"}
+
+
 def _pod_name(data: Mapping[str, Any]) -> str:
     return str(data.get("pod_name") or data.get("name") or "")
+
+
+def _safe_token(value: Any, *, default: str = "") -> str:
+    text = str(value or "").strip().lower()
+    safe = "".join(c if c.isalnum() or c == "-" else "-" for c in text)
+    safe = "-".join(part for part in safe.split("-") if part)
+    return safe or default
+
+
+def _resource_name(*, purpose: str, suffix: str, max_len: int) -> str:
+    purpose = _safe_token(purpose, default="eval")
+    suffix = _safe_token(suffix, default=str(int(time.time())))
+    raw = f"{NAME_PREFIX}-{purpose}-{suffix}".strip("-")
+    if len(raw) <= max_len:
+        return raw
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
+    fixed_len = len(NAME_PREFIX) + len(purpose) + len(digest) + 3
+    suffix_budget = max(1, max_len - fixed_len)
+    return (
+        f"{NAME_PREFIX}-{purpose}-{suffix[:suffix_budget]}-{digest}"[:max_len]
+        .strip("-")
+    )
+
+
+def _owned_pod_name(name: str, *, expected_purpose: str = "") -> bool:
+    if not (name == NAME_PREFIX or name.startswith(f"{NAME_PREFIX}-")):
+        return False
+    expected = _safe_token(expected_purpose)
+    if not expected:
+        return True
+    purpose_prefix = f"{NAME_PREFIX}-{expected}"
+    return name == purpose_prefix or name.startswith(f"{purpose_prefix}-")
 
 
 def _default_lease_expires_at() -> int:
@@ -583,11 +641,9 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length).decode("utf-8") if length else "{}"
             data = json.loads(raw or "{}")
+            purpose = str(data.get("purpose") or "eval")
             suffix = str(data.get("endpoint_name") or int(time.time()))
-            safe_suffix = "".join(
-                c if c.isalnum() or c == "-" else "-" for c in suffix.lower()
-            ).strip("-")
-            name = f"{NAME_PREFIX}-{safe_suffix}"[:63].strip("-")
+            name = _resource_name(purpose=purpose, suffix=suffix, max_len=63)
             result = LiumClient().create(name)
             self._send(200, result)
         except Exception as e:
@@ -603,7 +659,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
             return
         try:
-            ok = LiumClient().delete(parts[1])
+            expected_purpose = _expected_purpose(self, parsed)
+            ok = LiumClient().delete(
+                parts[1],
+                expected_purpose=expected_purpose,
+            )
             self._send(200, {"ok": ok})
         except Exception as e:
             self._send(500, {"error": type(e).__name__, "message": str(e)})
@@ -615,6 +675,19 @@ class Handler(BaseHTTPRequestHandler):
             fmt % args,
             flush=True,
         )
+
+
+def _expected_purpose(handler: BaseHTTPRequestHandler, parsed) -> str:
+    query = parse_qs(parsed.query)
+    if query.get("purpose"):
+        return _safe_token(query["purpose"][0])
+    try:
+        length = int(handler.headers.get("Content-Length") or 0)
+        raw = handler.rfile.read(length).decode("utf-8") if length else "{}"
+        data = json.loads(raw or "{}")
+    except Exception:
+        return ""
+    return _safe_token(data.get("purpose"))
 
 
 def main() -> None:

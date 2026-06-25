@@ -222,7 +222,12 @@ class InstanceAPIClient:
             raw=dict(result),
         )
 
-    async def delete(self, instance_id: str) -> bool:
+    async def delete(
+        self,
+        instance_id: str,
+        *,
+        variables: Optional[Mapping[str, Any]] = None,
+    ) -> bool:
         if not instance_id:
             return False
         if not self.config.resolved_api_url or not self.config.delete_path:
@@ -231,14 +236,17 @@ class InstanceAPIClient:
                 self.config.provider,
             )
             return False
-        path = _render_template(
-            self.config.delete_path,
-            {"instance_id": instance_id},
-        )
+        render_vars = {"instance_id": instance_id, **dict(variables or {})}
+        path = _render_template(self.config.delete_path, render_vars)
+        delete_payload = {
+            key: value for key, value in render_vars.items()
+            if key != "instance_id" and value not in (None, "")
+        }
         try:
             result = await self._request(
                 self.config.delete_method,
                 path,
+                json=delete_payload or None,
                 timeout=self.config.timeout_sec,
                 expect_json=False,
             )
