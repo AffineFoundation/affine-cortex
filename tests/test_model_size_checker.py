@@ -1,8 +1,11 @@
 """Model allow-list metadata."""
 
 import asyncio
+import json
 
+import affine.utils.model_size_checker as checker_mod
 from affine.utils.model_size_checker import (
+    CONFIG_FETCH_ATTEMPTS,
     QWEN36_ONLY_MODEL_TYPES,
     ModelSizeChecker,
     _match_allowed_model,
@@ -100,3 +103,52 @@ def test_quantized_config_without_method_still_rejected():
     result = _check_config(config)
     assert result["pass"] is False
     assert result["reason"] == "quantized_model:unknown"
+
+
+def test_config_fetch_retries_transient_timeout(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(_QWEN36_35B))
+    calls = []
+    delays = []
+
+    def fake_hf_hub_download(**_kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("temporary")
+        return str(config_path)
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(checker_mod, "hf_hub_download", fake_hf_hub_download)
+    monkeypatch.setattr(checker_mod.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(ModelSizeChecker().check("some/model", "rev"))
+
+    assert result["pass"] is True
+    assert result["model_type"] == "qwen3_5_moe"
+    assert len(calls) == 2
+    assert delays == [checker_mod.CONFIG_FETCH_RETRY_DELAYS_S[0]]
+
+
+def test_config_fetch_timeout_is_retryable_after_attempts_exhausted(monkeypatch):
+    calls = []
+    delays = []
+
+    def fake_hf_hub_download(**_kwargs):
+        calls.append(1)
+        raise TimeoutError("temporary")
+
+    async def fake_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(checker_mod, "hf_hub_download", fake_hf_hub_download)
+    monkeypatch.setattr(checker_mod.asyncio, "sleep", fake_sleep)
+
+    result = asyncio.run(ModelSizeChecker().check("some/model", "rev"))
+
+    assert result["pass"] is False
+    assert result["reason"] == "config_fetch_failed"
+    assert result["retryable"] is True
+    assert len(calls) == CONFIG_FETCH_ATTEMPTS
+    assert len(delays) == CONFIG_FETCH_ATTEMPTS - 1
