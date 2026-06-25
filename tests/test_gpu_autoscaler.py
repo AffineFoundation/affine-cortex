@@ -627,6 +627,67 @@ async def test_does_not_scale_down_while_champion_samples_are_incomplete():
 
 
 @pytest.mark.asyncio
+async def test_champion_completion_uses_scheduler_threshold_before_scale_down():
+    kv = InMemoryConfigStore()
+    state = StateStore(kv)
+    await state.set_champion(
+        ChampionRecord(
+            uid=7,
+            hotkey="hk7",
+            revision="rev7",
+            model="repo/model",
+            deployment_id="ssh:lium-b200-1:affine-sglang-current",
+            base_url="http://lium-b200-1.example.com:10001/v1",
+        )
+    )
+    await kv.set(
+        "current_task_ids",
+        {
+            "task_ids": {"MEMORY": list(range(220))},
+            "refreshed_at_block": 100,
+        },
+    )
+    await kv.set(
+        "environments",
+        {
+            "MEMORY": {
+                "enabled_for_sampling": True,
+                "sampling": {
+                    "sampling_count": 200,
+                    "dataset_range": [[0, 219]],
+                },
+            }
+        },
+    )
+    await kv.set(STATE_KEY, {"last_busy_at": 900})
+    endpoints = _Endpoints([
+        Endpoint(
+            name="lium-b200-1",
+            kind="ssh",
+            active=True,
+            assigned_uid=7,
+            autoscale_managed=True,
+            autoscale_provider="lium",
+            autoscale_instance_id="inst-lium-b200-1",
+        )
+    ])
+    autoscaler = _autoscaler(
+        _Queue(pending=0),
+        endpoints,
+        kv,
+        now=1000,
+        samples=_Samples(count=200),
+    )
+
+    result = await autoscaler.tick(_config(idle_seconds=60))
+
+    assert result.action == "none"
+    assert result.idle is False
+    assert _Client.deleted == []
+    assert endpoints.endpoints["lium-b200-1"].active is True
+
+
+@pytest.mark.asyncio
 async def test_renews_busy_managed_endpoint_near_lease_expiry():
     _Client.renewed = []
     _Client.renew_expires_at = 5000

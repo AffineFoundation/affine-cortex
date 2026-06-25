@@ -36,6 +36,7 @@ from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scorer.challenger_queue import ChallengerQueue
 from affine.src.scorer.dao_adapters import MinersQueueAdapter, SampleResultsAdapter
+from affine.src.scorer.sampling_thresholds import champion_completion_threshold
 from affine.src.scorer.window_state import StateStore, SystemConfigKVAdapter
 
 
@@ -521,12 +522,12 @@ class GPUAutoscaler:
         environments = await self._state.get_environments()
         refresh_block = int(task_state.refreshed_at_block or 0)
         for env, cfg in environments.items():
+            if not cfg.enabled_for_scoring:
+                continue
             task_ids = list(task_state.task_ids.get(env) or [])
             if not task_ids:
                 continue
-            target = len(task_ids)
-            if cfg.sampling_count:
-                target = min(target, int(cfg.sampling_count))
+            target = champion_completion_threshold(cfg.sampling_count)
             if target <= 0:
                 continue
             count = await self._samples.count_samples_for_tasks(

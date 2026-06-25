@@ -62,6 +62,29 @@ ORPHAN_SWEEP_INTERVAL_SEC = int(
 )
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
+async def _gpu_autoscaler_empty_provider_kind(config_dao) -> Optional[str]:
+    try:
+        from .gpu_autoscaler import load_config as load_gpu_autoscaler_config
+        config = await load_gpu_autoscaler_config(config_dao)
+        enabled = config.enabled
+    except Exception as e:
+        logger.warning(
+            f"scheduler: failed to read gpu_autoscaler config; falling back "
+            f"to AFFINE_GPU_AUTOSCALER_ENABLED env: {type(e).__name__}: {e}"
+        )
+        enabled = _env_flag_enabled("AFFINE_GPU_AUTOSCALER_ENABLED")
+    if not enabled:
+        return None
+    return os.getenv(
+        "AFFINE_GPU_AUTOSCALER_EMPTY_PROVIDER_KIND",
+        "ssh",
+    ).strip().lower()
+
+
 def _endpoint_matches_target(endpoint, target) -> bool:
     return (
         endpoint.assigned_uid == target.uid
@@ -69,6 +92,10 @@ def _endpoint_matches_target(endpoint, target) -> bool:
         and endpoint.assigned_model == target.model
         and endpoint.assigned_revision == target.revision
     )
+
+
+def _is_scoring_endpoint(endpoint) -> bool:
+    return (getattr(endpoint, "role", None) or "scoring") == "scoring"
 
 
 def _resolve_provider_kind(
@@ -84,6 +111,7 @@ def _resolve_provider_kind(
       - mixed ssh+targon kinds (not yet supported)
       - rows present but none of a known kind
     """
+    active = [ep for ep in active if _is_scoring_endpoint(ep)]
     if not active and empty_provider_kind == "ssh":
         return "ssh", [], []
     if not active:
@@ -142,7 +170,10 @@ async def _deploy_ssh_target(
     role: str = "active",
 ):
     endpoints = sorted(
-        await endpoints_dao.list_active(kind="ssh"),
+        [
+            ep for ep in await endpoints_dao.list_active(kind="ssh")
+            if _is_scoring_endpoint(ep)
+        ],
         key=lambda ep: ep.name,
     )
     selected = _select_ssh_endpoints(endpoints, target, role=role)
@@ -242,16 +273,7 @@ async def _run() -> None:
     from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
     endpoints_dao = InferenceEndpointsDAO()
     active = await endpoints_dao.list_active()
-    empty_provider_kind = None
-    if os.getenv("AFFINE_GPU_AUTOSCALER_ENABLED", "").lower() in (
-        "1",
-        "true",
-        "yes",
-        "on",
-    ):
-        empty_provider_kind = os.getenv(
-            "AFFINE_GPU_AUTOSCALER_EMPTY_PROVIDER_KIND", "ssh",
-        ).strip().lower()
+    empty_provider_kind = await _gpu_autoscaler_empty_provider_kind(config_dao)
     provider_kind, ssh_active, targon_active = _resolve_provider_kind(
         active,
         empty_provider_kind=empty_provider_kind,
@@ -353,12 +375,14 @@ async def _run() -> None:
         async def list_active_ssh_endpoint_names():
             return {
                 ep.name for ep in await endpoints_dao.list_active(kind="ssh")
+                if _is_scoring_endpoint(ep)
             }
 
         async def list_active_ssh_endpoint_activations():
             return {
                 ep.name: int(ep.activated_at or 0)
                 for ep in await endpoints_dao.list_active(kind="ssh")
+                if _is_scoring_endpoint(ep)
             }
 
         # SSH primary always time-shares champion + current challenger,
