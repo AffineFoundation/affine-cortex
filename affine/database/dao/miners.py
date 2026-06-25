@@ -89,6 +89,25 @@ class MinersDAO(BaseDAO):
             first_block: Block when this (hotkey, revision) was first committed.
             model_type: Raw HuggingFace config ``model_type`` when known.
         """
+        if not (model and model_hash and model_type and first_block):
+            existing = await self.get_miner_by_uid(uid)
+            if (
+                existing
+                and existing.get("hotkey") == hotkey
+                and existing.get("revision") == revision
+            ):
+                if not model and existing.get("model"):
+                    model = str(existing["model"])
+                if not model_hash and existing.get("model_hash"):
+                    model_hash = str(existing["model_hash"])
+                if not model_type and existing.get("model_type"):
+                    model_type = str(existing["model_type"])
+                if not first_block and existing.get("first_block") is not None:
+                    try:
+                        first_block = int(existing["first_block"])
+                    except (TypeError, ValueError):
+                        pass
+
         item = {
             'pk': self._make_pk(uid),
             'uid': uid,

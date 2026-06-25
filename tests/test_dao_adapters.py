@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 import affine.database.client as db_client
+from affine.database.dao.miners import MinersDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.src.monitor.miners_monitor import MinerInfo, MinersMonitor
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
@@ -116,6 +117,187 @@ class _UpdateRecordingClient:
 
     async def update_item(self, **kwargs):
         self.update_calls.append(kwargs)
+
+
+def _set_clauses(update_expression: str) -> set[str]:
+    assert update_expression.startswith("SET ")
+    clauses = []
+    start = 4
+    depth = 0
+    for idx, char in enumerate(update_expression[4:], start=4):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif char == "," and depth == 0:
+            clauses.append(update_expression[start:idx].strip())
+            start = idx + 1
+    clauses.append(update_expression[start:].strip())
+    return set(clauses)
+
+
+@pytest.mark.asyncio
+async def test_update_miner_info_skips_empty_identity_metadata(monkeypatch):
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+
+    dao = MinerStatsDAO()
+    await dao.update_miner_info(
+        hotkey="hk",
+        revision="rev",
+        model="",
+        uid=7,
+        first_block=100,
+        block_number=200,
+        is_valid=False,
+        invalid_reason="hf_repo_unavailable",
+        model_hash="",
+        model_type="",
+        is_online=True,
+    )
+
+    call = client.update_calls[0]
+    clauses = _set_clauses(call["UpdateExpression"])
+    values = call["ExpressionAttributeValues"]
+    assert "model = :model" not in clauses
+    assert "model_hash = :model_hash" not in clauses
+    assert "model_type = :model_type" not in clauses
+    assert ":model" not in values
+    assert ":model_hash" not in values
+    assert ":model_type" not in values
+    assert "first_block = if_not_exists(first_block, :first_block)" in clauses
+    assert "is_valid = :is_valid" in clauses
+    assert "invalid_reason = :invalid_reason" in clauses
+
+
+@pytest.mark.asyncio
+async def test_update_miner_info_writes_nonempty_identity_metadata(monkeypatch):
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+
+    dao = MinerStatsDAO()
+    await dao.update_miner_info(
+        hotkey="hk",
+        revision="rev",
+        model="org/model",
+        model_hash="hash",
+        model_type="qwen3_5_moe",
+    )
+
+    call = client.update_calls[0]
+    clauses = _set_clauses(call["UpdateExpression"])
+    values = call["ExpressionAttributeValues"]
+    assert "model = :model" in clauses
+    assert "model_hash = :model_hash" in clauses
+    assert "model_type = :model_type" in clauses
+    assert values[":model"] == {"S": "org/model"}
+    assert values[":model_hash"] == {"S": "hash"}
+    assert values[":model_type"] == {"S": "qwen3_5_moe"}
+
+
+class _GetPutRecordingClient:
+    def __init__(self, existing_item=None):
+        self.existing_item = existing_item
+        self.get_calls = []
+        self.put_calls = []
+
+    async def get_item(self, **kwargs):
+        self.get_calls.append(kwargs)
+        if self.existing_item is None:
+            return {}
+        return {"Item": self.existing_item}
+
+    async def put_item(self, **kwargs):
+        self.put_calls.append(kwargs)
+
+
+def _ddb_miner_item(
+    *,
+    uid: int,
+    hotkey: str,
+    revision: str,
+    model: str = "org/model",
+    model_hash: str = "hash",
+    model_type: str = "qwen3_5_moe",
+    first_block: int = 100,
+):
+    return {
+        "pk": {"S": f"UID#{uid}"},
+        "uid": {"N": str(uid)},
+        "hotkey": {"S": hotkey},
+        "model": {"S": model},
+        "revision": {"S": revision},
+        "model_hash": {"S": model_hash},
+        "model_type": {"S": model_type},
+        "first_block": {"N": str(first_block)},
+    }
+
+
+@pytest.mark.asyncio
+async def test_save_miner_preserves_empty_metadata_for_same_identity(monkeypatch):
+    client = _GetPutRecordingClient(
+        _ddb_miner_item(uid=7, hotkey="hk", revision="rev")
+    )
+    monkeypatch.setattr("affine.database.base_dao.get_client", lambda: client)
+
+    dao = MinersDAO()
+    await dao.save_miner(
+        uid=7,
+        hotkey="hk",
+        model="",
+        revision="rev",
+        model_hash="",
+        is_valid=False,
+        invalid_reason="hf_repo_unavailable",
+        block_number=200,
+        first_block=0,
+        model_type="",
+    )
+
+    item = client.put_calls[0]["Item"]
+    assert item["model"]["S"] == "org/model"
+    assert item["model_hash"]["S"] == "hash"
+    assert item["model_type"]["S"] == "qwen3_5_moe"
+    assert item["first_block"]["N"] == "100"
+    assert item["is_valid"]["S"] == "false"
+    assert item["invalid_reason"]["S"] == "hf_repo_unavailable"
+    assert item["block_number"]["N"] == "200"
+
+
+@pytest.mark.asyncio
+async def test_save_miner_does_not_inherit_metadata_across_uid_reuse(monkeypatch):
+    client = _GetPutRecordingClient(
+        _ddb_miner_item(uid=7, hotkey="old-hk", revision="old-rev")
+    )
+    monkeypatch.setattr("affine.database.base_dao.get_client", lambda: client)
+
+    dao = MinersDAO()
+    await dao.save_miner(
+        uid=7,
+        hotkey="new-hk",
+        model="org/new-model",
+        revision="new-rev",
+        model_hash="",
+        is_valid=True,
+        invalid_reason=None,
+        block_number=300,
+        first_block=250,
+        model_type="",
+    )
+
+    item = client.put_calls[0]["Item"]
+    assert item["hotkey"]["S"] == "new-hk"
+    assert item["revision"]["S"] == "new-rev"
+    assert item["model"]["S"] == "org/new-model"
+    assert item["model_hash"]["S"] == ""
+    assert item["model_type"]["S"] == ""
+    assert item["first_block"]["N"] == "250"
 
 
 @pytest.mark.asyncio
