@@ -7,12 +7,10 @@ import click
 from affine.database import close_client, init_client
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scheduler.flow import FlowConfig
-from affine.src.scorer.challenger_queue import ChallengerQueue
-from affine.src.scorer.dao_adapters import MinersQueueAdapter
 from affine.src.scorer.window_state import (
     StateStore,
     SystemConfigKVAdapter,
-    TaskIdState,
+    WindowRotationRequest,
 )
 from affine.utils.subtensor import get_subtensor
 
@@ -20,10 +18,11 @@ from affine.utils.subtensor import get_subtensor
 async def rotate_window_command(*, commit: bool = False) -> None:
     """Manually rotate the champion task window.
 
-    Always performs a full rotation: it releases the active challenger
-    claim (``in_progress`` -> ``sampling``), stales
-    ``current_task_ids.refreshed_at_block`` to an old block, and clears
-    ``current_battle`` so the next scheduler tick rotates immediately.
+    Always requests a full rotation: scheduler will tear down the active
+    challenger deployment, release the challenger claim
+    (``in_progress`` -> ``sampling``), stale
+    ``current_task_ids.refreshed_at_block`` to an old block, and clear
+    ``current_battle`` before refreshing the task pool.
 
     Default mode is dry-run; pass ``commit=True`` to write. Because
     in-flight sample writes would otherwise land on the stale pool, the
@@ -98,7 +97,10 @@ async def rotate_window_command(*, commit: bool = False) -> None:
             click.echo(f"  2. stale refreshed_at_block -> {stale_block}")
         else:
             click.echo("  2. (no task_state - rotation already unconditional)")
-        click.echo("  3. clear current_battle <- opens the rotation gate")
+        click.echo(
+            "  3. scheduler tears down current battle deployment, "
+            "releases claim, clears current_battle"
+        )
 
         if not commit:
             click.echo("\n(dry-run) re-run with --commit to perform the rotation.")
@@ -112,27 +114,19 @@ async def rotate_window_command(*, commit: bool = False) -> None:
             click.echo("Aborted.")
             return
 
-        if battle is not None:
-            queue = ChallengerQueue(MinersQueueAdapter())
-            released = await queue.release_claim(
-                battle.challenger.uid,
-                hotkey=battle.challenger.hotkey,
-                revision=battle.challenger.revision,
+        await state.set_window_rotation_request(
+            WindowRotationRequest(
+                requested_at_block=current_block,
+                stale_refreshed_at_block=stale_block,
             )
-            suffix = "" if released else " (was not in_progress - check status)"
-            click.echo(f"  1. release_claim(uid={battle.challenger.uid}) -> {released}{suffix}")
-
-        if task_state is not None:
-            await state.set_task_state(
-                TaskIdState(
-                    task_ids=task_state.task_ids,
-                    refreshed_at_block=stale_block,
-                )
-            )
-            click.echo(f"  2. refreshed_at_block -> {stale_block}")
-
-        await state.clear_battle()
-        click.echo("  3. current_battle cleared")
+        )
+        click.echo(
+            "  1. rotation request written "
+            f"(stale_refreshed_at_block={stale_block})"
+        )
+        click.echo(
+            "  2. scheduler will apply teardown/release/clear on its next tick"
+        )
         click.echo("\nrotation armed - scheduler rotates on its next tick.")
     finally:
         await close_client()

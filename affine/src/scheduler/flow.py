@@ -67,6 +67,7 @@ from affine.src.scorer.window_state import (
     MinerSnapshot,
     StateStore,
     TaskIdState,
+    WindowRotationRequest,
 )
 
 from . import targon as targon_lifecycle
@@ -159,7 +160,17 @@ def _task_pool_refresh_blocks_from_env() -> Optional[int]:
     raw = os.getenv(TASK_POOL_REFRESH_BLOCKS_ENV)
     if raw is None or raw.strip() == "":
         return None
-    return max(1, int(raw))
+    return _positive_int_config(raw, source=TASK_POOL_REFRESH_BLOCKS_ENV)
+
+
+def _positive_int_config(value: object, *, source: str) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{source} must be a positive integer, got {value!r}") from e
+    if out < 1:
+        raise ValueError(f"{source} must be a positive integer, got {value!r}")
+    return out
 
 DEFAULT_MARGIN = 0.03
 """Per-env additive margin the challenger must clear to be ``dominant``."""
@@ -235,7 +246,10 @@ class FlowConfig:
             self.task_pool_refresh_blocks = _task_pool_refresh_blocks_from_env()
         if self.task_pool_refresh_blocks is None:
             self.task_pool_refresh_blocks = self.window_blocks
-        self.task_pool_refresh_blocks = max(1, int(self.task_pool_refresh_blocks))
+        self.task_pool_refresh_blocks = _positive_int_config(
+            self.task_pool_refresh_blocks,
+            source="FlowConfig.task_pool_refresh_blocks",
+        )
 
 
 class FlowScheduler:
@@ -296,12 +310,23 @@ class FlowScheduler:
 
     async def _tick_main(self, current_block: int) -> None:
         envs = await self.state.get_environments()
+        battle = await self.state.get_battle()
+        task_state = await self.state.get_task_state()
+        rotation_request = await self.state.get_window_rotation_request()
+        if rotation_request is not None:
+            applied = await self._apply_window_rotation_request(
+                rotation_request,
+                battle=battle,
+                task_state=task_state,
+            )
+            if not applied:
+                return
+            battle = await self.state.get_battle()
+            task_state = await self.state.get_task_state()
+
         if not envs:
             logger.warning("FlowScheduler: no sampling-enabled envs; skipping tick")
             return
-
-        battle = await self.state.get_battle()
-        task_state = await self.state.get_task_state()
 
         # 1 + 2. Task-id pool refresh (between battles only).
         if task_state is None or (
@@ -1611,6 +1636,59 @@ class FlowScheduler:
             )
 
         await self.state.clear_battle()
+
+    async def _apply_window_rotation_request(
+        self,
+        request: WindowRotationRequest,
+        *,
+        battle: Optional[BattleRecord],
+        task_state: Optional[TaskIdState],
+    ) -> bool:
+        """Apply an operator-requested window rotation.
+
+        The CLI only records the request. Scheduler consumes it here so
+        active battle deployments are torn down through the provider-aware
+        ``teardown_fn`` before ``current_battle`` is cleared.
+        """
+        if battle is not None:
+            try:
+                await self._teardown_record(battle)
+            except Exception as e:
+                logger.error(
+                    f"FlowScheduler: window rotation request at block "
+                    f"{request.requested_at_block} could not teardown "
+                    f"battle deployment uid={battle.challenger.uid}: "
+                    f"{type(e).__name__}: {e}; will retry next tick"
+                )
+                return False
+            released = await self.queue.release_claim(
+                battle.challenger.uid,
+                hotkey=battle.challenger.hotkey,
+                revision=battle.challenger.revision,
+            )
+            logger.warning(
+                f"FlowScheduler: window rotation tore down battle "
+                f"uid={battle.challenger.uid} "
+                f"(claim_released={released})"
+            )
+
+        if task_state is not None:
+            await self.state.set_task_state(TaskIdState(
+                task_ids=task_state.task_ids,
+                refreshed_at_block=int(request.stale_refreshed_at_block),
+            ))
+            logger.warning(
+                f"FlowScheduler: window rotation staled task pool "
+                f"refreshed_at_block={request.stale_refreshed_at_block}"
+            )
+
+        await self.state.clear_battle()
+        await self.state.clear_window_rotation_request()
+        logger.warning(
+            f"FlowScheduler: consumed window rotation request from block "
+            f"{request.requested_at_block}"
+        )
+        return True
 
     async def _teardown_record(self, record: Any) -> None:
         deployments = list(getattr(record, "deployments", []) or [])

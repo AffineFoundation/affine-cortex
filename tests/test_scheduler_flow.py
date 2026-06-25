@@ -368,6 +368,20 @@ def test_flow_config_explicit_task_pool_refresh_beats_env(monkeypatch):
     assert cfg.task_pool_refresh_blocks == 789
 
 
+def test_flow_config_task_pool_refresh_rejects_invalid_env(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_TASK_POOL_REFRESH_BLOCKS", "not-an-int")
+
+    with pytest.raises(ValueError, match="SCHEDULER_TASK_POOL_REFRESH_BLOCKS"):
+        FlowConfig(window_blocks=123)
+
+
+def test_flow_config_task_pool_refresh_rejects_zero_env(monkeypatch):
+    monkeypatch.setenv("SCHEDULER_TASK_POOL_REFRESH_BLOCKS", "0")
+
+    with pytest.raises(ValueError, match="positive integer"):
+        FlowConfig(window_blocks=123)
+
+
 @pytest.mark.asyncio
 async def test_first_tick_refreshes_task_ids_then_returns():
     kv = _seed_state()
@@ -414,6 +428,97 @@ async def test_task_pool_refresh_interval_is_independent_from_window_id_blocks()
     await scheduler.tick(current_block=50 + WINDOW_BLOCKS * 10 + 1)
     refreshed_task = await state.get_task_state()
     assert refreshed_task.refreshed_at_block == 50 + WINDOW_BLOCKS * 10 + 1
+
+
+@pytest.mark.asyncio
+async def test_window_rotation_request_tears_down_battle_then_refreshes():
+    kv = _seed_state()
+    kv.data["current_battle"] = {
+        "challenger": {
+            "uid": 2,
+            "hotkey": "chal_hk",
+            "revision": "chal_rev",
+            "model": "org/chal",
+        },
+        "deployment_id": "wrk-chal",
+        "base_url": "https://t/wrk-chal",
+        "started_at_block": 90,
+    }
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3], "ENV_B": [4, 5, 6]},
+        "refreshed_at_block": 95,
+    }
+    kv.data["window_rotation_request"] = {
+        "requested_at_block": 1000,
+        "stale_refreshed_at_block": -1,
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, status=STATUS_IN_PROGRESS, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        window_blocks=WINDOW_BLOCKS,
+        task_pool_refresh_blocks=WINDOW_BLOCKS,
+    )
+
+    await scheduler.tick(current_block=1000)
+
+    assert deployer.teardowns == ["wrk-chal"]
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert await state.get_battle() is None
+    assert await state.get_window_rotation_request() is None
+    task_state = await state.get_task_state()
+    assert task_state.refreshed_at_block == 1000
+
+
+@pytest.mark.asyncio
+async def test_window_rotation_request_retries_when_teardown_fails():
+    kv = _seed_state()
+    kv.data["current_battle"] = {
+        "challenger": {
+            "uid": 2,
+            "hotkey": "chal_hk",
+            "revision": "chal_rev",
+            "model": "org/chal",
+        },
+        "deployment_id": "wrk-001",
+        "base_url": "https://t/wrk-001",
+        "started_at_block": 90,
+    }
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3], "ENV_B": [4, 5, 6]},
+        "refreshed_at_block": 95,
+    }
+    kv.data["window_rotation_request"] = {
+        "requested_at_block": 1000,
+        "stale_refreshed_at_block": -1,
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(2, "chal_hk", 200, status=STATUS_IN_PROGRESS, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker(next_deployment_id=1)
+    deployer.teardown_failures_once.add("wrk-001")
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+    )
+
+    await scheduler.tick(current_block=1000)
+
+    assert deployer.teardowns == ["wrk-001"]
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert await state.get_battle() is not None
+    assert await state.get_window_rotation_request() is not None
+    task_state = await state.get_task_state()
+    assert task_state.refreshed_at_block == 95
 
 
 @pytest.mark.asyncio

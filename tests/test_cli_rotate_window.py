@@ -12,6 +12,7 @@ from affine.src.scorer.window_state import (
     ChampionRecord,
     MinerSnapshot,
     TaskIdState,
+    WindowRotationRequest,
 )
 
 
@@ -85,6 +86,7 @@ class _Store:
             task_ids={"ENV_A": [1, 2, 3]},
             refreshed_at_block=990,
         )
+        self.rotation_request = None
         self.ops = []
 
     async def get_champion(self):
@@ -106,6 +108,14 @@ class _Store:
     async def clear_battle(self):
         self.ops.append(("clear_battle",))
         self.battle = None
+
+    async def set_window_rotation_request(self, request: WindowRotationRequest):
+        self.ops.append((
+            "set_window_rotation_request",
+            request.requested_at_block,
+            request.stale_refreshed_at_block,
+        ))
+        self.rotation_request = request
 
 
 def _battle():
@@ -143,17 +153,9 @@ def test_rotate_window_commit_aborts_without_sampling_confirm(monkeypatch):
     assert store.ops == []
 
 
-def test_rotate_window_commit_releases_stales_then_clears(monkeypatch):
+def test_rotate_window_commit_writes_rotation_request(monkeypatch):
     store = _Store(battle=_battle())
     _install_command_fakes(monkeypatch, store, current_block=1000)
-
-    class _Queue:
-        async def release_claim(self, uid, *, hotkey=None, revision=None):
-            store.ops.append(("release_claim", uid, hotkey, revision))
-            return True
-
-    monkeypatch.setattr(scheduler_commands, "MinersQueueAdapter", lambda: object())
-    monkeypatch.setattr(scheduler_commands, "ChallengerQueue", lambda adapter: _Queue())
 
     # Confirm the sampling service is stopped.
     result = CliRunner().invoke(cli, ["db", "rotate-window", "--commit"], input="y\n")
@@ -161,9 +163,7 @@ def test_rotate_window_commit_releases_stales_then_clears(monkeypatch):
     stale_block = 1000 - WINDOW_BLOCKS - 1
     assert result.exit_code == 0
     assert store.ops == [
-        ("release_claim", 2, "chal_hk", "chal_rev"),
-        ("set_task_state", stale_block),
-        ("clear_battle",),
+        ("set_window_rotation_request", 1000, stale_block),
     ]
 
 
@@ -172,19 +172,9 @@ def test_rotate_window_uses_configured_task_pool_refresh_blocks(monkeypatch):
     _install_command_fakes(monkeypatch, store, current_block=1000)
     monkeypatch.setenv("SCHEDULER_TASK_POOL_REFRESH_BLOCKS", "123")
 
-    class _Queue:
-        async def release_claim(self, uid, *, hotkey=None, revision=None):
-            store.ops.append(("release_claim", uid, hotkey, revision))
-            return True
-
-    monkeypatch.setattr(scheduler_commands, "MinersQueueAdapter", lambda: object())
-    monkeypatch.setattr(scheduler_commands, "ChallengerQueue", lambda adapter: _Queue())
-
     result = CliRunner().invoke(cli, ["db", "rotate-window", "--commit"], input="y\n")
 
     assert result.exit_code == 0
     assert store.ops == [
-        ("release_claim", 2, "chal_hk", "chal_rev"),
-        ("set_task_state", 876),
-        ("clear_battle",),
+        ("set_window_rotation_request", 1000, 876),
     ]

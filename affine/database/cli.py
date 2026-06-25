@@ -1006,11 +1006,12 @@ def sample_progress(window, miner):
 def rotate_window(commit):
     """Manually rotate the champion task window.
 
-    Full rotation: releases the active challenger claim, stales the task
-    pool, and clears the current battle so the scheduler rotates on its
-    next tick. Default is a dry-run that shows exactly what it would do;
-    re-run with --commit to write. Stop the sampling service first — the
-    command confirms this before writing.
+    Full rotation request: scheduler tears down the active battle
+    deployment, releases the active challenger claim, stales the task pool,
+    and clears the current battle before refreshing. Default is a dry-run
+    that shows exactly what it would request; re-run with --commit to write.
+    Stop the sampling service first — the command confirms this before
+    writing.
     """
     from affine.src.scheduler.commands import rotate_window_command
 
