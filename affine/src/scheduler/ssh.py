@@ -25,6 +25,7 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
   sglang_mem_fraction     GPU memory fraction passed to sglang (0.85)
   sglang_chunked_prefill  chunked-prefill size (4096)
   sglang_tool_call_parser parser name, "none" to omit (qwen)
+  sglang_docker_args      optional extra docker-run args
   ready_timeout_sec       seconds to wait for /v1/models (1800)
   poll_interval_sec       seconds between readiness probes (15)
 """
@@ -32,11 +33,12 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import paramiko
@@ -84,6 +86,7 @@ DEFAULT_POLL_INTERVAL_SEC = 15.0
 # Single container name — single-instance host means only one ever exists.
 # ``docker rm -f`` is idempotent so start() always kicks off a fresh state.
 CONTAINER_NAME = "affine-sglang-current"
+RESTART_POLICY = "unless-stopped"
 
 # HuggingFace snapshot cache layout: model "<owner>/<name>" lives at
 # ``<cache>/models--<owner>--<name>/``. Both the prefix and the org/name
@@ -119,6 +122,7 @@ class SSHConfig:
     sglang_mem_fraction: float = DEFAULT_MEM_FRACTION
     sglang_chunked_prefill: int = DEFAULT_CHUNKED_PREFILL
     sglang_tool_call_parser: str = DEFAULT_TOOL_CALL_PARSER
+    sglang_docker_args: Tuple[str, ...] = ()
     ready_timeout_sec: int = DEFAULT_READY_TIMEOUT_SEC
     poll_interval_sec: float = DEFAULT_POLL_INTERVAL_SEC
     connect_timeout: int = 30
@@ -165,6 +169,9 @@ class SSHConfig:
             sglang_mem_fraction=endpoint.sglang_mem_fraction,
             sglang_chunked_prefill=endpoint.sglang_chunked_prefill,
             sglang_tool_call_parser=endpoint.sglang_tool_call_parser,
+            sglang_docker_args=_coerce_docker_args(
+                getattr(endpoint, "sglang_docker_args", None)
+            ),
             ready_timeout_sec=endpoint.ready_timeout_sec,
             poll_interval_sec=endpoint.poll_interval_sec,
         )
@@ -181,6 +188,19 @@ class SSHConfig:
         """
         endpoint = self.endpoint_name or self.host
         return f"ssh:{endpoint}:{CONTAINER_NAME}"
+
+
+def _coerce_docker_args(value: Any) -> Tuple[str, ...]:
+    if not value:
+        return ()
+    if isinstance(value, str):
+        return tuple(shlex.split(value))
+    if isinstance(value, (list, tuple)):
+        return tuple(str(arg) for arg in value if str(arg))
+    raise ValueError(
+        "sglang_docker_args must be a string or list, "
+        f"got {type(value).__name__}"
+    )
 
 
 def _build_sglang_args(target: DeployTarget, config: "SSHConfig") -> List[str]:
@@ -223,6 +243,9 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
         f"--label {shlex.quote(k)}={shlex.quote(v)}"
         for k, v in labels.items()
     )
+    extra_docker_flags = " ".join(
+        shlex.quote(str(arg)) for arg in config.sglang_docker_args
+    )
 
     env_flags = (
         "-e HF_HOME=/data "
@@ -248,8 +271,10 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
     return (
         f"docker rm -f {CONTAINER_NAME} 2>/dev/null; "
         f"docker run -d --name {CONTAINER_NAME} --gpus all "
+        f"--restart {RESTART_POLICY} "
         f"--network host --ipc=host --shm-size=32g "
         f"--security-opt label=disable "
+        f"{extra_docker_flags} "
         f"{label_flags} "
         f"-v {shlex.quote(config.sglang_cache_dir)}:/data "
         f"{env_flags}"
@@ -452,6 +477,100 @@ def _parse_container_exit_status(output: str) -> Optional[int]:
         except ValueError:
             return None
     return None
+
+
+def _parse_container_inspect_json(output: str) -> Optional[Dict[str, Any]]:
+    """Parse ``docker inspect --format '{{json .}}'`` from noisy stdout."""
+    for line in reversed((output or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+async def _container_inspect(config: "SSHConfig") -> Optional[Dict[str, Any]]:
+    fmt = "{{json .}}"
+    cmd = f"docker inspect --format {shlex.quote(fmt)} {CONTAINER_NAME}"
+    rc, out, err = await _ssh_exec(config, cmd)
+    if rc != 0:
+        logger.warning(
+            f"ssh-provider: docker inspect {CONTAINER_NAME!r} failed "
+            f"on {config.host}: rc={rc} stderr={err!r}"
+        )
+        return None
+    return _parse_container_inspect_json(out)
+
+
+async def deployment_healthy(
+    config: "SSHConfig",
+    target: DeployTarget,
+    *,
+    base_url: Optional[str] = None,
+) -> bool:
+    """Return whether the remote container is still serving ``target``.
+
+    This is a runtime reconcile check for the flow scheduler. ``/v1/models``
+    alone is not enough on a single-instance host because the stable URL may
+    be serving a different miner after manual intervention or a crash window;
+    require both Docker labels and the OpenAI readiness probe to match.
+    """
+    probe_url = base_url or config.inference_url()
+    try:
+        info = await _container_inspect(config)
+    except Exception as e:
+        logger.warning(
+            f"ssh-provider: docker inspect health check raised on "
+            f"{config.host}; falling back to /v1/models only: "
+            f"{type(e).__name__}: {e}"
+        )
+        return await _probe_ready(probe_url)
+    if info is None:
+        return False
+
+    state = info.get("State") if isinstance(info.get("State"), dict) else {}
+    status = str(state.get("Status") or "")
+    if status != "running":
+        logger.warning(
+            f"ssh-provider: {CONTAINER_NAME} is not running on {config.host} "
+            f"(status={status!r}, exit={state.get('ExitCode')!r})"
+        )
+        return False
+
+    container_cfg = (
+        info.get("Config") if isinstance(info.get("Config"), dict) else {}
+    )
+    labels = container_cfg.get("Labels") or {}
+    if not isinstance(labels, dict):
+        labels = {}
+    expected_labels = {
+        "io.affine.endpoint": config.endpoint_name or config.host,
+        "io.affine.uid": str(target.uid),
+        "io.affine.hotkey": target.hotkey,
+        "io.affine.model": target.model,
+        "io.affine.revision": target.revision,
+    }
+    for key, expected in expected_labels.items():
+        actual = str(labels.get(key) or "")
+        if actual != str(expected):
+            logger.warning(
+                f"ssh-provider: {CONTAINER_NAME} label mismatch on "
+                f"{config.host}: {key}={actual!r}, expected={expected!r}"
+            )
+            return False
+
+    if not await _probe_ready(probe_url):
+        logger.warning(
+            f"ssh-provider: {CONTAINER_NAME} labels match uid={target.uid} "
+            f"but {probe_url}/models is not ready"
+        )
+        return False
+    return True
 
 
 async def _wait_ready(

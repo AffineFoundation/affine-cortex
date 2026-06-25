@@ -16,7 +16,7 @@ dataclass below for the typed view.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
 from affine.database.base_dao import BaseDAO
@@ -63,11 +63,30 @@ class Endpoint:
     sglang_mem_fraction: float = 0.85
     sglang_chunked_prefill: int = 4096
     sglang_tool_call_parser: str = "qwen"
+    sglang_docker_args: List[str] = field(default_factory=list)
     ready_timeout_sec: int = 1800
     poll_interval_sec: float = 15.0
 
     # targon-kind extras
     targon_api_url: Optional[str] = None
+
+    # Autoscaler metadata. These fields describe the outer GPU instance
+    # lifecycle (Lium/Targon/etc.) for operator-managed SSH endpoints; they
+    # are intentionally separate from scheduler assignment fields.
+    autoscale_managed: bool = False
+    autoscale_provider: Optional[str] = None
+    autoscale_instance_id: Optional[str] = None
+    autoscale_purpose: Optional[str] = None
+    autoscale_created_at: int = 0
+    autoscale_updated_at: int = 0
+    autoscale_lease_expires_at: int = 0
+
+    # Endpoint lifecycle identity. ``updated_at`` also changes for runtime
+    # assignment churn, so scheduler recovery must not use it as "host became
+    # active". ``generation`` and ``activated_at`` advance only when the
+    # endpoint is enabled or its deployment-relevant config changes.
+    generation: int = 0
+    activated_at: int = 0
 
     updated_at: int = 0
     updated_by: str = ""
@@ -80,6 +99,39 @@ class Endpoint:
         fields = {f.name for f in cls.__dataclass_fields__.values()}
         kw = {k: v for k, v in row.items() if k in fields and k != "name"}
         return cls(name=name, **kw)
+
+
+_ENDPOINT_RUNTIME_IDENTITY_FIELDS = (
+    "kind",
+    "public_inference_url",
+    "role",
+    "ssh_url",
+    "ssh_key_path",
+    "sglang_port",
+    "sglang_dp",
+    "sglang_image",
+    "sglang_cache_dir",
+    "sglang_context_len",
+    "sglang_mem_fraction",
+    "sglang_chunked_prefill",
+    "sglang_tool_call_parser",
+    "sglang_docker_args",
+    "ready_timeout_sec",
+    "poll_interval_sec",
+    "targon_api_url",
+)
+
+
+_ASSIGNMENT_FIELDS = (
+    "assigned_uid",
+    "assigned_hotkey",
+    "assigned_model",
+    "assigned_revision",
+    "deployment_id",
+    "base_url",
+    "assignment_role",
+    "assigned_at",
+)
 
 
 class InferenceEndpointsDAO(BaseDAO):
@@ -95,12 +147,38 @@ class InferenceEndpointsDAO(BaseDAO):
 
     async def upsert(self, endpoint: Endpoint, *, updated_by: str = "operator") -> Dict[str, Any]:
         """Insert or overwrite the named endpoint row."""
+        now = int(time.time())
+        previous = await self.get(endpoint.name)
+        generation = int((previous.generation if previous else 0) or 0)
+        activated_at = int((previous.activated_at if previous else 0) or 0)
+        if self._activation_bump_required(previous, endpoint):
+            generation += 1
+            activated_at = now
+
         payload = asdict(endpoint)
         payload.pop("name", None)
         payload["pk"] = self._make_pk(endpoint.name)
-        payload["updated_at"] = int(time.time())
+        payload["generation"] = generation
+        payload["activated_at"] = activated_at
+        payload["updated_at"] = now
         payload["updated_by"] = updated_by
         return await self.put(payload)
+
+    @staticmethod
+    def _activation_bump_required(
+        previous: Optional[Endpoint],
+        endpoint: Endpoint,
+    ) -> bool:
+        if not endpoint.active:
+            return False
+        if previous is None or not previous.active:
+            return True
+        if not previous.generation or not previous.activated_at:
+            return True
+        return any(
+            getattr(previous, field) != getattr(endpoint, field)
+            for field in _ENDPOINT_RUNTIME_IDENTITY_FIELDS
+        )
 
     async def get(self, name: str) -> Optional[Endpoint]:
         row = await super().get(self._make_pk(name))
@@ -195,3 +273,168 @@ class InferenceEndpointsDAO(BaseDAO):
                 ":updated_by": {"S": updated_by},
             },
         )
+
+    async def activate_autoscaled_endpoint(
+        self,
+        endpoint: Endpoint,
+        *,
+        updated_by: str = "gpu-autoscaler",
+    ) -> None:
+        """Activate/update an autoscaled endpoint without touching runtime
+        assignment fields the scheduler owns."""
+        now = int(time.time())
+        previous = await self.get(endpoint.name)
+        generation = int((previous.generation if previous else 0) or 0)
+        activated_at = int((previous.activated_at if previous else 0) or 0)
+        if self._activation_bump_required(previous, endpoint):
+            generation += 1
+            activated_at = now
+
+        payload = asdict(endpoint)
+        payload.pop("name", None)
+        for field in _ASSIGNMENT_FIELDS:
+            payload.pop(field, None)
+        payload.update({
+            "active": True,
+            "generation": generation,
+            "activated_at": activated_at,
+            "updated_at": now,
+            "updated_by": updated_by,
+        })
+        await self._update_endpoint_fields(endpoint.name, set_values=payload)
+
+    async def update_autoscale_lease(
+        self,
+        name: str,
+        *,
+        instance_id: str,
+        lease_expires_at: int,
+        updated_by: str = "gpu-autoscaler",
+    ) -> None:
+        now = int(time.time())
+        await self._update_endpoint_fields(
+            name,
+            set_values={
+                "autoscale_updated_at": now,
+                "autoscale_lease_expires_at": lease_expires_at,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            condition_expression="#cond_instance = :cond_instance",
+            condition_names={"#cond_instance": "autoscale_instance_id"},
+            condition_values={":cond_instance": instance_id},
+        )
+
+    async def deactivate_autoscaled_endpoint(
+        self,
+        name: str,
+        *,
+        instance_id: str,
+        updated_by: str = "gpu-autoscaler",
+    ) -> None:
+        now = int(time.time())
+        await self._update_endpoint_fields(
+            name,
+            set_values={
+                "active": False,
+                "autoscale_updated_at": now,
+                "autoscale_lease_expires_at": 0,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            remove_fields=(
+                "ssh_url",
+                "public_inference_url",
+                "autoscale_instance_id",
+                "autoscale_purpose",
+                *_ASSIGNMENT_FIELDS,
+            ),
+            condition_expression="#cond_instance = :cond_instance",
+            condition_names={"#cond_instance": "autoscale_instance_id"},
+            condition_values={":cond_instance": instance_id},
+        )
+
+    async def drain_autoscaled_endpoint(
+        self,
+        name: str,
+        *,
+        instance_id: str,
+        updated_by: str = "gpu-autoscaler",
+    ) -> None:
+        """Remove an endpoint from scheduler/executor capacity while
+        preserving provider identity for retryable cleanup.
+
+        Manual replacement uses this before deleting the provider instance:
+        DB readers stop dispatching to the endpoint immediately, but if the
+        provider delete fails the row still contains ``autoscale_instance_id``
+        so the next operator command can retry the cleanup.
+        """
+        now = int(time.time())
+        await self._update_endpoint_fields(
+            name,
+            set_values={
+                "active": False,
+                "autoscale_updated_at": now,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            remove_fields=(
+                "ssh_url",
+                "public_inference_url",
+                *_ASSIGNMENT_FIELDS,
+            ),
+            condition_expression="#cond_instance = :cond_instance",
+            condition_names={"#cond_instance": "autoscale_instance_id"},
+            condition_values={":cond_instance": instance_id},
+        )
+
+    async def _update_endpoint_fields(
+        self,
+        name: str,
+        *,
+        set_values: Dict[str, Any],
+        remove_fields=(),
+        condition_expression: Optional[str] = None,
+        condition_names: Optional[Dict[str, str]] = None,
+        condition_values: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        from affine.database.client import get_client
+
+        names: Dict[str, str] = {}
+        values: Dict[str, Dict[str, Any]] = {}
+        set_parts = []
+        for idx, (field, value) in enumerate(set_values.items()):
+            name_key = f"#s{idx}"
+            value_key = f":v{idx}"
+            names[name_key] = field
+            values[value_key] = self._serialize({"value": value})["value"]
+            set_parts.append(f"{name_key} = {value_key}")
+
+        remove_parts = []
+        for idx, field in enumerate(remove_fields):
+            name_key = f"#r{idx}"
+            names[name_key] = field
+            remove_parts.append(name_key)
+
+        names.update(condition_names or {})
+        for key, value in (condition_values or {}).items():
+            values[key] = self._serialize({"value": value})["value"]
+
+        update_parts = []
+        if set_parts:
+            update_parts.append("SET " + ", ".join(set_parts))
+        if remove_parts:
+            update_parts.append("REMOVE " + ", ".join(remove_parts))
+
+        params = {
+            "TableName": self.table_name,
+            "Key": {"pk": {"S": self._make_pk(name)}},
+            "UpdateExpression": " ".join(update_parts),
+            "ExpressionAttributeNames": names,
+            "ExpressionAttributeValues": values,
+        }
+        if condition_expression:
+            params["ConditionExpression"] = condition_expression
+
+        client = get_client()
+        await client.update_item(**params)

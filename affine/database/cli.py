@@ -674,6 +674,19 @@ async def _cmd_list_endpoints() -> None:
                 print(f"  ssh_url             : {ep.ssh_url}")
             if ep.public_inference_url:
                 print(f"  public_inference_url: {ep.public_inference_url}")
+            if ep.generation or ep.activated_at:
+                print(
+                    "  lifecycle           : "
+                    f"generation={ep.generation} "
+                    f"activated_at={ep.activated_at or '-'}"
+                )
+            if ep.autoscale_managed:
+                print(
+                    "  autoscale           : "
+                    f"provider={ep.autoscale_provider or '-'} "
+                    f"instance={ep.autoscale_instance_id or '-'} "
+                    f"created_at={ep.autoscale_created_at or '-'}"
+                )
             if ep.kind == "ssh":
                 print(f"  sglang              : port={ep.sglang_port} dp={ep.sglang_dp} image={ep.sglang_image}")
                 print(
@@ -683,6 +696,11 @@ async def _cmd_list_endpoints() -> None:
                     f"chunked_prefill={ep.sglang_chunked_prefill} "
                     f"tool_parser={ep.sglang_tool_call_parser}"
                 )
+                if ep.sglang_docker_args:
+                    print(
+                        "  docker args         : "
+                        + " ".join(ep.sglang_docker_args)
+                    )
                 print(
                     "  readiness           : "
                     f"timeout={ep.ready_timeout_sec}s "
@@ -711,7 +729,8 @@ async def _cmd_set_endpoint(
     public_inference_url: Optional[str], sglang_port: int, sglang_dp: int,
     sglang_image: str, sglang_cache_dir: str, sglang_context_len: int,
     sglang_mem_fraction: float, sglang_chunked_prefill: int,
-    sglang_tool_call_parser: str, ready_timeout_sec: int,
+    sglang_tool_call_parser: str, sglang_docker_arg: tuple[str, ...],
+    ready_timeout_sec: int,
     poll_interval_sec: float, active: bool, notes: Optional[str],
 ) -> None:
     await init_client()
@@ -729,6 +748,7 @@ async def _cmd_set_endpoint(
             sglang_mem_fraction=sglang_mem_fraction,
             sglang_chunked_prefill=sglang_chunked_prefill,
             sglang_tool_call_parser=sglang_tool_call_parser,
+            sglang_docker_args=list(sglang_docker_arg),
             ready_timeout_sec=ready_timeout_sec,
             poll_interval_sec=poll_interval_sec,
             notes=notes,
@@ -772,6 +792,8 @@ def list_endpoints():
 @click.option("--sglang-chunked-prefill", type=int, default=4096)
 @click.option("--sglang-tool-call-parser", default="qwen",
               help='Tool-call parser name; set to "none" to omit')
+@click.option("--sglang-docker-arg", multiple=True,
+              help="Extra docker-run argument. Repeat for multiple args.")
 @click.option("--ready-timeout-sec", type=int, default=1800)
 @click.option("--poll-interval-sec", type=float, default=15.0)
 @click.option("--active/--inactive", default=True)
@@ -780,8 +802,8 @@ def set_endpoint(
     name, kind, ssh_url, ssh_key_path, public_inference_url,
     sglang_port, sglang_dp, sglang_image, sglang_cache_dir,
     sglang_context_len, sglang_mem_fraction, sglang_chunked_prefill,
-    sglang_tool_call_parser, ready_timeout_sec, poll_interval_sec,
-    active, notes,
+    sglang_tool_call_parser, sglang_docker_arg, ready_timeout_sec,
+    poll_interval_sec, active, notes,
 ):
     """Register or update an inference endpoint."""
     if kind == "ssh" and not ssh_url:
@@ -795,6 +817,7 @@ def set_endpoint(
         sglang_mem_fraction=sglang_mem_fraction,
         sglang_chunked_prefill=sglang_chunked_prefill,
         sglang_tool_call_parser=sglang_tool_call_parser,
+        sglang_docker_arg=sglang_docker_arg,
         ready_timeout_sec=ready_timeout_sec,
         poll_interval_sec=poll_interval_sec,
         active=active, notes=notes,

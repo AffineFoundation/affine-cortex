@@ -274,6 +274,7 @@ MINER_STATS_SCHEMA = {
 #   sglang_mem_fraction    GPU memory fraction passed to sglang
 #   sglang_chunked_prefill chunked-prefill size passed to sglang
 #   sglang_tool_call_parser tool-call parser name, "none" to omit
+#   sglang_docker_args    extra docker-run args
 #   ready_timeout_sec      readiness probe timeout
 #   poll_interval_sec      readiness probe interval
 #
@@ -375,5 +376,4 @@ ANTICOPY_STATE_SCHEMA = {
     ],
     "BillingMode": "PAY_PER_REQUEST",
 }
-
 

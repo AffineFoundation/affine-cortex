@@ -17,6 +17,12 @@ services:
   scheduler:
     <<: *affine_image
 
+  gpu_autoscaler:
+    <<: *affine_image
+
+  targon_autoscale_wrapper:
+    <<: *affine_image
+
   executor:
     <<: *affine_image
 

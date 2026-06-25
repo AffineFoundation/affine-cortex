@@ -62,6 +62,29 @@ ORPHAN_SWEEP_INTERVAL_SEC = int(
 )
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").lower() in ("1", "true", "yes", "on")
+
+
+async def _gpu_autoscaler_empty_provider_kind(config_dao) -> Optional[str]:
+    try:
+        from .gpu_autoscaler import load_config as load_gpu_autoscaler_config
+        config = await load_gpu_autoscaler_config(config_dao)
+        enabled = config.enabled
+    except Exception as e:
+        logger.warning(
+            f"scheduler: failed to read gpu_autoscaler config; falling back "
+            f"to AFFINE_GPU_AUTOSCALER_ENABLED env: {type(e).__name__}: {e}"
+        )
+        enabled = _env_flag_enabled("AFFINE_GPU_AUTOSCALER_ENABLED")
+    if not enabled:
+        return None
+    return os.getenv(
+        "AFFINE_GPU_AUTOSCALER_EMPTY_PROVIDER_KIND",
+        "ssh",
+    ).strip().lower()
+
+
 def _endpoint_matches_target(endpoint, target) -> bool:
     return (
         endpoint.assigned_uid == target.uid
@@ -71,7 +94,15 @@ def _endpoint_matches_target(endpoint, target) -> bool:
     )
 
 
-def _resolve_provider_kind(active: List[object]) -> tuple:
+def _is_scoring_endpoint(endpoint) -> bool:
+    return (getattr(endpoint, "role", None) or "scoring") == "scoring"
+
+
+def _resolve_provider_kind(
+    active: List[object],
+    *,
+    empty_provider_kind: Optional[str] = None,
+) -> tuple:
     """Decide provider lifecycle from the active ``inference_endpoints``.
 
     Returns ``(kind, ssh_active, targon_active)`` where ``kind`` is
@@ -80,6 +111,9 @@ def _resolve_provider_kind(active: List[object]) -> tuple:
       - mixed ssh+targon kinds (not yet supported)
       - rows present but none of a known kind
     """
+    active = [ep for ep in active if _is_scoring_endpoint(ep)]
+    if not active and empty_provider_kind == "ssh":
+        return "ssh", [], []
     if not active:
         raise RuntimeError(
             "no active inference endpoints registered; configure one with "
@@ -136,7 +170,10 @@ async def _deploy_ssh_target(
     role: str = "active",
 ):
     endpoints = sorted(
-        await endpoints_dao.list_active(kind="ssh"),
+        [
+            ep for ep in await endpoints_dao.list_active(kind="ssh")
+            if _is_scoring_endpoint(ep)
+        ],
         key=lambda ep: ep.name,
     )
     selected = _select_ssh_endpoints(endpoints, target, role=role)
@@ -236,7 +273,11 @@ async def _run() -> None:
     from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
     endpoints_dao = InferenceEndpointsDAO()
     active = await endpoints_dao.list_active()
-    provider_kind, ssh_active, targon_active = _resolve_provider_kind(active)
+    empty_provider_kind = await _gpu_autoscaler_empty_provider_kind(config_dao)
+    provider_kind, ssh_active, targon_active = _resolve_provider_kind(
+        active,
+        empty_provider_kind=empty_provider_kind,
+    )
 
     if provider_kind == "ssh":
         active = sorted(ssh_active, key=lambda ep: ep.name)
@@ -309,9 +350,39 @@ async def _run() -> None:
             finally:
                 await endpoints_dao.clear_assignment(name)
 
+        async def deployment_health_fn(champion):
+            if not champion.deployment_id:
+                return False
+            _name, cfg = await _resolve_ssh_cfg(champion.deployment_id)
+            if cfg is None:
+                logger.warning(
+                    f"scheduler: no ssh endpoint owns champion "
+                    f"deployment_id={champion.deployment_id!r}; "
+                    f"treating deployment as unhealthy"
+                )
+                return False
+            target = targon_lifecycle.DeployTarget(
+                uid=champion.uid,
+                hotkey=champion.hotkey,
+                model=champion.model,
+                revision=champion.revision,
+                model_type=champion.model_type,
+            )
+            return await ssh_lifecycle.deployment_healthy(
+                cfg, target, base_url=champion.base_url,
+            )
+
         async def list_active_ssh_endpoint_names():
             return {
                 ep.name for ep in await endpoints_dao.list_active(kind="ssh")
+                if _is_scoring_endpoint(ep)
+            }
+
+        async def list_active_ssh_endpoint_activations():
+            return {
+                ep.name: int(ep.activated_at or 0)
+                for ep in await endpoints_dao.list_active(kind="ssh")
+                if _is_scoring_endpoint(ep)
             }
 
         # SSH primary always time-shares champion + current challenger,
@@ -345,7 +416,9 @@ async def _run() -> None:
         async def teardown_fn(deployment_id):
             await targon_lifecycle.teardown(targon_client, deployment_id)
 
+        deployment_health_fn = None
         list_active_ssh_endpoint_names = None
+        list_active_ssh_endpoint_activations = None
         flow_config = FlowConfig()
         logger.info(
             f"scheduler: provider=targon endpoint={primary.name!r} "
@@ -366,6 +439,10 @@ async def _run() -> None:
         list_valid_miners_fn=list_valid_miners_fn,
         list_current_miners_fn=list_current_miners_fn,
         list_active_endpoint_names_fn=list_active_ssh_endpoint_names,
+        list_active_endpoint_activations_fn=(
+            list_active_ssh_endpoint_activations
+        ),
+        deployment_health_fn=deployment_health_fn,
     )
 
     stop_event = asyncio.Event()

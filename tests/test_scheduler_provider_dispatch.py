@@ -17,15 +17,33 @@ from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.flow import DeploymentStateInvalidatedError
 from affine.src.scheduler.main import (
     _deploy_ssh_target,
+    _gpu_autoscaler_empty_provider_kind,
     _resolve_provider_kind,
 )
-from affine.src.scheduler.targon import DeployTarget
+from affine.src.scheduler.targon import DeployResult, DeployTarget
+
+
+class _UpdateRecordingClient:
+    def __init__(self):
+        self.update_calls = []
+
+    async def update_item(self, **kwargs):
+        self.update_calls.append(kwargs)
+
+
+class _ConfigDAOFake:
+    def __init__(self, values):
+        self.values = values
+
+    async def get_param_value(self, name, default=None):
+        return self.values.get(name, default)
 
 
 @dataclass
 class _Ep:
     name: str
     kind: str
+    role: str = ""
 
 
 def test_empty_active_raises():
@@ -33,11 +51,46 @@ def test_empty_active_raises():
         _resolve_provider_kind([])
 
 
+def test_empty_active_can_resolve_to_ssh_for_autoscaler():
+    kind, ssh, targon = _resolve_provider_kind([], empty_provider_kind="ssh")
+    assert kind == "ssh"
+    assert ssh == []
+    assert targon == []
+
+
+@pytest.mark.asyncio
+async def test_autoscaler_empty_provider_uses_system_config(monkeypatch):
+    monkeypatch.delenv("AFFINE_GPU_AUTOSCALER_ENABLED", raising=False)
+    config_dao = _ConfigDAOFake({
+        "gpu_autoscaler": {
+            "enabled": True,
+            "endpoints": [{"name": "slot-1", "provider": "lium"}],
+        }
+    })
+
+    assert await _gpu_autoscaler_empty_provider_kind(config_dao) == "ssh"
+
+
 def test_all_ssh_resolves_to_ssh():
     eps = [_Ep("b300", "ssh"), _Ep("b300-2", "ssh")]
     kind, ssh, targon = _resolve_provider_kind(eps)
     assert kind == "ssh"
     assert [ep.name for ep in ssh] == ["b300", "b300-2"]
+    assert targon == []
+
+
+def test_non_scoring_endpoints_are_ignored_for_provider_resolution():
+    eps = [_Ep("ceac", "ssh", role="anticopy")]
+
+    with pytest.raises(RuntimeError, match="no active inference endpoints"):
+        _resolve_provider_kind(eps)
+
+    kind, ssh, targon = _resolve_provider_kind(
+        eps,
+        empty_provider_kind="ssh",
+    )
+    assert kind == "ssh"
+    assert ssh == []
     assert targon == []
 
 
@@ -59,6 +112,134 @@ def test_unknown_kinds_raises():
     eps = [_Ep("weird", "vllm")]
     with pytest.raises(RuntimeError, match="none are kind=ssh"):
         _resolve_provider_kind(eps)
+
+
+def test_endpoint_activation_bumps_on_enable_or_runtime_config_change():
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    disabled = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=False,
+        ssh_url="ssh://old-host",
+    )
+    enabled = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+    )
+    moved = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://new-host",
+    )
+    legacy_active = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+        generation=0,
+        activated_at=0,
+    )
+    current_active = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+        generation=1,
+        activated_at=100,
+    )
+    assigned = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+        assigned_uid=123,
+    )
+
+    assert InferenceEndpointsDAO._activation_bump_required(None, enabled)
+    assert InferenceEndpointsDAO._activation_bump_required(disabled, enabled)
+    assert InferenceEndpointsDAO._activation_bump_required(legacy_active, enabled)
+    assert InferenceEndpointsDAO._activation_bump_required(enabled, moved)
+    assert not InferenceEndpointsDAO._activation_bump_required(current_active, assigned)
+    assert not InferenceEndpointsDAO._activation_bump_required(current_active, Endpoint(
+        name="b300",
+        kind="ssh",
+        active=False,
+        ssh_url="ssh://old-host",
+    ))
+
+
+@pytest.mark.asyncio
+async def test_activate_autoscaled_endpoint_does_not_write_assignment_fields(
+    monkeypatch,
+):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+    dao = InferenceEndpointsDAO()
+
+    async def fake_get(name):
+        return Endpoint(
+            name=name,
+            kind="ssh",
+            active=False,
+            assigned_uid=42,
+            assigned_hotkey="hk42",
+            generation=3,
+            activated_at=100,
+        )
+
+    dao.get = fake_get
+    await dao.activate_autoscaled_endpoint(
+        Endpoint(
+            name="b300",
+            kind="ssh",
+            active=True,
+            ssh_url="ssh://root@b300",
+            autoscale_instance_id="inst-b300",
+            assigned_uid=99,
+            assigned_hotkey="new",
+        )
+    )
+
+    call = client.update_calls[0]
+    updated_fields = set(call["ExpressionAttributeNames"].values())
+    assert "assigned_uid" not in updated_fields
+    assert "assigned_hotkey" not in updated_fields
+    assert "deployment_id" not in updated_fields
+    assert "autoscale_instance_id" in updated_fields
+    assert call["Key"] == {"pk": {"S": "ENDPOINT#b300"}}
+
+
+@pytest.mark.asyncio
+async def test_deactivate_autoscaled_endpoint_is_conditioned_on_instance(
+    monkeypatch,
+):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+    dao = InferenceEndpointsDAO()
+
+    await dao.deactivate_autoscaled_endpoint(
+        "b300",
+        instance_id="inst-b300",
+    )
+
+    call = client.update_calls[0]
+    removed_fields = set(call["ExpressionAttributeNames"].values())
+    assert call["ConditionExpression"] == "#cond_instance = :cond_instance"
+    assert call["ExpressionAttributeValues"][":cond_instance"] == {
+        "S": "inst-b300"
+    }
+    assert "autoscale_instance_id" in removed_fields
+    assert "assigned_uid" in removed_fields
+    assert "assigned_hotkey" in removed_fields
+    assert "deployment_id" in removed_fields
 
 
 class _EndpointsDAOFake:
@@ -120,3 +301,48 @@ async def test_ssh_deploy_failure_clears_assignment_and_reports_deployment(
     assert excinfo.value.invalidated_deployment_ids == (
         "ssh:b300:affine-sglang-current",
     )
+
+
+@pytest.mark.asyncio
+async def test_ssh_deploy_skips_non_scoring_endpoints(monkeypatch):
+    anticopy = Endpoint(
+        name="ceac",
+        kind="ssh",
+        role="anticopy",
+        ssh_url="ssh://root@ceac",
+    )
+    scoring = Endpoint(
+        name="b300",
+        kind="ssh",
+        ssh_url="ssh://root@b300",
+    )
+    dao = _EndpointsDAOFake([anticopy, scoring])
+
+    async def deploy(config, target):
+        return DeployResult(
+            deployment_id=config.deployment_id(),
+            base_url=config.inference_url(),
+        )
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.main.ssh_lifecycle.deploy",
+        deploy,
+    )
+
+    result = await _deploy_ssh_target(dao, {}, _target(), role="champion")
+
+    assert result.deployment_id == "ssh:b300:affine-sglang-current"
+    assert dao.assignments == [
+        (
+            "b300",
+            {
+                "uid": 42,
+                "hotkey": "hk42",
+                "model": "Qwen/Qwen3-30B-A22B",
+                "revision": "rev42",
+                "deployment_id": "ssh:b300:affine-sglang-current",
+                "base_url": "http://b300:10001/v1",
+                "role": "champion",
+            },
+        )
+    ]

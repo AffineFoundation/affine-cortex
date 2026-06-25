@@ -8,6 +8,7 @@ suite when b300 is reachable.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -18,6 +19,7 @@ from affine.src.scheduler.ssh import (
     CONTAINER_NAME,
     HF_ORG_SEPARATOR,
     HF_SNAPSHOT_PREFIX,
+    RESTART_POLICY,
     SSHConfig,
     _build_cache_cleanup_cmd,
     _build_docker_run_cmd,
@@ -26,6 +28,8 @@ from affine.src.scheduler.ssh import (
     _hf_cache_dir_name,
     _is_valid_hf_model_id,
     _parse_container_exit_status,
+    _parse_container_inspect_json,
+    deployment_healthy,
     deploy,
 )
 from affine.src.scheduler.targon import DeployTarget
@@ -73,6 +77,16 @@ def test_ssh_config_from_endpoint_defaults_to_root_and_port_22():
 def test_ssh_config_endpoint_missing_url_raises():
     with pytest.raises(ValueError, match="no ssh_url"):
         SSHConfig.from_endpoint(Endpoint(name="b300", kind="ssh"))
+
+
+def test_ssh_config_from_endpoint_keeps_extra_docker_args():
+    cfg = SSHConfig.from_endpoint(Endpoint(
+        name="targon",
+        kind="ssh",
+        ssh_url="ssh://worker@targon.example",
+        sglang_docker_args=["--cgroupns=host"],
+    ))
+    assert cfg.sglang_docker_args == ("--cgroupns=host",)
 
 
 def test_ssh_config_bad_scheme_raises():
@@ -316,6 +330,7 @@ def test_docker_cmd_rms_existing_container_first():
 def test_docker_cmd_passes_gpus_all_and_mounts_cache():
     cmd = _build_docker_run_cmd(_target(), _config())
     assert "--gpus all" in cmd
+    assert f"--restart {RESTART_POLICY}" in cmd
     assert "-v /data:/data" in cmd
     assert "lmsysorg/sglang:latest" in cmd
     assert "python -m sglang.launch_server" in cmd
@@ -353,6 +368,14 @@ def test_docker_cmd_uses_host_network_and_ipc():
     assert "--security-opt label=disable" in cmd
 
 
+def test_docker_cmd_includes_configured_extra_docker_args():
+    cmd = _build_docker_run_cmd(
+        _target(),
+        _config(sglang_docker_args=("--cgroupns=host",)),
+    )
+    assert "--cgroupns=host" in cmd
+
+
 def test_docker_cmd_passes_hf_token_when_env_set(monkeypatch):
     monkeypatch.setenv("HF_TOKEN", "hf_test_TOKEN_123")
     cmd = _build_docker_run_cmd(_target(), _config())
@@ -376,6 +399,77 @@ def test_parse_container_exit_status_tolerates_targon_banner():
         "Connecting to container wrk-abc...\nrunning 0\n"
     ) is None
     assert _parse_container_exit_status("Connecting to container wrk-abc...\n") is None
+
+
+def test_parse_container_inspect_json_tolerates_targon_banner():
+    payload = {"State": {"Status": "running"}, "Config": {"Labels": {}}}
+    assert _parse_container_inspect_json(
+        "Connecting to container wrk-abc...\n" + json.dumps(payload) + "\n"
+    ) == payload
+    assert _parse_container_inspect_json("Connecting only\n") is None
+
+
+@pytest.mark.asyncio
+async def test_deployment_healthy_requires_matching_running_container(monkeypatch):
+    target = _target()
+    cfg = _config(endpoint_name="ssh_b300")
+    labels = {
+        "io.affine.endpoint": "ssh_b300",
+        "io.affine.uid": str(target.uid),
+        "io.affine.hotkey": target.hotkey,
+        "io.affine.model": target.model,
+        "io.affine.revision": target.revision,
+    }
+    inspect_payload = {
+        "State": {"Status": "running", "ExitCode": 0},
+        "Config": {"Labels": labels},
+    }
+    probed = []
+
+    async def fake_ssh_exec(config, command):
+        assert command.startswith("docker inspect")
+        return 0, "Connecting to container wrk-abc...\n" + json.dumps(inspect_payload), ""
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        probed.append(base_url)
+        return True
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+
+    assert await deployment_healthy(
+        cfg, target, base_url="http://edge.example/v1",
+    )
+    assert probed == ["http://edge.example/v1"]
+
+
+@pytest.mark.asyncio
+async def test_deployment_healthy_rejects_wrong_model_label(monkeypatch):
+    target = _target()
+    cfg = _config(endpoint_name="ssh_b300")
+    inspect_payload = {
+        "State": {"Status": "running", "ExitCode": 0},
+        "Config": {
+            "Labels": {
+                "io.affine.endpoint": "ssh_b300",
+                "io.affine.uid": str(target.uid),
+                "io.affine.hotkey": target.hotkey,
+                "io.affine.model": "other/model",
+                "io.affine.revision": target.revision,
+            }
+        },
+    }
+
+    async def fake_ssh_exec(config, command):
+        return 0, json.dumps(inspect_payload), ""
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        raise AssertionError("readiness probe should not run after label mismatch")
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+
+    assert not await deployment_healthy(cfg, target)
 
 
 def test_tool_call_parser_none_omits_flag():

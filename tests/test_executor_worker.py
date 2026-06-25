@@ -1298,6 +1298,72 @@ def test_dispatch_skips_when_neither_has_url():
     assert _asyncio.run(_drive()) == 0
 
 
+def test_dispatch_cancels_stale_tasks_even_when_no_urls_remain():
+    """Endpoint scale-down clears all current deployment ids. Even when
+    there is nothing new to dispatch, the worker must still cancel
+    already-launched calls against the removed endpoint."""
+    import asyncio as _asyncio
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import (
+        ChampionRecord, EnvConfig, TaskIdState,
+    )
+
+    class _StateStub:
+        async def get_task_state(self):
+            return TaskIdState(
+                task_ids={"ENV_A": [1, 2, 3]}, refreshed_at_block=0,
+            )
+
+        async def get_environments(self):
+            return {
+                "ENV_A": EnvConfig(
+                    display_name="ENV_A", enabled_for_sampling=True,
+                    sampling_count=3, dataset_range=[[0, 100]],
+                ),
+            }
+
+        async def get_champion(self):
+            return ChampionRecord(
+                uid=1, hotkey="champ_hk", revision="champ_rev",
+                model="org/m1", deployment_id=None, base_url=None,
+                deployments=[], since_block=0,
+            )
+
+        async def get_battle(self):
+            return None
+
+        async def get_predeployed_challengers(self):
+            return []
+
+    class _SamplesStub:
+        async def read_scores_for_tasks(self, *a, **kw):
+            return {}
+
+    async def _run():
+        worker = ExecutorWorker(worker_id=0, env="ENV_A")
+        worker._state = _StateStub()
+        worker._samples = _SamplesStub()
+
+        async def _block():
+            await _asyncio.sleep(60)
+
+        stale_task = _asyncio.create_task(_block())
+        worker._tasks_by_deployment["ssh:removed:affine-sglang-current"] = {
+            stale_task
+        }
+
+        n = await worker._dispatch_new(set(), set())
+        await _asyncio.sleep(0)
+
+        assert n == 0
+        assert stale_task.cancelled() or stale_task.done()
+        assert "ssh:removed:affine-sglang-current" not in (
+            worker._tasks_by_deployment
+        )
+
+    _asyncio.run(_run())
+
+
 # ---- deployment_id drift validation -----------------------------------------
 #
 # Bug context: during sglang model swap, the executor's in-flight

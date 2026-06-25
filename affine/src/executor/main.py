@@ -426,6 +426,7 @@ async def _active_ssh_endpoint_names() -> List[str]:
         from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
         return [
             ep.name for ep in await InferenceEndpointsDAO().list_active(kind="ssh")
+            if (ep.role or "scoring") == "scoring"
         ]
     except Exception as e:
         logger.warning(

@@ -307,7 +307,10 @@ def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
 
 def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
-    window_blocks=WINDOW_BLOCKS, task_pool_refresh_blocks=None,
+    window_blocks=WINDOW_BLOCKS, deployment_health_fn=None,
+    list_active_endpoint_names_fn=None,
+    list_active_endpoint_activations_fn=None,
+    task_pool_refresh_blocks=None, config=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -323,7 +326,7 @@ def _build_scheduler(
         ]
 
     scheduler = FlowScheduler(
-        config=FlowConfig(
+        config=config or FlowConfig(
             window_blocks=window_blocks,
             task_pool_refresh_blocks=task_pool_refresh_blocks,
         ),
@@ -337,6 +340,11 @@ def _build_scheduler(
         sample_count_fn=samples.count_samples_for_tasks,
         scores_reader=samples.read_scores_for_tasks,
         list_valid_miners_fn=list_valid_miners_fn,
+        list_active_endpoint_names_fn=list_active_endpoint_names_fn,
+        list_active_endpoint_activations_fn=(
+            list_active_endpoint_activations_fn
+        ),
+        deployment_health_fn=deployment_health_fn,
     )
     return scheduler, state, weight_writer
 
@@ -399,6 +407,43 @@ async def test_first_tick_refreshes_task_ids_then_returns():
     assert task_state is not None
     assert set(task_state.task_ids.keys()) == {"ENV_A", "ENV_B"}
     assert task_state.refreshed_at_block == 50
+
+
+@pytest.mark.asyncio
+async def test_single_instance_refresh_clears_champion_base_url_without_deployment_id():
+    kv = _seed_state()
+    kv.data["champion"]["deployment_id"] = None
+    kv.data["champion"]["base_url"] = "http://old-endpoint/v1"
+    kv.data["champion"]["deployments"] = [
+        {
+            "endpoint_name": "lium-b200-1",
+            "deployment_id": "ssh:lium-b200-1:affine-sglang-current",
+            "base_url": "http://old-endpoint/v1",
+        }
+    ]
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+    ])
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=_DeployTracker(),
+        samples=_SamplesFake(),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    champ = await state.get_champion()
+    assert champ.deployment_id is None
+    assert champ.base_url is None
+    assert champ.deployments == []
 
 
 @pytest.mark.asyncio
@@ -597,6 +642,158 @@ async def test_champion_targon_deployed_on_second_tick():
     assert champ.deployment_id == "wrk-001"
     assert champ.base_url == "https://t/wrk-001"
     assert len(deployer.deploys) == 1
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_champion_deployment_is_cleared_and_redeployed():
+    """A persisted deployment_id/base_url is only a scheduler record; the
+    underlying sglang process can exit later. A failed runtime health check
+    must clear that stale state and run the normal champion deploy path so
+    executor stops sampling a dead URL."""
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-stale"
+    kv.data["champion"]["base_url"] = "https://t/stale"
+    kv.data["champion"]["deployments"] = [
+        {
+            "endpoint_name": "primary",
+            "deployment_id": "wrk-stale",
+            "base_url": "https://t/stale",
+        }
+    ]
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+    ])
+    deployer = _DeployTracker()
+    health_checks = []
+
+    async def deployment_health_fn(champion):
+        health_checks.append((champion.uid, champion.deployment_id))
+        return False
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer,
+        samples=_SamplesFake(), deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    assert health_checks == [(1, "wrk-stale")]
+    assert [d.uid for d in deployer.deploys] == [1]
+    champ = await state.get_champion()
+    assert champ.deployment_id == "wrk-001"
+    assert champ.base_url == "https://t/wrk-001"
+
+
+@pytest.mark.asyncio
+async def test_healthy_champion_deployment_is_not_redeployed():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-live"
+    kv.data["champion"]["base_url"] = "https://t/live"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+    ])
+    deployer = _DeployTracker()
+
+    async def deployment_health_fn(champion):
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer,
+        samples=_SamplesFake(), deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    champ = await state.get_champion()
+    assert champ.deployment_id == "wrk-live"
+    assert champ.base_url == "https://t/live"
+    assert deployer.deploys == []
+
+
+@pytest.mark.asyncio
+async def test_no_active_endpoint_waits_without_deploying_or_predeploying():
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100, status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=1)
+    samples = _SamplesFake()
+
+    async def no_active_endpoints():
+        return set()
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+        list_active_endpoint_names_fn=no_active_endpoints,
+    )
+
+    await scheduler.tick(current_block=50)   # refresh, then predeploy skips
+    await scheduler.tick(current_block=51)   # champion deploy skips
+
+    assert deployer.deploys == []
+    assert deployer.predeploys == []
+    assert await state.get_battle() is None
+    assert (await state.get_predeployed_challengers()) == []
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
+
+
+@pytest.mark.asyncio
+async def test_no_active_endpoint_does_not_claim_challenger():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-live"
+    kv.data["champion"]["base_url"] = "https://t/live"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100, status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+    for env, task_ids in kv.data["current_task_ids"]["task_ids"].items():
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_ids,
+            refresh_block=50,
+        )
+
+    async def no_active_endpoints():
+        return set()
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+        list_active_endpoint_names_fn=no_active_endpoints,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    assert deployer.deploys == []
+    assert await state.get_battle() is None
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
 
 
 @pytest.mark.asyncio
@@ -3006,9 +3203,9 @@ async def test_predeploy_no_spare_does_not_mark_failed():
 
 
 @pytest.mark.asyncio
-async def test_reaper_terminates_old_orphan_in_progress():
-    """Pre-existing in_progress row with no matching battle/champion and
-    age > grace gets terminated with claim_orphan_reaped reason."""
+async def test_reaper_skips_old_orphan_without_endpoint_snapshot():
+    """Without endpoint lifecycle evidence, the reaper must not blindly
+    release or terminate an old in_progress row."""
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -3024,9 +3221,104 @@ async def test_reaper_terminates_old_orphan_in_progress():
 
     await scheduler.tick(current_block=50)
 
+    assert miner_store.rows[99]["challenge_status"] == STATUS_IN_PROGRESS
+    assert miner_store.rows[99].get("termination_reason") in (None, "")
+
+
+def test_orphan_release_reason_uses_endpoint_lifecycle():
+    assert FlowScheduler._orphan_release_reason(
+        claimed_at=100,
+        endpoint_activations={"primary": 200},
+    ).startswith("endpoint_reactivated_after_claim:")
+    assert FlowScheduler._orphan_release_reason(
+        claimed_at=100,
+        endpoint_activations={},
+    ) == "no_active_endpoint"
+    assert FlowScheduler._orphan_release_reason(
+        claimed_at=200,
+        endpoint_activations={"primary": 100},
+    ) == "stale_claim_endpoint_stable"
+    assert FlowScheduler._orphan_release_reason(
+        claimed_at=200,
+        endpoint_activations=None,
+    ) == "stale_claim_no_endpoint_snapshot"
+
+
+@pytest.mark.asyncio
+async def test_reaper_releases_orphan_when_no_endpoint_is_active():
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(99, "orphan_hk", 50, status=STATUS_IN_PROGRESS,
+                    revision="orphan_rev"),
+    ])
+    miner_store.rows[99]["challenge_claimed_at"] = 100
+
+    async def endpoint_activations():
+        return {}
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+        list_active_endpoint_activations_fn=endpoint_activations,
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[99]["challenge_status"] == STATUS_SAMPLING
+    assert miner_store.rows[99].get("termination_reason") in (None, "")
+    assert (await state.get_battle()) is None
+
+
+@pytest.mark.asyncio
+async def test_reaper_releases_orphan_after_endpoint_reactivation():
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(99, "orphan_hk", 50, status=STATUS_IN_PROGRESS,
+                    revision="orphan_rev"),
+    ])
+    miner_store.rows[99]["challenge_claimed_at"] = 100
+
+    async def endpoint_activations():
+        return {"primary": 200}
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+        list_active_endpoint_activations_fn=endpoint_activations,
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert miner_store.rows[99]["challenge_status"] == STATUS_SAMPLING
+    assert (await state.get_battle()) is None
+
+
+@pytest.mark.asyncio
+async def test_reaper_terminates_old_orphan_when_endpoint_stayed_stable():
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
+        _make_miner(99, "orphan_hk", 50, status=STATUS_IN_PROGRESS,
+                    revision="orphan_rev"),
+    ])
+    miner_store.rows[99]["challenge_claimed_at"] = 200
+
+    async def endpoint_activations():
+        return {"primary": 100}
+
+    scheduler, _, _ = _build_scheduler(
+        kv=kv, miner_store=miner_store,
+        deployer=_DeployTracker(), samples=_SamplesFake(),
+        list_active_endpoint_activations_fn=endpoint_activations,
+    )
+
+    await scheduler.tick(current_block=50)
+
     assert miner_store.rows[99]["challenge_status"] == STATUS_TERMINATED
-    assert miner_store.rows[99]["termination_reason"].startswith(
-        "claim_orphan_reaped:age="
+    assert miner_store.rows[99]["termination_reason"] == (
+        "orphan_in_progress:stale_claim_endpoint_stable"
     )
 
 

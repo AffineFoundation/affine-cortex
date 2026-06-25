@@ -187,7 +187,7 @@ _PREDEPLOY_PEEK_LIMIT = 32
 
 ORPHAN_GRACE_SECONDS = 120
 """Minimum age of an ``in_progress`` row, missing from all in-flight
-roles, before the reaper terminates it."""
+roles, before the reaper releases it back to the queue."""
 
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
@@ -221,6 +221,17 @@ pre-deploy invalidation sweep to drop records whose endpoint has been
 removed from ``inference_endpoints`` while the scheduler was down
 (``af db set-endpoint --no-active`` or row deletion). Optional —
 non-ssh providers don't need it."""
+
+ListActiveEndpointActivationsFn = Callable[[], Awaitable[Dict[str, int]]]
+"""Return currently-active endpoint names mapped to ``activated_at`` unix
+seconds. Used by the orphan reaper to tell whether an ``in_progress`` claim
+belongs to an older endpoint generation. Optional for providers without
+endpoint lifecycle metadata."""
+
+DeploymentHealthFn = Callable[[ChampionRecord], Awaitable[bool]]
+"""Return whether a persisted champion deployment is still serving the
+saved champion identity. Optional; providers that cannot cheaply check
+runtime health can leave it unset."""
 
 
 @dataclass
@@ -269,6 +280,10 @@ class FlowScheduler:
         list_valid_miners_fn: ListValidMinersFn,
         list_current_miners_fn: Optional[ListCurrentMinersFn] = None,
         list_active_endpoint_names_fn: Optional[ListActiveEndpointNamesFn] = None,
+        list_active_endpoint_activations_fn: Optional[
+            ListActiveEndpointActivationsFn
+        ] = None,
+        deployment_health_fn: Optional[DeploymentHealthFn] = None,
     ):
         self.cfg = config
         self.state = state
@@ -283,6 +298,11 @@ class FlowScheduler:
         self._list_valid_miners = list_valid_miners_fn
         self._list_current_miners = list_current_miners_fn or list_valid_miners_fn
         self._list_active_endpoint_names = list_active_endpoint_names_fn
+        self._list_active_endpoint_activations = (
+            list_active_endpoint_activations_fn
+        )
+        self._deployment_health = deployment_health_fn
+        self._last_no_endpoint_log_at = 0.0
 
     # ---- entry point ------------------------------------------------------
 
@@ -372,6 +392,16 @@ class FlowScheduler:
             }
             if battle.challenger.uid not in valid_uids:
                 await self._decide_invalidation_lost(champion, battle)
+                return
+
+        # Runtime health reconciliation. The deployment_id/base_url pair
+        # says what the scheduler last *successfully* started, but not
+        # whether that process is still alive. Only check while no battle
+        # is in flight: on single-instance SSH hosts the primary machine
+        # intentionally serves the challenger during a battle and the
+        # champion deployment is cleared when the challenger is started.
+        if battle is None:
+            if not await self._recover_unhealthy_champion_deployment(champion):
                 return
 
         # 5. Champion needs inference. During a single-instance battle the
@@ -552,7 +582,11 @@ class FlowScheduler:
         # base_url.
         if self.cfg.single_instance_provider:
             champ = await self.state.get_champion()
-            if champ is not None and champ.deployment_id is not None:
+            if champ is not None and (
+                champ.deployment_id
+                or champ.base_url
+                or champ.deployments
+            ):
                 champ.deployment_id = None
                 champ.base_url = None
                 champ.deployments = []
@@ -606,6 +640,8 @@ class FlowScheduler:
     async def _deploy_champion(self, champion: ChampionRecord) -> None:
         """Bring up the champion's Targon workload. Adopt an existing one
         if it matches the naming convention (idempotent across restarts)."""
+        if not await self._deployment_capacity_available("champion"):
+            return
         target = targon_lifecycle.DeployTarget(
             uid=champion.uid, hotkey=champion.hotkey,
             model=champion.model, revision=champion.revision,
@@ -628,6 +664,47 @@ class FlowScheduler:
         logger.info(
             f"FlowScheduler: champion uid={champion.uid} deployed at {result.base_url}"
         )
+
+    async def _recover_unhealthy_champion_deployment(
+        self, champion: ChampionRecord,
+    ) -> bool:
+        """Redeploy champion if its persisted runtime has gone stale.
+
+        Returns ``True`` when the caller can continue the normal flow, or
+        ``False`` when this tick performed/attempted a recovery deployment
+        and should stop just like the ordinary champion deploy path.
+        """
+        if self._deployment_health is None:
+            return True
+        if not champion.deployment_id or not champion.base_url:
+            return True
+
+        try:
+            healthy = await self._deployment_health(champion)
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: champion deployment health check raised "
+                f"for uid={champion.uid} deployment_id="
+                f"{champion.deployment_id!r}; leaving state unchanged "
+                f"this tick: {type(e).__name__}: {e}"
+            )
+            return True
+        if healthy:
+            return True
+
+        stale_deployment_id = champion.deployment_id
+        stale_base_url = champion.base_url
+        champion.deployment_id = None
+        champion.base_url = None
+        champion.deployments = []
+        await self.state.set_champion(champion)
+        logger.warning(
+            f"FlowScheduler: champion uid={champion.uid} deployment "
+            f"{stale_deployment_id!r} at {stale_base_url!r} is unhealthy; "
+            f"cleared stale state and redeploying"
+        )
+        await self._deploy_champion(champion)
+        return False
 
     async def _samples_complete(
         self, miner: MinerSnapshot, *,
@@ -952,7 +1029,7 @@ class FlowScheduler:
     # ---- invariant reaper -------------------------------------------------
 
     async def _reap_in_progress_orphans(self) -> None:
-        """Terminate ``in_progress`` rows that don't match any in-flight
+        """Release ``in_progress`` rows that don't match any in-flight
         role (active battle challenger, current champion, predeployed
         challenger) and are older than :data:`ORPHAN_GRACE_SECONDS`.
 
@@ -973,6 +1050,18 @@ class FlowScheduler:
         rows = await self.queue.list_in_progress()
         if not rows:
             return
+        endpoint_activations: Optional[Dict[str, int]] = None
+        if self._list_active_endpoint_activations is not None:
+            try:
+                endpoint_activations = (
+                    await self._list_active_endpoint_activations()
+                )
+            except Exception as e:
+                logger.warning(
+                    f"FlowScheduler: active endpoint lifecycle lookup "
+                    f"failed; orphan reaper will use claim age only this "
+                    f"tick: {type(e).__name__}: {e}"
+                )
         now = int(time.time())
         for row in rows:
             uid = row.get("uid")
@@ -985,25 +1074,81 @@ class FlowScheduler:
             age = now - claimed_at if claimed_at > 0 else now
             if age < ORPHAN_GRACE_SECONDS:
                 continue
+            release_reason = self._orphan_release_reason(
+                claimed_at=claimed_at,
+                endpoint_activations=endpoint_activations,
+            )
+            if release_reason == "stale_claim_endpoint_stable":
+                try:
+                    await self.queue.mark_terminated(
+                        int(uid),
+                        OUTCOME_FAILED,
+                        reason=(
+                            "orphan_in_progress:"
+                            "stale_claim_endpoint_stable"
+                        ),
+                        hotkey=str(row.get("hotkey") or ""),
+                        revision=str(row.get("revision") or ""),
+                        model=str(row.get("model") or ""),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"FlowScheduler: orphan reaper failed to terminate "
+                        f"uid={uid}: {type(e).__name__}: {e}"
+                    )
+                    continue
+                logger.warning(
+                    f"FlowScheduler: terminated stale orphan in_progress "
+                    f"uid={uid} (age={age}s, reason={release_reason}, "
+                    f"protected_uids={sorted(protected)})"
+                )
+                continue
+            if release_reason == "stale_claim_no_endpoint_snapshot":
+                logger.warning(
+                    f"FlowScheduler: skipped orphan in_progress uid={uid}; "
+                    f"active endpoint lifecycle snapshot unavailable "
+                    f"(age={age}s, protected_uids={sorted(protected)})"
+                )
+                continue
             try:
-                await self.queue.mark_terminated(
+                released = await self.queue.release_claim(
                     int(uid),
-                    OUTCOME_FAILED,
-                    reason=f"claim_orphan_reaped:age={age}s",
                     hotkey=str(row.get("hotkey") or ""),
                     revision=str(row.get("revision") or ""),
-                    model=str(row.get("model") or ""),
                 )
             except Exception as e:
                 logger.warning(
-                    f"FlowScheduler: orphan reaper failed to terminate "
+                    f"FlowScheduler: orphan reaper failed to release "
                     f"uid={uid}: {type(e).__name__}: {e}"
                 )
                 continue
+            if not released:
+                logger.warning(
+                    f"FlowScheduler: orphan reaper lost release race "
+                    f"uid={uid} (age={age}s, "
+                    f"protected_uids={sorted(protected)})"
+                )
+                continue
             logger.warning(
-                f"FlowScheduler: reaped orphan in_progress uid={uid} "
-                f"(age={age}s, protected_uids={sorted(protected)})"
+                f"FlowScheduler: released orphan in_progress uid={uid} "
+                f"(age={age}s, reason={release_reason}, "
+                f"protected_uids={sorted(protected)})"
             )
+
+    @staticmethod
+    def _orphan_release_reason(
+        *,
+        claimed_at: int,
+        endpoint_activations: Optional[Dict[str, int]],
+    ) -> str:
+        if endpoint_activations is None:
+            return "stale_claim_no_endpoint_snapshot"
+        if not endpoint_activations:
+            return "no_active_endpoint"
+        latest = max(int(ts or 0) for ts in endpoint_activations.values())
+        if claimed_at > 0 and latest > claimed_at:
+            return f"endpoint_reactivated_after_claim:activated_at={latest}"
+        return "stale_claim_endpoint_stable"
 
     # ---- pre-sample phase -------------------------------------------------
 
@@ -1221,6 +1366,8 @@ class FlowScheduler:
         """Deploy queued miners on free non-primary endpoints, FIFO.
         Deploy failures leave the miner in queue and advance to the next
         candidate; ``NoSpareEndpoint`` ends the loop cleanly."""
+        if not await self._deployment_capacity_available("predeploy"):
+            return
         battle = await self.state.get_battle()
         records = await self.state.get_predeployed_challengers()
         exclude = {p.challenger.uid for p in records}
@@ -1291,6 +1438,8 @@ class FlowScheduler:
         self, champion: ChampionRecord, current_block: int,
     ) -> None:
         """Pick the next pending miner and stand up its Targon workload."""
+        if not await self._deployment_capacity_available("challenger"):
+            return
         candidate = await self.queue.pick_next(
             window_id=current_block // self.cfg.window_blocks,
             champion_uid=champion.uid,
@@ -1368,6 +1517,41 @@ class FlowScheduler:
             f"FlowScheduler: battle started — challenger uid={candidate.uid} "
             f"vs champion uid={champion.uid}"
         )
+
+    async def _deployment_capacity_available(self, role: str) -> bool:
+        """Return whether an SSH/single-instance deployment can start now.
+
+        Autoscaler-managed SSH endpoints legitimately disappear while the
+        queue is idle. In that state scheduler should leave champion and
+        challenger state untouched and wait for autoscaler to create a host,
+        instead of calling deploy_fn every tick and logging the same
+        ``no active ssh endpoints`` exception.
+        """
+        if (
+            not self.cfg.single_instance_provider
+            or self._list_active_endpoint_names is None
+        ):
+            return True
+        try:
+            active_endpoints = await self._list_active_endpoint_names()
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: active endpoint lookup failed before "
+                f"{role} deploy; proceeding with deploy attempt: "
+                f"{type(e).__name__}: {e}"
+            )
+            return True
+        if active_endpoints:
+            self._last_no_endpoint_log_at = 0.0
+            return True
+        now = time.time()
+        if now - self._last_no_endpoint_log_at >= 60:
+            logger.info(
+                f"FlowScheduler: no active ssh endpoints for {role} deploy; "
+                f"waiting for autoscaler"
+            )
+            self._last_no_endpoint_log_at = now
+        return False
 
     async def _decide(
         self,
