@@ -114,7 +114,12 @@ class GPUAutoscalerConfig:
     slots: List[ManagedEndpointSlot] = field(default_factory=list)
 
     @classmethod
-    def from_mapping(cls, payload: Optional[Mapping[str, Any]]) -> "GPUAutoscalerConfig":
+    def from_mapping(
+        cls,
+        payload: Optional[Mapping[str, Any]],
+        *,
+        apply_env_overrides: bool = False,
+    ) -> "GPUAutoscalerConfig":
         data = dict(payload or {})
         raw_providers = data.get("providers") or {}
         providers = {
@@ -193,7 +198,13 @@ class GPUAutoscalerConfig:
             providers=providers,
             slots=slots,
         )
-        return cfg.with_env_overrides()
+        cfg = replace(
+            cfg,
+            max_instances=max(0, min(cfg.max_instances, len(cfg.slots or []))),
+        )
+        if apply_env_overrides:
+            return cfg.with_env_overrides()
+        return cfg
 
     def with_env_overrides(self) -> "GPUAutoscalerConfig":
         enabled = _env_bool("AFFINE_GPU_AUTOSCALER_ENABLED", self.enabled)
@@ -918,13 +929,14 @@ class GPUAutoscaler:
 
 
 async def load_config(config_dao: SystemConfigDAO) -> GPUAutoscalerConfig:
-    payload = await config_dao.get_param_value(CONFIG_KEY, default={}) or {}
-    if not isinstance(payload, Mapping):
-        payload = {}
+    payload = await config_dao.get_param_value(CONFIG_KEY, default=None)
+    if isinstance(payload, Mapping) and payload:
+        return GPUAutoscalerConfig.from_mapping(payload)
+    payload = {}
     env_payload = _load_env_json("AFFINE_GPU_AUTOSCALER_CONFIG_JSON")
     if env_payload:
-        payload = _deep_merge(dict(payload), env_payload)
-    return GPUAutoscalerConfig.from_mapping(payload)
+        payload = dict(env_payload)
+    return GPUAutoscalerConfig.from_mapping(payload, apply_env_overrides=True)
 
 
 async def _run() -> None:
@@ -1038,16 +1050,6 @@ def _load_env_json(name: str) -> Dict[str, Any]:
         logger.warning("gpu-autoscaler: invalid %s JSON: %s", name, e)
         return {}
     return payload if isinstance(payload, dict) else {}
-
-
-def _deep_merge(base: Dict[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
-    for key, value in overrides.items():
-        if isinstance(value, Mapping) and isinstance(out.get(key), Mapping):
-            out[key] = _deep_merge(dict(out[key]), value)
-        else:
-            out[key] = value
-    return out
 
 
 if __name__ == "__main__":

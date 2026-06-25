@@ -12,6 +12,7 @@ from affine.src.scheduler.gpu_autoscaler import (
     GPUAutoscalerConfig,
     ManagedEndpointSlot,
     STATE_KEY,
+    load_config,
 )
 from affine.src.scorer.window_state import (
     ChampionRecord,
@@ -31,6 +32,14 @@ class _Queue:
 
     async def list_in_progress(self):
         return [object() for _ in range(self.in_progress)]
+
+
+class _ConfigDAO:
+    def __init__(self, values):
+        self.values = values
+
+    async def get_param_value(self, name, default=None):
+        return self.values.get(name, default)
 
 
 class _Endpoints:
@@ -211,6 +220,46 @@ def _autoscaler(queue, endpoints, kv, *, now=1000, samples=None):
 def test_default_gpu_down_wait_is_twelve_hours():
     cfg = GPUAutoscalerConfig.from_mapping({})
     assert cfg.max_gpu_down_wait_seconds == 12 * 60 * 60
+
+
+@pytest.mark.asyncio
+async def test_load_config_prefers_system_config_over_autoscaler_env(monkeypatch):
+    monkeypatch.setenv("AFFINE_GPU_AUTOSCALER_ENABLED", "false")
+    monkeypatch.setenv("AFFINE_GPU_AUTOSCALER_IDLE_SECONDS", "1")
+    monkeypatch.setenv(
+        "AFFINE_GPU_AUTOSCALER_CONFIG_JSON",
+        '{"enabled": false, "idle_seconds": 2}',
+    )
+
+    cfg = await load_config(_ConfigDAO({
+        "gpu_autoscaler": {
+            "enabled": True,
+            "idle_seconds": 123,
+            "endpoints": [{"name": "lium-b200-1", "provider": "lium"}],
+        }
+    }))
+
+    assert cfg.enabled is True
+    assert cfg.idle_seconds == 123
+    assert [slot.name for slot in cfg.slots] == ["lium-b200-1"]
+
+
+@pytest.mark.asyncio
+async def test_load_config_uses_autoscaler_env_when_system_config_absent(
+    monkeypatch,
+):
+    monkeypatch.setenv("AFFINE_GPU_AUTOSCALER_ENABLED", "true")
+    monkeypatch.setenv("AFFINE_GPU_AUTOSCALER_IDLE_SECONDS", "7")
+    monkeypatch.setenv(
+        "AFFINE_GPU_AUTOSCALER_CONFIG_JSON",
+        '{"endpoints": [{"name": "lium-b200-1", "provider": "lium"}]}',
+    )
+
+    cfg = await load_config(_ConfigDAO({}))
+
+    assert cfg.enabled is True
+    assert cfg.idle_seconds == 7
+    assert [slot.name for slot in cfg.slots] == ["lium-b200-1"]
 
 
 def test_managed_endpoint_slot_accepts_sglang_docker_args_override():
