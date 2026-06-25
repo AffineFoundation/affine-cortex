@@ -31,6 +31,9 @@ Docker Commands:
 
 Database Commands:
 - af db : Database management commands
+
+Operator Commands:
+- af gpu replace-endpoint : Rent a replacement GPU endpoint
 """
 
 import sys
@@ -189,6 +192,48 @@ def validate(ctx):
     
     sys.argv = ["validate"] + ctx.args
     validator_main.main(standalone_mode=False)
+
+
+# ============================================================================
+# Operator Commands
+# ============================================================================
+
+@cli.group(hidden=not SHOW_ADMIN_COMMANDS)
+def gpu():
+    """GPU endpoint lifecycle commands."""
+    pass
+
+
+@gpu.command("replace-endpoint")
+@click.option(
+    "--old",
+    "old_endpoint_name",
+    required=True,
+    help="Existing endpoint to replace, e.g. targon-b200-autoscale-1",
+)
+@click.option(
+    "--new-slot",
+    default=None,
+    help="Autoscaler slot to rent. Defaults to --old for same-slot replacement.",
+)
+@click.option(
+    "--keep-old",
+    is_flag=True,
+    help="Create the new slot but leave the old endpoint active.",
+)
+@click.option("--dry-run", is_flag=True, help="Print the plan without changes.")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
+def gpu_replace_endpoint(old_endpoint_name, new_slot, keep_old, dry_run, yes):
+    """Rent a GPU instance and replace an autoscaled endpoint."""
+    from affine.src.scheduler.gpu_autoscaler import replace_endpoint_command
+
+    asyncio.run(replace_endpoint_command(
+        old_endpoint_name=old_endpoint_name,
+        new_slot_name=new_slot,
+        keep_old=keep_old,
+        dry_run=dry_run,
+        yes=yes,
+    ))
 
 
 # ============================================================================

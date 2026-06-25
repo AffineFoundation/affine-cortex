@@ -354,6 +354,40 @@ class InferenceEndpointsDAO(BaseDAO):
             condition_values={":cond_instance": instance_id},
         )
 
+    async def drain_autoscaled_endpoint(
+        self,
+        name: str,
+        *,
+        instance_id: str,
+        updated_by: str = "gpu-autoscaler",
+    ) -> None:
+        """Remove an endpoint from scheduler/executor capacity while
+        preserving provider identity for retryable cleanup.
+
+        Manual replacement uses this before deleting the provider instance:
+        DB readers stop dispatching to the endpoint immediately, but if the
+        provider delete fails the row still contains ``autoscale_instance_id``
+        so the next operator command can retry the cleanup.
+        """
+        now = int(time.time())
+        await self._update_endpoint_fields(
+            name,
+            set_values={
+                "active": False,
+                "autoscale_updated_at": now,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            remove_fields=(
+                "ssh_url",
+                "public_inference_url",
+                *_ASSIGNMENT_FIELDS,
+            ),
+            condition_expression="#cond_instance = :cond_instance",
+            condition_names={"#cond_instance": "autoscale_instance_id"},
+            condition_values={":cond_instance": instance_id},
+        )
+
     async def _update_endpoint_fields(
         self,
         name: str,

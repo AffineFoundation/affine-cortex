@@ -313,6 +313,19 @@ class AutoscalerTickResult:
     lease_renewed_count: int = 0
 
 
+@dataclass(frozen=True)
+class EndpointReplaceResult:
+    old_endpoint_name: str
+    new_endpoint_name: str
+    new_slot_name: str
+    old_instance_id: str = ""
+    new_instance_id: str = ""
+    old_deleted: bool = False
+    new_created: bool = False
+    dry_run: bool = False
+    same_endpoint: bool = False
+
+
 class GPUAutoscaler:
     def __init__(
         self,
@@ -571,7 +584,11 @@ class GPUAutoscaler:
         return created
 
     async def _scale_up_slot(
-        self, config: GPUAutoscalerConfig, slot: ManagedEndpointSlot
+        self,
+        config: GPUAutoscalerConfig,
+        slot: ManagedEndpointSlot,
+        *,
+        updated_by: str = "gpu-autoscaler",
     ) -> bool:
         provider_config = (config.providers or {}).get(slot.provider)
         if provider_config is None:
@@ -619,7 +636,7 @@ class GPUAutoscaler:
         try:
             await self._endpoints.activate_autoscaled_endpoint(
                 endpoint,
-                updated_by="gpu-autoscaler",
+                updated_by=updated_by,
             )
         except Exception as e:
             logger.error(
@@ -843,7 +860,12 @@ class GPUAutoscaler:
         return destroyed
 
     async def _scale_down_endpoint(
-        self, config: GPUAutoscalerConfig, endpoint: Endpoint
+        self,
+        config: GPUAutoscalerConfig,
+        endpoint: Endpoint,
+        *,
+        updated_by: str = "gpu-autoscaler",
+        deactivate_before_delete: bool = False,
     ) -> bool:
         provider = (endpoint.autoscale_provider or "").lower()
         provider_config = (config.providers or {}).get(provider)
@@ -873,16 +895,91 @@ class GPUAutoscaler:
         purpose = getattr(endpoint, "autoscale_purpose", None)
         if purpose:
             delete_vars["purpose"] = purpose
+        endpoint_for_refs = replace(endpoint)
+        if deactivate_before_delete:
+            drained = await self._drain_endpoint(
+                endpoint_for_refs,
+                instance_id=instance_id,
+                provider=provider,
+                updated_by=updated_by,
+            )
+            if not drained:
+                return False
+
         deleted = await client.delete(instance_id, variables=delete_vars)
         if not deleted:
             return False
 
-        endpoint_for_refs = replace(endpoint)
+        if deactivate_before_delete:
+            await self._deactivate_endpoint(
+                endpoint_for_refs,
+                instance_id=instance_id,
+                provider=provider,
+                updated_by=updated_by,
+                clear_refs=False,
+            )
+            logger.info(
+                "gpu-autoscaler: deleted drained endpoint=%s provider=%s "
+                "instance=%s",
+                endpoint.name,
+                provider,
+                instance_id,
+            )
+            return True
+        return await self._deactivate_endpoint(
+            endpoint_for_refs,
+            instance_id=instance_id,
+            provider=provider,
+            updated_by=updated_by,
+        )
+
+    async def _drain_endpoint(
+        self,
+        endpoint: Endpoint,
+        *,
+        instance_id: str,
+        provider: str,
+        updated_by: str,
+    ) -> bool:
+        try:
+            await self._endpoints.drain_autoscaled_endpoint(
+                endpoint.name,
+                instance_id=instance_id,
+                updated_by=updated_by,
+            )
+        except Exception as e:
+            logger.warning(
+                "gpu-autoscaler: drain endpoint=%s instance=%s failed: "
+                "%s: %s",
+                endpoint.name,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            return False
+        await self._clear_deployment_refs(endpoint)
+        logger.info(
+            "gpu-autoscaler: drained endpoint=%s provider=%s instance=%s",
+            endpoint.name,
+            provider,
+            instance_id,
+        )
+        return True
+
+    async def _deactivate_endpoint(
+        self,
+        endpoint: Endpoint,
+        *,
+        instance_id: str,
+        provider: str,
+        updated_by: str,
+        clear_refs: bool = True,
+    ) -> bool:
         try:
             await self._endpoints.deactivate_autoscaled_endpoint(
                 endpoint.name,
                 instance_id=instance_id,
-                updated_by="gpu-autoscaler",
+                updated_by=updated_by,
             )
         except Exception as e:
             logger.warning(
@@ -894,7 +991,8 @@ class GPUAutoscaler:
                 e,
             )
             return False
-        await self._clear_deployment_refs(endpoint_for_refs)
+        if clear_refs:
+            await self._clear_deployment_refs(endpoint)
         logger.info(
             "gpu-autoscaler: deactivated endpoint=%s provider=%s instance=%s",
             endpoint.name,
@@ -904,38 +1002,183 @@ class GPUAutoscaler:
         return True
 
     async def _clear_deployment_refs(self, endpoint: Endpoint) -> None:
-        champion = await self._state.get_champion()
-        if not champion:
-            return
         deployment_id = endpoint.deployment_id or ""
         base_url = endpoint.base_url or endpoint.public_inference_url or ""
+        endpoint_name = endpoint.name
 
         def _matches_endpoint(dep) -> bool:
             return (
-                dep.endpoint_name == endpoint.name
+                dep.endpoint_name == endpoint_name
                 or (deployment_id and dep.deployment_id == deployment_id)
                 or (base_url and dep.base_url == base_url)
             )
 
-        deployments = [
-            dep for dep in (champion.deployments or [])
-            if not _matches_endpoint(dep)
-        ]
-        changed = len(deployments) != len(champion.deployments or [])
-        primary_removed = (
-            (deployment_id and champion.deployment_id == deployment_id)
-            or (base_url and champion.base_url == base_url)
-        )
-        if not changed and not primary_removed:
-            return
-        champion.deployments = deployments
-        if deployments:
-            champion.deployment_id = deployments[0].deployment_id
-            champion.base_url = deployments[0].base_url
+        def _record_matches(record) -> bool:
+            return (
+                (deployment_id and record.deployment_id == deployment_id)
+                or (base_url and record.base_url == base_url)
+                or any(_matches_endpoint(dep) for dep in record.deployments)
+            )
+
+        champion = await self._state.get_champion()
+        if champion:
+            deployments = [
+                dep for dep in (champion.deployments or [])
+                if not _matches_endpoint(dep)
+            ]
+            changed = len(deployments) != len(champion.deployments or [])
+            primary_removed = (
+                (deployment_id and champion.deployment_id == deployment_id)
+                or (base_url and champion.base_url == base_url)
+            )
+            if changed or primary_removed:
+                champion.deployments = deployments
+                if deployments:
+                    champion.deployment_id = deployments[0].deployment_id
+                    champion.base_url = deployments[0].base_url
+                else:
+                    champion.deployment_id = None
+                    champion.base_url = None
+                await self._state.set_champion(champion)
+
+        battle = await self._state.get_battle()
+        if battle is not None and _record_matches(battle):
+            released = await self._queue.release_claim(
+                battle.challenger.uid,
+                hotkey=battle.challenger.hotkey,
+                revision=battle.challenger.revision,
+            )
+            await self._state.clear_battle()
+            logger.warning(
+                "gpu-autoscaler: cleared battle uid=%s after endpoint=%s "
+                "deactivation (claim_released=%s)",
+                battle.challenger.uid,
+                endpoint_name,
+                released,
+            )
+
+        records = await self._state.get_predeployed_challengers()
+        if records:
+            kept = [record for record in records if not _record_matches(record)]
+            if len(kept) != len(records):
+                await self._state.set_predeployed_challengers(kept)
+                logger.warning(
+                    "gpu-autoscaler: dropped %s predeployed record(s) after "
+                    "endpoint=%s deactivation",
+                    len(records) - len(kept),
+                    endpoint_name,
+                )
+
+    async def replace_endpoint(
+        self,
+        config: GPUAutoscalerConfig,
+        *,
+        old_endpoint_name: str,
+        new_slot_name: Optional[str] = None,
+        delete_old: bool = True,
+        updated_by: str = "cli:gpu-replace-endpoint",
+    ) -> EndpointReplaceResult:
+        new_slot_name = new_slot_name or old_endpoint_name
+        slot = _find_slot(config, new_slot_name)
+        if slot is None:
+            raise ValueError(
+                f"autoscaler config has no endpoint slot {new_slot_name!r}"
+            )
+
+        old_endpoint = await self._endpoints.get(old_endpoint_name)
+        if delete_old and old_endpoint is None:
+            raise ValueError(f"old endpoint {old_endpoint_name!r} does not exist")
+
+        if delete_old and old_endpoint is not None:
+            _validate_autoscaled_endpoint(old_endpoint)
+
+        same_endpoint = old_endpoint_name == slot.name
+        if same_endpoint and not delete_old:
+            raise ValueError(
+                "--keep-old cannot be used when old endpoint and new slot are "
+                "the same; provider creation is name-idempotent"
+            )
+
+        old_instance_id = (
+            old_endpoint.autoscale_instance_id if old_endpoint is not None else ""
+        ) or ""
+        if config.dry_run:
+            return EndpointReplaceResult(
+                old_endpoint_name=old_endpoint_name,
+                new_endpoint_name=slot.name,
+                new_slot_name=slot.name,
+                old_instance_id=old_instance_id,
+                old_deleted=delete_old and old_endpoint is not None,
+                new_created=True,
+                dry_run=True,
+                same_endpoint=same_endpoint,
+            )
+
+        old_deleted = False
+        new_created = False
+
+        if same_endpoint:
+            if old_endpoint is not None:
+                old_deleted = await self._scale_down_endpoint(
+                    config,
+                    old_endpoint,
+                    updated_by=updated_by,
+                    deactivate_before_delete=True,
+                )
+                if not old_deleted:
+                    raise RuntimeError(
+                        f"failed to delete old endpoint {old_endpoint_name!r}; "
+                        "same-endpoint replacement stopped before creating "
+                        "the new instance"
+                    )
+            new_created = await self._scale_up_slot(
+                config,
+                slot,
+                updated_by=updated_by,
+            )
         else:
-            champion.deployment_id = None
-            champion.base_url = None
-        await self._state.set_champion(champion)
+            new_created = await self._scale_up_slot(
+                config,
+                slot,
+                updated_by=updated_by,
+            )
+            if not new_created:
+                raise RuntimeError(
+                    f"failed to create replacement endpoint from slot "
+                    f"{slot.name!r}; old endpoint left untouched"
+                )
+            if delete_old and old_endpoint is not None:
+                old_deleted = await self._scale_down_endpoint(
+                    config,
+                    old_endpoint,
+                    updated_by=updated_by,
+                    deactivate_before_delete=True,
+                )
+                if not old_deleted:
+                    logger.error(
+                        "gpu-autoscaler: replacement endpoint=%s is active, "
+                        "but old endpoint=%s instance=%s was not deleted; "
+                        "manual cleanup may be required",
+                        slot.name,
+                        old_endpoint_name,
+                        old_instance_id,
+                    )
+
+        new_endpoint = await self._endpoints.get(slot.name)
+        new_instance_id = (
+            new_endpoint.autoscale_instance_id if new_endpoint is not None else ""
+        ) or ""
+        return EndpointReplaceResult(
+            old_endpoint_name=old_endpoint_name,
+            new_endpoint_name=slot.name,
+            new_slot_name=slot.name,
+            old_instance_id=old_instance_id,
+            new_instance_id=new_instance_id,
+            old_deleted=old_deleted,
+            new_created=new_created,
+            dry_run=False,
+            same_endpoint=same_endpoint,
+        )
 
     async def _load_state(self) -> Dict[str, Any]:
         raw = await self._kv.get(STATE_KEY, default={})
@@ -951,6 +1194,128 @@ async def load_config(config_dao: SystemConfigDAO) -> GPUAutoscalerConfig:
     if env_payload:
         payload = dict(env_payload)
     return GPUAutoscalerConfig.from_mapping(payload, apply_env_overrides=True)
+
+
+def _find_slot(
+    config: GPUAutoscalerConfig,
+    name: str,
+) -> Optional[ManagedEndpointSlot]:
+    for slot in config.slots or []:
+        if slot.name == name:
+            return slot
+    return None
+
+
+def _validate_autoscaled_endpoint(endpoint: Endpoint) -> None:
+    if not endpoint.autoscale_managed:
+        raise ValueError(
+            f"endpoint {endpoint.name!r} is not autoscaler-managed; refusing "
+            "to delete it automatically"
+        )
+    if not endpoint.autoscale_provider:
+        raise ValueError(
+            f"endpoint {endpoint.name!r} has no autoscale_provider"
+        )
+    if not endpoint.autoscale_instance_id:
+        raise ValueError(
+            f"endpoint {endpoint.name!r} has no autoscale_instance_id"
+        )
+
+
+async def replace_endpoint_command(
+    *,
+    old_endpoint_name: str,
+    new_slot_name: Optional[str] = None,
+    keep_old: bool = False,
+    dry_run: bool = False,
+    yes: bool = False,
+) -> EndpointReplaceResult:
+    await init_client()
+    try:
+        config_dao = SystemConfigDAO()
+        config = await load_config(config_dao)
+        if dry_run:
+            config = replace(config, dry_run=True)
+
+        endpoints_dao = InferenceEndpointsDAO()
+        old_endpoint = await endpoints_dao.get(old_endpoint_name)
+        slot = _find_slot(config, new_slot_name or old_endpoint_name)
+        if slot is None:
+            raise click.ClickException(
+                f"autoscaler config has no endpoint slot "
+                f"{new_slot_name or old_endpoint_name!r}"
+            )
+
+        same_endpoint = old_endpoint_name == slot.name
+        click.echo("GPU endpoint replacement plan:")
+        click.echo(f"  old endpoint : {old_endpoint_name}")
+        if old_endpoint is None:
+            click.echo("  old instance : <missing>")
+        else:
+            click.echo(
+                "  old instance : "
+                f"{old_endpoint.autoscale_provider or '-'} / "
+                f"{old_endpoint.autoscale_instance_id or '-'}"
+            )
+        click.echo(
+            "  new slot     : "
+            f"{slot.name} ({slot.provider}, purpose={slot.purpose})"
+        )
+        if same_endpoint:
+            click.echo("  order        : drain old endpoint, delete old, create new")
+            click.echo(
+                "  note         : same-slot creates are provider-idempotent by "
+                "name, so create-before-delete would adopt the old instance"
+            )
+        elif keep_old:
+            click.echo("  order        : create new, keep old active")
+        else:
+            click.echo(
+                "  order        : create new first, then drain and delete old"
+            )
+        if dry_run:
+            click.echo("  mode         : dry-run")
+
+        if not dry_run and not yes:
+            click.confirm("Proceed with GPU endpoint replacement?", abort=True)
+
+        config_dao = SystemConfigDAO()
+        kv = SystemConfigKVAdapter(
+            config_dao,
+            updated_by="cli:gpu-replace-endpoint",
+        )
+        autoscaler = GPUAutoscaler(
+            queue=ChallengerQueue(MinersQueueAdapter(MinersDAO())),
+            endpoints_dao=endpoints_dao,
+            state_store=StateStore(kv),
+            kv_store=kv,
+            samples_adapter=SampleResultsAdapter(
+                dao=SampleResultsDAO(),
+                validator_hotkey="gpu-replace-endpoint",
+            ),
+        )
+        try:
+            result = await autoscaler.replace_endpoint(
+                config,
+                old_endpoint_name=old_endpoint_name,
+                new_slot_name=slot.name,
+                delete_old=not keep_old,
+            )
+        except Exception as e:
+            raise click.ClickException(str(e)) from e
+
+        if result.dry_run:
+            click.echo("✓ dry-run complete; no provider or database changes made")
+        else:
+            click.echo(
+                "✓ replacement complete: "
+                f"new_endpoint={result.new_endpoint_name} "
+                f"new_instance={result.new_instance_id or '-'} "
+                f"old_deleted={result.old_deleted}"
+            )
+        return result
+    finally:
+        await close_client()
 
 
 async def _run() -> None:

@@ -15,9 +15,11 @@ from affine.src.scheduler.gpu_autoscaler import (
     load_config,
 )
 from affine.src.scorer.window_state import (
+    BattleRecord,
     ChampionRecord,
     DeploymentRecord,
     InMemoryConfigStore,
+    MinerSnapshot,
     StateStore,
 )
 
@@ -26,12 +28,17 @@ class _Queue:
     def __init__(self, *, pending=0, in_progress=0):
         self.pending = pending
         self.in_progress = in_progress
+        self.released = []
 
     async def peek_next(self, n, *, champion_uid, exclude_uids=None):
         return [object() for _ in range(min(self.pending, n))]
 
     async def list_in_progress(self):
         return [object() for _ in range(self.in_progress)]
+
+    async def release_claim(self, uid, *, hotkey=None, revision=None):
+        self.released.append((uid, hotkey, revision))
+        return True
 
 
 class _ConfigDAO:
@@ -46,6 +53,7 @@ class _Endpoints:
     def __init__(self, endpoints=None):
         self.endpoints = {ep.name: ep for ep in (endpoints or [])}
         self.cleared = []
+        self.events = []
         self.fail_activate = False
         self.now = 1000
 
@@ -67,6 +75,8 @@ class _Endpoints:
     async def activate_autoscaled_endpoint(self, endpoint, *, updated_by="test"):
         if self.fail_activate:
             raise RuntimeError("simulated activation failure")
+        self.events.append(("activate", endpoint.name))
+        _Client.events.append(("activate", endpoint.name))
         existing = self.endpoints.get(endpoint.name)
         if existing is not None:
             endpoint.assigned_uid = existing.assigned_uid
@@ -91,6 +101,8 @@ class _Endpoints:
     async def deactivate_autoscaled_endpoint(
         self, name, *, instance_id, updated_by="test",
     ):
+        self.events.append(("deactivate", name, instance_id))
+        _Client.events.append(("deactivate", name, instance_id))
         endpoint = self.endpoints[name]
         if endpoint.autoscale_instance_id != instance_id:
             raise RuntimeError("stale instance id")
@@ -108,6 +120,26 @@ class _Endpoints:
         endpoint.autoscale_instance_id = None
         endpoint.autoscale_purpose = None
         endpoint.autoscale_lease_expires_at = 0
+
+    async def drain_autoscaled_endpoint(
+        self, name, *, instance_id, updated_by="test",
+    ):
+        self.events.append(("drain", name, instance_id))
+        _Client.events.append(("drain", name, instance_id))
+        endpoint = self.endpoints[name]
+        if endpoint.autoscale_instance_id != instance_id:
+            raise RuntimeError("stale instance id")
+        endpoint.active = False
+        endpoint.ssh_url = None
+        endpoint.public_inference_url = None
+        endpoint.assigned_uid = None
+        endpoint.assigned_hotkey = None
+        endpoint.assigned_model = None
+        endpoint.assigned_revision = None
+        endpoint.deployment_id = None
+        endpoint.base_url = None
+        endpoint.assignment_role = None
+        endpoint.assigned_at = 0
 
     async def clear_assignment(self, name, *, updated_by="test"):
         self.cleared.append(name)
@@ -127,9 +159,12 @@ class _Client:
     deleted = []
     delete_calls = []
     create_calls = []
+    events = []
     renewed = []
     create_lease_expires_at = 1500
     renew_expires_at = 0
+    create_returns_none_for_names = set()
+    delete_returns_false_for_ids = set()
 
     def __init__(self, config):
         self.config = config
@@ -139,6 +174,9 @@ class _Client:
             (dict(variables or {}), dict(payload_overrides or {}))
         )
         name = variables["endpoint_name"]
+        self.events.append(("create", name))
+        if name in self.create_returns_none_for_names:
+            return None
         return InstanceHandle(
             provider=self.config.provider,
             instance_id=f"inst-{name}",
@@ -150,6 +188,9 @@ class _Client:
     async def delete(self, instance_id, *, variables=None):
         self.deleted.append(instance_id)
         self.delete_calls.append((instance_id, dict(variables or {})))
+        self.events.append(("delete", instance_id))
+        if instance_id in self.delete_returns_false_for_ids:
+            return False
         return True
 
     async def renew(self, instance_id):
@@ -166,9 +207,12 @@ def _reset_client_state():
     _Client.deleted = []
     _Client.delete_calls = []
     _Client.create_calls = []
+    _Client.events = []
     _Client.renewed = []
     _Client.create_lease_expires_at = 1500
     _Client.renew_expires_at = 0
+    _Client.create_returns_none_for_names = set()
+    _Client.delete_returns_false_for_ids = set()
 
 
 def _config(
@@ -911,3 +955,191 @@ async def test_renews_legacy_endpoint_using_configured_lease_duration():
     ep = endpoints.endpoints["lium-b200-1"]
     assert ep.autoscale_updated_at == 1050
     assert ep.autoscale_lease_expires_at == 2050
+
+
+@pytest.mark.asyncio
+async def test_replace_same_endpoint_drains_old_before_delete_then_creates_new():
+    kv = InMemoryConfigStore()
+    state = StateStore(kv)
+    await state.set_battle(
+        BattleRecord(
+            challenger=MinerSnapshot(
+                uid=42,
+                hotkey="hk42",
+                revision="rev42",
+                model="org/model42",
+            ),
+            deployment_id="ssh:lium-b200-1:affine-sglang-current",
+            base_url="http://old.example.com:10001/v1",
+            started_at_block=123,
+            deployments=[
+                DeploymentRecord(
+                    endpoint_name="lium-b200-1",
+                    deployment_id="ssh:lium-b200-1:affine-sglang-current",
+                    base_url="http://old.example.com:10001/v1",
+                )
+            ],
+        )
+    )
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        assigned_uid=42,
+        assigned_hotkey="hk42",
+        assigned_model="org/model42",
+        assigned_revision="rev42",
+        deployment_id="ssh:lium-b200-1:affine-sglang-current",
+        base_url="http://old.example.com:10001/v1",
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    queue = _Queue()
+    autoscaler = _autoscaler(queue, endpoints, kv, now=2000)
+
+    result = await autoscaler.replace_endpoint(
+        _config(),
+        old_endpoint_name="lium-b200-1",
+    )
+
+    assert result.same_endpoint is True
+    assert result.old_deleted is True
+    assert result.new_created is True
+    assert result.old_instance_id == "old-inst"
+    assert result.new_instance_id == "inst-lium-b200-1"
+    assert _Client.events == [
+        ("drain", "lium-b200-1", "old-inst"),
+        ("delete", "old-inst"),
+        ("deactivate", "lium-b200-1", "old-inst"),
+        ("create", "lium-b200-1"),
+        ("activate", "lium-b200-1"),
+    ]
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.active is True
+    assert ep.autoscale_instance_id == "inst-lium-b200-1"
+    assert ep.assigned_uid is None
+    assert await state.get_battle() is None
+    assert queue.released == [(42, "hk42", "rev42")]
+
+
+@pytest.mark.asyncio
+async def test_replace_different_slot_creates_new_before_deleting_old():
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=2000)
+
+    result = await autoscaler.replace_endpoint(
+        _config(),
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-2",
+    )
+
+    assert result.same_endpoint is False
+    assert result.old_deleted is True
+    assert result.new_created is True
+    assert result.new_endpoint_name == "lium-b200-2"
+    assert _Client.events == [
+        ("create", "lium-b200-2"),
+        ("activate", "lium-b200-2"),
+        ("drain", "lium-b200-1", "old-inst"),
+        ("delete", "old-inst"),
+        ("deactivate", "lium-b200-1", "old-inst"),
+    ]
+    assert endpoints.endpoints["lium-b200-1"].active is False
+    assert endpoints.endpoints["lium-b200-2"].active is True
+    assert endpoints.endpoints["lium-b200-2"].autoscale_instance_id == (
+        "inst-lium-b200-2"
+    )
+
+
+@pytest.mark.asyncio
+async def test_replace_different_slot_leaves_old_when_create_fails():
+    _Client.create_returns_none_for_names = {"lium-b200-2"}
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=2000)
+
+    with pytest.raises(RuntimeError, match="old endpoint left untouched"):
+        await autoscaler.replace_endpoint(
+            _config(),
+            old_endpoint_name="lium-b200-1",
+            new_slot_name="lium-b200-2",
+        )
+
+    assert _Client.events == [("create", "lium-b200-2")]
+    assert _Client.deleted == []
+    assert endpoints.endpoints["lium-b200-1"].active is True
+    assert endpoints.endpoints["lium-b200-1"].autoscale_instance_id == "old-inst"
+
+
+@pytest.mark.asyncio
+async def test_replace_same_endpoint_keeps_instance_id_when_delete_fails():
+    _Client.delete_returns_false_for_ids = {"old-inst"}
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=2000)
+
+    with pytest.raises(RuntimeError, match="stopped before creating"):
+        await autoscaler.replace_endpoint(
+            _config(),
+            old_endpoint_name="lium-b200-1",
+        )
+
+    assert _Client.events == [
+        ("drain", "lium-b200-1", "old-inst"),
+        ("delete", "old-inst"),
+    ]
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.active is False
+    assert ep.autoscale_instance_id == "old-inst"
+
+
+@pytest.mark.asyncio
+async def test_replace_refuses_keep_old_with_same_slot():
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+    )
+    autoscaler = _autoscaler(_Queue(), _Endpoints([endpoint]), kv, now=2000)
+
+    with pytest.raises(ValueError, match="--keep-old"):
+        await autoscaler.replace_endpoint(
+            _config(),
+            old_endpoint_name="lium-b200-1",
+            delete_old=False,
+        )
