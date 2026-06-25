@@ -100,9 +100,22 @@ class BattleRecord:
 @dataclass
 class TaskIdState:
     """Per-env task_id pool the executor evaluates against. Regenerated
-    every ~7200 blocks (always between battles)."""
+    on the scheduler refresh interval (default ~7200 blocks, always
+    between battles)."""
     task_ids: Dict[str, List[int]] = field(default_factory=dict)
     refreshed_at_block: int = 0
+
+
+@dataclass
+class WindowRotationRequest:
+    """Operator-requested task-pool rotation to be applied by scheduler.
+
+    The CLI records the request, but scheduler owns the actual transition
+    because it has the provider-specific teardown function for any active
+    battle deployment.
+    """
+    requested_at_block: int
+    stale_refreshed_at_block: int
 
 
 @dataclass
@@ -155,6 +168,7 @@ class StateStore:
     KEY_BATTLE = "current_battle"
     KEY_PREDEPLOYED = "predeployed_challengers"
     KEY_TASK_IDS = "current_task_ids"
+    KEY_WINDOW_ROTATION = "window_rotation_request"
     KEY_ENVIRONMENTS = "environments"
 
     def __init__(self, kv: ConfigKVStore):
@@ -231,6 +245,25 @@ class StateStore:
 
     async def set_task_state(self, state: TaskIdState) -> None:
         await self._kv.set(self.KEY_TASK_IDS, asdict(state))
+
+    # -- manual rotation -----------------------------------------------------
+
+    async def get_window_rotation_request(
+        self,
+    ) -> Optional[WindowRotationRequest]:
+        raw = await self._kv.get(self.KEY_WINDOW_ROTATION)
+        if not raw or not isinstance(raw, dict):
+            return None
+        return _rotation_request_from_dict(raw)
+
+    async def set_window_rotation_request(
+        self,
+        request: WindowRotationRequest,
+    ) -> None:
+        await self._kv.set(self.KEY_WINDOW_ROTATION, asdict(request))
+
+    async def clear_window_rotation_request(self) -> None:
+        await self._kv.delete(self.KEY_WINDOW_ROTATION)
 
     # -- env config ---------------------------------------------------------
 
@@ -422,6 +455,13 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
         started_at_block=int(raw.get("started_at_block", 0)),
         deployments=deployments,
         previous_champion=previous_champion,
+    )
+
+
+def _rotation_request_from_dict(raw: Dict[str, Any]) -> WindowRotationRequest:
+    return WindowRotationRequest(
+        requested_at_block=int(raw.get("requested_at_block", 0)),
+        stale_refreshed_at_block=int(raw.get("stale_refreshed_at_block", 0)),
     )
 
 

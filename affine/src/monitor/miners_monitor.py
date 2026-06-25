@@ -22,7 +22,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Collection, Dict, Optional, Tuple
 
 from huggingface_hub import HfApi, get_hf_file_metadata, hf_hub_url
 from huggingface_hub.errors import (
@@ -101,6 +101,26 @@ def _anticopy_state_matches_champion(
             )
 
     return all(checks) if checks else True
+
+
+def _truthy(value: object) -> bool:
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _same_model_revision(
+    row: Optional[Dict[str, object]],
+    model: str,
+    revision: str,
+) -> bool:
+    return bool(
+        row
+        and _as_str(row.get("model")) == model
+        and _as_str(row.get("revision")) == revision
+    )
+
+
+def _format_model_types(model_types: Collection[str]) -> str:
+    return ", ".join(sorted(str(model_type) for model_type in model_types))
 
 
 @dataclass
@@ -317,9 +337,10 @@ class MinersMonitor:
 
         # Inherit prior template_check_result so a one-cycle HF blip doesn't
         # nuke the cached safety verdict.
+        existing: Optional[Dict[str, object]] = None
         try:
             existing = await self.dao.get_miner_by_uid(uid)
-            if existing and existing.get("model") == model and existing.get("revision") == revision:
+            if _same_model_revision(existing, model, revision):
                 info.template_check_result = existing.get("template_check_result")
         except Exception:
             pass
@@ -392,12 +413,55 @@ class MinersMonitor:
             )
             info.model_type = str(size_result.get("model_type") or "")
             if not size_result.get("pass"):
-                info.mark_invalid(
-                    f"model_check:{size_result.get('reason')}",
-                    permanent=True,
-                    terminate_stats=True,
+                retryable = bool(size_result.get("retryable"))
+                same_existing = _same_model_revision(existing, model, revision)
+                existing_model_type = (
+                    str(existing.get("model_type") or "") if same_existing else ""
                 )
-                return info
+                cached_type_allowed = (
+                    allowed_model_types is None
+                    or (
+                        bool(existing_model_type)
+                        and existing_model_type in allowed_model_types
+                    )
+                )
+                if (
+                    retryable
+                    and allowed_model_types is not None
+                    and existing_model_type
+                    and existing_model_type not in allowed_model_types
+                ):
+                    info.model_type = existing_model_type
+                    info.mark_invalid(
+                        "model_check:"
+                        f"model_type={existing_model_type} "
+                        f"(expected one of: {_format_model_types(allowed_model_types)})",
+                        permanent=True,
+                        terminate_stats=True,
+                    )
+                    return info
+                if (
+                    retryable
+                    and same_existing
+                    and _truthy(existing.get("is_valid"))
+                    and cached_type_allowed
+                ):
+                    info.is_valid = True
+                    info.model_type = str(
+                        existing.get("model_type") or info.model_type or ""
+                    )
+                    logger.warning(
+                        f"[MinersMonitor] preserving prior valid state for "
+                        f"uid={uid} after retryable model check failure: "
+                        f"{size_result.get('reason')}"
+                    )
+                else:
+                    info.mark_invalid(
+                        f"model_check:{size_result.get('reason')}",
+                        permanent=not retryable,
+                        terminate_stats=not retryable,
+                    )
+                    return info
 
         if uid != 0 and duplicate_source:
             info.mark_invalid(

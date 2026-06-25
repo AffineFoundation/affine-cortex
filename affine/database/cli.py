@@ -1015,6 +1015,32 @@ def sample_progress(window, miner):
     asyncio.run(_cmd_sample_progress(window, miner))
 
 
+# --------------------------------------------------------------------------- #
+# Window rotation
+# --------------------------------------------------------------------------- #
+
+
+@db.command("rotate-window")
+@click.option(
+    "--commit",
+    is_flag=True,
+    help="Perform the rotation; default is a dry-run preview of the operations",
+)
+def rotate_window(commit):
+    """Manually rotate the champion task window.
+
+    Full rotation request: scheduler tears down the active battle
+    deployment, releases the active challenger claim, stales the task pool,
+    and clears the current battle before refreshing. Default is a dry-run
+    that shows exactly what it would request; re-run with --commit to write.
+    Stop the sampling service first — the command confirms this before
+    writing.
+    """
+    from affine.src.scheduler.commands import rotate_window_command
+
+    asyncio.run(rotate_window_command(commit=commit))
+
+
 def main():
     db()
 

@@ -15,16 +15,29 @@ Key properties:
   loaded by the sglang image and traps the scheduler in a deploy-retry loop).
 """
 
-import json
 import asyncio
+import json
 import logging
 import os
 from typing import Any, Collection, Dict, Optional
 
 from huggingface_hub import hf_hub_download
+from huggingface_hub.errors import (
+    EntryNotFoundError,
+    GatedRepoError,
+    HfHubHTTPError,
+    LocalEntryNotFoundError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
+import httpx
+import requests
 
 
 logger = logging.getLogger("affine")
+
+CONFIG_FETCH_ATTEMPTS = 2
+CONFIG_FETCH_RETRY_DELAYS_S = (1.0,)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +161,47 @@ def _match_allowed_model(
     )
 
 
+def _http_status_code(exc: Exception) -> Optional[int]:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    return status_code if isinstance(status_code, int) else None
+
+
+def _is_retryable_config_fetch_error(exc: Exception) -> bool:
+    if isinstance(exc, LocalEntryNotFoundError):
+        return True
+    if isinstance(
+        exc,
+        (
+            EntryNotFoundError,
+            GatedRepoError,
+            RepositoryNotFoundError,
+            RevisionNotFoundError,
+        ),
+    ):
+        return False
+    if isinstance(exc, json.JSONDecodeError):
+        return False
+    if isinstance(exc, HfHubHTTPError):
+        status_code = _http_status_code(exc)
+        return status_code is None or status_code == 429 or status_code >= 500
+    if isinstance(
+        exc,
+        (
+            TimeoutError,
+            ConnectionError,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+        ),
+    ):
+        return True
+    return "Timeout" in type(exc).__name__
+
+
 class ModelSizeChecker:
     """Check model architecture against the allowed model whitelist."""
 
@@ -158,30 +212,47 @@ class ModelSizeChecker:
     ):
         self.hf_token = hf_token or os.getenv("HF_TOKEN")
         self.allowed_model_types = _normalize_model_types(allowed_model_types)
+        self._last_config_fetch_retryable = False
+        self._last_config_fetch_reason = "config_fetch_failed"
 
     async def _fetch_config(self, model_id: str, revision: str) -> Optional[dict]:
         """Fetch config.json from HuggingFace repo.
 
         Uses hf_hub_download which has built-in filesystem caching.
         """
-        try:
-            def _download():
-                path = hf_hub_download(
-                    repo_id=model_id,
-                    filename="config.json",
-                    revision=revision,
-                    token=self.hf_token,
-                )
-                with open(path, "r") as f:
-                    return json.load(f)
+        self._last_config_fetch_retryable = False
+        self._last_config_fetch_reason = "config_fetch_failed"
 
-            return await asyncio.to_thread(_download)
-        except Exception as e:
-            logger.warning(
-                f"[ModelSizeChecker] Failed to fetch config.json for "
-                f"{model_id}@{revision}: {type(e).__name__}: {e}"
+        def _download():
+            path = hf_hub_download(
+                repo_id=model_id,
+                filename="config.json",
+                revision=revision,
+                token=self.hf_token,
             )
-            return None
+            with open(path, "r") as f:
+                return json.load(f)
+
+        for attempt in range(1, CONFIG_FETCH_ATTEMPTS + 1):
+            try:
+                return await asyncio.to_thread(_download)
+            except Exception as e:
+                retryable = _is_retryable_config_fetch_error(e)
+                if isinstance(e, json.JSONDecodeError):
+                    self._last_config_fetch_reason = "config_parse_failed"
+                self._last_config_fetch_retryable = retryable
+                logger.warning(
+                    f"[ModelSizeChecker] Failed to fetch config.json for "
+                    f"{model_id}@{revision} "
+                    f"(attempt {attempt}/{CONFIG_FETCH_ATTEMPTS}, "
+                    f"retryable={retryable}): {type(e).__name__}: {e}"
+                )
+                if not retryable or attempt >= CONFIG_FETCH_ATTEMPTS:
+                    return None
+                delay_index = min(attempt - 1, len(CONFIG_FETCH_RETRY_DELAYS_S) - 1)
+                await asyncio.sleep(CONFIG_FETCH_RETRY_DELAYS_S[delay_index])
+
+        return None
 
     async def check(self, model_id: str, revision: str) -> Dict[str, Any]:
         """Check if model matches any allowed architecture.
@@ -195,8 +266,9 @@ class ModelSizeChecker:
         if config is None:
             return {
                 "pass": False,
-                "reason": "config_fetch_failed",
+                "reason": self._last_config_fetch_reason,
                 "model_type": "",
+                "retryable": self._last_config_fetch_retryable,
             }
 
         matched_model_type, mismatch = _match_allowed_model(
