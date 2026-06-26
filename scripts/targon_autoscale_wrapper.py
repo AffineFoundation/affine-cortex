@@ -99,13 +99,19 @@ PUBLIC_INFERENCE_URL = _env("TARGON_PUBLIC_INFERENCE_URL")
 REQUIRE_SSH_PROBE = _env_bool("TARGON_REQUIRE_SSH_PROBE", "true")
 REQUIRE_DOCKER = _env_bool("TARGON_REQUIRE_DOCKER", "true")
 REQUIRE_DOCKER_GPU = _env_bool("TARGON_REQUIRE_DOCKER_GPU", "true")
+REQUIRE_CUDA_DRIVER = _env_bool("TARGON_REQUIRE_CUDA_DRIVER", "true")
+REQUIRE_FABRIC_READY = _env_bool("TARGON_REQUIRE_FABRIC_READY", "true")
 FIX_NVIDIA_NO_CGROUPS = _env_bool("TARGON_FIX_NVIDIA_NO_CGROUPS", "true")
 DOCKER_GPU_TEST_IMAGE = _env(
     "TARGON_DOCKER_GPU_TEST_IMAGE",
     "nvidia/cuda:12.4.1-base-ubuntu22.04",
 )
+CUDA_DRIVER_PROBE_TIMEOUT = int(
+    _env("TARGON_CUDA_DRIVER_PROBE_TIMEOUT_SEC", "30") or "30"
+)
 SSH_CONNECT_TIMEOUT = int(_env("TARGON_SSH_CONNECT_TIMEOUT_SEC", "10") or "10")
 SSH_PROBE_TIMEOUT = int(_env("TARGON_SSH_PROBE_TIMEOUT_SEC", "300") or "300")
+SSH_READY_FAILURE_LIMIT = int(_env("TARGON_SSH_READY_FAILURE_LIMIT", "3") or "3")
 REQUEST_TIMEOUT = int(_env("TARGON_API_TIMEOUT_SEC", "60") or "60")
 RENEW_METHOD = _env("TARGON_RENEW_METHOD", "POST").upper()
 RENEW_PATH_TEMPLATE = _env(
@@ -342,6 +348,7 @@ class TargonAutoscaleClient:
     def wait_ready(self, uid: str) -> dict:
         start = time.time()
         last: dict[str, Any] = {}
+        ssh_ready_failures = 0
         while time.time() - start < WAIT_TIMEOUT:
             workload = self._safe_get_workload(uid)
             state = self._safe_get_state(uid)
@@ -353,19 +360,30 @@ class TargonAutoscaleClient:
                 raise TargonWrapperError(
                     f"Targon workload {uid} {status}: {str(_redacted(merged))[:800]}"
                 )
-            if _running(merged) and self._ssh_ready(uid):
-                ssh_url = _ssh_url(uid)
-                return {
-                    "instance_id": uid,
-                    "ssh_url": ssh_url,
-                    "public_inference_url": (
-                        _openai_endpoint(PUBLIC_INFERENCE_URL)
-                        or _public_url(merged, uid, PORT)
-                    ),
-                    "lease_expires_at": _lease_expires_at(merged),
-                    "status": status,
-                    "raw": _redacted(merged),
-                }
+            if _running(merged):
+                if self._ssh_ready(uid):
+                    ssh_url = _ssh_url(uid)
+                    return {
+                        "instance_id": uid,
+                        "ssh_url": ssh_url,
+                        "public_inference_url": (
+                            _openai_endpoint(PUBLIC_INFERENCE_URL)
+                            or _public_url(merged, uid, PORT)
+                        ),
+                        "lease_expires_at": _lease_expires_at(merged),
+                        "status": status,
+                        "raw": _redacted(merged),
+                    }
+                ssh_ready_failures += 1
+                if (
+                    SSH_READY_FAILURE_LIMIT > 0
+                    and ssh_ready_failures >= SSH_READY_FAILURE_LIMIT
+                ):
+                    raise TargonWrapperError(
+                        f"Targon workload {uid} SSH preflight failed "
+                        f"{ssh_ready_failures} time(s) after workload became "
+                        "running"
+                    )
             time.sleep(POLL_SECONDS)
         raise TargonWrapperError(
             f"Targon workload {uid} did not become ready in {WAIT_TIMEOUT}s; "
@@ -516,6 +534,10 @@ def _ssh_probe_command() -> str:
                 "nvidia-smi --query-gpu=index,name,memory.total "
                 "--format=csv,noheader >/dev/null"
             )
+            if REQUIRE_FABRIC_READY:
+                parts.append(_fabric_ready_probe_command())
+            if REQUIRE_CUDA_DRIVER:
+                parts.append(_cuda_driver_probe_command())
     parts.append("echo ready")
     return "; ".join(parts)
 
@@ -535,6 +557,36 @@ def _nvidia_no_cgroups_fix_command() -> str:
         "printf '[nvidia-container-cli]\\nno-cgroups = true\\n' > \"$cfg\"; "
         "fi"
     )
+
+
+def _fabric_ready_probe_command() -> str:
+    return (
+        "if nvidia-smi -q 2>/dev/null "
+        "| grep -qE '^[[:space:]]*Fabric[[:space:]]*$'; then "
+        "nvidia-smi -q 2>/dev/null | awk '"
+        "/^[[:space:]]*Fabric[[:space:]]*$/ { inside=1; next } "
+        "inside && /^[[:space:]]*State[[:space:]]*:/ { "
+        "if ($0 !~ /Completed/) bad=1; inside=0 } "
+        "END { if (bad) exit 1; exit 0 }"
+        "'; "
+        "fi"
+    )
+
+
+def _cuda_driver_probe_command() -> str:
+    timeout_sec = max(1, CUDA_DRIVER_PROBE_TIMEOUT)
+    script = (
+        "import ctypes;"
+        "from ctypes import c_int, byref;"
+        "lib=ctypes.CDLL('libcuda.so.1');"
+        "rc=lib.cuInit(0);"
+        "count=c_int(-1);"
+        "rc_count=lib.cuDeviceGetCount(byref(count));"
+        "raise SystemExit("
+        "0 if rc == 0 and rc_count == 0 and count.value > 0 else 1"
+        ")"
+    )
+    return f"timeout {timeout_sec}s python3 -c {shlex.quote(script)}"
 
 
 def _json_list_env(name: str) -> Optional[list[str]]:
