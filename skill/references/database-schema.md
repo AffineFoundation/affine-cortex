@@ -1,31 +1,35 @@
 # DynamoDB Schema Reference
 
-9 tables, all PAY_PER_REQUEST billing.
+> Verified against affine-cortex@e3a9fce (2026-06). 11 tables, PAY_PER_REQUEST. **Changed since the ELO era:** the old `task_pool` and `anti_copy_results` tables are gone; `inference_endpoints` and three `anticopy_*` tables were added (for self-hosted serving + CEAC).
 
-## Tables
+## Tables (`affine/database/schema.py`)
 
-| Table | PK | SK | TTL | Purpose |
-|-------|----|----|-----|---------|
-| **sample_results** | `MINER#{hotkey}#REV#{rev}#ENV#{env}` | `TASK#{task_id}` | 30 days | Completed evaluation samples |
-| **task_pool** | `MINER#{hotkey}#REV#{rev}` | `ENV#{env}#STATUS#{status}#TASK_ID#{id}` | - | Pending/assigned tasks |
-| **scores** | `SNAPSHOT#{id}` | `UID#{uid}` | - | Score snapshots |
-| **miners** | `MINER#{hotkey}` | `REVISION#{rev}` | - | Miner registrations |
-| **miner_stats** | `MINER#{hotkey}#REV#{rev}` | `ENV#{env}` | - | Per-env sampling stats |
-| **execution_logs** | `EXEC#{id}` | `TASK#{task_id}` | 7 days | Execution history |
-| **score_snapshots** | `SNAPSHOT#{id}` | `META` | - | Score snapshot metadata |
-| **system_config** | `CONFIG` | `KEY#{key}` | - | System configuration |
-| **anti_copy_results** | `PAIR#{a}#{b}` | `TIMESTAMP#{ts}` | 30 days | Copy detection results |
+| Table | Purpose |
+|-------|---------|
+| **sample_results** | Completed evaluation samples (TTL ~30d). Keyed by miner+revision+env / task_id |
+| **execution_logs** | Execution history (TTL ~7d) |
+| **scores** | Per-snapshot per-uid scores (winner-takes-all: champion 1.0, rest 0.0) |
+| **score_snapshots** | Snapshot metadata — winner uid/hotkey/revision/model, `final_weights`, full battle context |
+| **miners** | Miner registrations (commit `{model, revision}`, model_hash, is_valid) |
+| **miner_stats** | Per-miner lifecycle: `challenge_status` (sampling/in_progress/champion/terminated), wins/losses, termination_reason, per-env sampling stats |
+| **system_config** | System configuration — env gates, champion record, contest params, anticopy config |
+| **inference_endpoints** | Serving endpoints registry — `kind: "ssh" \| "targon"`, base_url, autoscale_managed, lease info |
+| **anticopy_rollouts** | CEAC: champion rollout pool index (R2-backed decision-position blobs) |
+| **anticopy_scores_index** | CEAC: per-candidate forward-pass score blobs (done-marker; no verdict) |
+| **anticopy_state** | CEAC: refresh/verdict service state |
 
-## Key Access Patterns
+(Large blobs — rollouts, CEAC score vectors — live in Cloudflare **R2**, not DynamoDB; the tables hold indexes/pointers.)
 
-- **Task fetch**: Query task_pool by PK (miner+rev), filter by env+status=PENDING
-- **Sample storage**: Put to sample_results after evaluation
-- **Score query**: Query scores by snapshot ID (latest), or scan for top-N
-- **Miner lookup**: Get miner by hotkey, query revisions
-- **Stats aggregation**: Query miner_stats for completeness checks
+## Key access patterns
 
-## Key Files
+- **Challenger queue** is *materialized*, not a table: online `miners` joined with `miner_stats.challenge_status`, ordered `(first_block ASC, uid ASC)`.
+- **Champion** is a record in `system_config` (`ChampionRecord`).
+- **Weights**: `/scores/weights/latest` reads `scores` + `score_snapshots` (winner share, optional past-N-champion split).
+- **CEAC verdict**: written to `anticopy_scores_index` / via DAO `update_verdict`; consumed by the monitor (`verdict_copy_of` → `mark_invalid`).
+- **Serving**: scheduler reads/writes `inference_endpoints` to deploy SGLang on SSH/Targon hosts.
 
-- `affine/database/schema.py` -- Table definitions
-- `affine/database/tables.py` -- Table initialization + TTL management
-- `affine/database/dao/*.py` -- Data access objects for each table
+## Key files
+
+- `affine/database/schema.py` — table definitions (`get_table_name(...)`)
+- `affine/database/tables.py` — table init + TTL
+- `affine/database/dao/*.py` — DAOs: `anticopy.py`, `execution_logs.py`, `inference_endpoints.py`, `miner_stats.py`, `miners.py`, `sample_results.py`, `score_snapshots.py`, `scores.py`, `system_config.py`
