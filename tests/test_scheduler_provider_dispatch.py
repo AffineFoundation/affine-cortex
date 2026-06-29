@@ -20,6 +20,7 @@ from affine.src.scheduler.main import (
     _gpu_autoscaler_empty_provider_kind,
     _resolve_provider_kind,
 )
+from affine.src.scheduler.ssh import SSHConfig
 from affine.src.scheduler.targon import DeployResult, DeployTarget
 
 
@@ -301,6 +302,40 @@ async def test_ssh_deploy_failure_clears_assignment_and_reports_deployment(
     assert excinfo.value.invalidated_deployment_ids == (
         "ssh:b300:affine-sglang-current",
     )
+
+
+@pytest.mark.asyncio
+async def test_ssh_deploy_refreshes_cached_endpoint_config(monkeypatch):
+    endpoint = Endpoint(
+        name="b300",
+        kind="ssh",
+        ssh_url="ssh://root@b300",
+        ssh_key_path="/root/.ssh/new-key",
+    )
+    dao = _EndpointsDAOFake([endpoint])
+    ssh_configs = {
+        "b300": SSHConfig(
+            host="b300",
+            endpoint_name="b300",
+            key_path="/root/.ssh/old-key",
+        )
+    }
+
+    async def deploy(config, target):
+        assert config.key_path == "/root/.ssh/new-key"
+        return DeployResult(
+            deployment_id=config.deployment_id(),
+            base_url=config.inference_url(),
+        )
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.main.ssh_lifecycle.deploy",
+        deploy,
+    )
+
+    await _deploy_ssh_target(dao, ssh_configs, _target(), role="challenger")
+
+    assert ssh_configs["b300"].key_path == "/root/.ssh/new-key"
 
 
 @pytest.mark.asyncio
