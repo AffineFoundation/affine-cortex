@@ -3296,7 +3296,7 @@ async def test_reaper_releases_orphan_after_endpoint_reactivation():
 
 
 @pytest.mark.asyncio
-async def test_reaper_terminates_old_orphan_when_endpoint_stayed_stable():
+async def test_reaper_releases_old_orphan_when_endpoint_stayed_stable():
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -3316,10 +3316,8 @@ async def test_reaper_terminates_old_orphan_when_endpoint_stayed_stable():
 
     await scheduler.tick(current_block=50)
 
-    assert miner_store.rows[99]["challenge_status"] == STATUS_TERMINATED
-    assert miner_store.rows[99]["termination_reason"] == (
-        "orphan_in_progress:stale_claim_endpoint_stable"
-    )
+    assert miner_store.rows[99]["challenge_status"] == STATUS_SAMPLING
+    assert miner_store.rows[99].get("termination_reason") in (None, "")
 
 
 @pytest.mark.asyncio
