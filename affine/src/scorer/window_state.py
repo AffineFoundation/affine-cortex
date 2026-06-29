@@ -156,6 +156,21 @@ class ConfigKVStore(Protocol):
     async def get(self, key: str, default: Any = None) -> Any: ...
     async def set(self, key: str, value: Any) -> None: ...
     async def delete(self, key: str) -> bool: ...
+    async def set_if_absent_or_expired(
+        self,
+        key: str,
+        value: Any,
+        *,
+        expires_at_field: str,
+        now: int,
+    ) -> bool: ...
+    async def delete_if_token(
+        self,
+        key: str,
+        token: str,
+        *,
+        token_field: str = "token",
+    ) -> bool: ...
 
 
 # ---- typed accessor -------------------------------------------------------
@@ -312,6 +327,35 @@ class InMemoryConfigStore:
     async def delete(self, key: str) -> bool:
         return self.data.pop(key, None) is not None
 
+    async def set_if_absent_or_expired(
+        self,
+        key: str,
+        value: Any,
+        *,
+        expires_at_field: str,
+        now: int,
+    ) -> bool:
+        raw = self.data.get(key)
+        if isinstance(raw, dict):
+            expires_at = raw.get(expires_at_field)
+            if expires_at is not None and int(expires_at) > now:
+                return False
+        self.data[key] = value
+        return True
+
+    async def delete_if_token(
+        self,
+        key: str,
+        token: str,
+        *,
+        token_field: str = "token",
+    ) -> bool:
+        raw = self.data.get(key)
+        if not isinstance(raw, dict) or raw.get(token_field) != token:
+            return False
+        self.data.pop(key, None)
+        return True
+
 
 # ---- production adapter ---------------------------------------------------
 
@@ -351,6 +395,48 @@ class SystemConfigKVAdapter:
 
     async def delete(self, key: str) -> bool:
         return await self._dao.delete_param(key)
+
+    async def set_if_absent_or_expired(
+        self,
+        key: str,
+        value: Any,
+        *,
+        expires_at_field: str,
+        now: int,
+    ) -> bool:
+        if isinstance(value, bool):
+            ptype = "bool"
+        elif isinstance(value, int):
+            ptype = "int"
+        elif isinstance(value, float):
+            ptype = "float"
+        elif isinstance(value, str):
+            ptype = "str"
+        elif isinstance(value, list):
+            ptype = "list"
+        else:
+            ptype = "dict"
+        return await self._dao.set_param_if_absent_or_expired(
+            param_name=key,
+            param_value=value,
+            param_type=ptype,
+            expires_at_field=expires_at_field,
+            now=now,
+            updated_by=self._updated_by,
+        )
+
+    async def delete_if_token(
+        self,
+        key: str,
+        token: str,
+        *,
+        token_field: str = "token",
+    ) -> bool:
+        return await self._dao.delete_param_if_token(
+            key,
+            token,
+            token_field=token_field,
+        )
 
 
 # ---- internal codecs ------------------------------------------------------

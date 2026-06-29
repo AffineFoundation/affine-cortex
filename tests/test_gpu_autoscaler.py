@@ -10,6 +10,8 @@ from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.gpu_autoscaler import (
     GPUAutoscaler,
     GPUAutoscalerConfig,
+    MANUAL_REPLACEMENT_LOCK_KEY,
+    MANUAL_REPLACEMENT_STATE_KEY,
     ManagedEndpointSlot,
     STATE_KEY,
     load_config,
@@ -404,6 +406,192 @@ async def test_scale_up_does_not_reuse_stale_lease_from_inactive_endpoint():
     ep = endpoints.endpoints["lium-b200-1"]
     assert ep.autoscale_instance_id == "inst-lium-b200-1"
     assert ep.autoscale_lease_expires_at == 0
+
+
+@pytest.mark.asyncio
+async def test_manual_replacement_lock_pauses_scale_up_for_locked_slot():
+    kv = InMemoryConfigStore()
+    await kv.set(MANUAL_REPLACEMENT_LOCK_KEY, {
+        "old_endpoint_name": "lium-b200-1",
+        "new_slot_name": "lium-b200-1",
+        "started_at": 900,
+        "expires_at": 1100,
+        "token": "replace-1",
+    })
+    endpoints = _Endpoints()
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+    cfg = GPUAutoscalerConfig(
+        enabled=True,
+        pending_threshold_per_instance=1,
+        max_gpu_down_wait_seconds=0,
+        min_instances=0,
+        max_instances=1,
+        providers={
+            "lium": InstanceAPIConfig(
+                provider="lium",
+                api_url="https://lium.example.com",
+                create_path="/instances",
+                delete_path="/instances/{instance_id}",
+            )
+        },
+        slots=[ManagedEndpointSlot(name="lium-b200-1", provider="lium")],
+    )
+
+    result = await autoscaler.tick(cfg)
+
+    assert result.action == "paused:manual-replacement"
+    assert result.desired_instances == 1
+    assert endpoints.endpoints == {}
+    assert _Client.create_calls == []
+    lock = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+    assert lock["token"] == "replace-1"
+
+
+@pytest.mark.asyncio
+async def test_expired_manual_replacement_lock_allows_scale_up():
+    kv = InMemoryConfigStore()
+    await kv.set(MANUAL_REPLACEMENT_LOCK_KEY, {
+        "old_endpoint_name": "lium-b200-1",
+        "new_slot_name": "lium-b200-1",
+        "started_at": 800,
+        "expires_at": 999,
+        "token": "replace-1",
+    })
+    endpoints = _Endpoints()
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    cfg = GPUAutoscalerConfig(
+        enabled=True,
+        pending_threshold_per_instance=1,
+        max_gpu_down_wait_seconds=0,
+        min_instances=0,
+        max_instances=1,
+        providers={
+            "lium": InstanceAPIConfig(
+                provider="lium",
+                api_url="https://lium.example.com",
+                create_path="/instances",
+                delete_path="/instances/{instance_id}",
+            )
+        },
+        slots=[ManagedEndpointSlot(name="lium-b200-1", provider="lium")],
+    )
+
+    result = await autoscaler.tick(cfg)
+
+    assert result.action == "scale-up:1"
+    assert sorted(endpoints.endpoints) == ["lium-b200-1"]
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+
+
+@pytest.mark.asyncio
+async def test_manual_replacement_lock_does_not_consume_restart_force_start():
+    kv = InMemoryConfigStore()
+    await kv.set(STATE_KEY, {
+        MANUAL_REPLACEMENT_STATE_KEY: {
+            "old_endpoint_name": "lium-b200-1",
+            "new_slot_name": "lium-b200-1",
+            "started_at": 900,
+            "expires_at": 1100,
+            "token": "replace-1",
+        }
+    })
+    endpoints = _Endpoints()
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    first = await autoscaler.tick(
+        _config(threshold=5, max_gpu_down_wait_seconds=3600)
+    )
+    await kv.set(STATE_KEY, {})
+    second = await autoscaler.tick(
+        _config(threshold=5, max_gpu_down_wait_seconds=3600)
+    )
+
+    assert first.action == "none"
+    assert first.desired_instances == 0
+    assert second.action == "scale-up:1"
+    assert second.desired_instances == 1
+    assert sorted(endpoints.endpoints) == ["lium-b200-1"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_manual_replacement_lock_still_pauses_scale_up():
+    kv = InMemoryConfigStore()
+    await kv.set(STATE_KEY, {
+        MANUAL_REPLACEMENT_STATE_KEY: {
+            "old_endpoint_name": "lium-b200-1",
+            "new_slot_name": "lium-b200-1",
+            "started_at": 900,
+            "expires_at": 1100,
+            "token": "legacy-replace",
+        }
+    })
+    endpoints = _Endpoints()
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    cfg = GPUAutoscalerConfig(
+        enabled=True,
+        pending_threshold_per_instance=1,
+        max_gpu_down_wait_seconds=0,
+        min_instances=0,
+        max_instances=1,
+        providers={
+            "lium": InstanceAPIConfig(
+                provider="lium",
+                api_url="https://lium.example.com",
+                create_path="/instances",
+                delete_path="/instances/{instance_id}",
+            )
+        },
+        slots=[ManagedEndpointSlot(name="lium-b200-1", provider="lium")],
+    )
+
+    result = await autoscaler.tick(cfg)
+
+    assert result.action == "paused:manual-replacement"
+    assert endpoints.endpoints == {}
+
+
+@pytest.mark.asyncio
+async def test_manual_replacement_lock_survives_state_updates():
+    kv = InMemoryConfigStore()
+    await kv.set(MANUAL_REPLACEMENT_LOCK_KEY, {
+        "old_endpoint_name": "lium-b200-1",
+        "new_slot_name": "lium-b200-1",
+        "started_at": 900,
+        "expires_at": 1100,
+        "token": "replace-1",
+    })
+    autoscaler = _autoscaler(
+        _Queue(pending=0),
+        _Endpoints(),
+        kv,
+        now=1000,
+    )
+
+    await autoscaler.tick(_config(threshold=1))
+
+    assert (await kv.get(MANUAL_REPLACEMENT_LOCK_KEY))["token"] == "replace-1"
 
 
 @pytest.mark.asyncio
@@ -1023,6 +1211,8 @@ async def test_replace_same_endpoint_drains_old_before_delete_then_creates_new()
     assert ep.assigned_uid is None
     assert await state.get_battle() is None
     assert queue.released == [(42, "hk42", "rev42")]
+    assert MANUAL_REPLACEMENT_STATE_KEY not in await kv.get(STATE_KEY, {})
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
 
 
 @pytest.mark.asyncio
@@ -1094,6 +1284,38 @@ async def test_replace_different_slot_leaves_old_when_create_fails():
 
 
 @pytest.mark.asyncio
+async def test_replace_refuses_when_manual_replacement_lock_active():
+    kv = InMemoryConfigStore()
+    await kv.set(MANUAL_REPLACEMENT_LOCK_KEY, {
+        "old_endpoint_name": "lium-b200-1",
+        "new_slot_name": "lium-b200-1",
+        "started_at": 1900,
+        "expires_at": 2300,
+        "token": "replace-1",
+    })
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=2000)
+
+    with pytest.raises(RuntimeError, match="already in progress"):
+        await autoscaler.replace_endpoint(
+            _config(),
+            old_endpoint_name="lium-b200-1",
+        )
+
+    assert _Client.events == []
+    assert endpoints.endpoints["lium-b200-1"].autoscale_instance_id == "old-inst"
+
+
+@pytest.mark.asyncio
 async def test_replace_same_endpoint_keeps_instance_id_when_delete_fails():
     _Client.delete_returns_false_for_ids = {"old-inst"}
     kv = InMemoryConfigStore()
@@ -1113,15 +1335,23 @@ async def test_replace_same_endpoint_keeps_instance_id_when_delete_fails():
         await autoscaler.replace_endpoint(
             _config(),
             old_endpoint_name="lium-b200-1",
+            lock_ttl_seconds=300,
         )
 
     assert _Client.events == [
         ("drain", "lium-b200-1", "old-inst"),
         ("delete", "old-inst"),
+        ("activate", "lium-b200-1"),
     ]
     ep = endpoints.endpoints["lium-b200-1"]
-    assert ep.active is False
+    assert ep.active is True
     assert ep.autoscale_instance_id == "old-inst"
+    lock = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+    assert lock["old_endpoint_name"] == (
+        "lium-b200-1"
+    )
+    assert lock["new_slot_name"] == "lium-b200-1"
+    assert lock["expires_at"] == 2300
 
 
 @pytest.mark.asyncio
