@@ -495,7 +495,7 @@ async def test_window_rotation_request_tears_down_battle_then_refreshes():
     }
     kv.data["window_rotation_request"] = {
         "requested_at_block": 1000,
-        "stale_refreshed_at_block": -1,
+        "stale_refreshed_at_block": 1000 - WINDOW_BLOCKS - 1,
     }
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -508,7 +508,7 @@ async def test_window_rotation_request_tears_down_battle_then_refreshes():
         deployer=deployer,
         samples=_SamplesFake(),
         window_blocks=WINDOW_BLOCKS,
-        task_pool_refresh_blocks=WINDOW_BLOCKS,
+        task_pool_refresh_blocks=WINDOW_BLOCKS * 10,
     )
 
     await scheduler.tick(current_block=1000)

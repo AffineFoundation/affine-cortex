@@ -1832,13 +1832,10 @@ class FlowScheduler:
             )
 
         if task_state is not None:
-            await self.state.set_task_state(TaskIdState(
-                task_ids=task_state.task_ids,
-                refreshed_at_block=int(request.stale_refreshed_at_block),
-            ))
+            await self.state.clear_task_state()
             logger.warning(
-                f"FlowScheduler: window rotation staled task pool "
-                f"refreshed_at_block={request.stale_refreshed_at_block}"
+                "FlowScheduler: window rotation cleared task pool; "
+                "scheduler will refresh it before continuing"
             )
 
         await self.state.clear_battle()

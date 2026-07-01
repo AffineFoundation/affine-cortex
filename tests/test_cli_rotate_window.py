@@ -6,7 +6,6 @@ from click.testing import CliRunner
 
 from affine.cli.main import cli
 import affine.src.scheduler.commands as scheduler_commands
-from affine.src.scheduler.flow import WINDOW_BLOCKS
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
@@ -160,14 +159,13 @@ def test_rotate_window_commit_writes_rotation_request(monkeypatch):
     # Confirm the sampling service is stopped.
     result = CliRunner().invoke(cli, ["db", "rotate-window", "--commit"], input="y\n")
 
-    stale_block = 1000 - WINDOW_BLOCKS - 1
     assert result.exit_code == 0
     assert store.ops == [
-        ("set_window_rotation_request", 1000, stale_block),
+        ("set_window_rotation_request", 1000, -1),
     ]
 
 
-def test_rotate_window_uses_configured_task_pool_refresh_blocks(monkeypatch):
+def test_rotate_window_request_does_not_depend_on_local_refresh_config(monkeypatch):
     store = _Store(battle=_battle())
     _install_command_fakes(monkeypatch, store, current_block=1000)
     monkeypatch.setenv("SCHEDULER_TASK_POOL_REFRESH_BLOCKS", "123")
@@ -176,5 +174,5 @@ def test_rotate_window_uses_configured_task_pool_refresh_blocks(monkeypatch):
 
     assert result.exit_code == 0
     assert store.ops == [
-        ("set_window_rotation_request", 1000, 876),
+        ("set_window_rotation_request", 1000, -1),
     ]

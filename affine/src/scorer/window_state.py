@@ -261,6 +261,9 @@ class StateStore:
     async def set_task_state(self, state: TaskIdState) -> None:
         await self._kv.set(self.KEY_TASK_IDS, asdict(state))
 
+    async def clear_task_state(self) -> None:
+        await self._kv.delete(self.KEY_TASK_IDS)
+
     # -- manual rotation -----------------------------------------------------
 
     async def get_window_rotation_request(
