@@ -179,7 +179,8 @@ async def _deploy_ssh_target(
     selected = _select_ssh_endpoints(endpoints, target, role=role)
     deployments = []
     for ep in selected:
-        cfg = ssh_configs.get(ep.name) or ssh_lifecycle.SSHConfig.from_endpoint(ep)
+        cfg = ssh_lifecycle.SSHConfig.from_endpoint(ep)
+        ssh_configs[ep.name] = cfg
         deployment_id = cfg.deployment_id()
         try:
             result = await ssh_lifecycle.deploy(cfg, target)
@@ -304,6 +305,22 @@ async def _run() -> None:
             still find a cfg to docker-rm + clear_assignment on."""
             for name, cfg in ssh_configs.items():
                 if deployment_id == cfg.deployment_id():
+                    try:
+                        endpoint = await endpoints_dao.get(name)
+                        if (
+                            endpoint is not None
+                            and endpoint.active
+                            and endpoint.kind == "ssh"
+                            and _is_scoring_endpoint(endpoint)
+                        ):
+                            cfg = ssh_lifecycle.SSHConfig.from_endpoint(endpoint)
+                            ssh_configs[name] = cfg
+                    except Exception as e:
+                        logger.warning(
+                            f"scheduler: live endpoint refresh failed during "
+                            f"teardown_fn for endpoint={name!r}: "
+                            f"{type(e).__name__}: {e}; using cached cfg"
+                        )
                     return name, cfg
             try:
                 live = await endpoints_dao.list_active(kind="ssh")

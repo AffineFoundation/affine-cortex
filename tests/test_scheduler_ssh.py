@@ -17,6 +17,8 @@ from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.main import _select_ssh_endpoints
 from affine.src.scheduler.ssh import (
     CONTAINER_NAME,
+    DEFAULT_HF_METADATA_TIMEOUT_SEC,
+    HF_XET_MAX_NON_XET_FILE_BYTES,
     HF_ORG_SEPARATOR,
     HF_SNAPSHOT_PREFIX,
     RESTART_POLICY,
@@ -27,8 +29,10 @@ from affine.src.scheduler.ssh import (
     _cleanup_stale_caches,
     _hf_cache_dir_name,
     _is_valid_hf_model_id,
+    _max_weight_file_size_bytes,
     _parse_container_exit_status,
     _parse_container_inspect_json,
+    _should_disable_hf_xet,
     deployment_healthy,
     deploy,
 )
@@ -344,6 +348,34 @@ def test_docker_cmd_allows_hf_xet_downloads():
     assert "HF_HUB_DISABLE_XET" not in cmd
 
 
+def test_docker_cmd_disables_hf_xet_when_requested():
+    cmd = _build_docker_run_cmd(
+        _target(), _config(), disable_hf_xet=True,
+    )
+    assert "-e HF_HUB_DISABLE_XET=1" in cmd
+
+
+def test_docker_cmd_dynamic_xet_policy_overrides_endpoint_extra_arg():
+    cfg = _config(sglang_docker_args=(
+        "--cgroupns=host",
+        "-e", "HF_HUB_DISABLE_XET=1",
+        "--env", "HF_HUB_DISABLE_XET=1",
+        "--env=HF_HUB_DISABLE_XET=1",
+        "-eHF_HUB_DISABLE_XET=1",
+    ))
+    enabled_cmd = _build_docker_run_cmd(
+        _target(), cfg, disable_hf_xet=False,
+    )
+    assert "--cgroupns=host" in enabled_cmd
+    assert "HF_HUB_DISABLE_XET" not in enabled_cmd
+
+    disabled_cmd = _build_docker_run_cmd(
+        _target(), cfg, disable_hf_xet=True,
+    )
+    assert "--cgroupns=host" in disabled_cmd
+    assert disabled_cmd.count("HF_HUB_DISABLE_XET=1") == 1
+
+
 def test_docker_cmd_labels_current_machine_assignment():
     cmd = _build_docker_run_cmd(
         _target(), _config(endpoint_name="ssh_b300")
@@ -388,6 +420,107 @@ def test_docker_cmd_omits_hf_token_when_env_unset(monkeypatch):
     cmd = _build_docker_run_cmd(_target(), _config())
     assert "-e HF_TOKEN=" not in cmd
     assert "-e HUGGING_FACE_HUB_TOKEN=" not in cmd
+
+
+@dataclass
+class _Sibling:
+    rfilename: str
+    size: int | None
+
+
+def test_max_weight_file_size_uses_largest_single_weight_shard():
+    siblings = [
+        _Sibling("config.json", 123),
+        _Sibling("model-00001-of-00003.safetensors", 10),
+        _Sibling("model-00002-of-00003.safetensors", 40),
+        _Sibling("model-00003-of-00003.safetensors", 30),
+    ]
+    assert _max_weight_file_size_bytes(siblings) == 40
+
+
+def test_max_weight_file_size_ignores_missing_sizes_and_non_weights():
+    siblings = [
+        _Sibling("README.md", 99),
+        _Sibling("model.safetensors.index.json", 100),
+        _Sibling("pytorch_model.bin", None),
+    ]
+    assert _max_weight_file_size_bytes(siblings) is None
+
+
+@pytest.mark.asyncio
+async def test_should_disable_hf_xet_for_sub_50g_max_shard(monkeypatch):
+    class _Info:
+        siblings = [_Sibling(
+            "model.safetensors",
+            HF_XET_MAX_NON_XET_FILE_BYTES - 1,
+        )]
+
+    class _Api:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, **kwargs):
+            assert kwargs["repo_id"] == _target().model
+            assert kwargs["revision"] == _target().revision
+            assert kwargs["files_metadata"] is True
+            assert kwargs["timeout"] == DEFAULT_HF_METADATA_TIMEOUT_SEC
+            return _Info()
+
+    monkeypatch.setattr("affine.src.scheduler.ssh.HfApi", _Api)
+    assert await _should_disable_hf_xet(_target())
+
+
+@pytest.mark.asyncio
+async def test_should_disable_hf_xet_uses_configured_metadata_timeout(
+    monkeypatch,
+):
+    class _Info:
+        siblings = [_Sibling("model.safetensors", 1)]
+
+    class _Api:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, **kwargs):
+            assert kwargs["timeout"] == 7.5
+            return _Info()
+
+    monkeypatch.setenv("AFFINE_SSH_HF_METADATA_TIMEOUT_SEC", "7.5")
+    monkeypatch.setattr("affine.src.scheduler.ssh.HfApi", _Api)
+
+    assert await _should_disable_hf_xet(_target())
+
+
+@pytest.mark.asyncio
+async def test_should_keep_hf_xet_for_50g_or_larger_max_shard(monkeypatch):
+    class _Info:
+        siblings = [_Sibling(
+            "model.safetensors",
+            HF_XET_MAX_NON_XET_FILE_BYTES,
+        )]
+
+    class _Api:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, **kwargs):
+            return _Info()
+
+    monkeypatch.setattr("affine.src.scheduler.ssh.HfApi", _Api)
+    assert not await _should_disable_hf_xet(_target())
+
+
+@pytest.mark.asyncio
+async def test_should_keep_hf_xet_when_metadata_lookup_fails(monkeypatch):
+    class _Api:
+        def __init__(self, token=None):
+            self.token = token
+
+        def model_info(self, **kwargs):
+            raise RuntimeError("hf unavailable")
+
+    monkeypatch.setattr("affine.src.scheduler.ssh.HfApi", _Api)
+    assert not await _should_disable_hf_xet(_target())
 
 
 def test_parse_container_exit_status_tolerates_targon_banner():
@@ -566,6 +699,13 @@ async def test_deploy_always_cleans_existing_container_before_start(monkeypatch)
 
     monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
     monkeypatch.setattr("affine.src.scheduler.ssh._wait_ready", fake_wait_ready)
+    async def fake_should_disable_hf_xet(target):
+        return False
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._should_disable_hf_xet",
+        fake_should_disable_hf_xet,
+    )
 
     cfg = _config(endpoint_name="ssh_b300")
     result = await deploy(cfg, _target())

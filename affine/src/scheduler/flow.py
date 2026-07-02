@@ -1078,31 +1078,6 @@ class FlowScheduler:
                 claimed_at=claimed_at,
                 endpoint_activations=endpoint_activations,
             )
-            if release_reason == "stale_claim_endpoint_stable":
-                try:
-                    await self.queue.mark_terminated(
-                        int(uid),
-                        OUTCOME_FAILED,
-                        reason=(
-                            "orphan_in_progress:"
-                            "stale_claim_endpoint_stable"
-                        ),
-                        hotkey=str(row.get("hotkey") or ""),
-                        revision=str(row.get("revision") or ""),
-                        model=str(row.get("model") or ""),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        f"FlowScheduler: orphan reaper failed to terminate "
-                        f"uid={uid}: {type(e).__name__}: {e}"
-                    )
-                    continue
-                logger.warning(
-                    f"FlowScheduler: terminated stale orphan in_progress "
-                    f"uid={uid} (age={age}s, reason={release_reason}, "
-                    f"protected_uids={sorted(protected)})"
-                )
-                continue
             if release_reason == "stale_claim_no_endpoint_snapshot":
                 logger.warning(
                     f"FlowScheduler: skipped orphan in_progress uid={uid}; "
@@ -1857,13 +1832,10 @@ class FlowScheduler:
             )
 
         if task_state is not None:
-            await self.state.set_task_state(TaskIdState(
-                task_ids=task_state.task_ids,
-                refreshed_at_block=int(request.stale_refreshed_at_block),
-            ))
+            await self.state.clear_task_state()
             logger.warning(
-                f"FlowScheduler: window rotation staled task pool "
-                f"refreshed_at_block={request.stale_refreshed_at_block}"
+                "FlowScheduler: window rotation cleared task pool; "
+                "scheduler will refresh it before continuing"
             )
 
         await self.state.clear_battle()

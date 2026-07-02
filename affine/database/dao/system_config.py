@@ -5,7 +5,11 @@ Manages dynamic configuration parameters.
 """
 
 from typing import Dict, Any, List, Optional
+
+from botocore.exceptions import ClientError
+
 from affine.database.base_dao import BaseDAO
+from affine.database.client import get_client
 from affine.database.schema import get_table_name
 
 
@@ -68,6 +72,98 @@ class SystemConfigDAO(BaseDAO):
         }
         
         return await self.put(item)
+
+    async def set_param_if_absent_or_expired(
+        self,
+        param_name: str,
+        param_value: Any,
+        param_type: str,
+        *,
+        expires_at_field: str = "expires_at",
+        now: int,
+        description: str = "",
+        updated_by: str = "system",
+    ) -> bool:
+        """Atomically set a config value when no unexpired value exists."""
+        import time
+
+        updated_at = int(time.time())
+        values = {
+            ":param_name": {"S": param_name},
+            ":param_value": self._serialize({"value": param_value})["value"],
+            ":param_type": {"S": param_type},
+            ":description": {"S": description},
+            ":updated_at": {"N": str(updated_at)},
+            ":updated_by": {"S": updated_by},
+            ":zero": {"N": "0"},
+            ":one": {"N": "1"},
+            ":now": {"N": str(int(now))},
+        }
+        try:
+            await get_client().update_item(
+                TableName=self.table_name,
+                Key={
+                    "pk": {"S": self._make_pk()},
+                    "sk": {"S": self._make_sk(param_name)},
+                },
+                UpdateExpression=(
+                    "SET param_name = :param_name, "
+                    "param_value = :param_value, "
+                    "param_type = :param_type, "
+                    "description = :description, "
+                    "updated_at = :updated_at, "
+                    "updated_by = :updated_by, "
+                    "#version = if_not_exists(#version, :zero) + :one"
+                ),
+                ConditionExpression=(
+                    "attribute_not_exists(pk) "
+                    "OR attribute_not_exists(param_value) "
+                    "OR attribute_not_exists(param_value.#expires_at) "
+                    "OR param_value.#expires_at <= :now"
+                ),
+                ExpressionAttributeNames={
+                    "#expires_at": expires_at_field,
+                    "#version": "version",
+                },
+                ExpressionAttributeValues=values,
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == (
+                "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
+        return True
+
+    async def delete_param_if_token(
+        self,
+        param_name: str,
+        token: str,
+        *,
+        token_field: str = "token",
+    ) -> bool:
+        """Atomically delete a config value only when its token matches."""
+        try:
+            await get_client().delete_item(
+                TableName=self.table_name,
+                Key={
+                    "pk": {"S": self._make_pk()},
+                    "sk": {"S": self._make_sk(param_name)},
+                },
+                ConditionExpression=(
+                    "attribute_exists(pk) "
+                    "AND param_value.#token = :token"
+                ),
+                ExpressionAttributeNames={"#token": token_field},
+                ExpressionAttributeValues={":token": {"S": str(token)}},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == (
+                "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
+        return True
     
     async def get_param(self, param_name: str) -> Optional[Dict[str, Any]]:
         """Get a configuration parameter.

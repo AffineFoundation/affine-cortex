@@ -249,6 +249,34 @@ def test_create_cleans_up_workload_when_wait_ready_fails(monkeypatch):
     assert ("DELETE", "/workloads/wrk-leaked") in calls
 
 
+def test_wait_ready_fails_after_running_ssh_preflight_failures(monkeypatch):
+    wrapper = _load_wrapper(
+        monkeypatch,
+        TARGON_REQUIRE_SSH_PROBE="true",
+        TARGON_SSH_READY_FAILURE_LIMIT="2",
+    )
+    probes = []
+
+    def request(self, method, path, **kwargs):
+        if (method, path) == ("GET", "/workloads/wrk-bad"):
+            return {"uid": "wrk-bad", "status": "RUNNING"}
+        if (method, path) == ("GET", "/workloads/wrk-bad/state"):
+            return {"status": "RUNNING", "ready_replicas": 1}
+        raise AssertionError((method, path))
+
+    def ssh_ready(self, uid):
+        probes.append(uid)
+        return False
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "_ssh_ready", ssh_ready)
+
+    with pytest.raises(wrapper.TargonWrapperError, match="SSH preflight failed"):
+        wrapper.TargonAutoscaleClient().wait_ready("wrk-bad")
+
+    assert probes == ["wrk-bad", "wrk-bad"]
+
+
 def test_create_falls_back_across_resource_names(monkeypatch):
     wrapper = _load_wrapper(
         monkeypatch,
@@ -542,6 +570,9 @@ def test_ssh_ready_runs_gpu_preflight_and_no_cgroups_fix(monkeypatch):
     assert "docker run --rm --gpus all" in probe
     assert "nvidia/cuda:12.4.1-base-ubuntu22.04" in probe
     assert "nvidia-smi --query-gpu=index,name,memory.total" in probe
+    assert "Fabric" in probe
+    assert "libcuda.so.1" in probe
+    assert "cuDeviceGetCount" in probe
 
 
 def test_ssh_probe_can_disable_gpu_preflight(monkeypatch):
@@ -556,3 +587,21 @@ def test_ssh_probe_can_disable_gpu_preflight(monkeypatch):
     assert "docker version" in probe
     assert "--gpus all" not in probe
     assert "no-cgroups" not in probe
+    assert "libcuda.so.1" not in probe
+    assert "Fabric" not in probe
+
+
+def test_ssh_probe_can_disable_cuda_and_fabric_checks(monkeypatch):
+    wrapper = _load_wrapper(
+        monkeypatch,
+        TARGON_REQUIRE_DOCKER="true",
+        TARGON_REQUIRE_DOCKER_GPU="true",
+        TARGON_REQUIRE_CUDA_DRIVER="false",
+        TARGON_REQUIRE_FABRIC_READY="false",
+    )
+
+    probe = wrapper._ssh_probe_command()
+
+    assert "--gpus all" in probe
+    assert "libcuda.so.1" not in probe
+    assert "Fabric" not in probe

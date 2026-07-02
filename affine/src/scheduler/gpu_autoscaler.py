@@ -42,12 +42,15 @@ from affine.src.scorer.window_state import StateStore, SystemConfigKVAdapter
 
 CONFIG_KEY = "gpu_autoscaler"
 STATE_KEY = "gpu_autoscaler_state"
+MANUAL_REPLACEMENT_LOCK_KEY = "gpu_autoscaler_manual_replacement"
+MANUAL_REPLACEMENT_STATE_KEY = "manual_replacement"
 DEFAULT_POLL_INTERVAL_SEC = 60
 DEFAULT_IDLE_SECONDS = 30 * 60
 DEFAULT_PENDING_THRESHOLD = 5
 DEFAULT_MAX_GPU_DOWN_WAIT_SECONDS = 12 * 60 * 60
 DEFAULT_LEASE_RENEW_MARGIN_SECONDS = 60 * 60
 DEFAULT_LEASE_RENEW_COOLDOWN_SECONDS = 5 * 60
+DEFAULT_MANUAL_REPLACEMENT_TTL_SECONDS = 60 * 60
 MAX_PENDING_PEEK = 10_000
 
 
@@ -357,6 +360,8 @@ class GPUAutoscaler:
         snapshot = await self._snapshot()
         state = await self._load_state()
         now = int(self._now())
+        manual_replacement = await self._active_manual_replacement(now, state)
+        replacement_slots = _manual_replacement_slots(manual_replacement)
         if snapshot.idle:
             state.setdefault("last_busy_at", now)
         else:
@@ -367,7 +372,11 @@ class GPUAutoscaler:
             snapshot,
             now,
         )
-        force_start = self._should_force_start_after_restart(snapshot)
+        force_start = (
+            False
+            if replacement_slots
+            else self._should_force_start_after_restart(snapshot)
+        )
         desired = config.desired_instances(
             snapshot.pending_count,
             gpu_down_for_sec=gpu_down_for_sec,
@@ -380,6 +389,7 @@ class GPUAutoscaler:
             snapshot,
             state,
             now,
+            blocked_slot_names=replacement_slots,
         )
         if lease_renewed:
             action = f"renew-lease:{lease_renewed}"
@@ -388,12 +398,19 @@ class GPUAutoscaler:
             created = await self._scale_up(
                 config,
                 count=desired - snapshot.active_capacity_count,
+                blocked_slot_names=replacement_slots,
             )
             if created:
                 action = f"scale-up:{created}"
                 state["last_scale_at"] = now
                 state.pop("gpu_down_at", None)
                 self._force_start_after_restart = False
+            elif replacement_slots and _only_missing_capacity_is_blocked(
+                config,
+                snapshot,
+                replacement_slots,
+            ):
+                action = "paused:manual-replacement"
         elif (
             desired < snapshot.active_capacity_count
             and snapshot.idle
@@ -403,12 +420,18 @@ class GPUAutoscaler:
                 config,
                 snapshot,
                 count=snapshot.active_capacity_count - desired,
+                blocked_slot_names=replacement_slots,
             )
             if destroyed:
                 action = f"scale-down:{destroyed}"
                 state["last_scale_at"] = now
                 if snapshot.active_capacity_count - destroyed <= 0:
                     state["gpu_down_at"] = now
+            elif replacement_slots and any(
+                name in replacement_slots
+                for name in snapshot.active_endpoint_names
+            ):
+                action = "paused:manual-replacement"
 
         state.update(
             {
@@ -426,7 +449,8 @@ class GPUAutoscaler:
         await self._kv.set(STATE_KEY, state)
         logger.info(
             "gpu-autoscaler: action=%s pending=%s active_capacity=%s desired=%s "
-            "idle=%s idle_for=%ss gpu_down_for=%ss force_start=%s",
+            "idle=%s idle_for=%ss gpu_down_for=%ss force_start=%s "
+            "manual_replacement=%s",
             action,
             snapshot.pending_count,
             snapshot.active_capacity_count,
@@ -435,6 +459,7 @@ class GPUAutoscaler:
             idle_for,
             gpu_down_for_sec,
             force_start,
+            ",".join(sorted(replacement_slots)) or "-",
         )
         return AutoscalerTickResult(
             action=action,
@@ -567,7 +592,13 @@ class GPUAutoscaler:
                 return False
         return True
 
-    async def _scale_up(self, config: GPUAutoscalerConfig, *, count: int) -> int:
+    async def _scale_up(
+        self,
+        config: GPUAutoscalerConfig,
+        *,
+        count: int,
+        blocked_slot_names: set,
+    ) -> int:
         created = 0
         active_names = {
             ep.name for ep in await self._endpoints.list_active(kind="ssh")
@@ -576,6 +607,8 @@ class GPUAutoscaler:
             if created >= count:
                 break
             if slot.name in active_names:
+                continue
+            if slot.name in blocked_slot_names:
                 continue
             ok = await self._scale_up_slot(config, slot)
             if ok:
@@ -708,6 +741,8 @@ class GPUAutoscaler:
         snapshot: AutoscalerSnapshot,
         state: Dict[str, Any],
         now: int,
+        *,
+        blocked_slot_names: set,
     ) -> int:
         if snapshot.idle or not snapshot.active_managed:
             return 0
@@ -718,6 +753,8 @@ class GPUAutoscaler:
         changed_attempts = False
         renewed = 0
         for endpoint in snapshot.active_managed:
+            if endpoint.name in blocked_slot_names:
+                continue
             expires_at = self._lease_expires_at(endpoint, config)
             if expires_at <= 0:
                 continue
@@ -841,13 +878,17 @@ class GPUAutoscaler:
         snapshot: AutoscalerSnapshot,
         *,
         count: int,
+        blocked_slot_names: set,
     ) -> int:
         destroyed = 0
         slot_order = {
             slot.name: idx for idx, slot in enumerate(config.slots or [])
         }
         candidates = sorted(
-            snapshot.active_managed,
+            [
+                ep for ep in snapshot.active_managed
+                if ep.name not in blocked_slot_names
+            ],
             key=lambda ep: slot_order.get(ep.name, 10_000),
             reverse=True,
         )
@@ -906,8 +947,41 @@ class GPUAutoscaler:
             if not drained:
                 return False
 
-        deleted = await client.delete(instance_id, variables=delete_vars)
+        try:
+            deleted = await client.delete(instance_id, variables=delete_vars)
+        except Exception as e:
+            logger.error(
+                "gpu-autoscaler: delete endpoint=%s provider=%s instance=%s "
+                "failed: %s: %s",
+                endpoint.name,
+                provider,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            if deactivate_before_delete:
+                await self._restore_drained_endpoint(
+                    endpoint_for_refs,
+                    instance_id=instance_id,
+                    provider=provider,
+                    updated_by=updated_by,
+                )
+            return False
         if not deleted:
+            logger.error(
+                "gpu-autoscaler: delete endpoint=%s provider=%s instance=%s "
+                "returned false",
+                endpoint.name,
+                provider,
+                instance_id,
+            )
+            if deactivate_before_delete:
+                await self._restore_drained_endpoint(
+                    endpoint_for_refs,
+                    instance_id=instance_id,
+                    provider=provider,
+                    updated_by=updated_by,
+                )
             return False
 
         if deactivate_before_delete:
@@ -965,6 +1039,39 @@ class GPUAutoscaler:
             instance_id,
         )
         return True
+
+    async def _restore_drained_endpoint(
+        self,
+        endpoint: Endpoint,
+        *,
+        instance_id: str,
+        provider: str,
+        updated_by: str,
+    ) -> None:
+        try:
+            await self._endpoints.activate_autoscaled_endpoint(
+                endpoint,
+                updated_by=updated_by,
+            )
+        except Exception as e:
+            logger.error(
+                "gpu-autoscaler: failed to restore drained endpoint=%s "
+                "provider=%s instance=%s after delete failure; manual "
+                "cleanup may be required: %s: %s",
+                endpoint.name,
+                provider,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            return
+        logger.warning(
+            "gpu-autoscaler: restored drained endpoint=%s provider=%s "
+            "instance=%s after delete failure",
+            endpoint.name,
+            provider,
+            instance_id,
+        )
 
     async def _deactivate_endpoint(
         self,
@@ -1077,6 +1184,7 @@ class GPUAutoscaler:
         new_slot_name: Optional[str] = None,
         delete_old: bool = True,
         updated_by: str = "cli:gpu-replace-endpoint",
+        lock_ttl_seconds: int = DEFAULT_MANUAL_REPLACEMENT_TTL_SECONDS,
     ) -> EndpointReplaceResult:
         new_slot_name = new_slot_name or old_endpoint_name
         slot = _find_slot(config, new_slot_name)
@@ -1114,61 +1222,79 @@ class GPUAutoscaler:
                 same_endpoint=same_endpoint,
             )
 
+        lock = await self._acquire_manual_replacement_lock(
+            old_endpoint_name=old_endpoint_name,
+            new_slot_name=slot.name,
+            updated_by=updated_by,
+            ttl_seconds=lock_ttl_seconds,
+        )
         old_deleted = False
         new_created = False
 
-        if same_endpoint:
-            if old_endpoint is not None:
-                old_deleted = await self._scale_down_endpoint(
+        try:
+            if same_endpoint:
+                if old_endpoint is not None:
+                    old_deleted = await self._scale_down_endpoint(
+                        config,
+                        old_endpoint,
+                        updated_by=updated_by,
+                        deactivate_before_delete=True,
+                    )
+                    if not old_deleted:
+                        raise RuntimeError(
+                            f"failed to delete old endpoint {old_endpoint_name!r}; "
+                            "same-endpoint replacement stopped before creating "
+                            "the new instance"
+                        )
+                new_created = await self._scale_up_slot(
                     config,
-                    old_endpoint,
+                    slot,
                     updated_by=updated_by,
-                    deactivate_before_delete=True,
                 )
-                if not old_deleted:
+                if not new_created:
                     raise RuntimeError(
-                        f"failed to delete old endpoint {old_endpoint_name!r}; "
-                        "same-endpoint replacement stopped before creating "
-                        "the new instance"
+                        f"failed to create replacement endpoint from slot "
+                        f"{slot.name!r}; old endpoint {old_endpoint_name!r} "
+                        "was already deleted"
                     )
-            new_created = await self._scale_up_slot(
-                config,
-                slot,
-                updated_by=updated_by,
-            )
-            if not new_created:
-                raise RuntimeError(
-                    f"failed to create replacement endpoint from slot "
-                    f"{slot.name!r}; old endpoint {old_endpoint_name!r} "
-                    "was already deleted"
-                )
-        else:
-            new_created = await self._scale_up_slot(
-                config,
-                slot,
-                updated_by=updated_by,
-            )
-            if not new_created:
-                raise RuntimeError(
-                    f"failed to create replacement endpoint from slot "
-                    f"{slot.name!r}; old endpoint left untouched"
-                )
-            if delete_old and old_endpoint is not None:
-                old_deleted = await self._scale_down_endpoint(
+            else:
+                new_created = await self._scale_up_slot(
                     config,
-                    old_endpoint,
+                    slot,
                     updated_by=updated_by,
-                    deactivate_before_delete=True,
                 )
-                if not old_deleted:
-                    logger.error(
-                        "gpu-autoscaler: replacement endpoint=%s is active, "
-                        "but old endpoint=%s instance=%s was not deleted; "
-                        "manual cleanup may be required",
-                        slot.name,
-                        old_endpoint_name,
-                        old_instance_id,
+                if not new_created:
+                    raise RuntimeError(
+                        f"failed to create replacement endpoint from slot "
+                        f"{slot.name!r}; old endpoint left untouched"
                     )
+                if delete_old and old_endpoint is not None:
+                    old_deleted = await self._scale_down_endpoint(
+                        config,
+                        old_endpoint,
+                        updated_by=updated_by,
+                        deactivate_before_delete=True,
+                    )
+                    if not old_deleted:
+                        logger.error(
+                            "gpu-autoscaler: replacement endpoint=%s is active, "
+                            "but old endpoint=%s instance=%s was not deleted; "
+                            "manual cleanup may be required",
+                            slot.name,
+                            old_endpoint_name,
+                            old_instance_id,
+                        )
+        except Exception:
+            logger.warning(
+                "gpu-autoscaler: keeping manual replacement lock for "
+                "old_endpoint=%s new_slot=%s until expires_at=%s",
+                old_endpoint_name,
+                slot.name,
+                lock.get("expires_at"),
+            )
+            raise
+        else:
+            await self._clear_manual_replacement_lock(lock)
 
         new_endpoint = await self._endpoints.get(slot.name)
         new_instance_id = (
@@ -1186,9 +1312,157 @@ class GPUAutoscaler:
             same_endpoint=same_endpoint,
         )
 
+    async def _acquire_manual_replacement_lock(
+        self,
+        *,
+        old_endpoint_name: str,
+        new_slot_name: str,
+        updated_by: str,
+        ttl_seconds: int,
+    ) -> Dict[str, Any]:
+        now = int(self._now())
+        state = await self._load_state()
+        existing = await self._active_manual_replacement(now, state)
+        if existing is not None:
+            raise RuntimeError(
+                "manual GPU replacement already in progress for "
+                f"old_endpoint={existing.get('old_endpoint_name')!r} "
+                f"new_slot={existing.get('new_slot_name')!r}; retry after "
+                f"expires_at={existing.get('expires_at')}"
+            )
+        ttl = max(1, int(ttl_seconds or 0))
+        lock = {
+            "old_endpoint_name": old_endpoint_name,
+            "new_slot_name": new_slot_name,
+            "started_at": now,
+            "expires_at": now + ttl,
+            "updated_by": updated_by,
+            "token": f"{old_endpoint_name}:{new_slot_name}:{now}",
+        }
+        acquired = await self._kv.set_if_absent_or_expired(
+            MANUAL_REPLACEMENT_LOCK_KEY,
+            lock,
+            expires_at_field="expires_at",
+            now=now,
+        )
+        if not acquired:
+            existing = await self._kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+            existing = existing if isinstance(existing, Mapping) else {}
+            raise RuntimeError(
+                "manual GPU replacement already in progress for "
+                f"old_endpoint={existing.get('old_endpoint_name')!r} "
+                f"new_slot={existing.get('new_slot_name')!r}; retry after "
+                f"expires_at={existing.get('expires_at')}"
+            )
+        logger.info(
+            "gpu-autoscaler: acquired manual replacement lock "
+            "old_endpoint=%s new_slot=%s expires_at=%s",
+            old_endpoint_name,
+            new_slot_name,
+            lock["expires_at"],
+        )
+        return lock
+
+    async def _clear_manual_replacement_lock(self, lock: Mapping[str, Any]) -> None:
+        token = str(lock.get("token") or "")
+        if token and await self._kv.delete_if_token(
+            MANUAL_REPLACEMENT_LOCK_KEY,
+            token,
+        ):
+            logger.info(
+                "gpu-autoscaler: cleared manual replacement lock "
+                "old_endpoint=%s new_slot=%s",
+                lock.get("old_endpoint_name"),
+                lock.get("new_slot_name"),
+            )
+            return
+
+        state = await self._load_state()
+        current = state.get(MANUAL_REPLACEMENT_STATE_KEY)
+        if (
+            isinstance(current, Mapping)
+            and current.get("token") == lock.get("token")
+        ):
+            state.pop(MANUAL_REPLACEMENT_STATE_KEY, None)
+            await self._kv.set(STATE_KEY, state)
+            logger.info(
+                "gpu-autoscaler: cleared manual replacement lock "
+                "old_endpoint=%s new_slot=%s",
+                lock.get("old_endpoint_name"),
+                lock.get("new_slot_name"),
+            )
+
+    async def _active_manual_replacement(
+        self,
+        now: int,
+        state: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Mapping[str, Any]]:
+        raw = await self._kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+        lock = _active_manual_replacement_value(raw, now)
+        if lock is not None:
+            return lock
+        if isinstance(raw, Mapping) and raw.get("token"):
+            await self._kv.delete_if_token(
+                MANUAL_REPLACEMENT_LOCK_KEY,
+                str(raw.get("token") or ""),
+            )
+
+        state = state if state is not None else await self._load_state()
+        return _active_manual_replacement(state, now)
+
     async def _load_state(self) -> Dict[str, Any]:
         raw = await self._kv.get(STATE_KEY, default={})
         return dict(raw) if isinstance(raw, Mapping) else {}
+
+
+def _active_manual_replacement_value(
+    raw: Any,
+    now: int,
+) -> Optional[Mapping[str, Any]]:
+    if not isinstance(raw, Mapping):
+        return None
+    expires_at = int(raw.get("expires_at") or 0)
+    if expires_at and expires_at <= now:
+        return None
+    return raw
+
+
+def _active_manual_replacement(
+    state: Dict[str, Any],
+    now: int,
+) -> Optional[Mapping[str, Any]]:
+    raw = state.get(MANUAL_REPLACEMENT_STATE_KEY)
+    lock = _active_manual_replacement_value(raw, now)
+    if lock is None:
+        state.pop(MANUAL_REPLACEMENT_STATE_KEY, None)
+        return None
+    return lock
+
+
+def _manual_replacement_slots(lock: Optional[Mapping[str, Any]]) -> set:
+    if not lock:
+        return set()
+    return {
+        str(name)
+        for name in (
+            lock.get("old_endpoint_name"),
+            lock.get("new_slot_name"),
+        )
+        if name
+    }
+
+
+def _only_missing_capacity_is_blocked(
+    config: GPUAutoscalerConfig,
+    snapshot: AutoscalerSnapshot,
+    blocked_slot_names: set,
+) -> bool:
+    for slot in config.slots or []:
+        if slot.name in snapshot.active_endpoint_names:
+            continue
+        if slot.name not in blocked_slot_names:
+            return False
+    return True
 
 
 async def load_config(config_dao: SystemConfigDAO) -> GPUAutoscalerConfig:

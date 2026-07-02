@@ -42,6 +42,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import paramiko
+from huggingface_hub import HfApi
 
 from affine.core.providers.targon_client import (
     QWEN36_REASONING_PARSER,
@@ -82,6 +83,9 @@ DEFAULT_CHUNKED_PREFILL = 4096
 DEFAULT_TOOL_CALL_PARSER = "qwen"
 DEFAULT_READY_TIMEOUT_SEC = 1800
 DEFAULT_POLL_INTERVAL_SEC = 15.0
+DEFAULT_HF_METADATA_TIMEOUT_SEC = 30.0
+HF_XET_MAX_NON_XET_FILE_BYTES = 50 * 1024 ** 3
+HF_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt")
 
 # Single container name — single-instance host means only one ever exists.
 # ``docker rm -f`` is idempotent so start() always kicks off a fresh state.
@@ -229,7 +233,133 @@ def _build_sglang_args(target: DeployTarget, config: "SSHConfig") -> List[str]:
     return args
 
 
-def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
+def _strip_env_from_docker_args(
+    args: Tuple[str, ...], env_name: str,
+) -> Tuple[str, ...]:
+    """Drop ``-e NAME=...`` from operator args so deploy policy owns it."""
+    out: List[str] = []
+    i = 0
+    while i < len(args):
+        arg = str(args[i])
+        if (
+            arg in ("-e", "--env")
+            and i + 1 < len(args)
+            and str(args[i + 1]).startswith(f"{env_name}=")
+        ):
+            i += 2
+            continue
+        if arg.startswith("--env=") and arg[len("--env="):].startswith(
+            f"{env_name}="
+        ):
+            i += 1
+            continue
+        if arg.startswith("-e") and arg != "-e" and arg[len("-e"):].startswith(
+            f"{env_name}="
+        ):
+            i += 1
+            continue
+        out.append(arg)
+        i += 1
+    return tuple(out)
+
+
+def _max_weight_file_size_bytes(siblings: Any) -> Optional[int]:
+    sizes: List[int] = []
+    for sibling in siblings or []:
+        name = str(
+            getattr(sibling, "rfilename", None)
+            or getattr(sibling, "filename", None)
+            or ""
+        )
+        if not name.endswith(HF_WEIGHT_SUFFIXES):
+            continue
+        size = getattr(sibling, "size", None)
+        if size is None:
+            continue
+        try:
+            sizes.append(int(size))
+        except (TypeError, ValueError):
+            continue
+    return max(sizes) if sizes else None
+
+
+def _hf_metadata_timeout_sec() -> float:
+    raw = os.getenv("AFFINE_SSH_HF_METADATA_TIMEOUT_SEC", "")
+    if not raw:
+        return DEFAULT_HF_METADATA_TIMEOUT_SEC
+    try:
+        return max(1.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "ssh-provider: invalid AFFINE_SSH_HF_METADATA_TIMEOUT_SEC=%r; "
+            "using %.1fs",
+            raw,
+            DEFAULT_HF_METADATA_TIMEOUT_SEC,
+        )
+        return DEFAULT_HF_METADATA_TIMEOUT_SEC
+
+
+async def _should_disable_hf_xet(target: DeployTarget) -> bool:
+    """Disable Xet only when the largest weight shard is below 50 GiB.
+
+    If metadata is unavailable, keep Xet enabled. That is the conservative
+    path for very large single-file weights, and avoids turning an inspection
+    hiccup into a deploy policy change.
+    """
+    hf_token = os.getenv("HF_TOKEN")
+    timeout_sec = _hf_metadata_timeout_sec()
+
+    def _fetch_model_info():
+        return HfApi(token=hf_token).model_info(
+            repo_id=target.model,
+            revision=target.revision,
+            files_metadata=True,
+            timeout=timeout_sec,
+        )
+
+    try:
+        info = await asyncio.wait_for(
+            asyncio.to_thread(_fetch_model_info),
+            timeout=timeout_sec + 1.0,
+        )
+    except Exception as e:
+        logger.warning(
+            "ssh-provider: HF metadata lookup failed for %s@%s; "
+            "leaving Xet enabled: %s: %s",
+            target.model,
+            target.revision[:8],
+            type(e).__name__,
+            e,
+        )
+        return False
+
+    max_size = _max_weight_file_size_bytes(getattr(info, "siblings", None))
+    if max_size is None:
+        logger.warning(
+            "ssh-provider: no HF weight file sizes found for %s@%s; "
+            "leaving Xet enabled",
+            target.model,
+            target.revision[:8],
+        )
+        return False
+    disable = max_size < HF_XET_MAX_NON_XET_FILE_BYTES
+    logger.info(
+        "ssh-provider: largest HF weight file for %s@%s is %.2f GiB; "
+        "HF Xet %s",
+        target.model,
+        target.revision[:8],
+        max_size / (1024 ** 3),
+        "disabled" if disable else "enabled",
+    )
+    return disable
+
+
+def _build_docker_run_cmd(
+    target: DeployTarget,
+    config: "SSHConfig",
+    *,
+    disable_hf_xet: bool = False,
+) -> str:
     """Full shell command: rm any existing container, then docker run sglang."""
     sglang_args = " ".join(shlex.quote(str(a)) for a in _build_sglang_args(target, config))
     labels = {
@@ -243,8 +373,11 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
         f"--label {shlex.quote(k)}={shlex.quote(v)}"
         for k, v in labels.items()
     )
+    docker_args = _strip_env_from_docker_args(
+        config.sglang_docker_args, "HF_HUB_DISABLE_XET",
+    )
     extra_docker_flags = " ".join(
-        shlex.quote(str(arg)) for arg in config.sglang_docker_args
+        shlex.quote(str(arg)) for arg in docker_args
     )
 
     env_flags = (
@@ -253,6 +386,8 @@ def _build_docker_run_cmd(target: DeployTarget, config: "SSHConfig") -> str:
         "-e TRANSFORMERS_CACHE=/data "
         "-e HF_HUB_DOWNLOAD_TIMEOUT=60 "
     )
+    if disable_hf_xet:
+        env_flags += "-e HF_HUB_DISABLE_XET=1 "
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
         q = shlex.quote(hf_token)
@@ -630,7 +765,10 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
     # the old sglang is still running.
     await _cleanup_stale_caches(config, target)
 
-    cmd = _build_docker_run_cmd(target, config)
+    disable_hf_xet = await _should_disable_hf_xet(target)
+    cmd = _build_docker_run_cmd(
+        target, config, disable_hf_xet=disable_hf_xet,
+    )
     logger.info(
         f"ssh-provider: deploying {target.model}@{target.revision[:8]} "
         f"on {config.host}:{config.port}"
