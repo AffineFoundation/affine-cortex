@@ -72,12 +72,19 @@ def _as_float(value: Any, default: float = 0.0) -> float:
 def _env_names(
     scores: List[Dict[str, Any]],
     *live_env_maps: Optional[Dict[str, Any]],
+    enabled_envs: Optional[List[Any]] = None,
 ) -> List[str]:
-    """Union of envs seen in the DECIDE ``scores_by_env`` snapshot and in any
-    live per-(uid, env) maps. Sampling-only envs (e.g. distill-v2, scoring
-    disabled) never appear in ``scores_by_env`` but do have live samples, so
-    feeding the live maps here lets them surface as their own rank column.
+    """Rank-table env column names.
+
+    Prefer the current API-configured env list when present, so disabled envs
+    with historical/frozen scores do not keep appearing as active columns.
+    Older APIs did not expose this list, so fall back to the historical union
+    behavior for compatibility: union envs seen in DECIDE ``scores_by_env`` and
+    live per-(uid, env) maps. Sampling-only envs, such as distill-v2, do not
+    appear in ``scores_by_env`` but do have live samples.
     """
+    if isinstance(enabled_envs, list):
+        return [str(env) for env in enabled_envs]
     envs: set[str] = set()
     for row in scores:
         scores_by_env = row.get("scores_by_env") or {}
@@ -344,7 +351,12 @@ def _print_rank_table(
     live_sample_averages = (window or {}).get("sample_averages") or {}
     # Build the env column set now that live maps are loaded, so sampling-only
     # envs (distill-v2: scoring disabled, absent from scores_by_env) still show.
-    envs = _env_names(scores, live_sample_averages, live_sample_counts)
+    envs = _env_names(
+        scores,
+        live_sample_averages,
+        live_sample_counts,
+        enabled_envs=(window or {}).get("enabled_envs"),
+    )
     # Per-row threshold basis. Prefer the comparator's decide-time
     # value (champion avg over (champion ∩ row) overlap), fall back
     # to the champion's full-set avg when overlap isn't recorded.
