@@ -71,6 +71,8 @@ class MinersDAO(BaseDAO):
         block_number: int,
         first_block: int,
         model_type: str = "",
+        reg_block: int = 0,
+        reg_hotkey: str = "",
     ) -> Dict[str, Any]:
         """Save or update miner validation state.
 
@@ -120,6 +122,8 @@ class MinersDAO(BaseDAO):
             'invalid_reason': invalid_reason,
             'block_number': block_number,
             'first_block': first_block,
+            'reg_block': reg_block,
+            'reg_hotkey': reg_hotkey,
         }
         return await self.put(item)
     

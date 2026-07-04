@@ -53,6 +53,9 @@ NETUID = int(os.getenv("AFFINE_NETUID", "120"))
 
 MULTI_COMMIT_ENFORCE_BLOCK = 7_710_000
 REPO_HOTKEY_SUFFIX_ENFORCE_BLOCK = 7_290_000
+# swap_hotkey abuse guard activation. A commit at or after this block on a
+# slot whose current hotkey was swapped in (not the registrant) is rejected.
+SWAP_ENFORCE_BLOCK = int(os.getenv("AFFINE_SWAP_ENFORCE_BLOCK", "8500000"))
 QWEN36_ONLY_ENFORCE_BLOCK = int(
     os.getenv("AFFINE_QWEN36_ONLY_ENFORCE_BLOCK", "0")
 )
@@ -139,6 +142,11 @@ class MinerInfo:
     template_check_result: Optional[str] = None  # "safe" | "unsafe:<reason>" | None
     tokenizer_sig: str = ""
     model_type: str = ""
+    # Registration anchor for this uid slot. reg_hotkey is the hotkey that
+    # held the slot when reg_block (block_at_registration) was last set, i.e.
+    # the one that paid the burn. Carried across cycles to catch swap_hotkey.
+    reg_block: int = 0
+    reg_hotkey: str = ""
 
     def key(self) -> str:
         return f"{self.hotkey}#{self.revision}"
@@ -240,6 +248,26 @@ class MinersMonitor:
 
     # ---- main refresh ----------------------------------------------------
 
+    @staticmethod
+    def _registration_anchor(
+        existing: Optional[Dict[str, object]], bar: int, hotkey: str
+    ) -> Tuple[int, str]:
+        """Return ``(reg_block, reg_hotkey)`` for a uid slot.
+
+        ``block_at_registration`` (``bar``) advances only on a real
+        (re)registration, which costs a burn; ``swap_hotkey`` never touches
+        it. So the hotkey seen the first time a given ``bar`` appears is the
+        registrant that paid for the slot. Carry it forward until ``bar``
+        advances again; otherwise anchor to the current hotkey.
+        """
+        if (
+            existing
+            and _as_int_or_none(existing.get("reg_block")) == bar
+            and existing.get("reg_hotkey")
+        ):
+            return bar, _as_str(existing.get("reg_hotkey"))
+        return bar, hotkey
+
     async def refresh_miners(self) -> Dict[str, MinerInfo]:
         logger.info("[MinersMonitor] refreshing miners from metagraph...")
         subtensor = await get_subtensor()
@@ -247,6 +275,27 @@ class MinersMonitor:
         commits = await subtensor.get_all_revealed_commitments(NETUID)
         current_block = int(await subtensor.get_current_block())
         blacklist = await self._load_blacklist()
+
+        # Preload persisted rows once so the swap guard can carry each slot's
+        # registration anchor across refresh cycles.
+        existing_rows: Dict[int, Dict[str, object]] = {}
+        try:
+            for row in await self.dao.get_all_miners():
+                ruid = _as_int_or_none(row.get("uid"))
+                if ruid is not None:
+                    existing_rows[ruid] = row
+        except Exception as e:
+            logger.debug(f"[MinersMonitor] preload existing rows failed: {e}")
+
+        anchors: Dict[int, Tuple[int, str]] = {}
+        for uid in range(len(meta.hotkeys)):
+            try:
+                bar = _as_int_or_none(meta.block_at_registration[uid]) or 0
+            except (IndexError, TypeError):
+                bar = 0
+            anchors[uid] = self._registration_anchor(
+                existing_rows.get(uid), bar, meta.hotkeys[uid]
+            )
 
         miners: list[MinerInfo] = []
         for uid in range(len(meta.hotkeys)):
@@ -278,16 +327,33 @@ class MinersMonitor:
                     miners.append(m)
                     continue
 
-                miners.append(
-                    await self._validate_miner(
-                        uid=uid,
-                        hotkey=hotkey,
-                        model=model,
-                        revision=revision,
-                        block=int(block) if uid != 0 else 0,
-                        commit_count=len(commits[hotkey]),
-                    )
+                block_int = int(block) if uid != 0 else 0
+                info = await self._validate_miner(
+                    uid=uid,
+                    hotkey=hotkey,
+                    model=model,
+                    revision=revision,
+                    block=block_int,
+                    commit_count=len(commits[hotkey]),
                 )
+                # swap_hotkey guard: a valid model on a slot whose current
+                # hotkey isn't the registrant was committed by a hotkey
+                # swapped in for free (no burn). Reject so one registration
+                # can't carry multiple scored models.
+                reg_hotkey = anchors[uid][1]
+                if (
+                    uid != 0
+                    and info.is_valid
+                    and reg_hotkey
+                    and reg_hotkey != hotkey
+                    and block_int >= SWAP_ENFORCE_BLOCK
+                ):
+                    info.mark_invalid(
+                        f"hotkey_swapped_no_registration:registrant={reg_hotkey[:10]}",
+                        permanent=True,
+                        terminate_stats=True,
+                    )
+                miners.append(info)
             except json.JSONDecodeError:
                 m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="")
                 m.mark_invalid("invalid_json_commit", permanent=True)
@@ -297,6 +363,12 @@ class MinersMonitor:
                 m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="")
                 m.mark_invalid(f"validation_error:{str(e)[:60]}", permanent=False)
                 miners.append(m)
+
+        # Stamp the registration anchor on every regular miner so the next
+        # cycle can tell a swapped-in hotkey from the registrant.
+        for m in miners:
+            rb, rh = anchors.get(m.uid, (0, ""))
+            m.reg_block, m.reg_hotkey = rb, rh
 
         miners = self._detect_plagiarism(miners)
 
@@ -867,6 +939,8 @@ class MinersMonitor:
                 block_number=current_block,
                 first_block=miner.block,
                 model_type=miner.model_type,
+                reg_block=miner.reg_block,
+                reg_hotkey=miner.reg_hotkey,
             )
             if miner.hotkey and miner.revision:
                 await self.stats_dao.update_miner_info(
