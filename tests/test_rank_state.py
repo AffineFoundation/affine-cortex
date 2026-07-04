@@ -57,6 +57,7 @@ async def test_current_state_on_empty_state(monkeypatch):
         "champion": None,
         "battle": None,
         "task_refresh_block": None,
+        "enabled_envs": [],
         "sample_counts": {},
         "sample_averages": {},
         "champion_overlap_avgs": {},

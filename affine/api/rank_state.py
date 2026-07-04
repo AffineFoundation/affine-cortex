@@ -272,6 +272,7 @@ async def get_current_state() -> Dict[str, Any]:
             "started_at_block": battle.started_at_block,
         } if battle else None,
         "task_refresh_block": task_state.refreshed_at_block if task_state else None,
+        "enabled_envs": list(envs.keys()),
         "sample_counts": sample_counts,
         # Per-(uid, env) running average over the current refresh_block.
         # Battle subjects show their live score in af get-rank instead
