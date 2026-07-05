@@ -367,6 +367,18 @@ _ENV_CONFIGS_CANONICAL = {
         docker_image="affinefoundation/distill-v2:latest",
         env_type="distill",
         env_vars={"UVICORN_WORKERS": "4"},
+        # Staging credentials (same pattern as swe-infinite): forwarded only
+        # when the host has them set. They let the validator read tasks from
+        # the private staging bucket during the 24h maturation window — before
+        # they appear in the public bucket — so scoring is ready by the time
+        # miners can pull them.
+        optional_env_vars=[
+            "R2_STAGING_ENDPOINT",
+            "R2_STAGING_ACCESS_KEY",
+            "R2_STAGING_SECRET_KEY",
+            "R2_STAGING_BUCKET",
+            "R2_STAGING_PREFIX",
+        ],
         mem_limit="5g",
         eval_params={
             "temperature": 0.0,
