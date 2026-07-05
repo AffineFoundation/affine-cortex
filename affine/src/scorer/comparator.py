@@ -62,12 +62,15 @@ WIN_MIN_DOMINANT_ENVS: int = 1
 #: flips. They use an ADDITIVE not_worse band (``champ - margin``) instead.
 ADDITIVE_MARGIN_ENVS: frozenset = frozenset({"DISTILL-V2"})
 
-#: Additive not_worse margin for ``ADDITIVE_MARGIN_ENVS``. Calibrated from
-#: distill-v2 data (2026-06): the true champion-vs-challenger improvement that
-#: matters (~0.05) sits well above this, the same-lineage noise floor (33-cell
-#: mean jitter ~0.001) and within-cohort spread (~0.017) sit well below, so
-#: 0.02 cleanly separates a real improvement from sampling noise.
-DEFAULT_ADDITIVE_MARGIN: float = 0.02
+#: Additive margin for ``ADDITIVE_MARGIN_ENVS`` (both the dominant threshold
+#: and the not_worse band ``champ ± margin``). Recalibrated 2026-07 after
+#: distill-v2 switched to the bounded ``softmax_advantage`` scorer: the new
+#: per-cell std grew ~1.7x (0.26 -> 0.44), so the champion-vs-challenger
+#: common-cell mean difference at typical M~33 has SE ~0.1. 0.1 keeps the
+#: band safely above that noise floor so distill (a noisy, sign-crossing
+#: quantity) doesn't spuriously flag ties as regressions or let noise win an
+#: env. The old 0.02 was calibrated on the unbounded reward_weighted_ce scale.
+DEFAULT_ADDITIVE_MARGIN: float = 0.1
 
 
 def not_worse_lower_bound(
