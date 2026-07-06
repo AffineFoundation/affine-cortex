@@ -20,7 +20,7 @@ services:
   gpu_autoscaler:
     <<: *affine_image
 
-  targon_autoscale_wrapper:
+  gpu_autoscale_wrapper:
     <<: *affine_image
 
   executor:

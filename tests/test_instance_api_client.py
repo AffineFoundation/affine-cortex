@@ -29,11 +29,47 @@ async def test_delete_treats_provider_404_as_success(monkeypatch):
     )
 
     async def fake_request(*args, **kwargs):
-        raise InstanceAPIHTTPError("DELETE", "/pods/pod-1", 404, "missing")
+        raise InstanceAPIHTTPError(
+            "DELETE",
+            "/pods/pod-1",
+            404,
+            (
+                '{"error_source":"provider",'
+                '"code":"provider_instance_not_found",'
+                '"provider_status_code":404}'
+            ),
+        )
 
     monkeypatch.setattr(client, "_request", fake_request)
 
     assert await client.delete("pod-1") is True
+
+
+@pytest.mark.asyncio
+async def test_delete_does_not_treat_wrapper_route_404_as_success(monkeypatch):
+    client = InstanceAPIClient(
+        InstanceAPIConfig(
+            provider="lium",
+            api_url="https://lium.example.com",
+            delete_path="/bad/{instance_id}",
+        )
+    )
+
+    async def fake_request(*args, **kwargs):
+        raise InstanceAPIHTTPError(
+            "DELETE",
+            "/bad/pod-1",
+            404,
+            (
+                '{"error_source":"wrapper",'
+                '"code":"route_not_found",'
+                '"message":"wrapper route not found"}'
+            ),
+        )
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    assert await client.delete("pod-1") is False
 
 
 @pytest.mark.asyncio
@@ -53,10 +89,13 @@ async def test_delete_renders_variables_and_sends_metadata(monkeypatch):
 
     monkeypatch.setattr(client, "_request", fake_request)
 
-    assert await client.delete(
-        "pod-1",
-        variables={"purpose": "eval", "endpoint_name": "lium-b200-1"},
-    ) is True
+    assert (
+        await client.delete(
+            "pod-1",
+            variables={"purpose": "eval", "endpoint_name": "lium-b200-1"},
+        )
+        is True
+    )
 
     args, kwargs = calls[0]
     assert args[:2] == ("DELETE", "/pods/pod-1?purpose=eval")
@@ -99,7 +138,11 @@ async def test_renew_raises_not_found_for_provider_404(monkeypatch):
             "POST",
             "/pods/pod-1/schedule-removal",
             404,
-            '{"message":"Pod not found"}',
+            (
+                '{"error_source":"provider",'
+                '"code":"provider_instance_not_found",'
+                '"provider_status_code":404}'
+            ),
         )
 
     monkeypatch.setattr(client, "_request", fake_request)
@@ -122,11 +165,13 @@ async def test_renew_raises_not_found_for_wrapped_provider_404(monkeypatch):
         raise InstanceAPIHTTPError(
             "POST",
             "/instances/pod-1/renew",
-            500,
+            502,
             (
-                '{"error":"LiumHTTPError","message":"POST '
-                '/pods/pod-1/schedule-removal -> 404: '
-                '{\\"message\\":\\"Pod not found\\",\\"status_code\\":404}"}'
+                '{"error":"LiumHTTPError",'
+                '"error_source":"provider",'
+                '"code":"provider_instance_not_found",'
+                '"provider_status_code":404,'
+                '"message":"POST /pods/pod-1/schedule-removal -> 404"}'
             ),
         )
 
@@ -134,3 +179,31 @@ async def test_renew_raises_not_found_for_wrapped_provider_404(monkeypatch):
 
     with pytest.raises(InstanceAPINotFoundError):
         await client.renew("pod-1")
+
+
+@pytest.mark.asyncio
+async def test_renew_does_not_treat_wrapper_route_404_as_reclaimed(monkeypatch):
+    client = InstanceAPIClient(
+        InstanceAPIConfig(
+            provider="lium",
+            api_url="https://lium.example.com",
+            renew_path="/bad/{instance_id}",
+        )
+    )
+
+    async def fake_request(*args, **kwargs):
+        raise InstanceAPIHTTPError(
+            "POST",
+            "/bad/pod-1",
+            404,
+            (
+                '{"error":"not_found",'
+                '"error_source":"wrapper",'
+                '"code":"route_not_found",'
+                '"message":"wrapper route not found"}'
+            ),
+        )
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    assert await client.renew("pod-1") is None

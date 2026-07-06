@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, Mapping, Optional
@@ -96,15 +97,13 @@ class InstanceAPIConfig:
             provider=provider,
             api_url=str(data.get("api_url") or ""),
             api_url_env=str(
-                data.get("api_url_env")
-                or f"{provider_upper}_AUTOSCALE_API_URL"
+                data.get("api_url_env") or f"{provider_upper}_AUTOSCALE_API_URL"
             ),
             api_key_env=str(data.get("api_key_env") or f"{provider_upper}_API_KEY"),
             auth_header=str(data.get("auth_header") or "Authorization"),
             auth_scheme=str(data.get("auth_scheme") or "Bearer"),
             extra_headers={
-                str(k): str(v)
-                for k, v in (data.get("extra_headers") or {}).items()
+                str(k): str(v) for k, v in (data.get("extra_headers") or {}).items()
             },
             create_method=str(data.get("create_method") or "POST").upper(),
             create_path=str(data.get("create_path") or ""),
@@ -126,8 +125,7 @@ class InstanceAPIConfig:
             ),
             timeout_sec=int(data.get("timeout_sec") or DEFAULT_TIMEOUT_SEC),
             response_paths={
-                str(k): _coerce_paths(v)
-                for k, v in response_paths.items()
+                str(k): _coerce_paths(v) for k, v in response_paths.items()
             },
         )
 
@@ -219,9 +217,7 @@ class InstanceAPIClient:
             provider=self.config.provider,
             instance_id=instance_id,
             ssh_url=self._extract(result, "ssh_url") or "",
-            public_inference_url=(
-                self._extract(result, "public_inference_url") or ""
-            ),
+            public_inference_url=(self._extract(result, "public_inference_url") or ""),
             lease_expires_at=_int_value(self._extract(result, "lease_expires_at")),
             raw=dict(result),
         )
@@ -243,7 +239,8 @@ class InstanceAPIClient:
         render_vars = {"instance_id": instance_id, **dict(variables or {})}
         path = _render_template(self.config.delete_path, render_vars)
         delete_payload = {
-            key: value for key, value in render_vars.items()
+            key: value
+            for key, value in render_vars.items()
             if key != "instance_id" and value not in (None, "")
         }
         try:
@@ -255,7 +252,7 @@ class InstanceAPIClient:
                 expect_json=False,
             )
         except InstanceAPIHTTPError as e:
-            if e.status_code == 404:
+            if _instance_not_found_error(e):
                 logger.info(
                     "gpu-autoscaler: provider=%s instance=%s already deleted",
                     self.config.provider,
@@ -271,8 +268,7 @@ class InstanceAPIClient:
             return False
         except InstanceAPIError as e:
             logger.warning(
-                "gpu-autoscaler: provider=%s delete failed for instance=%s: "
-                "%s: %s",
+                "gpu-autoscaler: provider=%s delete failed for instance=%s: %s: %s",
                 self.config.provider,
                 instance_id,
                 type(e).__name__,
@@ -303,8 +299,7 @@ class InstanceAPIClient:
         except InstanceAPIHTTPError as e:
             if _instance_not_found_error(e):
                 logger.warning(
-                    "gpu-autoscaler: provider=%s renew found missing "
-                    "instance=%s: %s",
+                    "gpu-autoscaler: provider=%s renew found missing instance=%s: %s",
                     self.config.provider,
                     instance_id,
                     e,
@@ -316,8 +311,7 @@ class InstanceAPIClient:
                     e.text,
                 ) from e
             logger.warning(
-                "gpu-autoscaler: provider=%s renew failed for instance=%s: "
-                "%s: %s",
+                "gpu-autoscaler: provider=%s renew failed for instance=%s: %s: %s",
                 self.config.provider,
                 instance_id,
                 type(e).__name__,
@@ -326,8 +320,7 @@ class InstanceAPIClient:
             return None
         except InstanceAPIError as e:
             logger.warning(
-                "gpu-autoscaler: provider=%s renew failed for instance=%s: "
-                "%s: %s",
+                "gpu-autoscaler: provider=%s renew failed for instance=%s: %s: %s",
                 self.config.provider,
                 instance_id,
                 type(e).__name__,
@@ -340,9 +333,7 @@ class InstanceAPIClient:
             provider=self.config.provider,
             instance_id=self._extract(result, "instance_id") or instance_id,
             ssh_url=self._extract(result, "ssh_url") or "",
-            public_inference_url=(
-                self._extract(result, "public_inference_url") or ""
-            ),
+            public_inference_url=(self._extract(result, "public_inference_url") or ""),
             lease_expires_at=_int_value(self._extract(result, "lease_expires_at")),
             raw=dict(result),
         )
@@ -362,8 +353,7 @@ class InstanceAPIClient:
             )
         except InstanceAPIError as e:
             logger.warning(
-                "gpu-autoscaler: provider=%s status failed for instance=%s: "
-                "%s: %s",
+                "gpu-autoscaler: provider=%s status failed for instance=%s: %s: %s",
                 self.config.provider,
                 instance_id,
                 type(e).__name__,
@@ -407,7 +397,10 @@ class InstanceAPIClient:
                     text = await resp.text()
                     if resp.status >= 400:
                         raise InstanceAPIHTTPError(
-                            method, path, resp.status, text,
+                            method,
+                            path,
+                            resp.status,
+                            text,
                         )
                     if resp.status == 204 or not text:
                         return {}
@@ -456,18 +449,32 @@ def _int_value(value: Any) -> int:
 
 
 def _instance_not_found_error(error: InstanceAPIHTTPError) -> bool:
-    if error.status_code == 404:
-        return True
-    text = (error.text or "").lower()
-    return (
-        "pod not found" in text
-        or "instance not found" in text
-        or (
-            "not found" in text
-            and "status_code" in text
-            and "404" in text
-        )
-    )
+    payload = _error_payload(error.text)
+    if not payload:
+        return False
+
+    source = str(payload.get("error_source") or payload.get("source") or "").lower()
+    code = str(payload.get("code") or "").lower()
+    provider_status = _int_value(payload.get("provider_status_code"))
+
+    if source == "wrapper" or code == "route_not_found":
+        return False
+    if source != "provider":
+        return False
+    return provider_status == 404 or code in {
+        "provider_instance_not_found",
+        "instance_not_found",
+        "pod_not_found",
+        "workload_not_found",
+    }
+
+
+def _error_payload(text: str) -> Optional[Mapping[str, Any]]:
+    try:
+        payload = json.loads(text or "{}")
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, Mapping) else None
 
 
 def _json_path(payload: Mapping[str, Any], path: str) -> Any:
@@ -501,13 +508,12 @@ def _render_template(value: Any, variables: Mapping[str, Any]) -> Any:
     return value
 
 
-def _deep_merge(base: Mapping[str, Any], overrides: Mapping[str, Any]) -> Dict[str, Any]:
+def _deep_merge(
+    base: Mapping[str, Any], overrides: Mapping[str, Any]
+) -> Dict[str, Any]:
     out: Dict[str, Any] = copy.deepcopy(dict(base))
     for key, value in overrides.items():
-        if (
-            isinstance(value, Mapping)
-            and isinstance(out.get(key), Mapping)
-        ):
+        if isinstance(value, Mapping) and isinstance(out.get(key), Mapping):
             out[key] = _deep_merge(out[key], value)
         else:
             out[key] = copy.deepcopy(value)

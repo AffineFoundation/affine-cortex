@@ -72,10 +72,7 @@ def test_create_registers_deploys_and_returns_provider_handle(monkeypatch):
 
     assert result["instance_id"] == "wrk-test"
     assert result["ssh_url"] == "ssh://wrk-test@ssh.deployments.targon.com:22"
-    assert (
-        result["public_inference_url"]
-        == "https://wrk-test-10001.caas.targon.com/v1"
-    )
+    assert result["public_inference_url"] == "https://wrk-test-10001.caas.targon.com/v1"
     assert calls[:3] == [
         ("GET", "/workloads", None),
         ("POST", "/workloads", calls[1][2]),
@@ -391,10 +388,13 @@ def test_delete_allows_matching_purpose_and_legacy_without_expected_purpose(
 
     monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
 
-    assert wrapper.TargonAutoscaleClient().delete(
-        "wrk-eval",
-        expected_purpose="eval",
-    ) is True
+    assert (
+        wrapper.TargonAutoscaleClient().delete(
+            "wrk-eval",
+            expected_purpose="eval",
+        )
+        is True
+    )
     assert wrapper.TargonAutoscaleClient().delete("wrk-legacy") is True
     assert ("DELETE", "/workloads/wrk-eval") in calls
     assert ("DELETE", "/workloads/wrk-legacy") in calls
@@ -424,6 +424,61 @@ def test_delete_missing_workload_is_idempotent(monkeypatch):
     monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
 
     assert wrapper.TargonAutoscaleClient().delete("wrk-missing") is True
+
+
+def test_error_payloads_distinguish_wrapper_and_provider_not_found(monkeypatch):
+    wrapper = _load_wrapper(monkeypatch)
+
+    route_payload = wrapper._route_not_found("POST", "/bad")
+    provider_payload = wrapper._provider_not_found(
+        wrapper.TargonNotFound("GET /workloads/wrk-missing -> 404")
+    )
+
+    assert route_payload["error_source"] == "wrapper"
+    assert route_payload["code"] == "route_not_found"
+    assert provider_payload["error_source"] == "provider"
+    assert provider_payload["provider_status_code"] == 404
+
+
+def test_error_response_structures_provider_and_wrapper_failures(monkeypatch):
+    wrapper = _load_wrapper(monkeypatch)
+
+    status, payload = wrapper._error_response(
+        wrapper.TargonHTTPError("GET", "/workloads/wrk-1", 403, "denied")
+    )
+    assert status == 403
+    assert payload["error_source"] == "provider"
+    assert payload["code"] == "provider_http_error"
+    assert payload["provider_status_code"] == 403
+    assert payload["provider_path"] == "/workloads/wrk-1"
+
+    status, payload = wrapper._error_response(
+        wrapper.TargonRequestError(
+            "GET",
+            "/workloads",
+            TimeoutError("slow"),
+            code="provider_timeout",
+            http_status=504,
+        )
+    )
+    assert status == 504
+    assert payload["error_source"] == "provider"
+    assert payload["code"] == "provider_timeout"
+
+    status, payload = wrapper._error_response(
+        wrapper.TargonWrapperError(
+            "TARGON_API_KEY is required",
+            code="wrapper_config_error",
+        )
+    )
+    assert status == 500
+    assert payload["error_source"] == "wrapper"
+    assert payload["code"] == "wrapper_config_error"
+
+    status, payload = wrapper._error_response(RuntimeError("boom"))
+    assert status == 500
+    assert payload["error_source"] == "wrapper"
+    assert payload["code"] == "wrapper_internal_error"
 
 
 def test_renew_extends_configured_logical_lease(monkeypatch):
@@ -459,8 +514,7 @@ def test_renew_calls_configured_provider_endpoint(monkeypatch):
         TARGON_RENEW_METHOD="PATCH",
         TARGON_RENEW_PATH_TEMPLATE="/workloads/{uid}",
         TARGON_RENEW_PAYLOAD_JSON=(
-            '{"envs":[{"name":"AFFINE_RENEW_UNTIL",'
-            '"value":"{lease_expires_iso}"}]}'
+            '{"envs":[{"name":"AFFINE_RENEW_UNTIL","value":"{lease_expires_iso}"}]}'
         ),
     )
     monkeypatch.setattr(wrapper.time, "time", lambda: 1_000)
@@ -492,14 +546,18 @@ def test_renew_calls_configured_provider_endpoint(monkeypatch):
     assert calls == [
         ("GET", "/workloads/wrk-test", None),
         ("GET", "/workloads/wrk-test/state", None),
-        ("PATCH", "/workloads/wrk-test", {
-            "envs": [
-                {
-                    "name": "AFFINE_RENEW_UNTIL",
-                    "value": "1970-01-01T02:16:40Z",
-                }
-            ]
-        }),
+        (
+            "PATCH",
+            "/workloads/wrk-test",
+            {
+                "envs": [
+                    {
+                        "name": "AFFINE_RENEW_UNTIL",
+                        "value": "1970-01-01T02:16:40Z",
+                    }
+                ]
+            },
+        ),
         ("GET", "/workloads/wrk-test/state", None),
     ]
 

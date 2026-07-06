@@ -22,7 +22,7 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Iterable, List, Mapping, Optional
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -52,24 +52,78 @@ NAME_PREFIX = _env("LIUM_POD_NAME_PREFIX", "affine-autoscale")
 
 
 class LiumWrapperError(RuntimeError):
-    pass
+    error_source = "wrapper"
+    code = "wrapper_error"
+    http_status = 500
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "",
+        http_status: int = 0,
+    ):
+        super().__init__(message)
+        self.message = message
+        if code:
+            self.code = code
+        if http_status:
+            self.http_status = http_status
 
 
-class LiumHTTPError(LiumWrapperError):
+class LiumProviderError(LiumWrapperError):
+    error_source = "provider"
+    code = "provider_error"
+    http_status = 502
+
+
+class LiumHTTPError(LiumProviderError):
+    code = "provider_http_error"
+
     def __init__(self, method: str, path: str, status_code: int, text: str):
         self.method = method
         self.path = path
         self.status_code = status_code
         self.text = text
+        code = (
+            "provider_instance_not_found"
+            if status_code == 404
+            else "provider_http_error"
+        )
         super().__init__(
-            f"{method} {path} -> {status_code}: {text[:500]}"
+            f"{method} {path} -> {status_code}: {text[:500]}",
+            code=code,
+            http_status=status_code,
+        )
+
+
+class LiumRequestError(LiumProviderError):
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        error: Exception,
+        *,
+        code: str = "provider_transport_error",
+        http_status: int = 502,
+    ):
+        self.method = method
+        self.path = path
+        self.original_error = error
+        super().__init__(
+            f"{method} {path} transport failed: {type(error).__name__}: {error}",
+            code=code,
+            http_status=http_status,
         )
 
 
 class LiumClient:
     def __init__(self) -> None:
         if not API_BASE:
-            raise LiumWrapperError("LIUM_API_BASE is required")
+            raise LiumWrapperError(
+                "LIUM_API_BASE is required",
+                code="wrapper_config_error",
+            )
         self.session = requests.Session()
         self.session.headers.update({"Content-Type": "application/json"})
         if API_KEY:
@@ -78,16 +132,33 @@ class LiumClient:
             )
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        resp = self.session.request(
-            method, f"{API_BASE}{path}", timeout=60, **kwargs
-        )
+        try:
+            resp = self.session.request(
+                method, f"{API_BASE}{path}", timeout=60, **kwargs
+            )
+        except requests.Timeout as e:
+            raise LiumRequestError(
+                method,
+                path,
+                e,
+                code="provider_timeout",
+                http_status=504,
+            ) from e
+        except requests.RequestException as e:
+            raise LiumRequestError(method, path, e) from e
         if resp.status_code in (204, 205):
             return {}
         if resp.status_code >= 400:
             raise LiumHTTPError(method, path, resp.status_code, resp.text)
         if not resp.content:
             return {}
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as e:
+            raise LiumProviderError(
+                f"{method} {path} returned non-JSON response: {resp.text[:500]}",
+                code="provider_invalid_response",
+            ) from e
 
     def items(self, payload: Any) -> List[dict]:
         if isinstance(payload, list):
@@ -116,12 +187,13 @@ class LiumClient:
         candidates = [
             e
             for e in self.items(data)
-            if int(e.get("available_gpu_count") or e.get("gpu_count") or 0)
-            >= GPU_COUNT
+            if int(e.get("available_gpu_count") or e.get("gpu_count") or 0) >= GPU_COUNT
         ]
         if not candidates:
-            raise LiumWrapperError(
-                f"No Lium executor has {GPU_COUNT} available GPUs for {MACHINE_NAME}"
+            raise LiumProviderError(
+                f"No Lium executor has {GPU_COUNT} available GPUs for {MACHINE_NAME}",
+                code="provider_capacity_unavailable",
+                http_status=503,
             )
         candidates.sort(
             key=lambda e: (
@@ -142,8 +214,9 @@ class LiumClient:
                 public_key = key.get("public_key")
                 if public_key:
                     return str(public_key)
-        raise LiumWrapperError(
-            f"No public key found for LIUM_SSH_KEY_NAME={SSH_KEY_NAME!r}"
+        raise LiumProviderError(
+            f"No public key found for LIUM_SSH_KEY_NAME={SSH_KEY_NAME!r}",
+            code="provider_configuration_error",
         )
 
     def resolve_template_id(self) -> str:
@@ -151,7 +224,10 @@ class LiumClient:
             return TEMPLATE_ID
         templates = self.items(self.request("GET", "/templates"))
         if not templates:
-            raise LiumWrapperError("No Lium templates available")
+            raise LiumProviderError(
+                "No Lium templates available",
+                code="provider_configuration_error",
+            )
 
         def score(template: Mapping[str, Any]) -> tuple:
             status = str(template.get("status") or "")
@@ -174,7 +250,10 @@ class LiumClient:
         templates.sort(key=score)
         template_id = str(templates[0].get("id") or "")
         if not template_id:
-            raise LiumWrapperError(f"Selected template has no id: {templates[0]}")
+            raise LiumProviderError(
+                f"Selected template has no id: {templates[0]}",
+                code="provider_invalid_response",
+            )
         return template_id
 
     def create(self, name: str) -> dict:
@@ -185,7 +264,10 @@ class LiumClient:
         executor = self.select_executor()
         executor_id = _instance_id(executor)
         if not executor_id:
-            raise LiumWrapperError(f"Selected executor has no id: {executor}")
+            raise LiumProviderError(
+                f"Selected executor has no id: {executor}",
+                code="provider_invalid_response",
+            )
         payload = {
             "pod_name": name,
             "template_id": self.resolve_template_id(),
@@ -212,7 +294,10 @@ class LiumClient:
         if not uid:
             uid = self.find_pod_by_name(name, attempts=5)
         if not uid:
-            raise LiumWrapperError(f"Rent response did not include a pod id: {result}")
+            raise LiumProviderError(
+                f"Rent response did not include a pod id: {result}",
+                code="provider_invalid_response",
+            )
         try:
             return self.wait_ready(uid)
         except Exception:
@@ -241,15 +326,18 @@ class LiumClient:
                 last = pod
             status = _status(pod)
             if status in {"failed", "error", "terminated", "deleted"}:
-                raise LiumWrapperError(f"Pod {uid} {status}: {str(pod)[:500]}")
+                raise LiumProviderError(
+                    f"Pod {uid} {status}: {str(pod)[:500]}",
+                    code="provider_instance_failed",
+                    http_status=502,
+                )
             ssh_url = _ssh_url(pod)
             if ssh_url and self._ssh_ready(ssh_url):
                 return {
                     "instance_id": uid,
                     "ssh_url": ssh_url,
                     "public_inference_url": (
-                        _openai_endpoint(PUBLIC_INFERENCE_URL)
-                        or _public_url(pod, PORT)
+                        _openai_endpoint(PUBLIC_INFERENCE_URL) or _public_url(pod, PORT)
                     ),
                     "lease_expires_at": (
                         _lease_expires_at(pod) or _default_lease_expires_at()
@@ -258,9 +346,11 @@ class LiumClient:
                     "raw": _redacted_pod(pod),
                 }
             time.sleep(POLL_SECONDS)
-        raise LiumWrapperError(
+        raise LiumProviderError(
             f"Pod {uid} did not become SSH-ready in {WAIT_TIMEOUT}s; "
-            f"last={str(_redacted_pod(last or {}))[:800]}"
+            f"last={str(_redacted_pod(last or {}))[:800]}",
+            code="provider_instance_not_ready",
+            http_status=504,
         )
 
     def get_pod(self, uid: str) -> Optional[dict]:
@@ -289,7 +379,9 @@ class LiumClient:
             raise LiumWrapperError(
                 f"Refusing to delete pod {uid}: pod_name={pod_name!r} "
                 f"does not match prefix={NAME_PREFIX!r} "
-                f"purpose={expected_purpose or '*'}"
+                f"purpose={expected_purpose or '*'}",
+                code="wrapper_safety_violation",
+                http_status=409,
             )
         try:
             self.request("DELETE", f"/pods/{uid}")
@@ -329,7 +421,13 @@ class LiumClient:
         }
 
     def _ssh_ready(self, ssh_url: str) -> bool:
-        user, host, port = _parse_ssh_url(ssh_url)
+        try:
+            user, host, port = _parse_ssh_url(ssh_url)
+        except ValueError as e:
+            raise LiumProviderError(
+                str(e),
+                code="provider_invalid_response",
+            ) from e
         cmd = [
             "ssh",
             "-i",
@@ -344,9 +442,7 @@ class LiumClient:
             "echo ready",
         ]
         try:
-            result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15
-            )
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
         except Exception:
             return False
         return result.returncode == 0 and "ready" in result.stdout
@@ -391,9 +487,8 @@ def _resource_name(*, purpose: str, suffix: str, max_len: int) -> str:
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
     fixed_len = len(NAME_PREFIX) + len(purpose) + len(digest) + 3
     suffix_budget = max(1, max_len - fixed_len)
-    return (
-        f"{NAME_PREFIX}-{purpose}-{suffix[:suffix_budget]}-{digest}"[:max_len]
-        .strip("-")
+    return f"{NAME_PREFIX}-{purpose}-{suffix[:suffix_budget]}-{digest}"[:max_len].strip(
+        "-"
     )
 
 
@@ -504,8 +599,10 @@ def _ssh_url(data: Mapping[str, Any]) -> str:
     port = parsed.get("port") or ssh.get("port") or data.get("ssh_port")
     if not port:
         for item in _port_items(data):
-            internal = item.get("port") or item.get("target_port") or item.get(
-                "container_port"
+            internal = (
+                item.get("port")
+                or item.get("target_port")
+                or item.get("container_port")
             )
             if int(internal or 0) == 22:
                 port = (
@@ -530,20 +627,20 @@ def _public_url(data: Mapping[str, Any], port: int) -> str:
 
 
 def _urls(data: Mapping[str, Any], port: int) -> Iterable[str]:
-    for value in (data.get("urls") or []):
+    for value in data.get("urls") or []:
         if isinstance(value, dict) and int(value.get("port") or port) == port:
             url = value.get("url")
             if url:
                 yield str(url)
     state = data.get("state") if isinstance(data.get("state"), dict) else {}
-    for value in (state.get("urls") or []):
+    for value in state.get("urls") or []:
         if isinstance(value, dict) and int(value.get("port") or port) == port:
             url = value.get("url")
             if url:
                 yield str(url)
     for item in _port_items(data):
-        internal = item.get("port") or item.get("target_port") or item.get(
-            "container_port"
+        internal = (
+            item.get("port") or item.get("target_port") or item.get("container_port")
         )
         if int(internal or 0) != port:
             continue
@@ -557,7 +654,9 @@ def _urls(data: Mapping[str, Any], port: int) -> Iterable[str]:
             or _parse_host_from_ssh_url(_ssh_url(data))
         )
         public_port = (
-            item.get("public_port") or item.get("external_port") or item.get("host_port")
+            item.get("public_port")
+            or item.get("external_port")
+            or item.get("host_port")
         )
         if host and public_port:
             yield f"{ENDPOINT_SCHEME}://{host}:{int(public_port)}"
@@ -619,11 +718,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"ok": True})
             return
-        self._send(404, {"error": "not found"})
+        self._send(404, _route_not_found("GET", self.path))
 
     def do_POST(self) -> None:
         if not self._authorized():
-            self._send(401, {"error": "unauthorized"})
+            self._send(401, _wrapper_error("unauthorized", "unauthorized"))
             return
         parsed = urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
@@ -631,50 +730,46 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = LiumClient().renew(parts[1])
                 self._send(200, result)
-            except LiumHTTPError as e:
-                if e.status_code == 404:
-                    self._send(
-                        404,
-                        {"error": type(e).__name__, "message": str(e)},
-                    )
-                    return
-                self._send(500, {"error": type(e).__name__, "message": str(e)})
             except Exception as e:
-                self._send(500, {"error": type(e).__name__, "message": str(e)})
+                self._send(*_error_response(e))
             return
         if parsed.path != "/instances":
-            self._send(404, {"error": "not found"})
+            self._send(404, _route_not_found("POST", parsed.path))
             return
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
-            data = json.loads(raw or "{}")
+            data, error = _read_json_body(self)
+            if error:
+                self._send(400, error)
+                return
             purpose = str(data.get("purpose") or "eval")
             suffix = str(data.get("endpoint_name") or int(time.time()))
             name = _resource_name(purpose=purpose, suffix=suffix, max_len=63)
             result = LiumClient().create(name)
             self._send(200, result)
         except Exception as e:
-            self._send(500, {"error": type(e).__name__, "message": str(e)})
+            self._send(*_error_response(e))
 
     def do_DELETE(self) -> None:
         if not self._authorized():
-            self._send(401, {"error": "unauthorized"})
+            self._send(401, _wrapper_error("unauthorized", "unauthorized"))
             return
         parsed = urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
         if len(parts) != 2 or parts[0] != "instances":
-            self._send(404, {"error": "not found"})
+            self._send(404, _route_not_found("DELETE", parsed.path))
             return
         try:
-            expected_purpose = _expected_purpose(self, parsed)
+            expected_purpose, error = _expected_purpose(self, parsed)
+            if error:
+                self._send(400, error)
+                return
             ok = LiumClient().delete(
                 parts[1],
                 expected_purpose=expected_purpose,
             )
             self._send(200, {"ok": ok})
         except Exception as e:
-            self._send(500, {"error": type(e).__name__, "message": str(e)})
+            self._send(*_error_response(e))
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(
@@ -685,17 +780,127 @@ class Handler(BaseHTTPRequestHandler):
         )
 
 
-def _expected_purpose(handler: BaseHTTPRequestHandler, parsed) -> str:
-    query = parse_qs(parsed.query)
-    if query.get("purpose"):
-        return _safe_token(query["purpose"][0])
+def _route_not_found(method: str, path: str) -> dict:
+    payload = _wrapper_error("route_not_found", "wrapper route not found")
+    payload.update(
+        {
+            "error": "not_found",
+            "method": method,
+            "path": path,
+        }
+    )
+    return payload
+
+
+def _wrapper_error(code: str, message: str, **extra: Any) -> dict:
+    payload = {
+        "error": code,
+        "error_source": "wrapper",
+        "code": code,
+        "message": message,
+    }
+    payload.update(extra)
+    return payload
+
+
+def _provider_error(error: Exception, **extra: Any) -> dict:
+    payload = {
+        "error": type(error).__name__,
+        "error_source": "provider",
+        "code": getattr(error, "code", "provider_error"),
+        "provider": "lium",
+        "message": str(error),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _provider_http_error(error: LiumHTTPError) -> dict:
+    return _provider_error(
+        error,
+        provider_status_code=error.status_code,
+        provider_method=error.method,
+        provider_path=error.path,
+        provider_response=error.text[:1000],
+    )
+
+
+def _provider_transport_error(error: LiumRequestError) -> dict:
+    return _provider_error(
+        error,
+        provider_method=error.method,
+        provider_path=error.path,
+    )
+
+
+def _provider_not_found(error: Exception) -> dict:
+    if isinstance(error, LiumHTTPError):
+        return _provider_http_error(error)
+    return _provider_error(
+        error,
+        code="provider_instance_not_found",
+        provider_status_code=404,
+    )
+
+
+def _bad_request(message: str, **extra: Any) -> dict:
+    return _wrapper_error("bad_request", message, **extra)
+
+
+def _error_response(error: Exception) -> tuple[int, dict]:
+    if isinstance(error, LiumHTTPError):
+        return error.status_code, _provider_http_error(error)
+    if isinstance(error, LiumRequestError):
+        return error.http_status, _provider_transport_error(error)
+    if isinstance(error, LiumProviderError):
+        return error.http_status, _provider_error(error)
+    if isinstance(error, LiumWrapperError):
+        return error.http_status, _wrapper_error(
+            error.code,
+            str(error),
+            error=type(error).__name__,
+        )
+    return 500, _wrapper_error(
+        "wrapper_internal_error",
+        str(error),
+        error=type(error).__name__,
+    )
+
+
+def _read_json_body(
+    handler: BaseHTTPRequestHandler,
+) -> tuple[dict, Optional[dict]]:
     try:
         length = int(handler.headers.get("Content-Length") or 0)
-        raw = handler.rfile.read(length).decode("utf-8") if length else "{}"
-        data = json.loads(raw or "{}")
-    except Exception:
-        return ""
-    return _safe_token(data.get("purpose"))
+    except ValueError:
+        return {}, _bad_request("Content-Length must be an integer")
+    if length <= 0:
+        return {}, None
+    raw = handler.rfile.read(length)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {}, _bad_request("request body must be UTF-8 JSON")
+    try:
+        data = json.loads(text or "{}")
+    except json.JSONDecodeError as e:
+        return {}, _bad_request(f"request body must be valid JSON: {e}")
+    if not isinstance(data, dict):
+        return {}, _bad_request("request body must be a JSON object")
+    return data, None
+
+
+def _expected_purpose(
+    handler: BaseHTTPRequestHandler,
+    parsed,
+) -> tuple[str, Optional[dict]]:
+    query = parse_qs(parsed.query)
+    if query.get("purpose"):
+        return _safe_token(query["purpose"][0]), None
+    data, error = _read_json_body(handler)
+    if error:
+        return "", error
+    return _safe_token(data.get("purpose")), None
 
 
 def main() -> None:
