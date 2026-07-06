@@ -16,6 +16,7 @@ import pytest
 from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.main import _select_ssh_endpoints
 from affine.src.scheduler.ssh import (
+    ACTIVE_HF_INCOMPLETE_CACHE_MAX_AGE_SECONDS,
     CONTAINER_NAME,
     DEFAULT_HF_METADATA_TIMEOUT_SEC,
     HF_XET_MAX_NON_XET_FILE_BYTES,
@@ -298,12 +299,11 @@ async def test_cleanup_skipped_for_invalid_model_id(monkeypatch):
     assert calls == [], "cleanup must not SSH when model id lacks '/'"
 
 
-def test_cache_cleanup_cmd_keeps_only_target():
-    """The cleanup snippet declares the new target's HF dir as the
-    sole keep entry. Single-instance mode hosts one model at a time;
-    keeping anything beyond the new target wastes disk for no
-    operational gain (a loss-path redeploy just re-downloads the
-    champion, which is no worse than the original deploy)."""
+def test_cache_cleanup_cmd_keeps_target_and_active_incomplete_downloads():
+    """The cleanup snippet keeps the new target's HF dir and recently
+    active incomplete downloads. The latter lets HF resume a large
+    challenger download after a transient readiness timeout instead of
+    starting from byte zero on every retry."""
     cmd = _build_cache_cleanup_cmd(_target(), _config())
     # Target dir name is computed and quoted into the script.
     expected_dir = _hf_cache_dir_name(_target().model)
@@ -316,6 +316,9 @@ def test_cache_cleanup_cmd_keeps_only_target():
     rm_idx = cmd.find("rm -rf")
     target_check_idx = cmd.find("$TARGET_DIR")
     assert target_check_idx < rm_idx, "target keep-check must come before rm"
+    assert "*.incomplete" in cmd
+    assert "kept-active:" in cmd
+    assert str(ACTIVE_HF_INCOMPLETE_CACHE_MAX_AGE_SECONDS // 60) in cmd
     # No previous-model lookup — single keep dir.
     assert "docker inspect" not in cmd
     assert "PREV" not in cmd

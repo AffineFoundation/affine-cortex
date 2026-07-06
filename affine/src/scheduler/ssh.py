@@ -84,8 +84,9 @@ DEFAULT_TOOL_CALL_PARSER = "qwen"
 DEFAULT_READY_TIMEOUT_SEC = 1800
 DEFAULT_POLL_INTERVAL_SEC = 15.0
 DEFAULT_HF_METADATA_TIMEOUT_SEC = 30.0
-HF_XET_MAX_NON_XET_FILE_BYTES = 50 * 1024 ** 3
+HF_XET_MAX_NON_XET_FILE_BYTES = 20 * 1024 ** 3
 HF_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt")
+ACTIVE_HF_INCOMPLETE_CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
 
 # Single container name — single-instance host means only one ever exists.
 # ``docker rm -f`` is idempotent so start() always kicks off a fresh state.
@@ -470,19 +471,25 @@ def _hf_cache_dir_name(model: str) -> str:
     return f"{HF_SNAPSHOT_PREFIX}{model.replace('/', HF_ORG_SEPARATOR)}"
 
 
-# Shell snippet that nukes every ``<cache>/<prefix>*`` directory
-# *except* the new target's. Run pre-deploy so b300 doesn't fill its
-# disk with stale weights from every past challenger. Single-instance
-# mode hosts one model at a time, so a single keep dir is all we ever
-# need on disk.
+# Shell snippet that nukes every ``<cache>/<prefix>*`` directory except
+# the new target's and recently active incomplete downloads. Run
+# pre-deploy so b300 doesn't fill its disk with stale weights from every
+# past challenger, while preserving HF's resumable download state across
+# transient ready timeouts.
 _CLEANUP_SCRIPT = r"""
 TARGET_DIR={target_dir_q}
 CACHE_DIR={cache_dir_q}
 PREFIX={prefix_q}
+ACTIVE_INCOMPLETE_MAX_AGE_MINUTES={active_incomplete_max_age_minutes_q}
 for d in "$CACHE_DIR"/"$PREFIX"*/; do
     [ -d "$d" ] || continue
     name=$(basename "$d")
     [ "$name" = "$TARGET_DIR" ] && continue
+    active_incomplete=$(find "$d" -type f -name '*.incomplete' -mmin "-$ACTIVE_INCOMPLETE_MAX_AGE_MINUTES" -print -quit 2>/dev/null)
+    if [ -n "$active_incomplete" ]; then
+        echo "kept-active: $name"
+        continue
+    fi
     echo "removed: $name"
     rm -rf "$d"
 done
@@ -491,10 +498,16 @@ done
 
 def _build_cache_cleanup_cmd(target: DeployTarget, config: SSHConfig) -> str:
     """Return the shell snippet that purges stale HF caches before a deploy."""
+    active_incomplete_max_age_minutes = max(
+        1, (ACTIVE_HF_INCOMPLETE_CACHE_MAX_AGE_SECONDS + 59) // 60
+    )
     return _CLEANUP_SCRIPT.format(
         target_dir_q=shlex.quote(_hf_cache_dir_name(target.model)),
         cache_dir_q=shlex.quote(config.sglang_cache_dir),
         prefix_q=shlex.quote(HF_SNAPSHOT_PREFIX),
+        active_incomplete_max_age_minutes_q=shlex.quote(
+            str(active_incomplete_max_age_minutes)
+        ),
     )
 
 
@@ -552,6 +565,8 @@ async def _cleanup_stale_caches(
     for line in (out or "").splitlines():
         if line.startswith("removed:"):
             logger.info(f"ssh-provider: stale cache {line}")
+        elif line.startswith("kept-active:"):
+            logger.info(f"ssh-provider: active download cache {line}")
 
 
 # ---- ready probe -----------------------------------------------------------
