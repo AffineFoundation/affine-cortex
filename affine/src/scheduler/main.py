@@ -259,6 +259,23 @@ async def _run() -> None:
             hotkey, revision, env, task_ids, refresh_block=refresh_block,
         )
 
+    async def sample_metrics_reader(
+        hotkey: str,
+        revision: str,
+        env: str,
+        task_ids: List[int],
+        refresh_block: int,
+        include_extra_usage: bool,
+    ):
+        return await samples_adapter.read_sample_metrics_for_tasks(
+            hotkey,
+            revision,
+            env,
+            task_ids,
+            refresh_block=refresh_block,
+            include_extra_usage=include_extra_usage,
+        )
+
     async def list_valid_miners_fn():
         return await miners_dao.get_valid_miners()
 
@@ -460,6 +477,7 @@ async def _run() -> None:
             list_active_ssh_endpoint_activations
         ),
         deployment_health_fn=deployment_health_fn,
+        sample_metrics_reader=sample_metrics_reader,
     )
 
     stop_event = asyncio.Event()

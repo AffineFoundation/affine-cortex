@@ -52,7 +52,15 @@ from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
+from affine.src.scorer.token_efficiency import (
+    TOKEN_EFFICIENCY_ENV,
+    compute_token_efficiency,
+    load_token_efficiency_config,
+)
 from affine.src.scorer.window_state import (
+    BattleRecord,
+    ChampionRecord,
+    MinerSnapshot,
     StateStore,
     SystemConfigKVAdapter,
     TaskIdState,
@@ -154,11 +162,32 @@ class LiveScoresMonitor:
 
         champion = await self._state.get_champion()
         champion_uid = champion.uid if champion is not None else None
+        get_battle = getattr(self._state, "get_battle", None)
+        battle = await get_battle() if callable(get_battle) else None
+        get_predeployed = getattr(
+            self._state, "get_predeployed_challengers", None
+        )
+        predeployed = await get_predeployed() if callable(get_predeployed) else []
+        get_payloads = getattr(self._state, "get_environment_payloads", None)
+        env_payloads = await get_payloads() if callable(get_payloads) else {}
+        token_config = load_token_efficiency_config(env_payloads)
+        get_scoring_envs = getattr(self._state, "get_scoring_environments", None)
+        runtime_scoring_envs = (
+            await get_scoring_envs() if callable(get_scoring_envs) else env_configs
+        )
+        token_runtime_envs = [
+            env for env in runtime_scoring_envs if task_state.task_ids.get(env)
+        ]
 
         start = time.time()
         per_miner_scores = await self._compute_scores(
             valid_miners, scoring_envs, task_state,
             champion_uid=champion_uid,
+            champion=champion,
+            battle=battle,
+            predeployed=predeployed,
+            token_config=token_config,
+            token_runtime_envs=token_runtime_envs,
         )
         compute_elapsed = time.time() - start
 
@@ -200,6 +229,11 @@ class LiveScoresMonitor:
         scoring_envs: List[str],
         task_state: TaskIdState,
         champion_uid: Optional[int] = None,
+        champion: Optional[ChampionRecord] = None,
+        battle: Optional[BattleRecord] = None,
+        predeployed: Optional[List[BattleRecord]] = None,
+        token_config: Any = None,
+        token_runtime_envs: Optional[List[str]] = None,
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """Return ``{uid_str: {env: {"count", "avg", "champion_overlap_avg"?}}}``
         for every (valid miner × scoring env) with at least one sample
@@ -208,19 +242,43 @@ class LiveScoresMonitor:
         empty."""
 
         sem = asyncio.Semaphore(MAX_CONCURRENCY)
+        token_runtime_env_set = set(token_runtime_envs or [])
+        token_subject_uids: set[int] = set()
+        if token_config and token_config.enabled_for_sampling:
+            if champion is not None:
+                token_subject_uids.add(champion.uid)
+            if battle is not None:
+                token_subject_uids.add(battle.challenger.uid)
+            for record in predeployed or []:
+                token_subject_uids.add(record.challenger.uid)
 
         async def _one(uid: int, hotkey: str, revision: str, env: str):
             task_ids = task_state.task_ids.get(env) or []
             if not task_ids:
-                return uid, env, None
+                return uid, env, None, None
             async with sem:
-                scored = await self._samples.read_scores_for_tasks(
-                    hotkey, revision, env, task_ids,
-                    refresh_block=task_state.refreshed_at_block,
-                )
+                if uid in token_subject_uids and env in token_runtime_env_set:
+                    metrics = await self._samples.read_sample_metrics_for_tasks(
+                        hotkey,
+                        revision,
+                        env,
+                        task_ids,
+                        refresh_block=task_state.refreshed_at_block,
+                        include_extra_usage=True,
+                    )
+                    scored = {
+                        task_id: metric.score
+                        for task_id, metric in metrics.items()
+                    }
+                else:
+                    metrics = None
+                    scored = await self._samples.read_scores_for_tasks(
+                        hotkey, revision, env, task_ids,
+                        refresh_block=task_state.refreshed_at_block,
+                    )
             if not scored:
-                return uid, env, None
-            return uid, env, scored
+                return uid, env, None, None
+            return uid, env, scored, metrics
 
         coros = []
         for m in valid_miners:
@@ -235,10 +293,13 @@ class LiveScoresMonitor:
         # Two-pass: gather raw {task_id: score} maps first so the
         # second pass can intersect each challenger with the champion.
         per_miner_env: Dict[int, Dict[str, Dict[int, float]]] = {}
-        for uid, env, scored in await asyncio.gather(*coros):
+        per_miner_metrics: Dict[int, Dict[str, Dict[int, Any]]] = {}
+        for uid, env, scored, metrics in await asyncio.gather(*coros):
             if scored is None:
                 continue
             per_miner_env.setdefault(uid, {})[env] = scored
+            if metrics is not None:
+                per_miner_metrics.setdefault(uid, {})[env] = metrics
 
         champ_per_env = (
             per_miner_env.get(int(champion_uid))
@@ -262,4 +323,96 @@ class LiveScoresMonitor:
                             mean(champ_per_env[env][t] for t in overlap)
                         )
                 out.setdefault(str(uid), {})[env] = entry
+        if token_config and token_config.enabled_for_sampling and champion is not None:
+            await self._merge_token_scores(
+                out,
+                champion=champion,
+                battle=battle,
+                predeployed=predeployed or [],
+                runtime_envs=token_runtime_envs or [],
+                task_state=task_state,
+                token_config=token_config,
+                metrics_cache=per_miner_metrics,
+            )
         return out
+
+    async def _merge_token_scores(
+        self,
+        out: Dict[str, Dict[str, Dict[str, Any]]],
+        *,
+        champion: ChampionRecord,
+        battle: Optional[BattleRecord],
+        predeployed: List[BattleRecord],
+        runtime_envs: List[str],
+        task_state: TaskIdState,
+        token_config: Any,
+        metrics_cache: Dict[int, Dict[str, Dict[int, Any]]],
+    ) -> None:
+        if (
+            token_config is None
+            or not token_config.enabled_for_sampling
+            or not runtime_envs
+        ):
+            return
+
+        async def _metrics(miner: MinerSnapshot | ChampionRecord):
+            result: Dict[str, Dict[int, Any]] = {}
+            for env in runtime_envs:
+                cached = metrics_cache.get(miner.uid, {}).get(env)
+                if cached is not None:
+                    result[env] = cached
+                    continue
+                tasks = task_state.task_ids.get(env) or []
+                if not tasks:
+                    continue
+                result[env] = await self._samples.read_sample_metrics_for_tasks(
+                    miner.hotkey,
+                    miner.revision,
+                    env,
+                    tasks,
+                    refresh_block=task_state.refreshed_at_block,
+                    include_extra_usage=True,
+                )
+            return result
+
+        champion_metrics = await _metrics(champion)
+        champion_overlap = {
+            env: set(metrics.keys())
+            for env, metrics in champion_metrics.items()
+        }
+        champion_comp = compute_token_efficiency(
+            env=TOKEN_EFFICIENCY_ENV,
+            config=token_config,
+            basis_metrics_by_runtime_env=champion_metrics,
+            subject_metrics_by_runtime_env=champion_metrics,
+            overlap_ids_by_runtime_env=champion_overlap,
+            subject_is_reference=True,
+        )
+        out.setdefault(str(champion.uid), {})[TOKEN_EFFICIENCY_ENV] = (
+            champion_comp.champion_payload
+        )
+
+        subjects: List[MinerSnapshot] = []
+        if battle is not None:
+            subjects.append(battle.challenger)
+        subjects.extend(record.challenger for record in predeployed)
+        seen: set[int] = set()
+        for subject in subjects:
+            if subject.uid in seen:
+                continue
+            seen.add(subject.uid)
+            subject_metrics = await _metrics(subject)
+            overlap = {
+                env: set(champion_metrics.get(env, {})) & set(subject_metrics.get(env, {}))
+                for env in runtime_envs
+            }
+            comp = compute_token_efficiency(
+                env=TOKEN_EFFICIENCY_ENV,
+                config=token_config,
+                basis_metrics_by_runtime_env=champion_metrics,
+                subject_metrics_by_runtime_env=subject_metrics,
+                overlap_ids_by_runtime_env=overlap,
+            )
+            out.setdefault(str(subject.uid), {})[TOKEN_EFFICIENCY_ENV] = (
+                comp.challenger_payload
+            )

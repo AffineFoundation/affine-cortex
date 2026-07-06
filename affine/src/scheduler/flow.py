@@ -58,6 +58,13 @@ from affine.src.scorer.sampling_thresholds import (
     SAMPLE_BUFFER_RATIO,
     champion_completion_threshold,
 )
+from affine.src.scorer.token_efficiency import (
+    TOKEN_EFFICIENCY_ENV,
+    SampleMetric,
+    TokenEfficiencyComputation,
+    compute_token_efficiency,
+    load_token_efficiency_config,
+)
 from affine.src.scorer.weight_writer import WeightSubject, WeightWriter
 from affine.src.scorer.window_state import (
     BattleRecord,
@@ -205,6 +212,12 @@ ScoresReader = Callable[[str, str, str, List[int], int],
 """(hotkey, revision, env, task_ids, refresh_block) → {task_id: score} for
 matches in the current refresh."""
 
+SampleMetricsReader = Callable[
+    [str, str, str, List[int], int, bool],
+    Awaitable[Dict[int, SampleMetric]],
+]
+"""(hotkey, revision, env, task_ids, refresh_block, include_usage) → metrics."""
+
 ListValidMinersFn = Callable[[], Awaitable[List[Dict[str, Any]]]]
 """Return every is_valid=true row in the miners table."""
 
@@ -284,6 +297,7 @@ class FlowScheduler:
             ListActiveEndpointActivationsFn
         ] = None,
         deployment_health_fn: Optional[DeploymentHealthFn] = None,
+        sample_metrics_reader: Optional[SampleMetricsReader] = None,
     ):
         self.cfg = config
         self.state = state
@@ -295,6 +309,7 @@ class FlowScheduler:
         self._teardown = teardown_fn
         self._sample_count = sample_count_fn
         self._scores_reader = scores_reader
+        self._sample_metrics_reader = sample_metrics_reader
         self._list_valid_miners = list_valid_miners_fn
         self._list_current_miners = list_current_miners_fn or list_valid_miners_fn
         self._list_active_endpoint_names = list_active_endpoint_names_fn
@@ -1667,20 +1682,80 @@ class FlowScheduler:
         champ_scores: Dict[str, Dict[int, float]] = {}
         chal_scores: Dict[str, Dict[int, float]] = {}
         overlap_task_ids: Dict[str, List[int]] = {}
+        champ_metrics: Dict[str, Dict[int, SampleMetric]] = {}
+        chal_metrics: Dict[str, Dict[int, SampleMetric]] = {}
+        token_config = load_token_efficiency_config(
+            await self.state.get_environment_payloads()
+        )
+        token_enabled = bool(token_config and token_config.enabled_for_sampling)
         for env in env_configs:
             tasks = task_state.task_ids.get(env, [])
-            champ_full = await self._scores_reader(
-                champion.hotkey, champion.revision, env, tasks,
-                task_state.refreshed_at_block,
-            )
-            chal_full = await self._scores_reader(
-                battle.challenger.hotkey, battle.challenger.revision, env, tasks,
-                task_state.refreshed_at_block,
-            )
+            if token_enabled and self._sample_metrics_reader is not None:
+                champ_metric_full = await self._sample_metrics_reader(
+                    champion.hotkey, champion.revision, env, tasks,
+                    task_state.refreshed_at_block, True,
+                )
+                chal_metric_full = await self._sample_metrics_reader(
+                    battle.challenger.hotkey, battle.challenger.revision, env, tasks,
+                    task_state.refreshed_at_block, True,
+                )
+                champ_full = {
+                    task_id: metric.score
+                    for task_id, metric in champ_metric_full.items()
+                }
+                chal_full = {
+                    task_id: metric.score
+                    for task_id, metric in chal_metric_full.items()
+                }
+            else:
+                champ_full = await self._scores_reader(
+                    champion.hotkey, champion.revision, env, tasks,
+                    task_state.refreshed_at_block,
+                )
+                chal_full = await self._scores_reader(
+                    battle.challenger.hotkey, battle.challenger.revision, env, tasks,
+                    task_state.refreshed_at_block,
+                )
+                champ_metric_full = {
+                    task_id: SampleMetric(score=score)
+                    for task_id, score in champ_full.items()
+                }
+                chal_metric_full = {
+                    task_id: SampleMetric(score=score)
+                    for task_id, score in chal_full.items()
+                }
             overlap_ids = sorted(set(champ_full) & set(chal_full))
             overlap_task_ids[env] = overlap_ids
             champ_scores[env] = {t: champ_full[t] for t in overlap_ids}
             chal_scores[env] = {t: chal_full[t] for t in overlap_ids}
+            champ_metrics[env] = {t: champ_metric_full[t] for t in overlap_ids}
+            chal_metrics[env] = {t: chal_metric_full[t] for t in overlap_ids}
+
+        token_sidecar: TokenEfficiencyComputation | None = None
+        if token_config and token_config.enabled_for_sampling:
+            token_sidecar = compute_token_efficiency(
+                env=TOKEN_EFFICIENCY_ENV,
+                config=token_config,
+                basis_metrics_by_runtime_env=champ_metrics,
+                subject_metrics_by_runtime_env=chal_metrics,
+                overlap_ids_by_runtime_env={
+                    env: set(ids) for env, ids in overlap_task_ids.items()
+                },
+            )
+            if (
+                token_config.enabled_for_scoring
+                and token_sidecar.available
+                and token_sidecar.champion_score is not None
+                and token_sidecar.challenger_score is not None
+                and token_sidecar.comparison_config is not None
+            ):
+                champ_scores[TOKEN_EFFICIENCY_ENV] = {
+                    0: token_sidecar.champion_score
+                }
+                chal_scores[TOKEN_EFFICIENCY_ENV] = {
+                    0: token_sidecar.challenger_score
+                }
+                env_configs[TOKEN_EFFICIENCY_ENV] = token_sidecar.comparison_config
 
         result = self.comparator.compare(
             champion_scores=champ_scores,
@@ -1688,6 +1763,8 @@ class FlowScheduler:
             env_configs=env_configs,
             min_dominant_envs=WIN_MIN_DOMINANT_ENVS,
         )
+        if token_sidecar is not None:
+            setattr(result, "token_efficiency", token_sidecar)
 
         if result.winner == "challenger":
             await self._teardown_record(champion)
@@ -2053,7 +2130,7 @@ def _as_float_or_none(v: Any) -> Optional[float]:
 
 def _final_scores_from_result(
     result: Any, *, role: str,
-) -> Dict[str, Dict[str, float]]:
+) -> Dict[str, Dict[str, Any]]:
     """Build ``{env: {count, avg, champion_overlap_avg}}`` for one side of
     a finished contest. Used to freeze the comparator's decide-time view
     of the loser onto their miner_stats row, so rank UI keeps showing
@@ -2064,7 +2141,7 @@ def _final_scores_from_result(
     side's avg is recorded as ``champion_overlap_avg`` — the basis the
     comparator actually used to decide this contest.
     """
-    out: Dict[str, Dict[str, float]] = {}
+    out: Dict[str, Dict[str, Any]] = {}
     for e in getattr(result, "per_env", []) or []:
         if role == "champion":
             own_n = int(getattr(e, "champion_n", 0) or 0)
@@ -2080,6 +2157,12 @@ def _final_scores_from_result(
         if opp_avg is not None:
             entry["champion_overlap_avg"] = opp_avg
         out[str(getattr(e, "env", ""))] = entry
+    token = _token_sidecar(result)
+    if token is not None:
+        out[token.env] = (
+            token.champion_payload if role == "champion"
+            else token.challenger_payload
+        )
     return out
 
 
@@ -2106,10 +2189,12 @@ def _opponent_scores_from_early_lost(
 
 
 def _own_scores_only(
-    scores_by_env: Dict[str, Dict[str, float]],
+    scores_by_env: Dict[str, Dict[str, Any]],
 ) -> Dict[str, Dict[str, float]]:
     out: Dict[str, Dict[str, float]] = {}
     for env, data in scores_by_env.items():
+        if data.get("unit") == "tokens":
+            continue
         if "count" not in data or "avg" not in data:
             continue
         out[env] = {"count": int(data["count"]), "avg": float(data["avg"])}
@@ -2132,6 +2217,11 @@ def _env_comparison_to_dict(e: Any) -> Dict[str, Any]:
         "verdict": getattr(e, "verdict", ""),
         "reason": getattr(e, "reason", ""),
     }
+
+
+def _token_sidecar(result: Any) -> Optional[TokenEfficiencyComputation]:
+    token = getattr(result, "token_efficiency", None)
+    return token if isinstance(token, TokenEfficiencyComputation) else None
 
 
 def _rules_for_snapshot() -> Dict[str, Any]:
@@ -2185,9 +2275,26 @@ def _outcome_for_snapshot(result: Any, champion: ChampionRecord) -> Dict[str, An
     out["dominant_count"] = int(getattr(result, "dominant_count", 0) or 0)
     out["not_worse_count"] = int(getattr(result, "not_worse_count", 0) or 0)
     out["worse_count"] = int(getattr(result, "worse_count", 0) or 0)
-    out["per_env"] = [
+    per_env = [
         _env_comparison_to_dict(e) for e in (getattr(result, "per_env", []) or [])
     ]
+    token = _token_sidecar(result)
+    if token is not None:
+        token_row = next(
+            (row for row in per_env if row.get("env") == token.env),
+            None,
+        )
+        metric = dict(token.snapshot_metric)
+        if token_row is not None:
+            token_row["metric"] = metric
+        else:
+            per_env.append({
+                "env": token.env,
+                "verdict": "unavailable",
+                "reason": token.reason,
+                "metric": metric,
+            })
+    out["per_env"] = per_env
     return out
 
 
@@ -2235,4 +2342,10 @@ def _comparison_scores_by_env(result: Any, *, role: str) -> Dict[str, Dict[str, 
                 "sample_count": sample_count,
                 "historical_count": sample_count,
             }
+    token = _token_sidecar(result)
+    if token is not None:
+        out[token.env] = (
+            token.challenger_payload if role == "challenger"
+            else token.champion_payload
+        )
     return out

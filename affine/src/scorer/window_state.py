@@ -139,6 +139,9 @@ class EnvConfig:
     dataset_range: List[List[int]]
     sampling_mode: str = "random"  # 'random' | 'latest'
     enabled_for_scoring: bool = True
+    kind: str = "runtime"
+    derived_metric: str = ""
+    scoring: Dict[str, Any] = field(default_factory=dict)
     # Optional remote source for the dataset's current top index. When
     # set, the scheduler resolves ``dataset_range`` from this URL at
     # each window refresh so envs whose dataset accumulates new
@@ -295,9 +298,12 @@ class StateStore:
         out: Dict[str, EnvConfig] = {}
         for env, cfg in raw.items():
             coerced = _env_from_payload(cfg)
-            if coerced.enabled_for_sampling:
+            if coerced.kind == "runtime" and coerced.enabled_for_sampling:
                 out[env] = coerced
         return out
+
+    async def get_runtime_environments(self) -> Dict[str, EnvConfig]:
+        return await self.get_environments()
 
     async def get_scoring_environments(self) -> Dict[str, EnvConfig]:
         """Envs the comparator should consider at DECIDE. Stricter
@@ -310,6 +316,31 @@ class StateStore:
             for env, cfg in (await self.get_environments()).items()
             if cfg.enabled_for_scoring
         }
+
+    async def get_runtime_scoring_environments(self) -> Dict[str, EnvConfig]:
+        return await self.get_scoring_environments()
+
+    async def get_derived_environments(self) -> Dict[str, EnvConfig]:
+        raw = await self._kv.get(self.KEY_ENVIRONMENTS, default={}) or {}
+        out: Dict[str, EnvConfig] = {}
+        for env, cfg in raw.items():
+            coerced = _env_from_payload(cfg)
+            if coerced.kind == "derived":
+                out[env] = coerced
+        return out
+
+    async def get_rank_display_environments(self) -> Dict[str, EnvConfig]:
+        raw = await self._kv.get(self.KEY_ENVIRONMENTS, default={}) or {}
+        out: Dict[str, EnvConfig] = {}
+        for env, cfg in raw.items():
+            coerced = _env_from_payload(cfg)
+            if coerced.enabled_for_sampling:
+                out[env] = coerced
+        return out
+
+    async def get_environment_payloads(self) -> Dict[str, Any]:
+        raw = await self._kv.get(self.KEY_ENVIRONMENTS, default={}) or {}
+        return raw if isinstance(raw, dict) else {}
 
 
 # ---- in-memory test fake --------------------------------------------------
@@ -562,6 +593,9 @@ def _env_from_payload(payload: Any) -> EnvConfig:
         )
     sampling = payload.get("sampling") or payload.get("window_config") or {}
     src = sampling.get("dataset_range_source")
+    scoring = payload.get("scoring") or {}
+    if not isinstance(scoring, dict):
+        scoring = {}
     return EnvConfig(
         display_name=str(payload.get("display_name", "")),
         enabled_for_sampling=bool(payload.get("enabled_for_sampling", False)),
@@ -573,4 +607,7 @@ def _env_from_payload(payload: Any) -> EnvConfig:
         dataset_range=list(sampling.get("dataset_range", []) or []),
         sampling_mode=str(sampling.get("sampling_mode", "random")),
         dataset_range_source=src if isinstance(src, dict) else None,
+        kind=str(payload.get("kind") or "runtime").lower(),
+        derived_metric=str(payload.get("derived_metric") or ""),
+        scoring=dict(scoring),
     )

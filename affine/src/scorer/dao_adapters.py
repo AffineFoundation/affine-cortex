@@ -18,6 +18,7 @@ from affine.database.dao.miners import MinersDAO
 from affine.database.dao.sample_results import SampleResultsDAO
 
 from .challenger_queue import STATUS_SAMPLING
+from .token_efficiency import SampleMetric, extract_token_usage
 
 
 # --------------------------------------------------------------------------- #
@@ -243,6 +244,71 @@ class SampleResultsAdapter:
         )
         return len(scores)
 
+    async def read_sample_metrics_for_tasks(
+        self,
+        hotkey: str,
+        revision: str,
+        env: str,
+        task_ids: List[int],
+        refresh_block: int,
+        *,
+        include_extra_usage: bool = False,
+    ) -> Dict[int, SampleMetric]:
+        """Return score plus optional usage for requested current-refresh rows."""
+        if not task_ids:
+            return {}
+        wanted = {int(t) for t in task_ids}
+        client = get_client()
+        pk = self._dao._make_pk(hotkey, revision, env)
+        out: Dict[int, SampleMetric] = {}
+        exclusive_start: Optional[Dict[str, Any]] = None
+        target_refresh = int(refresh_block)
+        projection = "task_id, score, refresh_block"
+        if include_extra_usage:
+            projection += ", extra_compressed"
+        while True:
+            params: Dict[str, Any] = {
+                "TableName": self._table_name,
+                "KeyConditionExpression": "pk = :pk AND begins_with(sk, :sk)",
+                "ExpressionAttributeValues": {
+                    ":pk": {"S": pk},
+                    ":sk": {"S": "TASK#"},
+                },
+                "ProjectionExpression": projection,
+                "ConsistentRead": True,
+            }
+            if exclusive_start:
+                params["ExclusiveStartKey"] = exclusive_start
+            resp = await client.query(**params)
+            for raw in resp.get("Items", []):
+                row = self._dao._deserialize(raw)
+                tid = row.get("task_id")
+                score = row.get("score")
+                row_refresh = row.get("refresh_block")
+                if tid is None or score is None or row_refresh is None:
+                    continue
+                if int(row_refresh) != target_refresh:
+                    continue
+                tid_int = int(tid)
+                if tid_int not in wanted:
+                    continue
+                usage = None
+                if include_extra_usage and row.get("extra_compressed") is not None:
+                    try:
+                        extra_json = self._dao.decompress_data(row["extra_compressed"])
+                        extra = json.loads(extra_json)
+                        usage = extract_token_usage(extra)
+                    except Exception as e:
+                        logger.warning(
+                            "SampleResultsAdapter: failed to parse usage for "
+                            f"env={env} task_id={tid_int}: {type(e).__name__}: {e}"
+                        )
+                out[tid_int] = SampleMetric(score=float(score), usage=usage)
+            exclusive_start = resp.get("LastEvaluatedKey")
+            if not exclusive_start:
+                break
+        return out
+
     async def read_scores_for_tasks(
         self, hotkey: str, revision: str, env: str, task_ids: List[int],
         refresh_block: int,
@@ -264,41 +330,8 @@ class SampleResultsAdapter:
         main table close that race; the cost is 2x RCU which is fine at
         this query rate.
         """
-        if not task_ids:
-            return {}
-        wanted = {int(t) for t in task_ids}
-        client = get_client()
-        pk = self._dao._make_pk(hotkey, revision, env)
-        out: Dict[int, float] = {}
-        exclusive_start: Optional[Dict[str, Any]] = None
-        target_refresh = int(refresh_block)
-        while True:
-            params: Dict[str, Any] = {
-                "TableName": self._table_name,
-                "KeyConditionExpression": "pk = :pk AND begins_with(sk, :sk)",
-                "ExpressionAttributeValues": {
-                    ":pk": {"S": pk},
-                    ":sk": {"S": "TASK#"},
-                },
-                "ProjectionExpression": "task_id, score, refresh_block",
-                "ConsistentRead": True,
-            }
-            if exclusive_start:
-                params["ExclusiveStartKey"] = exclusive_start
-            resp = await client.query(**params)
-            for raw in resp.get("Items", []):
-                row = self._dao._deserialize(raw)
-                tid = row.get("task_id")
-                score = row.get("score")
-                row_refresh = row.get("refresh_block")
-                if tid is None or score is None or row_refresh is None:
-                    continue
-                if int(row_refresh) != target_refresh:
-                    continue
-                tid_int = int(tid)
-                if tid_int in wanted:
-                    out[tid_int] = float(score)
-            exclusive_start = resp.get("LastEvaluatedKey")
-            if not exclusive_start:
-                break
-        return out
+        metrics = await self.read_sample_metrics_for_tasks(
+            hotkey, revision, env, task_ids, refresh_block=refresh_block,
+            include_extra_usage=False,
+        )
+        return {task_id: metric.score for task_id, metric in metrics.items()}
