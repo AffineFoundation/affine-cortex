@@ -159,6 +159,12 @@ def _average_of_env_scores(scores_by_env: Dict[str, Any]) -> float:
     means: list[float] = []
     for env_payload in scores_by_env.values():
         if isinstance(env_payload, dict):
+            if (
+                env_payload.get("include_in_average_score") is False
+                or env_payload.get("unit") == "tokens"
+                or env_payload.get("lower_is_better") is True
+            ):
+                continue
             for key in ("score", "mean", "avg", "average"):
                 if key in env_payload and isinstance(env_payload[key], (int, float)):
                     means.append(float(env_payload[key]))

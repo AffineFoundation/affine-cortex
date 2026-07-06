@@ -9,6 +9,7 @@ from affine.database.dao.miners import MinersDAO
 from affine.database.dao.score_snapshots import ScoreSnapshotsDAO
 from affine.database.dao.scores import ScoresDAO
 from affine.database.dao.system_config import SystemConfigDAO
+from affine.src.scorer.token_efficiency import TOKEN_EFFICIENCY_ENV
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
@@ -72,9 +73,10 @@ def _split_display_scores(
     Dict[str, Dict[str, int]],
     Dict[str, Dict[str, float]],
     Dict[str, Dict[str, float]],
-    Dict[str, Dict[str, Dict[str, float]]],
+    Dict[str, Dict[str, Dict[str, Any]]],
+    Dict[str, Dict[str, Dict[str, Any]]],
 ]:
-    """Project ``build_display_scores_map`` output into the four payload
+    """Project ``build_display_scores_map`` output into rank payload dicts.
     dicts the rank API exposes.
 
     The storage is one ``scores_by_env`` per miner; the ``frozen`` flag
@@ -88,7 +90,8 @@ def _split_display_scores(
     counts: Dict[str, Dict[str, int]] = {}
     averages: Dict[str, Dict[str, float]] = {}
     overlap_avgs: Dict[str, Dict[str, float]] = {}
-    terminal: Dict[str, Dict[str, Dict[str, float]]] = {}
+    terminal: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    details: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for uid, entry in display_map.items():
         scores = entry.get("scores") or {}
         if not isinstance(scores, dict) or not scores:
@@ -110,12 +113,18 @@ def _split_display_scores(
             raw_overlap = item.get("champion_overlap_avg")
             if isinstance(raw_overlap, (int, float)):
                 env_overlap[str(env)] = float(raw_overlap)
+            if (
+                str(env) == TOKEN_EFFICIENCY_ENV
+                or item.get("unit") == "tokens"
+                or item.get("lower_is_better") is True
+            ):
+                details.setdefault(uid, {})[str(env)] = item
         if env_counts:
             counts[uid] = env_counts
             averages[uid] = env_avgs
         if env_overlap:
             overlap_avgs[uid] = env_overlap
-    return counts, averages, overlap_avgs, terminal
+    return counts, averages, overlap_avgs, terminal, details
 
 
 def _live_sampling_uids(
@@ -224,7 +233,7 @@ async def get_current_state() -> Dict[str, Any]:
     battle = await store.get_battle()
     predeployed = await store.get_predeployed_challengers()
     task_state = await store.get_task_state()
-    envs = await store.get_environments()
+    envs = await store.get_rank_display_environments()
     # One read per miner pulls both live (LiveScoresMonitor) and frozen
     # (decide-time) scores from miner_stats; the DAO drops live entries
     # not matching ``current_refresh_block``.
@@ -254,7 +263,13 @@ async def get_current_state() -> Dict[str, Any]:
     display_map = await MinerStatsDAO().build_display_scores_map(
         all_miners, current_refresh_block=current_refresh,
     )
-    sample_counts, sample_averages, champion_overlap_avgs, terminal_scores = (
+    (
+        sample_counts,
+        sample_averages,
+        champion_overlap_avgs,
+        terminal_scores,
+        sample_details,
+    ) = (
         _split_display_scores(display_map)
     )
     past_champions = await _past_champions_split()
@@ -278,6 +293,7 @@ async def get_current_state() -> Dict[str, Any]:
         # Battle subjects show their live score in af get-rank instead
         # of the (stale) last-decided snapshot's 0.00 placeholder.
         "sample_averages": sample_averages,
+        "sample_details": sample_details,
         # Per-(uid, env) champion-on-overlap avg from the live cache.
         # Used as the per-row threshold basis for currently-battling
         # challengers; absence → CLI falls back to the champion's
