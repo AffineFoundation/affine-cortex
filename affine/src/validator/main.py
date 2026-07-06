@@ -260,14 +260,18 @@ class ValidatorService:
         try:
             # Timeout is less than the 10-min watchdog so a hung set_weights
             # call surfaces here rather than at the watchdog SIGTERM.
-            await asyncio.wait_for(
+            weights_set = await asyncio.wait_for(
                 self.weight_setter.set_weights(
                     weights_data.get("weights", {}),
                     burn_percentage,
                 ),
                 timeout=480,
             )
-            self.update_watchdog("weights set completed")
+            if weights_set:
+                self.update_watchdog("weights set completed")
+            else:
+                logger.error("set_weights completed without setting weights")
+                self.update_watchdog("weights set failed")
         except asyncio.TimeoutError:
             logger.error("set_weights timed out after 480s")
             self.update_watchdog("weights set timeout")
