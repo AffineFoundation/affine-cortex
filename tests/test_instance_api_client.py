@@ -7,6 +7,7 @@ from affine.core.providers.instance_api_client import (
     InstanceAPIClient,
     InstanceAPIConfig,
     InstanceAPIHTTPError,
+    InstanceAPINotFoundError,
 )
 
 
@@ -81,3 +82,55 @@ async def test_delete_reports_non_404_provider_errors(monkeypatch):
     monkeypatch.setattr(client, "_request", fake_request)
 
     assert await client.delete("pod-1") is False
+
+
+@pytest.mark.asyncio
+async def test_renew_raises_not_found_for_provider_404(monkeypatch):
+    client = InstanceAPIClient(
+        InstanceAPIConfig(
+            provider="lium",
+            api_url="https://lium.example.com",
+            renew_path="/pods/{instance_id}/schedule-removal",
+        )
+    )
+
+    async def fake_request(*args, **kwargs):
+        raise InstanceAPIHTTPError(
+            "POST",
+            "/pods/pod-1/schedule-removal",
+            404,
+            '{"message":"Pod not found"}',
+        )
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    with pytest.raises(InstanceAPINotFoundError):
+        await client.renew("pod-1")
+
+
+@pytest.mark.asyncio
+async def test_renew_raises_not_found_for_wrapped_provider_404(monkeypatch):
+    client = InstanceAPIClient(
+        InstanceAPIConfig(
+            provider="lium",
+            api_url="https://lium.example.com",
+            renew_path="/instances/{instance_id}/renew",
+        )
+    )
+
+    async def fake_request(*args, **kwargs):
+        raise InstanceAPIHTTPError(
+            "POST",
+            "/instances/pod-1/renew",
+            500,
+            (
+                '{"error":"LiumHTTPError","message":"POST '
+                '/pods/pod-1/schedule-removal -> 404: '
+                '{\\"message\\":\\"Pod not found\\",\\"status_code\\":404}"}'
+            ),
+        )
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    with pytest.raises(InstanceAPINotFoundError):
+        await client.renew("pod-1")

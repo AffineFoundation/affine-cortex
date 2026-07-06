@@ -631,6 +631,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 result = LiumClient().renew(parts[1])
                 self._send(200, result)
+            except LiumHTTPError as e:
+                if e.status_code == 404:
+                    self._send(
+                        404,
+                        {"error": type(e).__name__, "message": str(e)},
+                    )
+                    return
+                self._send(500, {"error": type(e).__name__, "message": str(e)})
             except Exception as e:
                 self._send(500, {"error": type(e).__name__, "message": str(e)})
             return

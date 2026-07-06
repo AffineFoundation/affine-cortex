@@ -5,6 +5,7 @@ import pytest
 from affine.core.providers.instance_api_client import (
     InstanceAPIConfig,
     InstanceHandle,
+    InstanceAPINotFoundError,
 )
 from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.gpu_autoscaler import (
@@ -167,6 +168,7 @@ class _Client:
     renew_expires_at = 0
     create_returns_none_for_names = set()
     delete_returns_false_for_ids = set()
+    renew_not_found_for_ids = set()
 
     def __init__(self, config):
         self.config = config
@@ -197,6 +199,13 @@ class _Client:
 
     async def renew(self, instance_id):
         self.renewed.append(instance_id)
+        if instance_id in self.renew_not_found_for_ids:
+            raise InstanceAPINotFoundError(
+                "POST",
+                f"/instances/{instance_id}/renew",
+                500,
+                "Pod not found",
+            )
         return InstanceHandle(
             provider=self.config.provider,
             instance_id=instance_id,
@@ -215,6 +224,7 @@ def _reset_client_state():
     _Client.renew_expires_at = 0
     _Client.create_returns_none_for_names = set()
     _Client.delete_returns_false_for_ids = set()
+    _Client.renew_not_found_for_ids = set()
 
 
 def _config(
@@ -1068,6 +1078,55 @@ async def test_renews_busy_managed_endpoint_near_lease_expiry():
     assert ep.autoscale_updated_at == 1000
     assert ep.autoscale_lease_expires_at == 5000
     state = await kv.get(STATE_KEY)
+    assert "lease_renew_attempted_at" not in state
+
+
+@pytest.mark.asyncio
+async def test_replaces_active_endpoint_when_renew_reports_provider_reclaimed():
+    _Client.renew_not_found_for_ids = {"old-inst"}
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_created_at=100,
+        autoscale_updated_at=100,
+        autoscale_lease_expires_at=1050,
+        deployment_id="ssh:lium-b200-1:affine-sglang-current",
+        base_url="http://old-lium.example.com:10001/v1",
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    result = await autoscaler.tick(
+        _config(
+            threshold=1,
+            idle_seconds=3600,
+            lease_renew_margin_seconds=60,
+        )
+    )
+
+    assert result.action == "scale-up:1"
+    assert result.active_capacity_count == 0
+    assert result.lease_reclaimed_count == 1
+    assert _Client.renewed == ["old-inst"]
+    assert _Client.create_calls[0][0]["endpoint_name"] == "lium-b200-1"
+    assert ("deactivate", "lium-b200-1", "old-inst") in _Client.events
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.active is True
+    assert ep.autoscale_instance_id == "inst-lium-b200-1"
+    assert ep.deployment_id is None
+    assert ep.base_url is None
+    state = await kv.get(STATE_KEY)
+    assert state["last_lease_reclaimed_count"] == 1
     assert "lease_renew_attempted_at" not in state
 
 

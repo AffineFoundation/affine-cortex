@@ -39,6 +39,10 @@ class InstanceAPIHTTPError(InstanceAPIError):
         super().__init__(f"{method} {path} -> HTTP {status_code}: {text[:400]}")
 
 
+class InstanceAPINotFoundError(InstanceAPIHTTPError):
+    """Provider reports that the managed instance no longer exists."""
+
+
 class InstanceAPITimeoutError(InstanceAPIError):
     pass
 
@@ -296,6 +300,30 @@ class InstanceAPIClient:
                 json=payload,
                 timeout=self.config.timeout_sec,
             )
+        except InstanceAPIHTTPError as e:
+            if _instance_not_found_error(e):
+                logger.warning(
+                    "gpu-autoscaler: provider=%s renew found missing "
+                    "instance=%s: %s",
+                    self.config.provider,
+                    instance_id,
+                    e,
+                )
+                raise InstanceAPINotFoundError(
+                    e.method,
+                    e.path,
+                    e.status_code,
+                    e.text,
+                ) from e
+            logger.warning(
+                "gpu-autoscaler: provider=%s renew failed for instance=%s: "
+                "%s: %s",
+                self.config.provider,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            return None
         except InstanceAPIError as e:
             logger.warning(
                 "gpu-autoscaler: provider=%s renew failed for instance=%s: "
@@ -425,6 +453,21 @@ def _int_value(value: Any) -> int:
         return int(value or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _instance_not_found_error(error: InstanceAPIHTTPError) -> bool:
+    if error.status_code == 404:
+        return True
+    text = (error.text or "").lower()
+    return (
+        "pod not found" in text
+        or "instance not found" in text
+        or (
+            "not found" in text
+            and "status_code" in text
+            and "404" in text
+        )
+    )
 
 
 def _json_path(payload: Mapping[str, Any], path: str) -> Any:
