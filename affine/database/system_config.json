@@ -47,11 +47,11 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": false,
       "sampling": {
-        "sampling_count": 30,
+        "sampling_count": 100,
         "dataset_range": [
           [
             0,
-            100
+            1680
           ]
         ],
         "sampling_mode": "latest",
