@@ -97,3 +97,81 @@ async def test_run_iteration_marks_failed_when_set_weights_returns_false():
     await ValidatorService.run_iteration(harness)
 
     assert harness.watchdog_updates[-1] == "weights set failed"
+
+
+class _FakeWindowSubtensor:
+    def __init__(self, current_block: int, last_update: int, rate_limit: int):
+        self.current_block = current_block
+        self.last_update = last_update
+        self.rate_limit = rate_limit
+        self.waited_blocks = []
+
+    async def get_current_block(self):
+        return self.current_block
+
+    async def wait_for_block(self, block):
+        self.waited_blocks.append(block)
+        self.current_block = block
+
+    async def get_uid_for_hotkey_on_subnet(self, hotkey, netuid):
+        return 0
+
+    async def blocks_since_last_update(self, netuid, uid):
+        return self.current_block - self.last_update
+
+    async def weights_rate_limit(self, netuid):
+        return self.rate_limit
+
+
+class _WindowHarness:
+    running = True
+    netuid = 120
+    wallet = SimpleNamespace(
+        hotkey=SimpleNamespace(ss58_address="test-hotkey")
+    )
+
+    def __init__(self):
+        self.block_updates = []
+
+    def update_block_progress(self, block_number: int):
+        self.block_updates.append(block_number)
+
+
+@pytest.mark.asyncio
+async def test_wait_for_next_window_waits_for_chain_rate_limit():
+    harness = _WindowHarness()
+    subtensor = _FakeWindowSubtensor(
+        current_block=179,
+        last_update=120,
+        rate_limit=100,
+    )
+
+    block = await ValidatorService.wait_for_next_window(
+        harness,
+        subtensor,
+        interval_blocks=180,
+    )
+
+    assert block == 221
+    assert subtensor.waited_blocks[0] == 180
+    assert subtensor.waited_blocks[-1] == 221
+    assert harness.block_updates[-1] == 221
+
+
+@pytest.mark.asyncio
+async def test_wait_for_next_window_returns_when_rate_limit_satisfied():
+    harness = _WindowHarness()
+    subtensor = _FakeWindowSubtensor(
+        current_block=179,
+        last_update=70,
+        rate_limit=100,
+    )
+
+    block = await ValidatorService.wait_for_next_window(
+        harness,
+        subtensor,
+        interval_blocks=180,
+    )
+
+    assert block == 180
+    assert subtensor.waited_blocks == [180]
