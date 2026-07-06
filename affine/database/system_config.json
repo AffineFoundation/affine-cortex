@@ -8,7 +8,12 @@
       "sampling": {
         "sampling_count": 200,
         "priority": 1,
-        "dataset_range": [[0, 5000]],
+        "dataset_range": [
+          [
+            0,
+            5000
+          ]
+        ],
         "sampling_mode": "latest",
         "dataset_range_source": {
           "url": "https://pub-7882418a56434a479bf9a7febd660b36.r2.dev/bugs/metadata.json",
@@ -23,7 +28,12 @@
       "enabled_for_scoring": false,
       "sampling": {
         "sampling_count": 200,
-        "dataset_range": [[0, 1000]],
+        "dataset_range": [
+          [
+            0,
+            1000
+          ]
+        ],
         "sampling_mode": "latest",
         "dataset_range_source": {
           "url": "https://pub-4546777cb27840ec91b892f19eb5742b.r2.dev/metadata.json",
@@ -38,11 +48,16 @@
       "enabled_for_scoring": false,
       "sampling": {
         "sampling_count": 30,
-        "dataset_range": [[0, 100]],
+        "dataset_range": [
+          [
+            0,
+            100
+          ]
+        ],
         "sampling_mode": "latest",
         "dataset_range_source": {
           "url": "https://pub-f6e8aaa82d31450daad5b16e3ca040b1.r2.dev/metadata.json",
-          "field": "tasks.completed_up_to",
+          "field": "tasks.staged_released",
           "range_type": "zero_to_value"
         }
       }
@@ -53,7 +68,12 @@
       "enabled_for_scoring": false,
       "sampling": {
         "sampling_count": 300,
-        "dataset_range": [[0, 78060000]],
+        "dataset_range": [
+          [
+            0,
+            78060000
+          ]
+        ],
         "sampling_mode": "random"
       }
     },
@@ -63,7 +83,16 @@
       "enabled_for_scoring": false,
       "sampling": {
         "sampling_count": 200,
-        "dataset_range": [[100000000, 300000000], [400000000, 500000000]],
+        "dataset_range": [
+          [
+            100000000,
+            300000000
+          ],
+          [
+            400000000,
+            500000000
+          ]
+        ],
         "sampling_mode": "random"
       }
     },
@@ -73,7 +102,12 @@
       "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 300,
-        "dataset_range": [[0, 1000000000]],
+        "dataset_range": [
+          [
+            0,
+            1000000000
+          ]
+        ],
         "sampling_mode": "random"
       }
     },
@@ -84,7 +118,12 @@
       "sampling": {
         "sampling_count": 100,
         "priority": 1,
-        "dataset_range": [[0, 1000000000]],
+        "dataset_range": [
+          [
+            0,
+            1000000000
+          ]
+        ],
         "sampling_mode": "random"
       }
     },
@@ -94,7 +133,12 @@
       "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 300,
-        "dataset_range": [[0, 132000000]],
+        "dataset_range": [
+          [
+            0,
+            132000000
+          ]
+        ],
         "sampling_mode": "random"
       }
     }
