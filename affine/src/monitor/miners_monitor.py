@@ -40,7 +40,10 @@ from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.anticopy.threshold import load_anticopy_config
-from affine.src.anticopy.tokenizer_sig import compute_tokenizer_signature
+from affine.src.anticopy.tokenizer_sig import (
+    TOKENIZER_SIG_TRANSIENT_FETCH_FAILED,
+    compute_tokenizer_signature,
+)
 from affine.utils.model_size_checker import (
     QWEN36_ONLY_MODEL_TYPES,
     check_model_size,
@@ -204,8 +207,8 @@ class MinersMonitor:
         # (model, revision) -> (cached result or None, fetched_at)
         self._weights_cache: Dict[Tuple[str, str], Tuple[Optional[Tuple[str, str, str]], float]] = {}
         self._weights_ttl_sec = 1800
-        # (model, revision) -> (tokenizer_sig_or_empty, fetched_at)
-        self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
+        # (model, revision) -> (tokenizer_sig_or_empty, reason, fetched_at)
+        self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, str, float]] = {}
         self._background_task: Optional[asyncio.Task] = None
 
     # ---- lifecycle -------------------------------------------------------
@@ -417,6 +420,28 @@ class MinersMonitor:
         except Exception:
             pass
 
+        def _preserve_prior_valid(reason: str) -> bool:
+            if not (
+                _same_model_revision(existing, model, revision)
+                and _truthy((existing or {}).get("is_valid"))
+            ):
+                return False
+            info.is_valid = True
+            info.invalid_reason = None
+            info.permanent_invalid = False
+            info.terminate_stats = False
+            info.model_hash = str(
+                info.model_hash or (existing or {}).get("model_hash") or ""
+            )
+            info.model_type = str(
+                info.model_type or (existing or {}).get("model_type") or ""
+            )
+            logger.warning(
+                f"[MinersMonitor] preserving prior valid state for "
+                f"uid={uid} after transient validation failure: {reason}"
+            )
+            return True
+
         # Multi-commit rule: a hotkey is only allowed one commit on this subnet.
         if uid != 0 and commit_count > 1 and block >= MULTI_COMMIT_ENFORCE_BLOCK:
             info.mark_invalid(
@@ -458,6 +483,8 @@ class MinersMonitor:
             )
             return info
         if not model_info:
+            if _preserve_prior_valid("hf_model_fetch_failed"):
+                return info
             info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
         model_hash, hf_revision, duplicate_source = model_info
@@ -622,10 +649,17 @@ class MinersMonitor:
                 champion_sig = ""
 
         if uid != 0 and anticopy_cfg is not None and anticopy_cfg.enabled and champion_sig:
-            cand_sig = await self._get_tokenizer_sig(model, revision)
+            cand_sig, sig_reason = await self._get_tokenizer_sig(model, revision)
             info.tokenizer_sig = cand_sig
             if not cand_sig:
-                info.mark_invalid("tokenizer_sig_fetch_failed", permanent=False)
+                reason = sig_reason or "fetch_failed"
+                invalid_reason = f"tokenizer_sig_{reason}"
+                if (
+                    reason == TOKENIZER_SIG_TRANSIENT_FETCH_FAILED
+                    and _preserve_prior_valid(invalid_reason)
+                ):
+                    return info
+                info.mark_invalid(invalid_reason, permanent=False)
                 return info
             if cand_sig != champion_sig:
                 info.mark_invalid(
@@ -693,24 +727,25 @@ class MinersMonitor:
             logger.debug(f"[MinersMonitor] load_anticopy_config failed: {e}")
             return None
 
-    async def _get_tokenizer_sig(self, model_id: str, revision: str) -> str:
-        """Cached sha256 of the candidate's ``tokenizer.json``. Empty
-        string means HF couldn't supply it (treat as transient)."""
+    async def _get_tokenizer_sig(self, model_id: str, revision: str) -> Tuple[str, str]:
+        """Cached sha256 of the candidate tokenizer plus failure reason."""
         key = (model_id, revision)
         now = time.time()
         cached = self._tokenizer_sig_cache.get(key)
-        if cached and now - cached[1] < self._weights_ttl_sec:
-            return cached[0]
+        if cached and now - cached[2] < self._weights_ttl_sec:
+            return cached[0], cached[1]
         try:
-            sig, _src = await compute_tokenizer_signature(model_id, revision)
+            sig, _src, reason = await compute_tokenizer_signature(model_id, revision)
         except Exception as e:
             logger.debug(
                 f"[MinersMonitor] tokenizer_sig fetch failed {model_id}@{revision[:8]}: {e}"
             )
             sig = None
+            reason = TOKENIZER_SIG_TRANSIENT_FETCH_FAILED
         sig_str = sig or ""
-        self._tokenizer_sig_cache[key] = (sig_str, now)
-        return sig_str
+        reason_str = reason or ""
+        self._tokenizer_sig_cache[key] = (sig_str, reason_str, now)
+        return sig_str, reason_str
 
     async def _get_model_info(
         self, model_id: str, revision: str
