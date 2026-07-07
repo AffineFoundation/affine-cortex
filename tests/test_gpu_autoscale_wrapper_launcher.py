@@ -20,11 +20,12 @@ def _load_launcher():
     return module
 
 
-def test_default_provider_is_targon(monkeypatch):
+def test_default_provider_starts_all_wrappers(monkeypatch):
     launcher = _load_launcher()
     monkeypatch.delenv(launcher.PROVIDER_ENV, raising=False)
 
-    assert launcher.selected_provider() == "targon"
+    assert launcher.selected_providers() == ("lium", "targon")
+    assert launcher.wrapper_script("lium").name == "lium_autoscale_wrapper.py"
     assert launcher.wrapper_script("targon").name == "targon_autoscale_wrapper.py"
 
 
@@ -32,15 +33,26 @@ def test_selects_lium_provider(monkeypatch):
     launcher = _load_launcher()
     monkeypatch.setenv(launcher.PROVIDER_ENV, " LIUM ")
 
-    assert launcher.selected_provider() == "lium"
+    assert launcher.selected_providers() == ("lium",)
     assert launcher.wrapper_script("lium").name == "lium_autoscale_wrapper.py"
 
 
-def test_invalid_provider_is_rejected():
+def test_selects_multiple_providers(monkeypatch):
+    launcher = _load_launcher()
+    monkeypatch.setenv(launcher.PROVIDER_ENV, "targon, lium, targon")
+
+    assert launcher.selected_providers() == ("targon", "lium")
+
+
+def test_invalid_provider_is_rejected(monkeypatch):
     launcher = _load_launcher()
 
     with pytest.raises(ValueError, match="must be one of"):
         launcher.wrapper_script("unknown")
+
+    monkeypatch.setenv(launcher.PROVIDER_ENV, "unknown")
+    with pytest.raises(ValueError, match="must be one of"):
+        launcher.selected_providers()
 
 
 def test_main_execs_selected_wrapper(monkeypatch):
@@ -60,3 +72,21 @@ def test_main_execs_selected_wrapper(monkeypatch):
     assert calls
     assert calls[0][0] == sys.executable
     assert calls[0][1][1].endswith("lium_autoscale_wrapper.py")
+
+
+def test_main_runs_all_wrappers_by_default(monkeypatch):
+    launcher = _load_launcher()
+    calls = []
+
+    def fake_run_many(providers):
+        calls.append(providers)
+        return 0
+
+    monkeypatch.delenv(launcher.PROVIDER_ENV, raising=False)
+    monkeypatch.setattr(launcher, "run_many", fake_run_many)
+
+    with pytest.raises(SystemExit) as exc:
+        launcher.main()
+
+    assert exc.value.code == 0
+    assert calls == [("lium", "targon")]

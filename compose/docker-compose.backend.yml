@@ -75,10 +75,10 @@ services:
       - /var/log/affine/gpu_autoscaler:/var/log/affine/gpu_autoscaler
     command: ["-v", "servers", "gpu-autoscaler"]
 
-  # GPU Autoscale Provider Wrapper — adapts the selected GPU platform to the
-  # small provider API consumed by gpu_autoscaler. Set
-  # AFFINE_GPU_AUTOSCALE_WRAPPER_PROVIDER=targon|lium in .env. Defaults to
-  # Targon for backwards compatibility with the current production stack.
+  # GPU Autoscale Provider Wrapper — adapts GPU platforms to the small provider
+  # API consumed by gpu_autoscaler. One container starts both Lium and Targon
+  # listeners by default; set AFFINE_GPU_AUTOSCALE_WRAPPER_PROVIDER=targon|lium
+  # in .env only for single-provider debugging/deployments.
   gpu_autoscale_wrapper:
     image: affinefoundation/affine:latest
     container_name: affine-gpu-autoscale-wrapper
