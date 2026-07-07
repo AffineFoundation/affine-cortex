@@ -504,6 +504,13 @@ BURN_UID = -1
 _SPLIT_SNAPSHOT_SCAN_LIMIT = 500
 
 
+def _snapshot_block_number(snapshot: Dict[str, Any]) -> int:
+    try:
+        return int(snapshot.get("block_number"))
+    except (TypeError, ValueError):
+        return -1
+
+
 def _is_system_miner_uid(uid: int) -> bool:
     return uid > 1000
 
@@ -698,8 +705,13 @@ async def compute_split_payees(
     )
     if not snapshots:
         return None
-    latest_block = snapshots[0].get("block_number")
-    if not (isinstance(latest_block, int) and latest_block >= activation_block):
+    snapshots = sorted(
+        snapshots,
+        key=_snapshot_block_number,
+        reverse=True,
+    )
+    latest_block = _snapshot_block_number(snapshots[0])
+    if latest_block < activation_block:
         return None
 
     champion_count = max(
