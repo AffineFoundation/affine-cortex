@@ -442,6 +442,40 @@ class MinersMonitor:
             )
             return True
 
+        async def _apply_anticopy_copy_verdict(anticopy_cfg) -> bool:
+            if (
+                uid == 0
+                or anticopy_cfg is None
+                or not anticopy_cfg.enabled
+            ):
+                return False
+            try:
+                score_row = await self.anticopy_scores_dao.get_score(
+                    hotkey, revision,
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[MinersMonitor] anticopy score lookup failed "
+                    f"{hotkey[:10]}: {e}"
+                )
+                score_row = None
+            if not score_row or not (score_row.get("verdict_copy_of") or "").strip():
+                return False
+
+            origin_model = (
+                score_row.get("closest_peer_model") or "unknown"
+            )
+            dm = score_row.get("decision_median")
+            try:
+                dm_str = f"{float(dm):.4f}"
+            except (TypeError, ValueError):
+                dm_str = "?"
+            info.mark_invalid(
+                f"anticopy_copy:copied_from={origin_model},dm={dm_str}",
+                permanent=False,
+            )
+            return True
+
         # Multi-commit rule: a hotkey is only allowed one commit on this subnet.
         if uid != 0 and commit_count > 1 and block >= MULTI_COMMIT_ENFORCE_BLOCK:
             info.mark_invalid(
@@ -484,6 +518,8 @@ class MinersMonitor:
             return info
         if not model_info:
             if _preserve_prior_valid("hf_model_fetch_failed"):
+                anticopy_cfg = await self._safe_load_anticopy_config()
+                await _apply_anticopy_copy_verdict(anticopy_cfg)
                 return info
             info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
@@ -658,6 +694,7 @@ class MinersMonitor:
                     reason == TOKENIZER_SIG_TRANSIENT_FETCH_FAILED
                     and _preserve_prior_valid(invalid_reason)
                 ):
+                    await _apply_anticopy_copy_verdict(anticopy_cfg)
                     return info
                 info.mark_invalid(invalid_reason, permanent=False)
                 return info
@@ -681,29 +718,7 @@ class MinersMonitor:
             and anticopy_cfg is not None
             and anticopy_cfg.enabled
         ):
-            try:
-                score_row = await self.anticopy_scores_dao.get_score(
-                    hotkey, revision,
-                )
-            except Exception as e:
-                logger.debug(
-                    f"[MinersMonitor] anticopy score lookup failed "
-                    f"{hotkey[:10]}: {e}"
-                )
-                score_row = None
-            if score_row and (score_row.get("verdict_copy_of") or "").strip():
-                origin_model = (
-                    score_row.get("closest_peer_model") or "unknown"
-                )
-                dm = score_row.get("decision_median")
-                try:
-                    dm_str = f"{float(dm):.4f}"
-                except (TypeError, ValueError):
-                    dm_str = "?"
-                info.mark_invalid(
-                    f"anticopy_copy:copied_from={origin_model},dm={dm_str}",
-                    permanent=False,
-                )
+            if await _apply_anticopy_copy_verdict(anticopy_cfg):
                 return info
 
         info.is_valid = True

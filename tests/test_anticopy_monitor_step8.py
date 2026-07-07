@@ -353,6 +353,48 @@ async def test_transient_hf_fetch_failure_preserves_previously_valid_miner(monke
 
 
 @pytest.mark.asyncio
+async def test_transient_hf_fetch_failure_does_not_bypass_copy_verdict(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(
+        cfg_enabled=True,
+        score_row={
+            "hotkey": "hk_hf_copy_xyz",
+            "revision": "rev",
+            "verdict_copy_of": "hk_origin_xyz",
+            "closest_peer_model": "victim-org/Affine-original",
+            "decision_median": 0.0123,
+        },
+    )
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_hf_copy_xyz",
+        "revision": "rev",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+
+    async def _transient_hf_failure(_model, _revision):
+        return None
+
+    monitor._get_model_info = _transient_hf_failure
+
+    info = await monitor._validate_miner(
+        uid=238, hotkey="hk_hf_copy_xyz",
+        model="org/affine-model-hk_hf_copy_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.invalid_reason.startswith("anticopy_copy:")
+    assert "victim-org/Affine-original" in info.invalid_reason
+    assert info.permanent_invalid is False
+    assert info.terminate_stats is False
+
+
+@pytest.mark.asyncio
 async def test_transient_tokenizer_sig_failure_preserves_previously_valid_miner(monkeypatch):
     monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
     monitor = _build_monitor(cfg_enabled=True, champion_sig="champ_sig", cand_sig="")
@@ -386,6 +428,54 @@ async def test_transient_tokenizer_sig_failure_preserves_previously_valid_miner(
     assert info.invalid_reason is None
     assert info.model_hash == "hash_abc"
     assert info.model_type == "qwen3_5_moe"
+    assert info.permanent_invalid is False
+    assert info.terminate_stats is False
+
+
+@pytest.mark.asyncio
+async def test_transient_tokenizer_sig_failure_does_not_bypass_copy_verdict(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(
+        cfg_enabled=True,
+        champion_sig="champ_sig",
+        cand_sig="",
+        score_row={
+            "hotkey": "hk_tokenizer_copy_xyz",
+            "revision": "rev",
+            "verdict_copy_of": "hk_origin_xyz",
+            "closest_peer_model": "victim-org/Affine-original",
+            "decision_median": 0.0123,
+        },
+    )
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_tokenizer_copy_xyz",
+        "revision": "rev",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+    monitor._get_model_info = _hot_get_model_info
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_model_size",
+        _async_pass_size,
+    )
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_template_safety",
+        _async_safe,
+    )
+
+    info = await monitor._validate_miner(
+        uid=255, hotkey="hk_tokenizer_copy_xyz",
+        model="org/affine-model-hk_tokenizer_copy_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.invalid_reason.startswith("anticopy_copy:")
+    assert "victim-org/Affine-original" in info.invalid_reason
     assert info.permanent_invalid is False
     assert info.terminate_stats is False
 
