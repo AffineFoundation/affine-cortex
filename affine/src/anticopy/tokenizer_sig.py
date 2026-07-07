@@ -13,6 +13,11 @@ import os
 from typing import Optional, Tuple
 
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import (
+    GatedRepoError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 
 
 # Files we'll try in order. The first one that exists at the given
@@ -21,6 +26,8 @@ from huggingface_hub import HfApi, hf_hub_download
 # ``tokenizer.model`` is the SentencePiece fallback some older
 # checkpoints still use.
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer.model")
+TOKENIZER_SIG_REPO_INACCESSIBLE = "repo_inaccessible"
+TOKENIZER_SIG_REVISION_NOT_FOUND = "revision_not_found"
 TOKENIZER_SIG_MISSING_ARTIFACT = "missing_tokenizer_artifact"
 TOKENIZER_SIG_PARSE_FAILED = "tokenizer_parse_failed"
 TOKENIZER_SIG_TRANSIENT_FETCH_FAILED = "transient_fetch_failed"
@@ -61,6 +68,10 @@ def compute_tokenizer_signature_sync(
         info = api.repo_info(
             repo_id=model_id, repo_type="model", revision=revision, files_metadata=True,
         )
+    except RevisionNotFoundError:
+        return None, "", TOKENIZER_SIG_REVISION_NOT_FOUND
+    except (GatedRepoError, RepositoryNotFoundError):
+        return None, "", TOKENIZER_SIG_REPO_INACCESSIBLE
     except Exception:
         return None, "", TOKENIZER_SIG_TRANSIENT_FETCH_FAILED
 

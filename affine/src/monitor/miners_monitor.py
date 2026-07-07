@@ -29,6 +29,7 @@ from huggingface_hub.errors import (
     DisabledRepoError,
     GatedRepoError,
     RepositoryNotFoundError,
+    RevisionNotFoundError,
 )
 
 from affine.core.setup import logger
@@ -850,6 +851,9 @@ class MinersMonitor:
         except RepositoryNotFoundError as e:
             self._weights_cache.pop(key, None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
+        except RevisionNotFoundError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_revision_not_found", e)
         except Exception as e:
             logger.warning(
                 f"[MinersMonitor] HF fetch failed {model_id}@{revision[:8]}: "
@@ -913,6 +917,9 @@ class MinersMonitor:
         except RepositoryNotFoundError as e:
             self._weights_cache.pop((model_id, revision), None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
+        except RevisionNotFoundError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(model_id, revision, "hf_revision_not_found", e)
         except Exception as e:
             logger.warning(
                 f"[MinersMonitor] HF access check failed {model_id}@{revision[:8]}: "

@@ -9,9 +9,15 @@ invalid. These tests cover that single remaining gate.
 
 from __future__ import annotations
 
+import httpx
 import pytest
+from huggingface_hub.errors import RevisionNotFoundError
 
 import affine.database.client as db_client
+from affine.src.anticopy import tokenizer_sig as tokenizer_sig_mod
+from affine.src.anticopy.tokenizer_sig import (
+    TOKENIZER_SIG_REVISION_NOT_FOUND,
+)
 from affine.src.anticopy.threshold import AntiCopyConfig
 from affine.src.monitor.miners_monitor import MinersMonitor
 
@@ -86,6 +92,18 @@ class _FakeMinerDAO:
 
     async def get_miner_by_uid(self, _uid):
         return self.row
+
+
+def _revision_not_found_error() -> RevisionNotFoundError:
+    request = httpx.Request(
+        "GET",
+        "https://huggingface.co/api/models/org/model/revision/missing",
+    )
+    response = httpx.Response(404, request=request)
+    return RevisionNotFoundError(
+        "Revision not found",
+        response=response,
+    )
 
 
 def _build_monitor(
@@ -395,6 +413,45 @@ async def test_transient_hf_fetch_failure_does_not_bypass_copy_verdict(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_revision_not_found_does_not_preserve_previously_valid_miner(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(cfg_enabled=True)
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_revision_missing_xyz",
+        "revision": "missing",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+
+    class _RevisionMissingHfApi:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def repo_info(self, *args, **kwargs):
+            raise _revision_not_found_error()
+
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.HfApi",
+        _RevisionMissingHfApi,
+    )
+
+    info = await monitor._validate_miner(
+        uid=238, hotkey="hk_revision_missing_xyz",
+        model="org/affine-model-hk_revision_missing_xyz",
+        revision="missing",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.invalid_reason == "hf_revision_not_found"
+    assert info.permanent_invalid is True
+    assert info.terminate_stats is True
+
+
+@pytest.mark.asyncio
 async def test_transient_tokenizer_sig_failure_preserves_previously_valid_miner(monkeypatch):
     monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
     monitor = _build_monitor(cfg_enabled=True, champion_sig="champ_sig", cand_sig="")
@@ -478,6 +535,26 @@ async def test_transient_tokenizer_sig_failure_does_not_bypass_copy_verdict(monk
     assert "victim-org/Affine-original" in info.invalid_reason
     assert info.permanent_invalid is False
     assert info.terminate_stats is False
+
+
+def test_tokenizer_sig_revision_not_found_is_deterministic(monkeypatch):
+    class _RevisionMissingHfApi:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def repo_info(self, *args, **kwargs):
+            raise _revision_not_found_error()
+
+    monkeypatch.setattr(tokenizer_sig_mod, "HfApi", _RevisionMissingHfApi)
+
+    sig, src, reason = tokenizer_sig_mod.compute_tokenizer_signature_sync(
+        "org/model",
+        "missing",
+    )
+
+    assert sig is None
+    assert src == ""
+    assert reason == TOKENIZER_SIG_REVISION_NOT_FOUND
 
 
 @pytest.mark.asyncio
