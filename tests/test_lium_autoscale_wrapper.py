@@ -152,6 +152,36 @@ def test_delete_treats_missing_owned_pod_as_success():
     assert client.delete("pod-1") is True
 
 
+def test_status_returns_normalized_pod_state():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+
+    def request(method, path, **kwargs):
+        assert (method, path) == ("GET", "/pods/pod-1")
+        return {
+            "uid": "pod-1",
+            "status": "RUNNING",
+            "ssh_url": "ssh://root@203.0.113.10:2222",
+            "ports": [
+                {
+                    "port": 10001,
+                    "url": "https://pod-1.example.com",
+                }
+            ],
+            "user_public_key": "ssh-rsa secret",
+        }
+
+    client.request = request
+
+    result = client.status("pod-1")
+
+    assert result["instance_id"] == "pod-1"
+    assert result["status"] == "running"
+    assert result["ssh_url"] == "ssh://root@203.0.113.10:2222"
+    assert result["public_inference_url"] == "https://pod-1.example.com/v1"
+    assert result["raw"]["user_public_key"] == "<redacted>"
+
+
 def test_error_payloads_distinguish_wrapper_and_provider_not_found():
     lium = _load_wrapper()
 

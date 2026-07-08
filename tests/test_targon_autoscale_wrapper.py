@@ -126,6 +126,41 @@ def test_create_adopts_existing_workload_by_name_without_registering(
     assert ("POST", "/workloads/wrk-existing/deploy") not in calls
 
 
+def test_status_returns_normalized_workload_state(monkeypatch):
+    wrapper = _load_wrapper(monkeypatch)
+    calls = []
+
+    def request(self, method, path, **kwargs):
+        calls.append((method, path))
+        if (method, path) == ("GET", "/workloads/wrk-test"):
+            return {"uid": "wrk-test", "name": "affine-autoscale-a"}
+        if (method, path) == ("GET", "/workloads/wrk-test/state"):
+            return {
+                "status": "RUNNING",
+                "ready_replicas": 1,
+                "urls": [
+                    {
+                        "port": 10001,
+                        "url": "https://wrk-test-10001.caas.targon.com",
+                    }
+                ],
+            }
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(wrapper.TargonAutoscaleClient, "request", request)
+
+    result = wrapper.TargonAutoscaleClient().status("wrk-test")
+
+    assert result["instance_id"] == "wrk-test"
+    assert result["status"] == "running"
+    assert result["ssh_url"] == "ssh://wrk-test@ssh.deployments.targon.com:22"
+    assert result["public_inference_url"] == "https://wrk-test-10001.caas.targon.com/v1"
+    assert calls == [
+        ("GET", "/workloads/wrk-test"),
+        ("GET", "/workloads/wrk-test/state"),
+    ]
+
+
 def test_create_deploys_adopted_workload_when_left_registered(
     monkeypatch,
 ):

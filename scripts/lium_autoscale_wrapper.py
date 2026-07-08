@@ -362,6 +362,19 @@ class LiumClient:
             raise
         return pod if isinstance(pod, dict) else {}
 
+    def status(self, uid: str) -> dict:
+        pod = self.request("GET", f"/pods/{uid}")
+        return {
+            "instance_id": uid,
+            "lease_expires_at": _lease_expires_at(pod),
+            "status": _status(pod),
+            "ssh_url": _ssh_url(pod),
+            "public_inference_url": (
+                _openai_endpoint(PUBLIC_INFERENCE_URL) or _public_url(pod, PORT)
+            ),
+            "raw": _redacted_pod(pod),
+        }
+
     def delete(self, uid: str, *, expected_purpose: str = "") -> bool:
         return self._delete_owned_pod(uid, expected_purpose=expected_purpose)
 
@@ -582,6 +595,9 @@ def _port_items(data: Mapping[str, Any]) -> List[dict]:
 
 
 def _ssh_url(data: Mapping[str, Any]) -> str:
+    direct = str(data.get("ssh_url") or "").strip()
+    if direct:
+        return direct
     parsed = _parse_ssh_cmd(data)
     ssh = data.get("ssh") if isinstance(data.get("ssh"), dict) else {}
     network = data.get("network") if isinstance(data.get("network"), dict) else {}
@@ -718,7 +734,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"ok": True})
             return
-        self._send(404, _route_not_found("GET", self.path))
+        if not self._authorized():
+            self._send(401, _wrapper_error("unauthorized", "unauthorized"))
+            return
+        parsed = urlparse(self.path)
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) == 2 and parts[0] == "instances":
+            try:
+                result = LiumClient().status(parts[1])
+                self._send(200, result)
+            except Exception as e:
+                self._send(*_error_response(e))
+            return
+        self._send(404, _route_not_found("GET", parsed.path))
 
     def do_POST(self) -> None:
         if not self._authorized():

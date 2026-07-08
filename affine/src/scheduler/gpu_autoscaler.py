@@ -51,6 +51,7 @@ DEFAULT_PENDING_THRESHOLD = 5
 DEFAULT_MAX_GPU_DOWN_WAIT_SECONDS = 12 * 60 * 60
 DEFAULT_LEASE_RENEW_MARGIN_SECONDS = 60 * 60
 DEFAULT_LEASE_RENEW_COOLDOWN_SECONDS = 5 * 60
+DEFAULT_ENDPOINT_HEALTH_CHECK_INTERVAL_SECONDS = 5 * 60
 DEFAULT_MANUAL_REPLACEMENT_TTL_SECONDS = 60 * 60
 MAX_PENDING_PEEK = 10_000
 
@@ -113,6 +114,9 @@ class GPUAutoscalerConfig:
     lease_duration_seconds: int = 0
     lease_renew_margin_seconds: int = DEFAULT_LEASE_RENEW_MARGIN_SECONDS
     lease_renew_cooldown_seconds: int = DEFAULT_LEASE_RENEW_COOLDOWN_SECONDS
+    endpoint_health_check_interval_seconds: int = (
+        DEFAULT_ENDPOINT_HEALTH_CHECK_INTERVAL_SECONDS
+    )
     min_instances: int = 0
     max_instances: int = 1
     dry_run: bool = False
@@ -198,6 +202,15 @@ class GPUAutoscalerConfig:
                     default=DEFAULT_LEASE_RENEW_COOLDOWN_SECONDS,
                 ),
             ),
+            endpoint_health_check_interval_seconds=max(
+                0,
+                _seconds_value(
+                    data,
+                    seconds_keys=("endpoint_health_check_interval_seconds",),
+                    minutes_keys=("endpoint_health_check_interval_minutes",),
+                    default=DEFAULT_ENDPOINT_HEALTH_CHECK_INTERVAL_SECONDS,
+                ),
+            ),
             min_instances=max(0, int(data.get("min_instances") or 0)),
             max_instances=max(0, max_instances),
             dry_run=_bool_value(data.get("dry_run"), default=False),
@@ -253,6 +266,10 @@ class GPUAutoscalerConfig:
             "AFFINE_GPU_AUTOSCALER_LEASE_RENEW_COOLDOWN_SECONDS",
             self.lease_renew_cooldown_seconds,
         )
+        health_check_interval = _env_int(
+            "AFFINE_GPU_AUTOSCALER_ENDPOINT_HEALTH_CHECK_INTERVAL_SECONDS",
+            self.endpoint_health_check_interval_seconds,
+        )
         return replace(
             self,
             enabled=enabled,
@@ -264,6 +281,7 @@ class GPUAutoscalerConfig:
             lease_duration_seconds=max(0, lease_duration),
             lease_renew_margin_seconds=max(0, lease_margin),
             lease_renew_cooldown_seconds=max(0, lease_cooldown),
+            endpoint_health_check_interval_seconds=max(0, health_check_interval),
             max_instances=max(0, min(self.max_instances, len(self.slots or []))),
         )
 
@@ -316,12 +334,21 @@ class AutoscalerTickResult:
     gpu_down_for_sec: int = 0
     lease_renewed_count: int = 0
     lease_reclaimed_count: int = 0
+    endpoint_health_checked_count: int = 0
+    endpoint_health_reclaimed_count: int = 0
 
 
 @dataclass(frozen=True)
 class LeaseRenewResult:
     renewed_count: int = 0
     reclaimed_count: int = 0
+
+
+@dataclass(frozen=True)
+class EndpointHealthCheckResult:
+    checked_count: int = 0
+    reclaimed_count: int = 0
+    reclaimed_endpoint_names: set = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -392,12 +419,24 @@ class GPUAutoscaler:
         )
         idle_for = now - int(state.get("last_busy_at", now) or now)
         action = "none"
-        lease_result = await self._renew_busy_expiring_leases(
+        health_result = await self._check_active_endpoint_health(
             config,
             snapshot,
             state,
             now,
             blocked_slot_names=replacement_slots,
+        )
+        if health_result.reclaimed_count:
+            action = f"endpoint-health-reclaimed:{health_result.reclaimed_count}"
+
+        lease_result = await self._renew_busy_expiring_leases(
+            config,
+            snapshot,
+            state,
+            now,
+            blocked_slot_names=(
+                set(replacement_slots) | set(health_result.reclaimed_endpoint_names)
+            ),
         )
         if lease_result.reclaimed_count:
             action = f"endpoint-reclaimed:{lease_result.reclaimed_count}"
@@ -406,7 +445,9 @@ class GPUAutoscaler:
 
         effective_active_capacity_count = max(
             0,
-            snapshot.active_capacity_count - lease_result.reclaimed_count,
+            snapshot.active_capacity_count
+            - lease_result.reclaimed_count
+            - health_result.reclaimed_count,
         )
 
         if desired > effective_active_capacity_count:
@@ -460,13 +501,16 @@ class GPUAutoscaler:
                 "last_force_start_after_restart": force_start,
                 "last_lease_renewed_count": lease_result.renewed_count,
                 "last_lease_reclaimed_count": lease_result.reclaimed_count,
+                "last_endpoint_health_checked_count": health_result.checked_count,
+                "last_endpoint_health_reclaimed_count": health_result.reclaimed_count,
             }
         )
         await self._kv.set(STATE_KEY, state)
         logger.info(
             "gpu-autoscaler: action=%s pending=%s active_capacity=%s desired=%s "
             "idle=%s idle_for=%ss gpu_down_for=%ss force_start=%s "
-            "manual_replacement=%s lease_reclaimed=%s",
+            "manual_replacement=%s lease_reclaimed=%s health_checked=%s "
+            "health_reclaimed=%s",
             action,
             snapshot.pending_count,
             effective_active_capacity_count,
@@ -477,6 +521,8 @@ class GPUAutoscaler:
             force_start,
             ",".join(sorted(replacement_slots)) or "-",
             lease_result.reclaimed_count,
+            health_result.checked_count,
+            health_result.reclaimed_count,
         )
         return AutoscalerTickResult(
             action=action,
@@ -488,6 +534,8 @@ class GPUAutoscaler:
             gpu_down_for_sec=gpu_down_for_sec,
             lease_renewed_count=lease_result.renewed_count,
             lease_reclaimed_count=lease_result.reclaimed_count,
+            endpoint_health_checked_count=health_result.checked_count,
+            endpoint_health_reclaimed_count=health_result.reclaimed_count,
         )
 
     def _should_force_start_after_restart(
@@ -752,6 +800,107 @@ class GPUAutoscaler:
         if not endpoint.notes:
             endpoint.notes = f"autoscaled via {slot.provider}"
         return endpoint
+
+    async def _check_active_endpoint_health(
+        self,
+        config: GPUAutoscalerConfig,
+        snapshot: AutoscalerSnapshot,
+        state: Dict[str, Any],
+        now: int,
+        *,
+        blocked_slot_names: set,
+    ) -> EndpointHealthCheckResult:
+        if not snapshot.active_managed:
+            return EndpointHealthCheckResult()
+        if config.endpoint_health_check_interval_seconds <= 0:
+            return EndpointHealthCheckResult()
+
+        attempts = dict(state.get("endpoint_health_checked_at") or {})
+        changed_attempts = False
+        checked = 0
+        reclaimed = 0
+        reclaimed_names = set()
+        for endpoint in snapshot.active_managed:
+            if endpoint.name in blocked_slot_names:
+                continue
+            last_attempt = int(attempts.get(endpoint.name) or 0)
+            if (
+                last_attempt
+                and now - last_attempt < config.endpoint_health_check_interval_seconds
+            ):
+                continue
+            attempts[endpoint.name] = now
+            changed_attempts = True
+            outcome = await self._check_endpoint_health(config, endpoint)
+            if outcome == "skipped":
+                attempts.pop(endpoint.name, None)
+                changed_attempts = True
+                continue
+            checked += 1
+            if outcome == "reclaimed":
+                reclaimed += 1
+                reclaimed_names.add(endpoint.name)
+                attempts.pop(endpoint.name, None)
+                changed_attempts = True
+
+        if changed_attempts:
+            if attempts:
+                state["endpoint_health_checked_at"] = attempts
+            else:
+                state.pop("endpoint_health_checked_at", None)
+        return EndpointHealthCheckResult(
+            checked_count=checked,
+            reclaimed_count=reclaimed,
+            reclaimed_endpoint_names=reclaimed_names,
+        )
+
+    async def _check_endpoint_health(
+        self,
+        config: GPUAutoscalerConfig,
+        endpoint: Endpoint,
+    ) -> str:
+        provider = (endpoint.autoscale_provider or "").lower()
+        provider_config = (config.providers or {}).get(provider)
+        if provider_config is None or not provider_config.status_path:
+            return "skipped"
+        instance_id = endpoint.autoscale_instance_id or ""
+        if not instance_id:
+            logger.warning(
+                "gpu-autoscaler: endpoint=%s has no autoscale_instance_id",
+                endpoint.name,
+            )
+            return "failed"
+        if config.dry_run:
+            logger.info(
+                "gpu-autoscaler: dry-run would check endpoint=%s instance=%s health",
+                endpoint.name,
+                instance_id,
+            )
+            return "healthy"
+
+        client = self._client_factory(provider_config)
+        try:
+            status = await client.status(instance_id)
+        except InstanceAPINotFoundError as e:
+            logger.warning(
+                "gpu-autoscaler: endpoint=%s provider=%s instance=%s was "
+                "missing during health check; deactivating endpoint so "
+                "autoscaler can request replacement: %s",
+                endpoint.name,
+                provider,
+                instance_id,
+                e,
+            )
+            deactivated = await self._deactivate_endpoint(
+                replace(endpoint),
+                instance_id=instance_id,
+                provider=provider,
+                updated_by="gpu-autoscaler:provider-reclaimed",
+            )
+            return "reclaimed" if deactivated else "failed"
+        if status is None:
+            return "failed"
+        return "healthy"
 
     async def _renew_busy_expiring_leases(
         self,

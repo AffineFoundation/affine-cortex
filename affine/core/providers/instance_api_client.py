@@ -93,6 +93,9 @@ class InstanceAPIConfig:
         response_paths = data.get("response_paths")
         if not isinstance(response_paths, Mapping):
             response_paths = {}
+        status_path = str(data.get("status_path") or "")
+        if not status_path and _uses_normalized_instance_api(data):
+            status_path = "/instances/{instance_id}"
         return cls(
             provider=provider,
             api_url=str(data.get("api_url") or ""),
@@ -117,7 +120,7 @@ class InstanceAPIConfig:
                 else {}
             ),
             status_method=str(data.get("status_method") or "GET").upper(),
-            status_path=str(data.get("status_path") or ""),
+            status_path=status_path,
             create_payload=(
                 dict(data.get("create_payload"))
                 if isinstance(data.get("create_payload"), Mapping)
@@ -351,6 +354,29 @@ class InstanceAPIClient:
                 path,
                 timeout=self.config.timeout_sec,
             )
+        except InstanceAPIHTTPError as e:
+            if _instance_not_found_error(e):
+                logger.warning(
+                    "gpu-autoscaler: provider=%s status found missing "
+                    "instance=%s: %s",
+                    self.config.provider,
+                    instance_id,
+                    e,
+                )
+                raise InstanceAPINotFoundError(
+                    e.method,
+                    e.path,
+                    e.status_code,
+                    e.text,
+                ) from e
+            logger.warning(
+                "gpu-autoscaler: provider=%s status failed for instance=%s: %s: %s",
+                self.config.provider,
+                instance_id,
+                type(e).__name__,
+                e,
+            )
+            return None
         except InstanceAPIError as e:
             logger.warning(
                 "gpu-autoscaler: provider=%s status failed for instance=%s: %s: %s",
@@ -439,6 +465,17 @@ def _coerce_paths(value: Any) -> tuple[str, ...]:
     if isinstance(value, Iterable):
         return tuple(str(v) for v in value)
     return ()
+
+
+def _uses_normalized_instance_api(data: Mapping[str, Any]) -> bool:
+    create_path = str(data.get("create_path") or "").rstrip("/")
+    delete_path = str(data.get("delete_path") or "").rstrip("/")
+    renew_path = str(data.get("renew_path") or "").rstrip("/")
+    return (
+        create_path == "/instances"
+        or delete_path == "/instances/{instance_id}"
+        or renew_path == "/instances/{instance_id}/renew"
+    )
 
 
 def _int_value(value: Any) -> int:

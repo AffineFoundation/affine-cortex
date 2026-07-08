@@ -504,6 +504,25 @@ class TargonAutoscaleClient:
             http_status=504,
         )
 
+    def status(self, uid: str) -> dict:
+        workload = self.request("GET", f"/workloads/{uid}")
+        state = self._safe_get_state(uid)
+        merged = _merge_workload_state(
+            workload if isinstance(workload, dict) else {},
+            state,
+        )
+        return {
+            "instance_id": uid,
+            "lease_expires_at": _lease_expires_at(merged),
+            "status": _status(merged),
+            "ssh_url": _ssh_url(uid),
+            "public_inference_url": (
+                _openai_endpoint(PUBLIC_INFERENCE_URL)
+                or _public_url(merged, uid, PORT)
+            ),
+            "raw": _redacted(merged),
+        }
+
     def _safe_get_workload(self, uid: str) -> dict:
         try:
             workload = self.request("GET", f"/workloads/{uid}")
@@ -1013,7 +1032,19 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"ok": True})
             return
-        self._send(404, _route_not_found("GET", self.path))
+        if not self._authorized():
+            self._send(401, _wrapper_error("unauthorized", "unauthorized"))
+            return
+        parsed = urlparse(self.path)
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) == 2 and parts[0] == "instances":
+            try:
+                result = TargonAutoscaleClient().status(parts[1])
+                self._send(200, result)
+            except Exception as e:
+                self._send(*_error_response(e))
+            return
+        self._send(404, _route_not_found("GET", parsed.path))
 
     def do_POST(self) -> None:
         if not self._authorized():
