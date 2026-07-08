@@ -13,13 +13,16 @@ scheduler needs: SSH URL, public inference URL, and instance id.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import math
 import os
 import signal
 import time
 from dataclasses import dataclass, field, replace
+from asyncio.subprocess import Process
 from typing import Any, Callable, Dict, List, Mapping, Optional
+from urllib.parse import urlparse
 
 import click
 
@@ -83,13 +86,19 @@ class ManagedEndpointSlot:
     purpose: str = "eval"
     endpoint: Dict[str, Any] = field(default_factory=dict)
     create_payload: Dict[str, Any] = field(default_factory=dict)
+    tunnel: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ManagedEndpointSlot":
         endpoint = dict(payload.get("endpoint") or {})
-        for field in _ENDPOINT_OVERRIDE_FIELDS:
-            if field in payload and field not in endpoint:
-                endpoint[field] = payload[field]
+        for field_name in _ENDPOINT_OVERRIDE_FIELDS:
+            if field_name in payload and field_name not in endpoint:
+                endpoint[field_name] = payload[field_name]
+        tunnel = (
+            dict(payload.get("tunnel"))
+            if isinstance(payload.get("tunnel"), Mapping)
+            else {}
+        )
         return cls(
             name=str(payload.get("name") or ""),
             provider=str(payload.get("provider") or "").lower(),
@@ -101,6 +110,7 @@ class ManagedEndpointSlot:
                 if isinstance(payload.get("create_payload"), Mapping)
                 else {}
             ),
+            tunnel=tunnel,
         )
 
 
@@ -310,6 +320,117 @@ class GPUAutoscalerConfig:
 
 
 @dataclass(frozen=True)
+class TunnelSpec:
+    endpoint_name: str
+    instance_id: str
+    ssh_url: str
+    ssh_key_path: str
+    public_url: str
+    bind_host: str = "0.0.0.0"
+    target_host: str = "127.0.0.1"
+    target_port: int = 10001
+    connect_timeout_sec: float = 10.0
+
+    @property
+    def local_port(self) -> int:
+        parsed = urlparse(self.public_url or "")
+        if not parsed.port:
+            raise ValueError(
+                f"public_inference_url for endpoint {self.endpoint_name!r} "
+                "must include an explicit port when tunnel is enabled"
+            )
+        return int(parsed.port)
+
+
+@dataclass
+class _TunnelProcess:
+    spec: TunnelSpec
+    process: Process
+
+
+class SSHTunnelManager:
+    def __init__(self):
+        self._tunnels: Dict[str, _TunnelProcess] = {}
+
+    async def ensure(self, spec: TunnelSpec) -> None:
+        current = self._tunnels.get(spec.endpoint_name)
+        if (
+            current is not None
+            and current.spec == spec
+            and current.process.returncode is None
+        ):
+            return
+
+        await self.stop(spec.endpoint_name)
+        user, host, port = _parse_ssh_url(spec.ssh_url)
+        forward = (
+            f"{spec.bind_host}:{spec.local_port}:"
+            f"{spec.target_host}:{spec.target_port}"
+        )
+        cmd = [
+            "ssh",
+            "-N",
+            "-o", "ExitOnForwardFailure=yes",
+            "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "StrictHostKeyChecking=no",
+        ]
+        if spec.ssh_key_path:
+            cmd.extend(["-i", spec.ssh_key_path])
+        cmd.extend(["-p", str(port), "-L", forward, f"{user}@{host}"])
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await _wait_for_local_port(
+                "127.0.0.1",
+                spec.local_port,
+                timeout_sec=spec.connect_timeout_sec,
+            )
+            await asyncio.sleep(0)
+            if process.returncode is not None:
+                raise RuntimeError(
+                    f"ssh tunnel process exited with code {process.returncode}"
+                )
+        except Exception:
+            await _stop_process(process, timeout_sec=2.0)
+            raise
+        self._tunnels[spec.endpoint_name] = _TunnelProcess(
+            spec=spec,
+            process=process,
+        )
+        logger.info(
+            "gpu-autoscaler: tunnel ready endpoint=%s instance=%s "
+            "local_port=%s target=%s:%s",
+            spec.endpoint_name,
+            spec.instance_id,
+            spec.local_port,
+            spec.target_host,
+            spec.target_port,
+        )
+
+    async def stop(self, endpoint_name: str) -> None:
+        current = self._tunnels.pop(endpoint_name, None)
+        if current is None:
+            return
+        await _stop_process(current.process, timeout_sec=5.0)
+        logger.info(
+            "gpu-autoscaler: tunnel stopped endpoint=%s instance=%s "
+            "local_port=%s",
+            endpoint_name,
+            current.spec.instance_id,
+            current.spec.local_port,
+        )
+
+    async def stop_all(self) -> None:
+        for endpoint_name in list(self._tunnels):
+            await self.stop(endpoint_name)
+
+
+@dataclass(frozen=True)
 class AutoscalerSnapshot:
     pending_count: int
     in_progress_count: int
@@ -374,6 +495,7 @@ class GPUAutoscaler:
         kv_store,
         samples_adapter: SampleResultsAdapter,
         client_factory: Optional[Callable[[InstanceAPIConfig], InstanceAPIClient]] = None,
+        tunnel_manager: Optional[SSHTunnelManager] = None,
         now_fn: Optional[Callable[[], float]] = None,
     ):
         self._queue = queue
@@ -382,8 +504,12 @@ class GPUAutoscaler:
         self._kv = kv_store
         self._samples = samples_adapter
         self._client_factory = client_factory or InstanceAPIClient
+        self._tunnels = tunnel_manager or SSHTunnelManager()
         self._now = now_fn or time.time
         self._force_start_after_restart = True
+
+    async def close(self) -> None:
+        await self._tunnels.stop_all()
 
     async def tick(self, config: GPUAutoscalerConfig) -> AutoscalerTickResult:
         if not config.enabled:
@@ -393,6 +519,10 @@ class GPUAutoscaler:
             return AutoscalerTickResult(action="no-slots")
 
         snapshot = await self._snapshot()
+        tunnel_reconcile_failures = await self._reconcile_active_endpoint_tunnels(
+            config,
+            snapshot,
+        )
         state = await self._load_state()
         now = int(self._now())
         manual_replacement = await self._active_manual_replacement(now, state)
@@ -418,7 +548,11 @@ class GPUAutoscaler:
             force_start=force_start,
         )
         idle_for = now - int(state.get("last_busy_at", now) or now)
-        action = "none"
+        action = (
+            f"tunnel-reconcile-failed:{tunnel_reconcile_failures}"
+            if tunnel_reconcile_failures
+            else "none"
+        )
         health_result = await self._check_active_endpoint_health(
             config,
             snapshot,
@@ -503,6 +637,7 @@ class GPUAutoscaler:
                 "last_lease_reclaimed_count": lease_result.reclaimed_count,
                 "last_endpoint_health_checked_count": health_result.checked_count,
                 "last_endpoint_health_reclaimed_count": health_result.reclaimed_count,
+                "last_tunnel_reconcile_failures": tunnel_reconcile_failures,
             }
         )
         await self._kv.set(STATE_KEY, state)
@@ -510,7 +645,7 @@ class GPUAutoscaler:
             "gpu-autoscaler: action=%s pending=%s active_capacity=%s desired=%s "
             "idle=%s idle_for=%ss gpu_down_for=%ss force_start=%s "
             "manual_replacement=%s lease_reclaimed=%s health_checked=%s "
-            "health_reclaimed=%s",
+            "health_reclaimed=%s tunnel_reconcile_failures=%s",
             action,
             snapshot.pending_count,
             effective_active_capacity_count,
@@ -523,6 +658,7 @@ class GPUAutoscaler:
             lease_result.reclaimed_count,
             health_result.checked_count,
             health_result.reclaimed_count,
+            tunnel_reconcile_failures,
         )
         return AutoscalerTickResult(
             action=action,
@@ -537,6 +673,48 @@ class GPUAutoscaler:
             endpoint_health_checked_count=health_result.checked_count,
             endpoint_health_reclaimed_count=health_result.reclaimed_count,
         )
+
+    async def _reconcile_active_endpoint_tunnels(
+        self,
+        config: GPUAutoscalerConfig,
+        snapshot: AutoscalerSnapshot,
+    ) -> int:
+        failures = 0
+        for endpoint in snapshot.active_managed:
+            slot = _find_slot(config, endpoint.name)
+            if slot is None or not _tunnel_enabled(slot):
+                continue
+            reconciled = _endpoint_with_slot_tunnel_overrides(endpoint, slot)
+            try:
+                await self._ensure_endpoint_tunnel(slot, reconciled)
+            except Exception as e:
+                failures += 1
+                logger.error(
+                    "gpu-autoscaler: failed to reconcile tunnel for "
+                    "endpoint=%s instance=%s: %s: %s",
+                    endpoint.name,
+                    endpoint.autoscale_instance_id,
+                    type(e).__name__,
+                    e,
+                )
+                continue
+            if reconciled != endpoint:
+                try:
+                    await self._endpoints.activate_autoscaled_endpoint(
+                        reconciled,
+                        updated_by="gpu-autoscaler",
+                    )
+                except Exception as e:
+                    failures += 1
+                    logger.error(
+                        "gpu-autoscaler: failed to reconcile endpoint=%s "
+                        "before tunnel setup: %s: %s",
+                        endpoint.name,
+                        type(e).__name__,
+                        e,
+                    )
+                    continue
+        return failures
 
     def _should_force_start_after_restart(
         self,
@@ -733,6 +911,28 @@ class GPUAutoscaler:
             await client.delete(handle.instance_id, variables=variables)
             return False
         try:
+            await self._ensure_endpoint_tunnel(slot, endpoint)
+        except Exception as e:
+            logger.error(
+                "gpu-autoscaler: tunnel setup failed after create "
+                "endpoint=%s provider=%s instance=%s; deleting instance: "
+                "%s: %s",
+                endpoint.name,
+                slot.provider,
+                handle.instance_id,
+                type(e).__name__,
+                e,
+            )
+            await self._tunnels.stop(endpoint.name)
+            deleted = await client.delete(handle.instance_id, variables=variables)
+            if not deleted:
+                logger.error(
+                    "gpu-autoscaler: failed to delete instance=%s after "
+                    "tunnel setup failure; manual cleanup may be required",
+                    handle.instance_id,
+                )
+            return False
+        try:
             await self._endpoints.activate_autoscaled_endpoint(
                 endpoint,
                 updated_by=updated_by,
@@ -748,6 +948,7 @@ class GPUAutoscaler:
                 type(e).__name__,
                 e,
             )
+            await self._tunnels.stop(endpoint.name)
             deleted = await client.delete(handle.instance_id, variables=variables)
             if not deleted:
                 logger.error(
@@ -790,12 +991,15 @@ class GPUAutoscaler:
             autoscale_updated_at=int(self._now()),
             autoscale_lease_expires_at=int(handle.lease_expires_at or 0),
         )
-        for field, value in (slot.endpoint or {}).items():
-            if field in _ENDPOINT_OVERRIDE_FIELDS and value is not None:
-                setattr(endpoint, field, value)
+        for field_name, value in (slot.endpoint or {}).items():
+            if field_name in _ENDPOINT_OVERRIDE_FIELDS and value is not None:
+                setattr(endpoint, field_name, value)
         endpoint.ssh_url = handle.ssh_url or endpoint.ssh_url
+        slot_public_url = (slot.endpoint or {}).get("public_inference_url")
         endpoint.public_inference_url = (
-            handle.public_inference_url or endpoint.public_inference_url
+            slot_public_url
+            or handle.public_inference_url
+            or endpoint.public_inference_url
         )
         if not endpoint.notes:
             endpoint.notes = f"autoscaled via {slot.provider}"
@@ -901,6 +1105,16 @@ class GPUAutoscaler:
         if status is None:
             return "failed"
         return "healthy"
+
+    async def _ensure_endpoint_tunnel(
+        self,
+        slot: ManagedEndpointSlot,
+        endpoint: Endpoint,
+    ) -> None:
+        spec = _tunnel_spec_for_endpoint(slot, endpoint)
+        if spec is None:
+            return
+        await self._tunnels.ensure(spec)
 
     async def _renew_busy_expiring_leases(
         self,
@@ -1293,6 +1507,7 @@ class GPUAutoscaler:
             return False
         if clear_refs:
             await self._clear_deployment_refs(endpoint)
+        await self._tunnels.stop(endpoint.name)
         logger.info(
             "gpu-autoscaler: deactivated endpoint=%s provider=%s instance=%s",
             endpoint.name,
@@ -1658,6 +1873,95 @@ def _only_missing_capacity_is_blocked(
     return True
 
 
+def _tunnel_enabled(slot: ManagedEndpointSlot) -> bool:
+    return _bool_value((slot.tunnel or {}).get("enabled"), default=False)
+
+
+def _endpoint_with_slot_tunnel_overrides(
+    endpoint: Endpoint,
+    slot: ManagedEndpointSlot,
+) -> Endpoint:
+    slot_public_url = (slot.endpoint or {}).get("public_inference_url")
+    if slot_public_url and endpoint.public_inference_url != slot_public_url:
+        return replace(endpoint, public_inference_url=str(slot_public_url))
+    return endpoint
+
+
+def _tunnel_spec_for_endpoint(
+    slot: ManagedEndpointSlot,
+    endpoint: Endpoint,
+) -> Optional[TunnelSpec]:
+    if not _tunnel_enabled(slot):
+        return None
+    instance_id = endpoint.autoscale_instance_id or ""
+    ssh_url = endpoint.ssh_url or ""
+    public_url = endpoint.public_inference_url or ""
+    if not instance_id or not ssh_url or not public_url:
+        raise ValueError(
+            f"endpoint {endpoint.name!r} tunnel requires instance_id, "
+            "ssh_url, and public_inference_url"
+        )
+    tunnel = slot.tunnel or {}
+    target_port = int(
+        tunnel.get("target_port")
+        or tunnel.get("remote_port")
+        or endpoint.sglang_port
+        or 10001
+    )
+    return TunnelSpec(
+        endpoint_name=endpoint.name,
+        instance_id=instance_id,
+        ssh_url=ssh_url,
+        ssh_key_path=str(tunnel.get("ssh_key_path") or endpoint.ssh_key_path or ""),
+        public_url=public_url,
+        bind_host=str(tunnel.get("bind_host") or "0.0.0.0"),
+        target_host=str(tunnel.get("target_host") or "127.0.0.1"),
+        target_port=target_port,
+        connect_timeout_sec=float(tunnel.get("connect_timeout_sec") or 10.0),
+    )
+
+
+def _parse_ssh_url(url: str) -> tuple[str, str, int]:
+    parsed = urlparse(url or "")
+    if parsed.scheme != "ssh" or not parsed.hostname:
+        raise ValueError(f"invalid ssh_url: {url!r}")
+    return parsed.username or "root", parsed.hostname, int(parsed.port or 22)
+
+
+async def _wait_for_local_port(
+    host: str,
+    port: int,
+    *,
+    timeout_sec: float,
+) -> None:
+    deadline = time.monotonic() + max(0.1, timeout_sec)
+    last_error: Optional[Exception] = None
+    while time.monotonic() < deadline:
+        try:
+            reader, writer = await asyncio.open_connection(host, port)
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+        except Exception as e:
+            last_error = e
+            await asyncio.sleep(0.2)
+    raise TimeoutError(
+        f"local tunnel port {host}:{port} did not become ready"
+    ) from last_error
+
+
+async def _stop_process(process: Process, *, timeout_sec: float) -> None:
+    if process.returncode is not None:
+        return
+    process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+
 async def load_config(config_dao: SystemConfigDAO) -> GPUAutoscalerConfig:
     payload = await config_dao.get_param_value(CONFIG_KEY, default=None)
     if isinstance(payload, Mapping) and payload:
@@ -1834,6 +2138,7 @@ async def _run() -> None:
             except asyncio.TimeoutError:
                 pass
     finally:
+        await autoscaler.close()
         await close_client()
 
 
