@@ -8,9 +8,9 @@ Polls subtensor for new blocks; on each block tick calls
   → champion samples wait → start battle → challenger samples wait
   → decide → cleanup
 
-All state lives in ``system_config``; this process is restart-safe via
-deterministic re-derivation (sampler is seeded; Targon adopts existing
-workloads by naming convention).
+All state lives in ``system_config``; this process is restart-safe because
+task pools are persisted and Targon adopts existing workloads by naming
+convention.
 """
 
 from __future__ import annotations
