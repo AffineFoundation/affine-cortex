@@ -20,6 +20,18 @@ from affine.database.dao.sample_results import SampleResultsDAO
 from .challenger_queue import STATUS_SAMPLING
 from .token_efficiency import SampleMetric, extract_token_usage
 
+_SWE_TOKEN_EXCLUDED_AGENT_TYPES = {"codex"}
+_SWE_TOKEN_ENVS = {"SWE", "SWE-INFINITE"}
+
+
+def _should_skip_token_usage(env: str, extra: Dict[str, Any]) -> bool:
+    """Return True for sample types whose token accounting is not canonical."""
+    if str(env).upper() not in _SWE_TOKEN_ENVS:
+        return False
+    return str(extra.get("agent_type") or "").strip().lower() in (
+        _SWE_TOKEN_EXCLUDED_AGENT_TYPES
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Miner queue
@@ -297,7 +309,8 @@ class SampleResultsAdapter:
                     try:
                         extra_json = self._dao.decompress_data(row["extra_compressed"])
                         extra = json.loads(extra_json)
-                        usage = extract_token_usage(extra)
+                        if not _should_skip_token_usage(env, extra):
+                            usage = extract_token_usage(extra)
                     except Exception as e:
                         logger.warning(
                             "SampleResultsAdapter: failed to parse usage for "
