@@ -60,6 +60,17 @@ QWEN36_ONLY_ENFORCE_BLOCK = int(
     os.getenv("AFFINE_QWEN36_ONLY_ENFORCE_BLOCK", "0")
 )
 
+# HF repos can transiently 404 for a few minutes right after a repo is
+# created or renamed, while the hub CDN propagates. Terminating on the first
+# such 404 kills a good miner on its very first monitor cycle. Only
+# ``hf_repo_not_found`` is treated as possibly transient; disabled/gated/
+# private are deliberate states a miner sets and are terminated immediately.
+# A repo that is still not_found after this grace window is terminated.
+HF_TRANSIENT_UNAVAILABLE_REASONS = frozenset({"hf_repo_not_found"})
+HF_UNAVAILABLE_GRACE_SECONDS = int(
+    os.getenv("AFFINE_HF_UNAVAILABLE_GRACE_SECONDS", "900")
+)
+
 
 def _as_int_or_none(value: object) -> Optional[int]:
     try:
@@ -206,6 +217,10 @@ class MinersMonitor:
         self._weights_ttl_sec = 1800
         # (model, revision) -> (tokenizer_sig_or_empty, fetched_at)
         self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
+        # (model, revision) -> first time we saw a transient HF 404. Grace
+        # window before that escalates to a permanent terminate; cleared on
+        # any successful fetch.
+        self._repo_unavailable_since: Dict[Tuple[str, str], float] = {}
         self._background_task: Optional[asyncio.Task] = None
 
     # ---- lifecycle -------------------------------------------------------
@@ -451,6 +466,15 @@ class MinersMonitor:
         try:
             model_info = await self._get_model_info(model, revision)
         except HFRepoUnavailable as e:
+            if self._repo_unavailable_grace_active(model, revision, e.reason):
+                logger.warning(
+                    f"[MinersMonitor] HF repo unavailable uid={uid} "
+                    f"{model}@{revision[:8]} reason={e.reason}; within "
+                    f"{HF_UNAVAILABLE_GRACE_SECONDS}s grace, deferring "
+                    f"termination (transient 404 on a new/renamed repo?)"
+                )
+                info.mark_invalid(e.reason, permanent=False)
+                return info
             info.mark_invalid(
                 e.reason,
                 permanent=True,
@@ -460,6 +484,7 @@ class MinersMonitor:
         if not model_info:
             info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
+        self._clear_repo_unavailable(model, revision)
         model_hash, hf_revision, duplicate_source = model_info
         info.model_hash = model_hash
         info.hf_revision = hf_revision
@@ -711,6 +736,34 @@ class MinersMonitor:
         sig_str = sig or ""
         self._tokenizer_sig_cache[key] = (sig_str, now)
         return sig_str
+
+    def _repo_unavailable_grace_active(
+        self, model: str, revision: str, reason: str
+    ) -> bool:
+        """Whether a transient HF unavailability should be tolerated for now
+        instead of permanently terminating the miner this cycle.
+
+        Only ``hf_repo_not_found`` is graced: a freshly created/renamed repo
+        can 404 for a few minutes while the hub propagates, which otherwise
+        kills a good miner on its very first monitor cycle. The first
+        observation starts the clock; once ``HF_UNAVAILABLE_GRACE_SECONDS``
+        elapses (repo still gone) this returns False and the caller
+        terminates. Deliberate states (disabled/gated/private) are never
+        graced. In-memory only: a process restart just re-grants the window,
+        which can delay but never wrongly trigger a termination.
+        """
+        if reason not in HF_TRANSIENT_UNAVAILABLE_REASONS:
+            return False
+        key = (model, revision)
+        first = self._repo_unavailable_since.get(key)
+        now = time.time()
+        if first is None:
+            self._repo_unavailable_since[key] = now
+            return True
+        return (now - first) < HF_UNAVAILABLE_GRACE_SECONDS
+
+    def _clear_repo_unavailable(self, model: str, revision: str) -> None:
+        self._repo_unavailable_since.pop((model, revision), None)
 
     async def _get_model_info(
         self, model_id: str, revision: str
