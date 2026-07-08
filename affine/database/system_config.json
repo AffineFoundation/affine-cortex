@@ -45,7 +45,7 @@
     "DISTILL-V2": {
       "display_name": "DISTILL-V2",
       "enabled_for_sampling": true,
-      "enabled_for_scoring": false,
+      "enabled_for_scoring": true,
       "sampling": {
         "sampling_count": 100,
         "dataset_range": [

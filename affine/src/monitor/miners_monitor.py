@@ -29,6 +29,7 @@ from huggingface_hub.errors import (
     DisabledRepoError,
     GatedRepoError,
     RepositoryNotFoundError,
+    RevisionNotFoundError,
 )
 
 from affine.core.setup import logger
@@ -40,7 +41,10 @@ from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.anticopy.threshold import load_anticopy_config
-from affine.src.anticopy.tokenizer_sig import compute_tokenizer_signature
+from affine.src.anticopy.tokenizer_sig import (
+    TOKENIZER_SIG_TRANSIENT_FETCH_FAILED,
+    compute_tokenizer_signature,
+)
 from affine.utils.model_size_checker import (
     QWEN36_ONLY_MODEL_TYPES,
     check_model_size,
@@ -215,8 +219,8 @@ class MinersMonitor:
         # (model, revision) -> (cached result or None, fetched_at)
         self._weights_cache: Dict[Tuple[str, str], Tuple[Optional[Tuple[str, str, str]], float]] = {}
         self._weights_ttl_sec = 1800
-        # (model, revision) -> (tokenizer_sig_or_empty, fetched_at)
-        self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, float]] = {}
+        # (model, revision) -> (tokenizer_sig_or_empty, reason, fetched_at)
+        self._tokenizer_sig_cache: Dict[Tuple[str, str], Tuple[str, str, float]] = {}
         # (model, revision) -> first time we saw a transient HF 404. Grace
         # window before that escalates to a permanent terminate; cleared on
         # any successful fetch.
@@ -432,6 +436,62 @@ class MinersMonitor:
         except Exception:
             pass
 
+        def _preserve_prior_valid(reason: str) -> bool:
+            if not (
+                _same_model_revision(existing, model, revision)
+                and _truthy((existing or {}).get("is_valid"))
+            ):
+                return False
+            info.is_valid = True
+            info.invalid_reason = None
+            info.permanent_invalid = False
+            info.terminate_stats = False
+            info.model_hash = str(
+                info.model_hash or (existing or {}).get("model_hash") or ""
+            )
+            info.model_type = str(
+                info.model_type or (existing or {}).get("model_type") or ""
+            )
+            logger.warning(
+                f"[MinersMonitor] preserving prior valid state for "
+                f"uid={uid} after transient validation failure: {reason}"
+            )
+            return True
+
+        async def _apply_anticopy_copy_verdict(anticopy_cfg) -> bool:
+            if (
+                uid == 0
+                or anticopy_cfg is None
+                or not anticopy_cfg.enabled
+            ):
+                return False
+            try:
+                score_row = await self.anticopy_scores_dao.get_score(
+                    hotkey, revision,
+                )
+            except Exception as e:
+                logger.debug(
+                    f"[MinersMonitor] anticopy score lookup failed "
+                    f"{hotkey[:10]}: {e}"
+                )
+                score_row = None
+            if not score_row or not (score_row.get("verdict_copy_of") or "").strip():
+                return False
+
+            origin_model = (
+                score_row.get("closest_peer_model") or "unknown"
+            )
+            dm = score_row.get("decision_median")
+            try:
+                dm_str = f"{float(dm):.4f}"
+            except (TypeError, ValueError):
+                dm_str = "?"
+            info.mark_invalid(
+                f"anticopy_copy:copied_from={origin_model},dm={dm_str}",
+                permanent=False,
+            )
+            return True
+
         # Multi-commit rule: a hotkey is only allowed one commit on this subnet.
         if uid != 0 and commit_count > 1 and block >= MULTI_COMMIT_ENFORCE_BLOCK:
             info.mark_invalid(
@@ -482,6 +542,10 @@ class MinersMonitor:
             )
             return info
         if not model_info:
+            if _preserve_prior_valid("hf_model_fetch_failed"):
+                anticopy_cfg = await self._safe_load_anticopy_config()
+                await _apply_anticopy_copy_verdict(anticopy_cfg)
+                return info
             info.mark_invalid("hf_model_fetch_failed", permanent=False)
             return info
         self._clear_repo_unavailable(model, revision)
@@ -647,10 +711,18 @@ class MinersMonitor:
                 champion_sig = ""
 
         if uid != 0 and anticopy_cfg is not None and anticopy_cfg.enabled and champion_sig:
-            cand_sig = await self._get_tokenizer_sig(model, revision)
+            cand_sig, sig_reason = await self._get_tokenizer_sig(model, revision)
             info.tokenizer_sig = cand_sig
             if not cand_sig:
-                info.mark_invalid("tokenizer_sig_fetch_failed", permanent=False)
+                reason = sig_reason or "fetch_failed"
+                invalid_reason = f"tokenizer_sig_{reason}"
+                if (
+                    reason == TOKENIZER_SIG_TRANSIENT_FETCH_FAILED
+                    and _preserve_prior_valid(invalid_reason)
+                ):
+                    await _apply_anticopy_copy_verdict(anticopy_cfg)
+                    return info
+                info.mark_invalid(invalid_reason, permanent=False)
                 return info
             if cand_sig != champion_sig:
                 info.mark_invalid(
@@ -672,29 +744,7 @@ class MinersMonitor:
             and anticopy_cfg is not None
             and anticopy_cfg.enabled
         ):
-            try:
-                score_row = await self.anticopy_scores_dao.get_score(
-                    hotkey, revision,
-                )
-            except Exception as e:
-                logger.debug(
-                    f"[MinersMonitor] anticopy score lookup failed "
-                    f"{hotkey[:10]}: {e}"
-                )
-                score_row = None
-            if score_row and (score_row.get("verdict_copy_of") or "").strip():
-                origin_model = (
-                    score_row.get("closest_peer_model") or "unknown"
-                )
-                dm = score_row.get("decision_median")
-                try:
-                    dm_str = f"{float(dm):.4f}"
-                except (TypeError, ValueError):
-                    dm_str = "?"
-                info.mark_invalid(
-                    f"anticopy_copy:copied_from={origin_model},dm={dm_str}",
-                    permanent=False,
-                )
+            if await _apply_anticopy_copy_verdict(anticopy_cfg):
                 return info
 
         info.is_valid = True
@@ -718,24 +768,25 @@ class MinersMonitor:
             logger.debug(f"[MinersMonitor] load_anticopy_config failed: {e}")
             return None
 
-    async def _get_tokenizer_sig(self, model_id: str, revision: str) -> str:
-        """Cached sha256 of the candidate's ``tokenizer.json``. Empty
-        string means HF couldn't supply it (treat as transient)."""
+    async def _get_tokenizer_sig(self, model_id: str, revision: str) -> Tuple[str, str]:
+        """Cached sha256 of the candidate tokenizer plus failure reason."""
         key = (model_id, revision)
         now = time.time()
         cached = self._tokenizer_sig_cache.get(key)
-        if cached and now - cached[1] < self._weights_ttl_sec:
-            return cached[0]
+        if cached and now - cached[2] < self._weights_ttl_sec:
+            return cached[0], cached[1]
         try:
-            sig, _src = await compute_tokenizer_signature(model_id, revision)
+            sig, _src, reason = await compute_tokenizer_signature(model_id, revision)
         except Exception as e:
             logger.debug(
                 f"[MinersMonitor] tokenizer_sig fetch failed {model_id}@{revision[:8]}: {e}"
             )
             sig = None
+            reason = TOKENIZER_SIG_TRANSIENT_FETCH_FAILED
         sig_str = sig or ""
-        self._tokenizer_sig_cache[key] = (sig_str, now)
-        return sig_str
+        reason_str = reason or ""
+        self._tokenizer_sig_cache[key] = (sig_str, reason_str, now)
+        return sig_str, reason_str
 
     def _repo_unavailable_grace_active(
         self, model: str, revision: str, reason: str
@@ -853,6 +904,9 @@ class MinersMonitor:
         except RepositoryNotFoundError as e:
             self._weights_cache.pop(key, None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
+        except RevisionNotFoundError as e:
+            self._weights_cache.pop(key, None)
+            self._raise_repo_unavailable(model_id, revision, "hf_revision_not_found", e)
         except Exception as e:
             logger.warning(
                 f"[MinersMonitor] HF fetch failed {model_id}@{revision[:8]}: "
@@ -916,6 +970,9 @@ class MinersMonitor:
         except RepositoryNotFoundError as e:
             self._weights_cache.pop((model_id, revision), None)
             self._raise_repo_unavailable(model_id, revision, "hf_repo_not_found", e)
+        except RevisionNotFoundError as e:
+            self._weights_cache.pop((model_id, revision), None)
+            self._raise_repo_unavailable(model_id, revision, "hf_revision_not_found", e)
         except Exception as e:
             logger.warning(
                 f"[MinersMonitor] HF access check failed {model_id}@{revision[:8]}: "

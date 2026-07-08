@@ -187,7 +187,7 @@ class RolloutRefreshService:
             )
 
         # Compute champion's tokenizer signature once for the whole tick.
-        tokenizer_sig, _src = await compute_tokenizer_signature(
+        tokenizer_sig, _src, _reason = await compute_tokenizer_signature(
             champ_model, champ_revision,
         )
         if not tokenizer_sig:

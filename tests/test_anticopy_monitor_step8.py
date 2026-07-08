@@ -9,9 +9,15 @@ invalid. These tests cover that single remaining gate.
 
 from __future__ import annotations
 
+import httpx
 import pytest
+from huggingface_hub.errors import RevisionNotFoundError
 
 import affine.database.client as db_client
+from affine.src.anticopy import tokenizer_sig as tokenizer_sig_mod
+from affine.src.anticopy.tokenizer_sig import (
+    TOKENIZER_SIG_REVISION_NOT_FOUND,
+)
 from affine.src.anticopy.threshold import AntiCopyConfig
 from affine.src.monitor.miners_monitor import MinersMonitor
 
@@ -88,6 +94,18 @@ class _FakeMinerDAO:
         return self.row
 
 
+def _revision_not_found_error() -> RevisionNotFoundError:
+    request = httpx.Request(
+        "GET",
+        "https://huggingface.co/api/models/org/model/revision/missing",
+    )
+    response = httpx.Response(404, request=request)
+    return RevisionNotFoundError(
+        "Revision not found",
+        response=response,
+    )
+
+
 def _build_monitor(
     *,
     cfg_enabled=True,
@@ -115,7 +133,8 @@ def _build_monitor(
     )
 
     async def _fake_sig(_model, _rev):
-        return cand_sig
+        reason = "" if cand_sig else "transient_fetch_failed"
+        return cand_sig, reason
     monitor._get_tokenizer_sig = _fake_sig
     return monitor
 
@@ -313,6 +332,268 @@ async def test_retryable_model_check_preserves_previously_valid_miner(monkeypatc
     assert info.is_valid is True
     assert info.invalid_reason is None
     assert info.model_type == "qwen3_5_moe"
+    assert info.permanent_invalid is False
+    assert info.terminate_stats is False
+
+
+@pytest.mark.asyncio
+async def test_transient_hf_fetch_failure_preserves_previously_valid_miner(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(cfg_enabled=True)
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_hf_transient_xyz",
+        "revision": "rev",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+
+    async def _transient_hf_failure(_model, _revision):
+        return None
+
+    monitor._get_model_info = _transient_hf_failure
+
+    info = await monitor._validate_miner(
+        uid=238, hotkey="hk_hf_transient_xyz",
+        model="org/affine-model-hk_hf_transient_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is True
+    assert info.invalid_reason is None
+    assert info.model_hash == "hash_cached"
+    assert info.model_type == "qwen3_5_moe"
+    assert info.permanent_invalid is False
+    assert info.terminate_stats is False
+
+
+@pytest.mark.asyncio
+async def test_transient_hf_fetch_failure_does_not_bypass_copy_verdict(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(
+        cfg_enabled=True,
+        score_row={
+            "hotkey": "hk_hf_copy_xyz",
+            "revision": "rev",
+            "verdict_copy_of": "hk_origin_xyz",
+            "closest_peer_model": "victim-org/Affine-original",
+            "decision_median": 0.0123,
+        },
+    )
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_hf_copy_xyz",
+        "revision": "rev",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+
+    async def _transient_hf_failure(_model, _revision):
+        return None
+
+    monitor._get_model_info = _transient_hf_failure
+
+    info = await monitor._validate_miner(
+        uid=238, hotkey="hk_hf_copy_xyz",
+        model="org/affine-model-hk_hf_copy_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.invalid_reason.startswith("anticopy_copy:")
+    assert "victim-org/Affine-original" in info.invalid_reason
+    assert info.permanent_invalid is False
+    assert info.terminate_stats is False
+
+
+@pytest.mark.asyncio
+async def test_revision_not_found_does_not_preserve_previously_valid_miner(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(cfg_enabled=True)
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_revision_missing_xyz",
+        "revision": "missing",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+
+    class _RevisionMissingHfApi:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def repo_info(self, *args, **kwargs):
+            raise _revision_not_found_error()
+
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.HfApi",
+        _RevisionMissingHfApi,
+    )
+
+    info = await monitor._validate_miner(
+        uid=238, hotkey="hk_revision_missing_xyz",
+        model="org/affine-model-hk_revision_missing_xyz",
+        revision="missing",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.invalid_reason == "hf_revision_not_found"
+    assert info.permanent_invalid is True
+    assert info.terminate_stats is True
+
+
+@pytest.mark.asyncio
+async def test_transient_tokenizer_sig_failure_preserves_previously_valid_miner(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(cfg_enabled=True, champion_sig="champ_sig", cand_sig="")
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_tokenizer_transient_xyz",
+        "revision": "rev",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+    monitor._get_model_info = _hot_get_model_info
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_model_size",
+        _async_pass_size,
+    )
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_template_safety",
+        _async_safe,
+    )
+
+    info = await monitor._validate_miner(
+        uid=255, hotkey="hk_tokenizer_transient_xyz",
+        model="org/affine-model-hk_tokenizer_transient_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is True
+    assert info.invalid_reason is None
+    assert info.model_hash == "hash_abc"
+    assert info.model_type == "qwen3_5_moe"
+    assert info.permanent_invalid is False
+    assert info.terminate_stats is False
+
+
+@pytest.mark.asyncio
+async def test_transient_tokenizer_sig_failure_does_not_bypass_copy_verdict(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(
+        cfg_enabled=True,
+        champion_sig="champ_sig",
+        cand_sig="",
+        score_row={
+            "hotkey": "hk_tokenizer_copy_xyz",
+            "revision": "rev",
+            "verdict_copy_of": "hk_origin_xyz",
+            "closest_peer_model": "victim-org/Affine-original",
+            "decision_median": 0.0123,
+        },
+    )
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_tokenizer_copy_xyz",
+        "revision": "rev",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+    monitor._get_model_info = _hot_get_model_info
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_model_size",
+        _async_pass_size,
+    )
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_template_safety",
+        _async_safe,
+    )
+
+    info = await monitor._validate_miner(
+        uid=255, hotkey="hk_tokenizer_copy_xyz",
+        model="org/affine-model-hk_tokenizer_copy_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.invalid_reason.startswith("anticopy_copy:")
+    assert "victim-org/Affine-original" in info.invalid_reason
+    assert info.permanent_invalid is False
+    assert info.terminate_stats is False
+
+
+def test_tokenizer_sig_revision_not_found_is_deterministic(monkeypatch):
+    class _RevisionMissingHfApi:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def repo_info(self, *args, **kwargs):
+            raise _revision_not_found_error()
+
+    monkeypatch.setattr(tokenizer_sig_mod, "HfApi", _RevisionMissingHfApi)
+
+    sig, src, reason = tokenizer_sig_mod.compute_tokenizer_signature_sync(
+        "org/model",
+        "missing",
+    )
+
+    assert sig is None
+    assert src == ""
+    assert reason == TOKENIZER_SIG_REVISION_NOT_FOUND
+
+
+@pytest.mark.asyncio
+async def test_missing_tokenizer_artifact_does_not_preserve_prior_valid(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = _build_monitor(cfg_enabled=True, champion_sig="champ_sig", cand_sig="")
+    monitor.dao = _FakeMinerDAO({
+        "model": "org/affine-model-hk_missing_tokenizer_xyz",
+        "revision": "rev",
+        "is_valid": "true",
+        "template_check_result": "safe",
+        "model_hash": "hash_cached",
+        "model_type": "qwen3_5_moe",
+    })
+    monitor._get_model_info = _hot_get_model_info
+
+    async def _missing_tokenizer(_model, _rev):
+        return "", "missing_tokenizer_artifact"
+
+    monitor._get_tokenizer_sig = _missing_tokenizer
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_model_size",
+        _async_pass_size,
+    )
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.check_template_safety",
+        _async_safe,
+    )
+
+    info = await monitor._validate_miner(
+        uid=255, hotkey="hk_missing_tokenizer_xyz",
+        model="org/affine-model-hk_missing_tokenizer_xyz",
+        revision="rev",
+        block=99_999_999,
+        commit_count=1,
+    )
+
+    assert info.is_valid is False
+    assert info.invalid_reason == "tokenizer_sig_missing_tokenizer_artifact"
     assert info.permanent_invalid is False
     assert info.terminate_stats is False
 

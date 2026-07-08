@@ -493,7 +493,7 @@ class ForwardWorker:
 
             # 1) Compute the candidate's tokenizer signature once so we
             # can stamp it on the score row for later filtering.
-            cand_sig, _ = await compute_tokenizer_signature(model, revision)
+            cand_sig, _, _reason = await compute_tokenizer_signature(model, revision)
 
             # 2) Stage weights locally + swap the sglang server onto them.
             local_path = await self._fetch_weights(model, revision)
@@ -661,7 +661,7 @@ class ForwardWorker:
             f"sglang swap)"
         )
         try:
-            cand_sig, _src = await compute_tokenizer_signature(
+            cand_sig, _src, _reason = await compute_tokenizer_signature(
                 model, revision,
             )
         except Exception as e:

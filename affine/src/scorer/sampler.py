@@ -1,19 +1,19 @@
 """
 Window sampler
 
-Deterministically picks a fixed set of task_ids per (window_id, env) from each
-env's dataset_range. Two modes:
+Picks a fixed set of task_ids from each env's dataset_range. Two modes:
 
 - ``mode='latest'`` (SWE / DISTILL): take the highest N task_ids in
   ``dataset_range`` (the dataset's tail). These datasets append-only
   accumulate fresh tasks; only the tail is unseen.
-- ``mode='random'`` (everything else): seed a local ``random.Random`` from
-  ``(window_id, block_start, env)`` and sample N distinct task_ids
-  weighted by range size. Idempotent across restarts.
+- ``mode='random'`` (everything else): use OS-backed randomness and sample
+  N distinct task_ids weighted by range size. The generated pool is persisted
+  by the scheduler, so restarts reuse the stored task ids instead of
+  re-sampling.
 """
 
-import hashlib
 import random
+import secrets
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
@@ -33,12 +33,8 @@ class EnvSamplingConfig:
 
 
 class WindowSampler:
-    @staticmethod
-    def _seed(window_id: int, block_start: int, env: str) -> int:
-        digest = hashlib.sha256(
-            f"{window_id}|{block_start}|{env}".encode()
-        ).digest()[:16]
-        return int.from_bytes(digest, "big")
+    def _rng(self) -> random.Random:
+        return secrets.SystemRandom()
 
     @staticmethod
     def _sample_one_env(
@@ -72,8 +68,8 @@ class WindowSampler:
 
         if len(picked) < n:
             # Exhaustive fill in deterministic range order. Within each range
-            # we shuffle the remaining ids with the same rng so the tail of
-            # the picked list is also seed-derived.
+            # we shuffle the remaining ids with the same rng so the tail is
+            # still random-derived.
             for start, end in ranges:
                 if len(picked) >= n:
                     break
@@ -126,7 +122,7 @@ class WindowSampler:
             if cfg.mode == SAMPLING_MODE_LATEST:
                 result[env] = self._latest_one_env(ranges, cfg.sampling_count)
             elif cfg.mode == SAMPLING_MODE_RANDOM:
-                rng = random.Random(self._seed(window_id, block_start, env))
+                rng = self._rng()
                 result[env] = self._sample_one_env(ranges, cfg.sampling_count, rng)
             else:
                 raise ValueError(

@@ -1,7 +1,8 @@
-"""Unit tests for WindowSampler determinism and correctness."""
+"""Unit tests for WindowSampler randomness and correctness."""
 
 import pytest
 
+import affine.src.scorer.sampler as sampler_module
 from affine.src.scorer.sampler import (
     SAMPLING_MODE_LATEST,
     SAMPLING_MODE_RANDOM,
@@ -14,35 +15,40 @@ def _cfg(env: str, ranges, n: int, mode: str = SAMPLING_MODE_RANDOM) -> EnvSampl
     return EnvSamplingConfig(env=env, dataset_range=ranges, sampling_count=n, mode=mode)
 
 
-def test_same_inputs_yield_same_output():
+def test_default_random_mode_uses_system_random(monkeypatch):
+    calls = 0
+
+    def fake_system_random():
+        nonlocal calls
+        calls += 1
+        return sampler_module.random.Random(10_000 + calls)
+
+    monkeypatch.setattr(sampler_module.secrets, "SystemRandom", fake_system_random)
     s = WindowSampler()
     a = s.generate(42, 1_000_000, {"x": _cfg("x", [[0, 50_000]], 1000)})
     b = s.generate(42, 1_000_000, {"x": _cfg("x", [[0, 50_000]], 1000)})
+    assert calls == 2
+    assert a != b
+
+
+def test_public_inputs_do_not_control_random_output(monkeypatch):
+    monkeypatch.setattr(
+        sampler_module.secrets,
+        "SystemRandom",
+        lambda: sampler_module.random.Random(12345),
+    )
+
+    env_configs = {"x": _cfg("x", [[0, 50_000]], 1000)}
+    a = WindowSampler().generate(1, 100, env_configs)
+    b = WindowSampler().generate(1190, 8_568_894, env_configs)
     assert a == b
 
 
-def test_different_window_ids_diverge():
-    s = WindowSampler()
-    a = s.generate(1, 0, {"x": _cfg("x", [[0, 50_000]], 1000)})["x"]
-    b = s.generate(2, 0, {"x": _cfg("x", [[0, 50_000]], 1000)})["x"]
-    overlap = len(set(a) & set(b))
-    # 1000 of 50k drawn twice → expected overlap ≈ 1000²/50000 = 20.
-    # Allow generous slack but flag pathological overlap.
-    assert overlap < 100
-
-
-def test_different_envs_under_same_window_diverge():
-    s = WindowSampler()
-    out = s.generate(
-        42,
-        0,
-        {
-            "a": _cfg("a", [[0, 50_000]], 1000),
-            "b": _cfg("b", [[0, 50_000]], 1000),
-        },
-    )
-    overlap = len(set(out["a"]) & set(out["b"]))
-    assert overlap < 100
+def test_legacy_seed_mode_is_removed():
+    assert not hasattr(WindowSampler, "_seed")
+    kwargs = {"deterministic": True}
+    with pytest.raises(TypeError):
+        WindowSampler(**kwargs)
 
 
 def test_output_size_matches_sampling_count():
@@ -76,13 +82,6 @@ def test_oversample_raises():
         assert "exceeds available" in str(e)
     else:
         raise AssertionError("expected ValueError on oversample")
-
-
-def test_block_start_affects_seed():
-    s = WindowSampler()
-    a = s.generate(1, 100, {"x": _cfg("x", [[0, 50_000]], 1000)})["x"]
-    b = s.generate(1, 200, {"x": _cfg("x", [[0, 50_000]], 1000)})["x"]
-    assert a != b
 
 
 def test_sorted_output():
@@ -166,32 +165,27 @@ def test_mixed_modes_per_env():
 # ---- production-scale + fallback-path coverage ------------------------------
 
 
-def test_random_sampling_near_total_uses_deterministic_fallback():
+def test_random_sampling_near_total_uses_fallback():
     """When n is close to total, the random-with-rejection loop bails out
-    and the deterministic-fill fallback completes the set. The output is
-    still seed-reproducible across runs."""
+    and the fallback completes the set."""
     s = WindowSampler()
     # Force the fallback: 99 of 100 → collision rate is very high.
     a = s.generate(1, 0, {"x": _cfg("x", [[0, 100]], 99)})["x"]
-    b = s.generate(1, 0, {"x": _cfg("x", [[0, 100]], 99)})["x"]
-    assert a == b
     assert len(a) == 99
     assert len(set(a)) == 99
     for tid in a:
         assert 0 <= tid < 100
 
 
-def test_random_sampling_at_production_swe_scale_is_deterministic():
+def test_random_sampling_at_production_swe_scale():
     """SWE/DISTILL use latest mode, but the random sampler must also
     scale to large dataset ranges. ``LIVEWEB``-style range is the
     stress test: 400 picks from 78M ids, near-zero collision rate."""
     s = WindowSampler()
     cfg = _cfg("liveweb", [[0, 78_060_000]], 400)
-    out_a = s.generate(42, 1_000_000, {"liveweb": cfg})["liveweb"]
-    out_b = s.generate(42, 1_000_000, {"liveweb": cfg})["liveweb"]
-    assert out_a == out_b
-    assert len(out_a) == 400
-    assert len(set(out_a)) == 400
+    out = s.generate(42, 1_000_000, {"liveweb": cfg})["liveweb"]
+    assert len(out) == 400
+    assert len(set(out)) == 400
 
 
 def test_random_sampling_with_multi_interval_dataset():

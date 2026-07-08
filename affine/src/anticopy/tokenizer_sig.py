@@ -13,6 +13,11 @@ import os
 from typing import Optional, Tuple
 
 from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub.errors import (
+    GatedRepoError,
+    RepositoryNotFoundError,
+    RevisionNotFoundError,
+)
 
 
 # Files we'll try in order. The first one that exists at the given
@@ -21,14 +26,18 @@ from huggingface_hub import HfApi, hf_hub_download
 # ``tokenizer.model`` is the SentencePiece fallback some older
 # checkpoints still use.
 TOKENIZER_FILES = ("tokenizer.json", "tokenizer.model")
+TOKENIZER_SIG_REPO_INACCESSIBLE = "repo_inaccessible"
+TOKENIZER_SIG_REVISION_NOT_FOUND = "revision_not_found"
+TOKENIZER_SIG_MISSING_ARTIFACT = "missing_tokenizer_artifact"
+TOKENIZER_SIG_PARSE_FAILED = "tokenizer_parse_failed"
+TOKENIZER_SIG_TRANSIENT_FETCH_FAILED = "transient_fetch_failed"
 
 
 async def compute_tokenizer_signature(
     model_id: str, revision: str, *, hf_token: Optional[str] = None
-) -> Tuple[Optional[str], str]:
-    """Return ``(sha256_hex, source_filename)`` for the model's
-    tokenizer at the given revision. Returns ``(None, "")`` if the
-    repo has neither artifact.
+) -> Tuple[Optional[str], str, str]:
+    """Return ``(sha256_hex, source_filename, reason)`` for the model's
+    tokenizer at the given revision. ``reason`` is empty on success.
 
     Network-bound — call from inside ``asyncio.to_thread`` or use the
     helper :func:`compute_tokenizer_signature_sync` directly.
@@ -40,7 +49,7 @@ async def compute_tokenizer_signature(
 
 def compute_tokenizer_signature_sync(
     model_id: str, revision: str, hf_token: Optional[str] = None
-) -> Tuple[Optional[str], str]:
+) -> Tuple[Optional[str], str, str]:
     """Sync version, suitable for use outside an event loop.
 
     Returns a *canonical* tokenization signature: sha256 over
@@ -59,16 +68,23 @@ def compute_tokenizer_signature_sync(
         info = api.repo_info(
             repo_id=model_id, repo_type="model", revision=revision, files_metadata=True,
         )
+    except RevisionNotFoundError:
+        return None, "", TOKENIZER_SIG_REVISION_NOT_FOUND
+    except (GatedRepoError, RepositoryNotFoundError):
+        return None, "", TOKENIZER_SIG_REPO_INACCESSIBLE
     except Exception:
-        return None, ""
+        return None, "", TOKENIZER_SIG_TRANSIENT_FETCH_FAILED
 
     available = {
         (getattr(s, "rfilename", "") or getattr(s, "path", "") or "")
         for s in (getattr(info, "siblings", None) or [])
     }
-    for fname in TOKENIZER_FILES:
-        if fname not in available:
-            continue
+    present = [fname for fname in TOKENIZER_FILES if fname in available]
+    if not present:
+        return None, "", TOKENIZER_SIG_MISSING_ARTIFACT
+
+    saw_fetch_failure = False
+    for fname in present:
         try:
             path = hf_hub_download(
                 repo_id=model_id,
@@ -77,11 +93,17 @@ def compute_tokenizer_signature_sync(
                 token=hf_token,
             )
         except Exception:
+            saw_fetch_failure = True
             continue
         sig = _canonical_tokenizer_sig(path)
         if sig is not None:
-            return sig, fname
-    return None, ""
+            return sig, fname, ""
+    reason = (
+        TOKENIZER_SIG_TRANSIENT_FETCH_FAILED
+        if saw_fetch_failure
+        else TOKENIZER_SIG_PARSE_FAILED
+    )
+    return None, "", reason
 
 
 def _canonical_tokenizer_sig(path: str) -> Optional[str]:
