@@ -30,11 +30,87 @@ import requests
 
 
 class TargonWrapperError(RuntimeError):
-    pass
+    error_source = "wrapper"
+    code = "wrapper_error"
+    http_status = 500
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "",
+        http_status: int = 0,
+    ):
+        super().__init__(message)
+        self.message = message
+        if code:
+            self.code = code
+        if http_status:
+            self.http_status = http_status
 
 
-class TargonNotFound(TargonWrapperError):
-    pass
+class TargonProviderError(TargonWrapperError):
+    error_source = "provider"
+    code = "provider_error"
+    http_status = 502
+
+
+class TargonHTTPError(TargonProviderError):
+    code = "provider_http_error"
+
+    def __init__(self, method: str, path: str, status_code: int, text: str):
+        self.method = method
+        self.path = path
+        self.status_code = status_code
+        self.text = text
+        code = (
+            "provider_instance_not_found"
+            if status_code == 404
+            else "provider_http_error"
+        )
+        super().__init__(
+            f"{method} {path} -> {status_code}: {text[:500]}",
+            code=code,
+            http_status=status_code,
+        )
+
+
+class TargonNotFound(TargonHTTPError):
+    def __init__(self, method: str, path: str = "", text: str = ""):
+        if path:
+            super().__init__(method, path, 404, text)
+            return
+        message = method
+        self.method = ""
+        self.path = ""
+        self.status_code = 404
+        self.text = message
+        TargonProviderError.__init__(
+            self,
+            message,
+            code="provider_instance_not_found",
+            http_status=404,
+        )
+
+
+class TargonRequestError(TargonProviderError):
+    def __init__(
+        self,
+        method: str,
+        path: str,
+        error: Exception,
+        *,
+        code: str = "provider_transport_error",
+        http_status: int = 502,
+    ):
+        self.method = method
+        self.path = path
+        self.original_error = error
+        super().__init__(
+            f"{method} {path} transport failed: {type(error).__name__}: {error}",
+            code=code,
+            http_status=http_status,
+        )
 
 
 def _env(name: str, default: str = "") -> str:
@@ -54,11 +130,17 @@ def _env_string_list(name: str) -> list[str]:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as e:
-            raise TargonWrapperError(f"{name} must be a JSON string array: {e}")
+            raise TargonWrapperError(
+                f"{name} must be a JSON string array: {e}",
+                code="wrapper_config_error",
+            )
         if not isinstance(parsed, list) or not all(
             isinstance(value, str) for value in parsed
         ):
-            raise TargonWrapperError(f"{name} must be a JSON string array")
+            raise TargonWrapperError(
+                f"{name} must be a JSON string array",
+                code="wrapper_config_error",
+            )
         values = parsed
     else:
         values = raw.split(",")
@@ -124,9 +206,15 @@ RENEW_PAYLOAD_JSON = _env("TARGON_RENEW_PAYLOAD_JSON")
 class TargonAutoscaleClient:
     def __init__(self) -> None:
         if not API_BASE:
-            raise TargonWrapperError("TARGON_API_URL is required")
+            raise TargonWrapperError(
+                "TARGON_API_URL is required",
+                code="wrapper_config_error",
+            )
         if not API_KEY:
-            raise TargonWrapperError("TARGON_API_KEY is required")
+            raise TargonWrapperError(
+                "TARGON_API_KEY is required",
+                code="wrapper_config_error",
+            )
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -136,26 +224,41 @@ class TargonAutoscaleClient:
         )
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        resp = self.session.request(
-            method,
-            f"{API_BASE}{path}",
-            timeout=REQUEST_TIMEOUT,
-            **kwargs,
-        )
+        try:
+            resp = self.session.request(
+                method,
+                f"{API_BASE}{path}",
+                timeout=REQUEST_TIMEOUT,
+                **kwargs,
+            )
+        except requests.Timeout as e:
+            raise TargonRequestError(
+                method,
+                path,
+                e,
+                code="provider_timeout",
+                http_status=504,
+            ) from e
+        except requests.RequestException as e:
+            raise TargonRequestError(method, path, e) from e
         if resp.status_code in (204, 205):
             return {}
         if resp.status_code == 404:
-            raise TargonNotFound(f"{method} {path} -> 404")
+            raise TargonNotFound(method, path, resp.text)
         if resp.status_code >= 400:
-            raise TargonWrapperError(
-                f"{method} {path} -> {resp.status_code}: {resp.text[:500]}"
-            )
+            raise TargonHTTPError(method, path, resp.status_code, resp.text)
         if not resp.content:
             return {}
         content_type = resp.headers.get("Content-Type", "")
         if "json" not in content_type.lower():
             return {"_raw": resp.text}
-        return resp.json()
+        try:
+            return resp.json()
+        except ValueError as e:
+            raise TargonProviderError(
+                f"{method} {path} returned invalid JSON: {resp.text[:500]}",
+                code="provider_invalid_response",
+            ) from e
 
     def create(self, name: str) -> dict:
         errors: list[str] = []
@@ -169,8 +272,9 @@ class TargonAutoscaleClient:
                     f"{type(e).__name__}: {e}",
                     flush=True,
                 )
-        raise TargonWrapperError(
-            "Targon create failed for all resource names: " + "; ".join(errors)
+        raise TargonProviderError(
+            "Targon create failed for all resource names: " + "; ".join(errors),
+            code="provider_create_failed",
         )
 
     def _create_with_resource(self, name: str, resource_name: str) -> dict:
@@ -198,8 +302,9 @@ class TargonAutoscaleClient:
                 )
                 if existing:
                     return existing
-                raise TargonWrapperError(
-                    f"Targon create response did not include uid: {result}"
+                raise TargonProviderError(
+                    f"Targon create response did not include uid: {result}",
+                    code="provider_invalid_response",
                 )
             self.request("POST", f"/workloads/{uid}/deploy")
             ready = self.wait_ready(uid)
@@ -229,13 +334,15 @@ class TargonAutoscaleClient:
         if not RENTAL_IMAGE:
             raise TargonWrapperError(
                 "TARGON_RENTAL_IMAGE is required. Use an image with SSH, "
-                "Docker and NVIDIA container runtime available."
+                "Docker and NVIDIA container runtime available.",
+                code="wrapper_config_error",
             )
         ssh_keys = self._ssh_key_uids()
         if not ssh_keys:
             raise TargonWrapperError(
                 "Set TARGON_SSH_KEY_UID or TARGON_SSH_KEY_NAME so the "
-                "autoscaler-created rental is reachable over SSH."
+                "autoscaler-created rental is reachable over SSH.",
+                code="wrapper_config_error",
             )
 
         body: dict[str, Any] = {
@@ -278,8 +385,9 @@ class TargonAutoscaleClient:
             name = str(key.get("name") or key.get("key_name") or "")
             if uid and name == SSH_KEY_NAME:
                 return [uid]
-        raise TargonWrapperError(
-            f"No Targon SSH key found for TARGON_SSH_KEY_NAME={SSH_KEY_NAME!r}"
+        raise TargonProviderError(
+            f"No Targon SSH key found for TARGON_SSH_KEY_NAME={SSH_KEY_NAME!r}",
+            code="provider_configuration_error",
         )
 
     def items(self, payload: Any) -> List[dict]:
@@ -357,8 +465,10 @@ class TargonAutoscaleClient:
                 last = merged
             status = _status(merged)
             if status in {"failed", "error", "terminated", "deleted"}:
-                raise TargonWrapperError(
-                    f"Targon workload {uid} {status}: {str(_redacted(merged))[:800]}"
+                raise TargonProviderError(
+                    f"Targon workload {uid} {status}: {str(_redacted(merged))[:800]}",
+                    code="provider_instance_failed",
+                    http_status=502,
                 )
             if _running(merged):
                 if self._ssh_ready(uid):
@@ -379,16 +489,39 @@ class TargonAutoscaleClient:
                     SSH_READY_FAILURE_LIMIT > 0
                     and ssh_ready_failures >= SSH_READY_FAILURE_LIMIT
                 ):
-                    raise TargonWrapperError(
+                    raise TargonProviderError(
                         f"Targon workload {uid} SSH preflight failed "
                         f"{ssh_ready_failures} time(s) after workload became "
-                        "running"
+                        "running",
+                        code="provider_instance_not_ready",
+                        http_status=504,
                     )
             time.sleep(POLL_SECONDS)
-        raise TargonWrapperError(
+        raise TargonProviderError(
             f"Targon workload {uid} did not become ready in {WAIT_TIMEOUT}s; "
-            f"last={str(_redacted(last))[:1000]}"
+            f"last={str(_redacted(last))[:1000]}",
+            code="provider_instance_not_ready",
+            http_status=504,
         )
+
+    def status(self, uid: str) -> dict:
+        workload = self.request("GET", f"/workloads/{uid}")
+        state = self._safe_get_state(uid)
+        merged = _merge_workload_state(
+            workload if isinstance(workload, dict) else {},
+            state,
+        )
+        return {
+            "instance_id": uid,
+            "lease_expires_at": _lease_expires_at(merged),
+            "status": _status(merged),
+            "ssh_url": _ssh_url(uid),
+            "public_inference_url": (
+                _openai_endpoint(PUBLIC_INFERENCE_URL)
+                or _public_url(merged, uid, PORT)
+            ),
+            "raw": _redacted(merged),
+        }
 
     def _safe_get_workload(self, uid: str) -> dict:
         try:
@@ -464,7 +597,9 @@ class TargonAutoscaleClient:
             ):
                 raise TargonWrapperError(
                     f"Refusing to delete non-autoscaler Targon workload "
-                    f"{uid} name={name!r} purpose={expected_purpose or '*'}"
+                    f"{uid} name={name!r} purpose={expected_purpose or '*'}",
+                    code="wrapper_safety_violation",
+                    http_status=409,
                 )
         try:
             self.request("DELETE", f"/workloads/{uid}")
@@ -477,8 +612,9 @@ class TargonAutoscaleClient:
         name = str(workload.get("name") or "") if isinstance(workload, dict) else ""
         if name and not _owned_workload_name(name):
             raise TargonWrapperError(
-                f"Refusing to renew non-autoscaler Targon workload "
-                f"{uid} name={name!r}"
+                f"Refusing to renew non-autoscaler Targon workload {uid} name={name!r}",
+                code="wrapper_safety_violation",
+                http_status=409,
             )
         state = self._safe_get_state(uid)
         merged = _merge_workload_state(
@@ -545,14 +681,14 @@ def _ssh_probe_command() -> str:
 def _nvidia_no_cgroups_fix_command() -> str:
     return (
         "cfg=/etc/nvidia-container-runtime/config.toml; "
-        "if [ -f \"$cfg\" ]; then "
+        'if [ -f "$cfg" ]; then '
         "if grep -qE '^[#[:space:]]*no-cgroups[[:space:]]*=' \"$cfg\"; then "
         "sed -i 's/^[#[:space:]]*no-cgroups[[:space:]]*=.*/"
-        "no-cgroups = true/' \"$cfg\"; "
+        'no-cgroups = true/\' "$cfg"; '
         "elif grep -qE '^\\[nvidia-container-cli\\]' \"$cfg\"; then "
         "sed -i '/^\\[nvidia-container-cli\\]/a no-cgroups = true' \"$cfg\"; "
         "else printf '\\n[nvidia-container-cli]\\nno-cgroups = true\\n' "
-        ">> \"$cfg\"; fi; "
+        '>> "$cfg"; fi; '
         "elif mkdir -p /etc/nvidia-container-runtime 2>/dev/null; then "
         "printf '[nvidia-container-cli]\\nno-cgroups = true\\n' > \"$cfg\"; "
         "fi"
@@ -596,9 +732,15 @@ def _json_list_env(name: str) -> Optional[list[str]]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise TargonWrapperError(f"{name} must be a JSON array of strings: {e}")
+        raise TargonWrapperError(
+            f"{name} must be a JSON array of strings: {e}",
+            code="wrapper_config_error",
+        )
     if not isinstance(parsed, list) or not all(isinstance(v, str) for v in parsed):
-        raise TargonWrapperError(f"{name} must be a JSON array of strings")
+        raise TargonWrapperError(
+            f"{name} must be a JSON array of strings",
+            code="wrapper_config_error",
+        )
     return parsed
 
 
@@ -609,12 +751,18 @@ def _json_envs(name: str) -> list[dict]:
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise TargonWrapperError(f"{name} must be a JSON object or env array: {e}")
+        raise TargonWrapperError(
+            f"{name} must be a JSON object or env array: {e}",
+            code="wrapper_config_error",
+        )
     if isinstance(parsed, dict):
         return [{"name": str(k), "value": str(v)} for k, v in parsed.items()]
     if isinstance(parsed, list) and all(isinstance(v, dict) for v in parsed):
         return parsed
-    raise TargonWrapperError(f"{name} must be a JSON object or env array")
+    raise TargonWrapperError(
+        f"{name} must be a JSON object or env array",
+        code="wrapper_config_error",
+    )
 
 
 def _instance_id(data: Mapping[str, Any]) -> str:
@@ -647,7 +795,9 @@ def _running(data: Mapping[str, Any]) -> bool:
     return status in {"running", "ready", "active", "healthy"}
 
 
-def _merge_workload_state(workload: Mapping[str, Any], state: Mapping[str, Any]) -> dict:
+def _merge_workload_state(
+    workload: Mapping[str, Any], state: Mapping[str, Any]
+) -> dict:
     merged: dict[str, Any] = dict(workload or {})
     if state:
         merged["state"] = dict(state)
@@ -758,10 +908,14 @@ def _json_payload_env() -> dict:
         parsed = json.loads(RENEW_PAYLOAD_JSON)
     except json.JSONDecodeError as e:
         raise TargonWrapperError(
-            f"TARGON_RENEW_PAYLOAD_JSON must be a JSON object: {e}"
+            f"TARGON_RENEW_PAYLOAD_JSON must be a JSON object: {e}",
+            code="wrapper_config_error",
         )
     if not isinstance(parsed, dict):
-        raise TargonWrapperError("TARGON_RENEW_PAYLOAD_JSON must be a JSON object")
+        raise TargonWrapperError(
+            "TARGON_RENEW_PAYLOAD_JSON must be a JSON object",
+            code="wrapper_config_error",
+        )
     return parsed
 
 
@@ -827,9 +981,8 @@ def _resource_name(*, purpose: str, suffix: str, max_len: int) -> str:
     digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:6]
     fixed_len = len(NAME_PREFIX) + len(purpose) + len(digest) + 3
     suffix_budget = max(1, max_len - fixed_len)
-    return (
-        f"{NAME_PREFIX}-{purpose}-{suffix[:suffix_budget]}-{digest}"[:max_len]
-        .strip("-")
+    return f"{NAME_PREFIX}-{purpose}-{suffix[:suffix_budget]}-{digest}"[:max_len].strip(
+        "-"
     )
 
 
@@ -879,11 +1032,23 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"ok": True})
             return
-        self._send(404, {"error": "not found"})
+        if not self._authorized():
+            self._send(401, _wrapper_error("unauthorized", "unauthorized"))
+            return
+        parsed = urlparse(self.path)
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) == 2 and parts[0] == "instances":
+            try:
+                result = TargonAutoscaleClient().status(parts[1])
+                self._send(200, result)
+            except Exception as e:
+                self._send(*_error_response(e))
+            return
+        self._send(404, _route_not_found("GET", parsed.path))
 
     def do_POST(self) -> None:
         if not self._authorized():
-            self._send(401, {"error": "unauthorized"})
+            self._send(401, _wrapper_error("unauthorized", "unauthorized"))
             return
         parsed = urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
@@ -892,15 +1057,16 @@ class Handler(BaseHTTPRequestHandler):
                 result = TargonAutoscaleClient().renew(parts[1])
                 self._send(200, result)
             except Exception as e:
-                self._send(500, {"error": type(e).__name__, "message": str(e)})
+                self._send(*_error_response(e))
             return
         if parsed.path != "/instances":
-            self._send(404, {"error": "not found"})
+            self._send(404, _route_not_found("POST", parsed.path))
             return
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            raw = self.rfile.read(length).decode("utf-8") if length else "{}"
-            data = json.loads(raw or "{}")
+            data, error = _read_json_body(self)
+            if error:
+                self._send(400, error)
+                return
             name = _resource_name(
                 purpose=str(data.get("purpose") or "eval"),
                 suffix=str(data.get("endpoint_name") or int(time.time())),
@@ -909,26 +1075,29 @@ class Handler(BaseHTTPRequestHandler):
             result = TargonAutoscaleClient().create(name)
             self._send(200, result)
         except Exception as e:
-            self._send(500, {"error": type(e).__name__, "message": str(e)})
+            self._send(*_error_response(e))
 
     def do_DELETE(self) -> None:
         if not self._authorized():
-            self._send(401, {"error": "unauthorized"})
+            self._send(401, _wrapper_error("unauthorized", "unauthorized"))
             return
         parsed = urlparse(self.path)
         parts = [p for p in parsed.path.split("/") if p]
         if len(parts) != 2 or parts[0] != "instances":
-            self._send(404, {"error": "not found"})
+            self._send(404, _route_not_found("DELETE", parsed.path))
             return
         try:
-            expected_purpose = _expected_purpose(self, parsed)
+            expected_purpose, error = _expected_purpose(self, parsed)
+            if error:
+                self._send(400, error)
+                return
             ok = TargonAutoscaleClient().delete(
                 parts[1],
                 expected_purpose=expected_purpose,
             )
             self._send(200, {"ok": ok})
         except Exception as e:
-            self._send(500, {"error": type(e).__name__, "message": str(e)})
+            self._send(*_error_response(e))
 
     def log_message(self, fmt: str, *args: Any) -> None:
         print(
@@ -939,17 +1108,127 @@ class Handler(BaseHTTPRequestHandler):
         )
 
 
-def _expected_purpose(handler: BaseHTTPRequestHandler, parsed) -> str:
-    query = parse_qs(parsed.query)
-    if query.get("purpose"):
-        return _safe_token(query["purpose"][0])
+def _route_not_found(method: str, path: str) -> dict:
+    payload = _wrapper_error("route_not_found", "wrapper route not found")
+    payload.update(
+        {
+            "error": "not_found",
+            "method": method,
+            "path": path,
+        }
+    )
+    return payload
+
+
+def _wrapper_error(code: str, message: str, **extra: Any) -> dict:
+    payload = {
+        "error": code,
+        "error_source": "wrapper",
+        "code": code,
+        "message": message,
+    }
+    payload.update(extra)
+    return payload
+
+
+def _provider_error(error: Exception, **extra: Any) -> dict:
+    payload = {
+        "error": type(error).__name__,
+        "error_source": "provider",
+        "code": getattr(error, "code", "provider_error"),
+        "provider": "targon",
+        "message": str(error),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _provider_http_error(error: TargonHTTPError) -> dict:
+    return _provider_error(
+        error,
+        provider_status_code=error.status_code,
+        provider_method=error.method,
+        provider_path=error.path,
+        provider_response=error.text[:1000],
+    )
+
+
+def _provider_transport_error(error: TargonRequestError) -> dict:
+    return _provider_error(
+        error,
+        provider_method=error.method,
+        provider_path=error.path,
+    )
+
+
+def _provider_not_found(error: Exception) -> dict:
+    if isinstance(error, TargonHTTPError):
+        return _provider_http_error(error)
+    return _provider_error(
+        error,
+        code="provider_instance_not_found",
+        provider_status_code=404,
+    )
+
+
+def _bad_request(message: str, **extra: Any) -> dict:
+    return _wrapper_error("bad_request", message, **extra)
+
+
+def _error_response(error: Exception) -> tuple[int, dict]:
+    if isinstance(error, TargonHTTPError):
+        return error.status_code, _provider_http_error(error)
+    if isinstance(error, TargonRequestError):
+        return error.http_status, _provider_transport_error(error)
+    if isinstance(error, TargonProviderError):
+        return error.http_status, _provider_error(error)
+    if isinstance(error, TargonWrapperError):
+        return error.http_status, _wrapper_error(
+            error.code,
+            str(error),
+            error=type(error).__name__,
+        )
+    return 500, _wrapper_error(
+        "wrapper_internal_error",
+        str(error),
+        error=type(error).__name__,
+    )
+
+
+def _read_json_body(
+    handler: BaseHTTPRequestHandler,
+) -> tuple[dict, Optional[dict]]:
     try:
         length = int(handler.headers.get("Content-Length") or 0)
-        raw = handler.rfile.read(length).decode("utf-8") if length else "{}"
-        data = json.loads(raw or "{}")
-    except Exception:
-        return ""
-    return _safe_token(data.get("purpose"))
+    except ValueError:
+        return {}, _bad_request("Content-Length must be an integer")
+    if length <= 0:
+        return {}, None
+    raw = handler.rfile.read(length)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return {}, _bad_request("request body must be UTF-8 JSON")
+    try:
+        data = json.loads(text or "{}")
+    except json.JSONDecodeError as e:
+        return {}, _bad_request(f"request body must be valid JSON: {e}")
+    if not isinstance(data, dict):
+        return {}, _bad_request("request body must be a JSON object")
+    return data, None
+
+
+def _expected_purpose(
+    handler: BaseHTTPRequestHandler,
+    parsed,
+) -> tuple[str, Optional[dict]]:
+    query = parse_qs(parsed.query)
+    if query.get("purpose"):
+        return _safe_token(query["purpose"][0]), None
+    data, error = _read_json_body(handler)
+    if error:
+        return "", error
+    return _safe_token(data.get("purpose")), None
 
 
 def main() -> None:

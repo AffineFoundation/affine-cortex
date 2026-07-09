@@ -194,7 +194,7 @@ class ValidatorService:
             logger.debug(f"Watchdog updated: {operation}")
 
     async def wait_for_next_window(self, subtensor, interval_blocks: int):
-        """Wait for the next weight submission window"""
+        """Wait for the next weight submission window and chain rate limit."""
         current_block = await subtensor.get_current_block()
         self.update_block_progress(current_block)
         
@@ -227,8 +227,69 @@ class ValidatorService:
                 # Re-fetch current block after error
                 current_block = await subtensor.get_current_block()
                 self.update_block_progress(current_block)
-        
-        return next_window_start
+
+        try:
+            uid = await subtensor.get_uid_for_hotkey_on_subnet(
+                self.wallet.hotkey.ss58_address,
+                self.netuid,
+            )
+            if uid is None:
+                logger.warning(
+                    "Hotkey %s is not registered on subnet %s; proceeding to set_weights",
+                    self.wallet.hotkey.ss58_address,
+                    self.netuid,
+                )
+                return current_block
+
+            while self.running:
+                blocks_since_last_update, weights_rate_limit = await asyncio.gather(
+                    subtensor.blocks_since_last_update(self.netuid, uid),
+                    subtensor.weights_rate_limit(self.netuid),
+                )
+                blocks_since_last_update = int(blocks_since_last_update)
+                weights_rate_limit = int(weights_rate_limit)
+                if blocks_since_last_update > weights_rate_limit:
+                    logger.info(
+                        "Weight rate limit satisfied: uid=%s blocks_since_last_update=%s weights_rate_limit=%s",
+                        uid,
+                        blocks_since_last_update,
+                        weights_rate_limit,
+                    )
+                    return current_block
+
+                blocks_remaining = weights_rate_limit - blocks_since_last_update + 1
+                target_block = current_block + blocks_remaining
+                logger.info(
+                    "Waiting for weight rate limit: uid=%s blocks_since_last_update=%s "
+                    "weights_rate_limit=%s target=%s remaining=%s",
+                    uid,
+                    blocks_since_last_update,
+                    weights_rate_limit,
+                    target_block,
+                    blocks_remaining,
+                )
+
+                while self.running and current_block < target_block:
+                    try:
+                        logger.info(
+                            "Current block: %s, rate-limit target: %s, remaining: %s",
+                            current_block,
+                            target_block,
+                            target_block - current_block,
+                        )
+                        await subtensor.wait_for_block(current_block + 1)
+                        current_block = await subtensor.get_current_block()
+                        self.update_block_progress(current_block)
+                    except Exception as e:
+                        logger.error(f"Error waiting for weight rate limit: {e}")
+                        await asyncio.sleep(30)
+                        current_block = await subtensor.get_current_block()
+                        self.update_block_progress(current_block)
+        except Exception as e:
+            logger.error(f"Error checking weight rate limit: {e}")
+            return current_block
+
+        return current_block
 
     async def run_iteration(self):
         """Run one iteration of weight setting.
@@ -260,14 +321,18 @@ class ValidatorService:
         try:
             # Timeout is less than the 10-min watchdog so a hung set_weights
             # call surfaces here rather than at the watchdog SIGTERM.
-            await asyncio.wait_for(
+            weights_set = await asyncio.wait_for(
                 self.weight_setter.set_weights(
                     weights_data.get("weights", {}),
                     burn_percentage,
                 ),
                 timeout=480,
             )
-            self.update_watchdog("weights set completed")
+            if weights_set:
+                self.update_watchdog("weights set completed")
+            else:
+                logger.error("set_weights completed without setting weights")
+                self.update_watchdog("weights set failed")
         except asyncio.TimeoutError:
             logger.error("set_weights timed out after 480s")
             self.update_watchdog("weights set timeout")

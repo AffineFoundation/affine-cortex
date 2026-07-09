@@ -12,6 +12,34 @@ import asyncio
 from affine.core.setup import logger
 from affine.utils.subtensor import get_subtensor
 
+
+def _is_successful_extrinsic_response(response) -> bool:
+    """Return the explicit success flag from a bittensor extrinsic response."""
+    if isinstance(response, bool):
+        return response
+
+    success = getattr(response, "success", None)
+    if success is None:
+        logger.error(
+            "Unexpected response from subtensor.set_weights: %r",
+            response,
+        )
+        return False
+
+    return bool(success)
+
+
+def _extrinsic_failure_message(response) -> str:
+    message = getattr(response, "message", None)
+    error = getattr(response, "error", None)
+    parts = []
+    if message:
+        parts.append(str(message))
+    if error:
+        parts.append(str(error))
+    return "; ".join(parts) or repr(response)
+
+
 class WeightSetter:
     def __init__(self, wallet: bt.Wallet, netuid: int):
         self.wallet = wallet
@@ -126,7 +154,7 @@ class WeightSetter:
                 current_block = await subtensor.get_current_block()
                 logger.info(f"Current block: {current_block}")
                 
-                success = await subtensor.set_weights(
+                response = await subtensor.set_weights(
                     wallet=self.wallet,
                     netuid=self.netuid,
                     uids=uids,
@@ -135,11 +163,15 @@ class WeightSetter:
                     wait_for_finalization=True,
                 )
                 
-                if success:
+                if _is_successful_extrinsic_response(response):
                     logger.info("✅ Weights set successfully (chain confirmed)")
                     return True
                 else:
-                    logger.error(f"❌ Chain rejected weight setting on attempt {attempt + 1}")
+                    logger.error(
+                        "❌ Chain rejected weight setting on attempt %s: %s",
+                        attempt + 1,
+                        _extrinsic_failure_message(response),
+                    )
                     if attempt < max_retries - 1:
                         logger.info("Retrying weight setting in 60 seconds...")
                         await asyncio.sleep(60)

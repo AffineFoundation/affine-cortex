@@ -5,6 +5,7 @@ import pytest
 from affine.core.providers.instance_api_client import (
     InstanceAPIConfig,
     InstanceHandle,
+    InstanceAPINotFoundError,
 )
 from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.gpu_autoscaler import (
@@ -163,10 +164,13 @@ class _Client:
     create_calls = []
     events = []
     renewed = []
+    status_calls = []
     create_lease_expires_at = 1500
     renew_expires_at = 0
     create_returns_none_for_names = set()
     delete_returns_false_for_ids = set()
+    renew_not_found_for_ids = set()
+    status_not_found_for_ids = set()
 
     def __init__(self, config):
         self.config = config
@@ -197,11 +201,33 @@ class _Client:
 
     async def renew(self, instance_id):
         self.renewed.append(instance_id)
+        if instance_id in self.renew_not_found_for_ids:
+            raise InstanceAPINotFoundError(
+                "POST",
+                f"/instances/{instance_id}/renew",
+                500,
+                "Pod not found",
+            )
         return InstanceHandle(
             provider=self.config.provider,
             instance_id=instance_id,
             lease_expires_at=self.renew_expires_at,
         )
+
+    async def status(self, instance_id):
+        self.status_calls.append(instance_id)
+        if instance_id in self.status_not_found_for_ids:
+            raise InstanceAPINotFoundError(
+                "GET",
+                f"/instances/{instance_id}",
+                404,
+                (
+                    '{"error_source":"provider",'
+                    '"code":"provider_instance_not_found",'
+                    '"provider_status_code":404}'
+                ),
+            )
+        return {"instance_id": instance_id, "status": "running"}
 
 
 @pytest.fixture(autouse=True)
@@ -211,10 +237,13 @@ def _reset_client_state():
     _Client.create_calls = []
     _Client.events = []
     _Client.renewed = []
+    _Client.status_calls = []
     _Client.create_lease_expires_at = 1500
     _Client.renew_expires_at = 0
     _Client.create_returns_none_for_names = set()
     _Client.delete_returns_false_for_ids = set()
+    _Client.renew_not_found_for_ids = set()
+    _Client.status_not_found_for_ids = set()
 
 
 def _config(
@@ -226,7 +255,9 @@ def _config(
     lease_duration_seconds=0,
     lease_renew_margin_seconds=3600,
     lease_renew_cooldown_seconds=300,
+    endpoint_health_check_interval_seconds=300,
     renew_path="/instances/{instance_id}/renew",
+    status_path="",
 ):
     return GPUAutoscalerConfig(
         enabled=enabled,
@@ -236,6 +267,9 @@ def _config(
         lease_duration_seconds=lease_duration_seconds,
         lease_renew_margin_seconds=lease_renew_margin_seconds,
         lease_renew_cooldown_seconds=lease_renew_cooldown_seconds,
+        endpoint_health_check_interval_seconds=(
+            endpoint_health_check_interval_seconds
+        ),
         min_instances=0,
         max_instances=2,
         providers={
@@ -245,6 +279,7 @@ def _config(
                 create_path="/instances",
                 delete_path="/instances/{instance_id}",
                 renew_path=renew_path,
+                status_path=status_path,
             )
         },
         slots=[
@@ -1069,6 +1104,146 @@ async def test_renews_busy_managed_endpoint_near_lease_expiry():
     assert ep.autoscale_lease_expires_at == 5000
     state = await kv.get(STATE_KEY)
     assert "lease_renew_attempted_at" not in state
+
+
+@pytest.mark.asyncio
+async def test_replaces_active_endpoint_when_renew_reports_provider_reclaimed():
+    _Client.renew_not_found_for_ids = {"old-inst"}
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_created_at=100,
+        autoscale_updated_at=100,
+        autoscale_lease_expires_at=1050,
+        deployment_id="ssh:lium-b200-1:affine-sglang-current",
+        base_url="http://old-lium.example.com:10001/v1",
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    result = await autoscaler.tick(
+        _config(
+            threshold=1,
+            idle_seconds=3600,
+            lease_renew_margin_seconds=60,
+        )
+    )
+
+    assert result.action == "scale-up:1"
+    assert result.active_capacity_count == 0
+    assert result.lease_reclaimed_count == 1
+    assert _Client.renewed == ["old-inst"]
+    assert _Client.create_calls[0][0]["endpoint_name"] == "lium-b200-1"
+    assert ("deactivate", "lium-b200-1", "old-inst") in _Client.events
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.active is True
+    assert ep.autoscale_instance_id == "inst-lium-b200-1"
+    assert ep.deployment_id is None
+    assert ep.base_url is None
+    state = await kv.get(STATE_KEY)
+    assert state["last_lease_reclaimed_count"] == 1
+    assert "lease_renew_attempted_at" not in state
+
+
+@pytest.mark.asyncio
+async def test_replaces_active_endpoint_when_status_reports_provider_reclaimed():
+    _Client.status_not_found_for_ids = {"old-inst"}
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_created_at=100,
+        autoscale_updated_at=100,
+        autoscale_lease_expires_at=5000,
+        deployment_id="ssh:lium-b200-1:affine-sglang-current",
+        base_url="http://old-lium.example.com:10001/v1",
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    result = await autoscaler.tick(
+        _config(
+            threshold=1,
+            idle_seconds=3600,
+            lease_renew_margin_seconds=60,
+            status_path="/instances/{instance_id}",
+        )
+    )
+
+    assert result.action == "scale-up:1"
+    assert result.active_capacity_count == 0
+    assert result.endpoint_health_checked_count == 1
+    assert result.endpoint_health_reclaimed_count == 1
+    assert result.lease_reclaimed_count == 0
+    assert _Client.status_calls == ["old-inst"]
+    assert _Client.renewed == []
+    assert _Client.create_calls[0][0]["endpoint_name"] == "lium-b200-1"
+    assert ("deactivate", "lium-b200-1", "old-inst") in _Client.events
+    ep = endpoints.endpoints["lium-b200-1"]
+    assert ep.active is True
+    assert ep.autoscale_instance_id == "inst-lium-b200-1"
+    assert ep.deployment_id is None
+    assert ep.base_url is None
+    state = await kv.get(STATE_KEY)
+    assert state["last_endpoint_health_checked_count"] == 1
+    assert state["last_endpoint_health_reclaimed_count"] == 1
+    assert "endpoint_health_checked_at" not in state
+
+
+@pytest.mark.asyncio
+async def test_endpoint_health_check_respects_five_minute_interval():
+    kv = InMemoryConfigStore()
+    await kv.set(STATE_KEY, {"endpoint_health_checked_at": {"lium-b200-1": 900}})
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="inst-lium-b200-1",
+        autoscale_lease_expires_at=5000,
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+
+    result = await autoscaler.tick(
+        _config(
+            threshold=1,
+            idle_seconds=3600,
+            lease_renew_margin_seconds=60,
+            endpoint_health_check_interval_seconds=300,
+            status_path="/instances/{instance_id}",
+        )
+    )
+
+    assert result.endpoint_health_checked_count == 0
+    assert _Client.status_calls == []
+    state = await kv.get(STATE_KEY)
+    assert state["endpoint_health_checked_at"] == {"lium-b200-1": 900}
 
 
 @pytest.mark.asyncio

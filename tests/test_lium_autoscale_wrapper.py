@@ -7,12 +7,10 @@ import pytest
 
 
 def _load_wrapper():
-    path = Path(__file__).resolve().parents[1] / "scripts" / (
-        "lium_autoscale_wrapper.py"
+    path = (
+        Path(__file__).resolve().parents[1] / "scripts" / ("lium_autoscale_wrapper.py")
     )
-    spec = importlib.util.spec_from_file_location(
-        "lium_autoscale_wrapper", path
-    )
+    spec = importlib.util.spec_from_file_location("lium_autoscale_wrapper", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -154,6 +152,91 @@ def test_delete_treats_missing_owned_pod_as_success():
     assert client.delete("pod-1") is True
 
 
+def test_status_returns_normalized_pod_state():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+
+    def request(method, path, **kwargs):
+        assert (method, path) == ("GET", "/pods/pod-1")
+        return {
+            "uid": "pod-1",
+            "status": "RUNNING",
+            "ssh_url": "ssh://root@203.0.113.10:2222",
+            "ports": [
+                {
+                    "port": 10001,
+                    "url": "https://pod-1.example.com",
+                }
+            ],
+            "user_public_key": "ssh-rsa secret",
+        }
+
+    client.request = request
+
+    result = client.status("pod-1")
+
+    assert result["instance_id"] == "pod-1"
+    assert result["status"] == "running"
+    assert result["ssh_url"] == "ssh://root@203.0.113.10:2222"
+    assert result["public_inference_url"] == "https://pod-1.example.com/v1"
+    assert result["raw"]["user_public_key"] == "<redacted>"
+
+
+def test_error_payloads_distinguish_wrapper_and_provider_not_found():
+    lium = _load_wrapper()
+
+    route_payload = lium._route_not_found("POST", "/bad")
+    provider_payload = lium._provider_not_found(
+        lium.LiumHTTPError("GET", "/pods/pod-1", 404, "missing")
+    )
+
+    assert route_payload["error_source"] == "wrapper"
+    assert route_payload["code"] == "route_not_found"
+    assert provider_payload["error_source"] == "provider"
+    assert provider_payload["provider_status_code"] == 404
+
+
+def test_error_response_structures_provider_and_wrapper_failures():
+    lium = _load_wrapper()
+
+    status, payload = lium._error_response(
+        lium.LiumHTTPError("GET", "/pods/pod-1", 401, "bad token")
+    )
+    assert status == 401
+    assert payload["error_source"] == "provider"
+    assert payload["code"] == "provider_http_error"
+    assert payload["provider_status_code"] == 401
+    assert payload["provider_path"] == "/pods/pod-1"
+
+    status, payload = lium._error_response(
+        lium.LiumRequestError(
+            "GET",
+            "/pods",
+            TimeoutError("slow"),
+            code="provider_timeout",
+            http_status=504,
+        )
+    )
+    assert status == 504
+    assert payload["error_source"] == "provider"
+    assert payload["code"] == "provider_timeout"
+
+    status, payload = lium._error_response(
+        lium.LiumWrapperError(
+            "LIUM_API_BASE is required",
+            code="wrapper_config_error",
+        )
+    )
+    assert status == 500
+    assert payload["error_source"] == "wrapper"
+    assert payload["code"] == "wrapper_config_error"
+
+    status, payload = lium._error_response(RuntimeError("boom"))
+    assert status == 500
+    assert payload["error_source"] == "wrapper"
+    assert payload["code"] == "wrapper_internal_error"
+
+
 def test_create_deletes_owned_pod_when_wait_ready_fails():
     lium = _load_wrapper()
     client = lium.LiumClient.__new__(lium.LiumClient)
@@ -163,9 +246,7 @@ def test_create_deletes_owned_pod_when_wait_ready_fails():
     client.resolve_template_id = lambda: "template-1"
     client.resolve_ssh_public_key = lambda: "ssh-rsa test"
     client.request = lambda *args, **kwargs: {"uid": "pod-1"}
-    client.wait_ready = lambda uid: (_ for _ in ()).throw(
-        RuntimeError("not ready")
-    )
+    client.wait_ready = lambda uid: (_ for _ in ()).throw(RuntimeError("not ready"))
     client._delete_owned_pod = lambda uid: deleted.append(uid) or True
 
     with pytest.raises(RuntimeError, match="not ready"):
