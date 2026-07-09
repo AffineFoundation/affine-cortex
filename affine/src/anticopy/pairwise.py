@@ -82,6 +82,14 @@ class PairResult:
     # carries no usable signal. This is the single number
     # ``is_copy_verdict`` compares against ``nll_threshold``.
     decision_median_combined: float = -1.0
+    # Argmax top-1 agreement pooled over every env's decision-position
+    # **intersection** (positions both models were uncertain about).
+    # ``top1_n`` is the intersection size; ``top1_agree_combined`` is
+    # ``matches / top1_n`` in ``[0, 1]``, or ``-1.0`` when no rollout
+    # carried aligned top-1 data on both sides (the pair yields no top-1
+    # signal — the gate falls back to the |Δlogp| rule).
+    top1_n: int = 0
+    top1_agree_combined: float = -1.0
 
 
 # --------------------------------------------------------- format helpers
@@ -89,25 +97,43 @@ class PairResult:
 
 def _normalize_rollout(
     rollout: Dict[str, Any],
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Return ``(positions, lps)`` as numpy arrays containing only the
-    decision positions for ``rollout``. Accepts both v3 (sparse) and
-    v2 (full ``resp_lp``) rollout dicts.
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(positions, lps, top1)`` as numpy arrays containing only
+    the decision positions for ``rollout``. Accepts both v4/v3 (sparse)
+    and v2 (full ``resp_lp`` / ``resp_top``) rollout dicts.
 
-    The arrays returned are int32 positions and float32 lps. The
-    caller may rely on positions being sorted ascending (v3 uploads
-    are written sorted; v2 ``np.flatnonzero`` is naturally sorted).
+    ``positions`` is int32, ``lps`` float32, ``top1`` int32 (the argmax
+    token id at each decision position). ``top1`` is either the same
+    length as ``positions`` (top-1 data available) or **empty** — legacy
+    blobs written before the top-1 field existed carry no argmax, so the
+    top-1 agreement gate simply skips that rollout.
+
+    The caller may rely on positions being sorted ascending (v4/v3
+    uploads are written sorted; v2 ``np.flatnonzero`` is naturally
+    sorted); ``top1`` is aligned index-for-index with ``positions``.
     """
     pos = rollout.get("decision_positions")
     lps = rollout.get("decision_lps")
     if pos is not None and lps is not None:
         pos_arr = pos if isinstance(pos, np.ndarray) else np.asarray(pos, dtype=np.int32)
         lp_arr = lps if isinstance(lps, np.ndarray) else np.asarray(lps, dtype=np.float32)
-        return pos_arr.astype(np.int32, copy=False), lp_arr.astype(np.float32, copy=False)
+        pos_arr = pos_arr.astype(np.int32, copy=False)
+        lp_arr = lp_arr.astype(np.float32, copy=False)
+        top1 = rollout.get("decision_top1")
+        if top1 is not None:
+            top1_arr = top1 if isinstance(top1, np.ndarray) else np.asarray(top1, dtype=np.int32)
+            top1_arr = top1_arr.astype(np.int32, copy=False)
+        else:
+            top1_arr = np.empty(0, dtype=np.int32)
+        return pos_arr, lp_arr, top1_arr
 
     resp = rollout.get("resp_lp")
     if not resp:
-        return (np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32))
+        return (
+            np.empty(0, dtype=np.int32),
+            np.empty(0, dtype=np.float32),
+            np.empty(0, dtype=np.int32),
+        )
     # ``None`` entries (masked tokens) drop from the comparison; convert
     # them to a value the mask can't pick up.
     arr = np.asarray(
@@ -117,7 +143,34 @@ def _normalize_rollout(
     mask = arr < DECISION_LOGP_CUTOFF
     pos_arr = np.flatnonzero(mask).astype(np.int32)
     lp_arr = arr[mask].astype(np.float32, copy=False)
-    return pos_arr, lp_arr
+    top1_arr = _extract_top1(rollout.get("resp_top"), pos_arr)
+    return pos_arr, lp_arr, top1_arr
+
+
+def _extract_top1(
+    resp_top: Optional[List[Any]], pos_arr: np.ndarray,
+) -> np.ndarray:
+    """Pull the argmax token id at each decision position from a v2
+    ``resp_top`` list (``resp_top[i] = [[lp, token_id], ...]`` sorted by
+    descending logprob, so index 0 is the argmax).
+
+    Returns an int32 array aligned with ``pos_arr``, or an **empty**
+    array if ``resp_top`` is missing or any decision position lacks a
+    top-1 entry — in that case the rollout contributes no top-1 signal
+    rather than a partially-aligned one.
+    """
+    if not resp_top or pos_arr.size == 0:
+        return np.empty(0, dtype=np.int32)
+    out = np.empty(pos_arr.size, dtype=np.int32)
+    for i, p in enumerate(pos_arr.tolist()):
+        slot = resp_top[p] if p < len(resp_top) else None
+        if not slot:
+            return np.empty(0, dtype=np.int32)
+        try:
+            out[i] = int(slot[0][1])
+        except (TypeError, ValueError, IndexError):
+            return np.empty(0, dtype=np.int32)
+    return out
 
 
 def sparsify_rollout(rollout: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,14 +180,20 @@ def sparsify_rollout(rollout: Dict[str, Any]) -> Dict[str, Any]:
     per-token logprob array — typically a ~20× shrink on disk."""
     if "decision_positions" in rollout and "decision_lps" in rollout:
         return rollout
-    pos, lp = _normalize_rollout(rollout)
-    return {
+    pos, lp, top1 = _normalize_rollout(rollout)
+    out = {
         "rollout_key": rollout.get("rollout_key"),
         "env": rollout.get("env", ""),
         "n_tokens": rollout.get("n_tokens", 0),
         "decision_positions": [int(x) for x in pos.tolist()],
         "decision_lps": [float(x) for x in lp.tolist()],
     }
+    # ``decision_top1`` (argmax token id per decision position) is only
+    # emitted when the source carried usable ``resp_top`` — legacy blobs
+    # without it stay top-1-less and simply skip the top-1 gate later.
+    if top1.size == pos.size and top1.size > 0:
+        out["decision_top1"] = [int(x) for x in top1.tolist()]
+    return out
 
 
 def _sparse_decision_gaps(
@@ -169,6 +228,39 @@ def _sparse_decision_gaps(
     return np.abs(a_vals - b_vals).astype(np.float32, copy=False)
 
 
+def _sparse_top1_intersection(
+    pos_a: np.ndarray, top1_a: np.ndarray,
+    pos_b: np.ndarray, top1_b: np.ndarray,
+) -> Tuple[int, int]:
+    """Return ``(n_match, n_total)`` for the argmax top-1 agreement over
+    the **intersection** of the two sides' decision positions.
+
+    The intersection — positions where *both* models were uncertain — is
+    the purest discriminator: independent fine-tunes diverge most there,
+    so it maximises separation between "copy" and "independent" and keeps
+    the gate conservative. Positions where only one side was uncertain
+    are excluded (that side's argmax equals the ground-truth token there,
+    which would inflate agreement toward the easy case).
+
+    Contributes nothing (``(0, 0)``) when either side lacks aligned
+    top-1 data — e.g. a legacy blob written before the field existed.
+    """
+    if (
+        top1_a.size == 0 or top1_b.size == 0
+        or top1_a.size != pos_a.size or top1_b.size != pos_b.size
+    ):
+        return 0, 0
+    inter = np.intersect1d(pos_a, pos_b)
+    if inter.size == 0:
+        return 0, 0
+    # ``inter`` ⊆ pos_a and ⊆ pos_b, both sorted ascending, so
+    # searchsorted yields the exact aligned index into each top1 array.
+    a_tok = top1_a[np.searchsorted(pos_a, inter)]
+    b_tok = top1_b[np.searchsorted(pos_b, inter)]
+    n_match = int(np.count_nonzero(a_tok == b_tok))
+    return n_match, int(inter.size)
+
+
 # --------------------------------------------------------- compare_scores
 
 
@@ -190,6 +282,8 @@ def compare_scores(
     per_env_decision: Dict[str, List[float]] = defaultdict(list)
     n_overlap_rollouts = 0
     n_overlap_tokens = 0
+    top1_match = 0
+    top1_total = 0
 
     for ra in score_a.get("per_rollout", []) or []:
         k = ra.get("rollout_key")
@@ -197,14 +291,17 @@ def compare_scores(
         if not rb:
             continue
         env = ra.get("env") or rb.get("env") or "?"
-        pos_a, lp_a = _normalize_rollout(ra)
-        pos_b, lp_b = _normalize_rollout(rb)
+        pos_a, lp_a, t1_a = _normalize_rollout(ra)
+        pos_b, lp_b, t1_b = _normalize_rollout(rb)
         gaps = _sparse_decision_gaps(pos_a, lp_a, pos_b, lp_b)
         if gaps.size == 0:
             continue
         n_overlap_rollouts += 1
         n_overlap_tokens += int(gaps.size)
         per_env_decision[env].extend(float(g) for g in gaps.tolist())
+        m, tot = _sparse_top1_intersection(pos_a, t1_a, pos_b, t1_b)
+        top1_match += m
+        top1_total += tot
 
     per_env: Dict[str, EnvCompare] = {}
     all_decision_gaps: List[float] = []
@@ -219,12 +316,17 @@ def compare_scores(
     decision_median_combined = (
         float(median(all_decision_gaps)) if all_decision_gaps else -1.0
     )
+    top1_agree_combined = (
+        float(top1_match / top1_total) if top1_total > 0 else -1.0
+    )
 
     return PairResult(
         n_overlap_rollouts=n_overlap_rollouts,
         n_overlap_tokens=n_overlap_tokens,
         per_env=per_env,
         decision_median_combined=decision_median_combined,
+        top1_n=top1_total,
+        top1_agree_combined=top1_agree_combined,
     )
 
 
@@ -235,10 +337,26 @@ def is_copy_verdict(
     per_env_nll_thresholds: Optional[Dict[str, float]] = None,
     per_env_min_envs: int = 3,
     agreement_ratio: float = 1.0,  # noqa: ARG001 — accepted for back-compat
+    top1_threshold: Optional[float] = None,
+    top1_min_overlap: int = 0,
 ) -> bool:
     """Final verdict logic.
 
-    Two modes, selected by whether ``per_env_nll_thresholds`` is set:
+    A pair is a copy if **either** gate fires (OR):
+
+    * **Top-1 gate** (when ``top1_threshold`` is set): the argmax top-1
+      agreement over the decision-position intersection is at least
+      ``top1_threshold`` on at least ``top1_min_overlap`` positions. Two
+      copies emit the same next token even where the model is uncertain;
+      independent fine-tunes diverge there. This catches copies whose
+      logprobs were perturbed enough to clear the |Δlogp| bar but whose
+      argmax ranking is preserved. No-op when top-1 data is unavailable
+      (``top1_agree_combined < 0``) or ``top1_threshold`` is ``None``.
+    * **|Δlogp| gate** (below): the decision-median rule, in one of the
+      two modes selected by whether ``per_env_nll_thresholds`` is set.
+
+    The |Δlogp| gate has two modes, selected by whether
+    ``per_env_nll_thresholds`` is set:
 
     * **Per-env mode** (dict non-empty): a candidate is a copy iff
       every env that has decision tokens lands below its own per-env
@@ -258,6 +376,15 @@ def is_copy_verdict(
     that still pass it; the per-env rule already supersedes the
     earlier ``X-of-Y env votes`` style of agreement gate.
     """
+    # Top-1 argmax agreement gate (OR): fires independently of the
+    # |Δlogp| rule below.
+    if (
+        top1_threshold is not None
+        and pair.top1_agree_combined >= 0
+        and pair.top1_n >= top1_min_overlap
+        and pair.top1_agree_combined >= top1_threshold
+    ):
+        return True
     if per_env_nll_thresholds:
         # Walk every configured env first so ``present`` reflects the
         # full count (early-break would skew the floor check).
@@ -305,6 +432,11 @@ class CopyDecision:
     # ``{env_name: median |Δlogp|}`` for envs with ≥1 decision token.
     # Empty when no peer produced usable evidence.
     decision_per_env: Dict[str, float] = field(default_factory=dict)
+    # Argmax top-1 agreement (decision-position intersection) against
+    # the winning (or closest) peer, in ``[0, 1]``. ``-1.0`` when no
+    # peer carried aligned top-1 data. Persisted for operator triage —
+    # tells apart a top-1-gated verdict from a |Δlogp|-gated one.
+    top1_agreement: float = -1.0
 
 
 def _per_env_decision_medians(pair: PairResult) -> Dict[str, float]:
@@ -335,6 +467,8 @@ def detect_copies(
     min_overlap: int,
     agreement_ratio: float,
     lookback_blocks: int = 0,
+    top1_threshold: Optional[float] = None,
+    top1_min_overlap: int = 0,
 ) -> CopyDecision:
     """For a freshly computed score, scan every active peer that
     committed earlier (lower ``first_block``) and return the earliest
@@ -384,7 +518,8 @@ def detect_copies(
         if pair.n_overlap_tokens < min_overlap:
             continue
         if not is_copy_verdict(
-            pair, nll_threshold=nll_threshold, agreement_ratio=agreement_ratio
+            pair, nll_threshold=nll_threshold, agreement_ratio=agreement_ratio,
+            top1_threshold=top1_threshold, top1_min_overlap=top1_min_overlap,
         ):
             continue
         candidates.append((peer_first_block, peer_hotkey, peer, pair))
@@ -398,6 +533,7 @@ def detect_copies(
         decision.decision_median = closest_median
         if closest_pair is not None:
             decision.decision_per_env = _per_env_decision_medians(closest_pair)
+            decision.top1_agreement = float(closest_pair.top1_agree_combined)
         return decision
 
     # Earliest committer wins (smallest (first_block, hotkey)).
@@ -407,6 +543,7 @@ def detect_copies(
     decision.copy_of_hotkey = candidates[0][1]
     decision.decision_median = _aggregate_decision_median(winning_pair)
     decision.decision_per_env = _per_env_decision_medians(winning_pair)
+    decision.top1_agreement = float(winning_pair.top1_agree_combined)
     # When a winner exists, the closest peer IS the winner. Reset so
     # the two fields agree.
     decision.closest_peer_model = str(winning_peer.get("model", ""))

@@ -391,3 +391,109 @@ def test_sparsify_rollout_is_idempotent():
         twice["decision_positions"] == once["decision_positions"]
         and twice["decision_lps"] == once["decision_lps"]
     )
+
+
+# ------------------------------------------------------------ top-1 argmax gate
+
+
+def _top(pairs):
+    """Build a ``resp_top`` list where slot i's argmax token id is
+    ``pairs[i]`` (single-entry top-k is enough — only index 0 is read)."""
+    return [[[0.0, int(t)]] for t in pairs]
+
+
+def test_sparsify_captures_decision_top1():
+    """``decision_top1`` holds the argmax token id at each decision
+    position; positions 1 and 3 are the only lp < -0.5 slots."""
+    r = _rollout(
+        "k", "CDE",
+        [-0.1, -0.7, -0.1, -1.2, -0.2],
+        top=_top([11, 22, 33, 44, 55]),
+    )
+    sparse = sparsify_rollout(r)
+    assert sparse["decision_positions"] == [1, 3]
+    assert sparse["decision_top1"] == [22, 44]
+
+
+def test_top1_gate_flags_copy_despite_large_logprob_gap():
+    """Argmax agrees at the jointly-uncertain positions but logprobs are
+    wildly apart: the |Δlogp| gate fails, the top-1 gate flips it."""
+    a = _score("A", [_rollout(
+        "k", "CDE",
+        [-0.1, -0.7, -0.1, -1.2, -0.2],
+        top=_top([1, 500, 3, 700, 5]),
+    )])
+    b = _score("B", [_rollout(
+        "k", "CDE",
+        [-0.1, -3.0, -0.1, -4.0, -0.2],       # huge gaps at pos 1, 3
+        top=_top([1, 500, 3, 700, 5]),        # same argmax at pos 1, 3
+    )])
+    pair = compare_scores(a, b)
+    assert pair.top1_n == 2
+    assert pair.top1_agree_combined == 1.0
+    # |Δlogp| gate alone: median gap ~2.55 ≫ 0.05 → not a copy.
+    assert not is_copy_verdict(pair, nll_threshold=0.05)
+    # top-1 gate ON → copy.
+    assert is_copy_verdict(
+        pair, nll_threshold=0.05, top1_threshold=0.90, top1_min_overlap=2,
+    )
+
+
+def test_top1_gate_does_not_fire_when_argmax_diverges():
+    # Large |Δlogp| gaps so the |Δlogp| gate stays off — isolates top-1.
+    a = _score("A", [_rollout(
+        "k", "CDE",
+        [-0.7, -0.7, -0.7, -0.7],
+        top=_top([500, 600, 700, 800]),
+    )])
+    b = _score("B", [_rollout(
+        "k", "CDE",
+        [-3.0, -3.0, -3.0, -3.0],
+        top=_top([500, 999, 998, 997]),       # only 1/4 argmax agree
+    )])
+    pair = compare_scores(a, b)
+    assert pair.top1_n == 4
+    assert pair.top1_agree_combined == 0.25
+    assert not is_copy_verdict(
+        pair, nll_threshold=0.001, top1_threshold=0.90, top1_min_overlap=1,
+    )
+
+
+def test_top1_gate_respects_min_overlap():
+    """A perfect agreement over too few positions must not trip the
+    gate (|Δlogp| kept large so only the top-1 gate could fire)."""
+    a = _score("A", [_rollout("k", "CDE", [-0.7], top=_top([500]))])
+    b = _score("B", [_rollout("k", "CDE", [-3.0], top=_top([500]))])
+    pair = compare_scores(a, b)
+    assert pair.top1_n == 1 and pair.top1_agree_combined == 1.0
+    assert not is_copy_verdict(
+        pair, nll_threshold=0.001, top1_threshold=0.90, top1_min_overlap=50,
+    )
+
+
+def test_top1_absent_yields_no_signal_and_gate_noop():
+    """Legacy rollouts without ``resp_top`` carry no argmax → top-1
+    combined is the -1 sentinel and the gate can't fire (|Δlogp| kept
+    large so the other gate stays off too)."""
+    a = _score("A", [_rollout("k", "CDE", [-0.7, -0.7])])   # no top
+    b = _score("B", [_rollout("k", "CDE", [-3.0, -3.0])])
+    pair = compare_scores(a, b)
+    assert pair.top1_n == 0
+    assert pair.top1_agree_combined == -1.0
+    assert not is_copy_verdict(
+        pair, nll_threshold=0.001, top1_threshold=0.90, top1_min_overlap=1,
+    )
+
+
+def test_top1_intersection_only_counts_jointly_uncertain():
+    """A is uncertain at pos 0,1; B only at pos 1. Intersection = {1};
+    only that position is scored for top-1 agreement."""
+    a = _score("A", [_rollout(
+        "k", "CDE", [-0.7, -0.7, -0.1], top=_top([500, 600, 3]),
+    )])
+    b = _score("B", [_rollout(
+        "k", "CDE", [-0.1, -0.7, -0.1], top=_top([1, 600, 3]),
+    )])
+    pair = compare_scores(a, b)
+    assert pair.top1_n == 1
+    assert pair.top1_agree_combined == 1.0
