@@ -67,19 +67,17 @@ def _normalize_blob_for_cache(blob: Dict[str, Any]) -> Dict[str, Any]:
       contributes no gaps.
 
     After this pass every rollout dict contains only ``rollout_key``,
-    ``env``, ``decision_positions`` (np.int32), ``decision_lps``
-    (np.float32) and ``decision_top1`` (np.int32, empty for legacy
-    blobs) — the only fields :func:`compare_scores` consults.
+    ``env``, ``decision_positions`` (np.int32) and ``decision_lps``
+    (np.float32) — the only fields :func:`compare_scores` consults.
     """
     new_per_rollout = []
     for ro in (blob.get("per_rollout") or []):
-        pos, lp, top1 = _normalize_rollout(ro)
+        pos, lp = _normalize_rollout(ro)
         new_per_rollout.append({
             "rollout_key": ro.get("rollout_key"),
             "env": ro.get("env", ""),
             "decision_positions": pos,        # np.int32
             "decision_lps": lp,               # np.float32
-            "decision_top1": top1,            # np.int32 (empty if absent)
         })
     blob["per_rollout"] = new_per_rollout
     return blob
@@ -123,7 +121,6 @@ def _pick_origin(
     closest_median = -1.0
     closest_per_env: Dict[str, float] = {}
     closest_peer_model: str = ""
-    closest_top1: float = -1.0
     winning_pair: Optional[PairResult] = None
     winning_hk: str = ""
     winning_model: str = ""
@@ -148,7 +145,6 @@ def _pick_origin(
             closest_median = pair_med
             closest_per_env = _per_env_decision_medians(pair)
             closest_peer_model = peer_model
-            closest_top1 = float(pair.top1_agree_combined)
         if (
             pair.n_overlap_tokens >= cfg.min_overlap
             and is_copy_verdict(
@@ -157,8 +153,6 @@ def _pick_origin(
                 per_env_nll_thresholds=cfg.per_env_nll_thresholds,
                 per_env_min_envs=cfg.per_env_min_envs,
                 agreement_ratio=cfg.agreement_ratio,
-                top1_threshold=cfg.top1_threshold,
-                top1_min_overlap=cfg.top1_min_overlap,
             )
         ):
             winning_pair = pair
@@ -172,12 +166,10 @@ def _pick_origin(
         decision.decision_median = float(winning_pair.decision_median_combined)
         decision.decision_per_env = _per_env_decision_medians(winning_pair)
         decision.closest_peer_model = winning_model
-        decision.top1_agreement = float(winning_pair.top1_agree_combined)
     else:
         decision.decision_median = closest_median
         decision.decision_per_env = dict(closest_per_env)
         decision.closest_peer_model = closest_peer_model
-        decision.top1_agreement = closest_top1
     return decision
 
 
@@ -306,7 +298,6 @@ class VerdictBackfillService:
                     decision_median=decision.decision_median,
                     decision_per_env=dict(decision.decision_per_env),
                     closest_peer_model=decision.closest_peer_model,
-                    top1_agreement=decision.top1_agreement,
                 )
             except Exception as e:
                 logger.warning(
@@ -318,13 +309,11 @@ class VerdictBackfillService:
                 logger.info(
                     f"[anticopy.verdict] {hk[:10]} verdict copy_of="
                     f"{decision.copy_of_hotkey[:10]} "
-                    f"dec_med={decision.decision_median:.4f} "
-                    f"top1={decision.top1_agreement:.4f}"
+                    f"dec_med={decision.decision_median:.4f}"
                 )
             else:
                 logger.info(
                     f"[anticopy.verdict] {hk[:10]} verdict independent "
                     f"dec_med={decision.decision_median:.4f} "
-                    f"top1={decision.top1_agreement:.4f} "
                     f"closest={(decision.closest_peer_model or '-')[:40]}"
                 )

@@ -180,13 +180,11 @@ class AntiCopyScoresIndexDAO(BaseDAO):
         decision_median: float,
         decision_per_env: Optional[Dict[str, float]] = None,
         closest_peer_model: Optional[str] = None,
-        top1_agreement: Optional[float] = None,
     ) -> None:
         """Refresh the verdict + diagnostics. ``decision_per_env`` is
         the per-env breakdown of the winning (or closest) peer pair;
-        ``closest_peer_model`` is the HF repo string of that peer;
-        ``top1_agreement`` is the argmax top-1 agreement against that
-        peer. Any of these may be omitted to leave the column alone."""
+        ``closest_peer_model`` is the HF repo string of that peer.
+        Either may be omitted to leave the existing column alone."""
         client = get_client()
         update_parts = [
             "verdict_copy_of = :copy_of",
@@ -201,9 +199,6 @@ class AntiCopyScoresIndexDAO(BaseDAO):
         if closest_peer_model is not None:
             update_parts.append("closest_peer_model = :closest")
             values[":closest"] = {"S": str(closest_peer_model)}
-        if top1_agreement is not None:
-            update_parts.append("top1_agreement = :top1")
-            values[":top1"] = {"N": str(float(top1_agreement))}
         if decision_per_env is not None:
             update_parts.append("decision_per_env = :per_env")
             values[":per_env"] = {

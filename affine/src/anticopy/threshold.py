@@ -99,20 +99,6 @@ DEFAULT_PER_ENV_NLL_THRESHOLDS: Dict[str, float] = {}
 # overlap is too thin to make an "all envs agree" claim.
 DEFAULT_PER_ENV_MIN_ENVS = 3
 
-# Argmax top-1 agreement gate. A pair is flagged a copy if the two
-# models pick the same next token at ≥ this fraction of the positions
-# they were *both* uncertain about (decision-position intersection).
-# ORed with the |Δlogp| gate: catches copies whose logprobs were
-# perturbed past the |Δlogp| bar but whose argmax ranking survived.
-# Empirically copies sit ~0.99 and independent fine-tunes ~0.28 on
-# reasoning-heavy positions, so 0.90 separates cleanly. Set to a value
-# > 1.0 (or 0) to disable the gate.
-DEFAULT_TOP1_THRESHOLD = 0.90
-
-# Minimum intersection size before the top-1 gate may fire — guards
-# against calling copy off a handful of jointly-uncertain positions.
-DEFAULT_TOP1_MIN_OVERLAP = 50
-
 
 @dataclass
 class AntiCopyConfig:
@@ -133,8 +119,6 @@ class AntiCopyConfig:
         default_factory=lambda: dict(DEFAULT_PER_ENV_NLL_THRESHOLDS)
     )
     per_env_min_envs: int = DEFAULT_PER_ENV_MIN_ENVS
-    top1_threshold: float = DEFAULT_TOP1_THRESHOLD
-    top1_min_overlap: int = DEFAULT_TOP1_MIN_OVERLAP
 
 
 async def load_anticopy_config(
@@ -202,9 +186,5 @@ async def load_anticopy_config(
         per_env_nll_thresholds=per_env_thresholds,
         per_env_min_envs=max(
             1, _i("per_env_min_envs", DEFAULT_PER_ENV_MIN_ENVS)
-        ),
-        top1_threshold=_f("top1_threshold", DEFAULT_TOP1_THRESHOLD),
-        top1_min_overlap=max(
-            0, _i("top1_min_overlap", DEFAULT_TOP1_MIN_OVERLAP)
         ),
     )
