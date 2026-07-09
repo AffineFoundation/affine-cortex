@@ -2,41 +2,66 @@
 
 FastAPI server at `affine/api/server.py`, prefix `/api/v1`.
 
-## Public Endpoints
+## Authentication
 
-### GET /rank/current
+Executor auth via Bittensor keypair signatures:
+- Headers: `X-Hotkey` (SS58), `X-Signature` (hex-encoded), `X-Message` (unix timestamp)
+- Timestamp must be within 60 seconds
+- Verified via `bittensor.Keypair.verify()`
+- Non-strict mode: all hotkeys allowed (development)
+- Strict mode: only registered validators
 
-Aggregated rank/status payload consumed by `af get-rank`.
+## Task Endpoints (`/api/v1/tasks`)
 
-Response sections:
-- `window`: current champion, in-flight battle, task refresh block, aggregate sample counts.
-- `queue`: pending challenger queue head.
-- `scores`: latest score snapshot with per-environment metrics.
+### POST /tasks/fetch
+Fetch pending tasks for evaluation.
+- Request: `X-Hotkey`, `X-Signature`, `X-Message` headers
+- Response: `TaskFetchResponse` with enriched tasks (miner_uid, model, and the scheduler-deployed serving `base_url` — no longer a Chutes slug; inference is self-hosted via SGLang)
+- Internal: Gets ALL pending tasks, random shuffle, takes batch_size
+
+### POST /tasks/submit
+Submit evaluation results.
+- Request: `SampleSubmission` with executor signature
+- Response: `SampleSubmitResponse`
+- Internal: Verify signature, background save sample + log + delete task
+
+### GET /tasks/pool/stats
+Task pool statistics.
+
+## Sample Endpoints (`/api/v1/samples`)
+
+### GET /samples/{hotkey}/{env}/{task_id}
+Get specific sample result.
+
+### GET /samples/scoring
+Scoring data for all miners (used by the scheduler's champion-challenge comparator; the standalone "scorer" service was removed — its logic lives in `affine/src/scheduler/flow.py`).
+- Cached with 5-minute refresh
+
+### GET /samples/pool/uid/{uid}/{env}
+Task pool for specific miner+env.
+
+## Miner Endpoints (`/api/v1/miners`)
 
 ### GET /miners/uid/{uid}
+Miner information by UID.
 
-Public miner metadata by UID.
+### GET /miners/uid/{uid}/stats
+Miner sampling statistics.
 
-### GET /miners/hotkey/{hotkey}
-
-Public miner metadata by hotkey.
+## Score Endpoints (`/api/v1/scores`)
 
 ### GET /scores/latest
-
 Latest score snapshot.
 
 ### GET /scores/uid/{uid}
-
-Score row for a specific miner UID.
+Score for specific miner.
 
 ### GET /scores/weights/latest
+Latest normalized weights (consumed by validators).
 
-Latest normalized weights consumed by validator weight setting.
+## Scoring Cache
 
-### GET /config
-
-Public validator config keys only.
-
-## Internal Endpoints
-
-Internal diagnostics are mounted only when `INTERNAL_ENDPOINTS_ENABLED` is set.
+- Proactive cache with background refresh every 5 minutes
+- State machine: EMPTY -> WARMING -> READY <-> REFRESHING
+- Two modes: `scoring` (enabled_for_scoring) and `sampling` (enabled_for_sampling)
+- File: `affine/api/services/scoring_cache.py`
