@@ -54,3 +54,91 @@ def test_rate_limit_is_swallowed(monkeypatch):
 def test_network_error_is_swallowed(monkeypatch):
     # Transient connection blip → must not terminate the miner.
     _run(monkeypatch, raises=ConnectionError("temporary"))
+
+
+# --------------------------------------------------------------------------- #
+# Grace window for transient HF 404 on freshly created/renamed repos.
+# A brand-new repo can 404 for a few minutes while the hub propagates; the
+# monitor must defer (not permanently terminate) until the grace window lapses.
+# --------------------------------------------------------------------------- #
+
+from affine.src.monitor.miners_monitor import HF_UNAVAILABLE_GRACE_SECONDS
+
+
+def _grace_monitor():
+    m = MinersMonitor.__new__(MinersMonitor)
+    m._repo_unavailable_since = {}
+    return m
+
+
+def test_not_found_grace_defers_then_escalates(monkeypatch):
+    m = _grace_monitor()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.time.time", lambda: clock["t"]
+    )
+    # First sighting → within grace.
+    assert m._repo_unavailable_grace_active("o/affine-hk", "rev", "hf_repo_not_found")
+    # Still inside the window.
+    clock["t"] += HF_UNAVAILABLE_GRACE_SECONDS - 1
+    assert m._repo_unavailable_grace_active("o/affine-hk", "rev", "hf_repo_not_found")
+    # Past the window → escalate (terminate for real).
+    clock["t"] += 2
+    assert not m._repo_unavailable_grace_active("o/affine-hk", "rev", "hf_repo_not_found")
+
+
+def test_deliberate_states_never_graced():
+    m = _grace_monitor()
+    for reason in ("hf_repo_gated", "hf_repo_private", "hf_repo_disabled"):
+        assert not m._repo_unavailable_grace_active("o/affine-hk", "rev", reason)
+    # No grace bookkeeping should have been created for them.
+    assert m._repo_unavailable_since == {}
+
+
+def test_clear_resets_grace_on_recovery(monkeypatch):
+    m = _grace_monitor()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.time.time", lambda: clock["t"]
+    )
+    assert m._repo_unavailable_grace_active("o/affine-hk", "rev", "hf_repo_not_found")
+    m._clear_repo_unavailable("o/affine-hk", "rev")
+    # A later 404 gets a fresh full window rather than an already-expired one.
+    clock["t"] += HF_UNAVAILABLE_GRACE_SECONDS + 100
+    assert m._repo_unavailable_grace_active("o/affine-hk", "rev", "hf_repo_not_found")
+
+
+def _validate_with_404(monkeypatch, m):
+    from affine.src.monitor.miners_monitor import HFRepoUnavailable
+
+    async def raise_404(model_id, revision):
+        raise HFRepoUnavailable("hf_repo_not_found")
+
+    monkeypatch.setattr(m, "_get_model_info", raise_404)
+    return asyncio.run(
+        m._validate_miner(
+            uid=5,
+            hotkey="hk",
+            model="owner/affine-hk",
+            revision="rev",
+            block=0,
+        )
+    )
+
+
+def test_validate_miner_defers_first_cycle_then_terminates(monkeypatch):
+    m = _grace_monitor()
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(
+        "affine.src.monitor.miners_monitor.time.time", lambda: clock["t"]
+    )
+    # First cycle: transient 404 → invalid this cycle but NOT a permanent kill.
+    info = _validate_with_404(monkeypatch, m)
+    assert info.is_valid is False
+    assert info.permanent_invalid is False
+    assert info.terminate_stats is False
+    # After the grace window: same 404 now escalates to permanent terminate.
+    clock["t"] += HF_UNAVAILABLE_GRACE_SECONDS + 1
+    info = _validate_with_404(monkeypatch, m)
+    assert info.permanent_invalid is True
+    assert info.terminate_stats is True
