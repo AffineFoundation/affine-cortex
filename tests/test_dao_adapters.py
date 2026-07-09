@@ -150,6 +150,49 @@ async def test_sample_metrics_skip_swe_codex_usage(monkeypatch):
     assert metrics[2].usage.token_count == 200
 
 
+@pytest.mark.asyncio
+async def test_sample_metrics_only_parse_supported_token_usage_envs(monkeypatch):
+    dao = _FakeSampleDAO()
+
+    async def read_metric(env, total_tokens):
+        client = _FakeDynamoClient([
+            {
+                "Items": [
+                    {
+                        "task_id": 1,
+                        "score": 0.1,
+                        "refresh_block": 10,
+                        "extra_compressed": dao.compress_data(json.dumps({
+                            "usage": {"total_tokens": total_tokens},
+                        })),
+                    },
+                ]
+            }
+        ])
+        monkeypatch.setattr(
+            "affine.src.scorer.dao_adapters.get_client",
+            lambda: client,
+        )
+
+        adapter = SampleResultsAdapter(dao=dao)
+        metrics = await adapter.read_sample_metrics_for_tasks(
+            "hk", "rev", env, [1],
+            refresh_block=10,
+            include_extra_usage=True,
+        )
+        return metrics[1].usage
+
+    terminal_usage = await read_metric("TERMINAL", 123)
+    memory_usage = await read_metric("MEMORY", 456)
+    distill_usage = await read_metric("DISTILL-V2", 789)
+
+    assert terminal_usage is not None
+    assert terminal_usage.token_count == 123
+    assert memory_usage is not None
+    assert memory_usage.token_count == 456
+    assert distill_usage is None
+
+
 class _MemoryMinerStatsDAO(MinerStatsDAO):
     def __init__(self, direct, rows):
         super().__init__()

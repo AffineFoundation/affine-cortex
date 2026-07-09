@@ -22,6 +22,7 @@ from .token_efficiency import SampleMetric, extract_token_usage
 
 _SWE_TOKEN_EXCLUDED_AGENT_TYPES = {"codex"}
 _SWE_TOKEN_ENVS = {"SWE", "SWE-INFINITE"}
+_TOKEN_USAGE_ENVS = {"SWE", "SWE-INFINITE", "MEMORY", "TERMINAL"}
 
 
 def _should_skip_token_usage(env: str, extra: Dict[str, Any]) -> bool:
@@ -31,6 +32,11 @@ def _should_skip_token_usage(env: str, extra: Dict[str, Any]) -> bool:
     return str(extra.get("agent_type") or "").strip().lower() in (
         _SWE_TOKEN_EXCLUDED_AGENT_TYPES
     )
+
+
+def _supports_token_usage(env: str) -> bool:
+    """Only these runtime envs have canonical token totals for scoring."""
+    return str(env).upper() in _TOKEN_USAGE_ENVS
 
 
 # --------------------------------------------------------------------------- #
@@ -305,7 +311,11 @@ class SampleResultsAdapter:
                 if tid_int not in wanted:
                     continue
                 usage = None
-                if include_extra_usage and row.get("extra_compressed") is not None:
+                if (
+                    include_extra_usage
+                    and _supports_token_usage(env)
+                    and row.get("extra_compressed") is not None
+                ):
                     try:
                         extra_json = self._dao.decompress_data(row["extra_compressed"])
                         extra = json.loads(extra_json)
