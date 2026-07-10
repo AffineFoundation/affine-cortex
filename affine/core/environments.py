@@ -44,6 +44,26 @@ def _remove_base_url_fields(value: Any) -> Any:
     return value
 
 
+def _float_or_none(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _terminal_binary_score(
+    result: Dict[str, Any], extra: Dict[str, Any], raw_score: float
+) -> float:
+    binary_value = _float_or_none(result.get("binary_score"))
+    if binary_value is None:
+        binary_value = _float_or_none(extra.get("binary_score"))
+    if binary_value is None:
+        binary_value = raw_score
+    return 1.0 if binary_value >= 0.99 else 0.0
+
+
 # ========================= Utility Functions =========================
 
 def convert_memory_format(mem_limit: str, mode: str) -> str:
@@ -849,12 +869,20 @@ class SDKEnvironment:
         extra["image"] = self.docker_image
         sanitized = _remove_base_url_fields(payload)
         extra["request"] = sanitized
+
+        raw_score = float(result.get("score", 0.0))
+        score = raw_score
+        if self.env_name == "terminal":
+            score = _terminal_binary_score(result, extra, raw_score)
+            extra["partial_score"] = raw_score
+            extra["binary_score"] = score
+            extra["score_mode"] = "binary"
         
         return Result(
             miner_hotkey=miner.hotkey if miner else "",
             model_revision=miner.revision if miner else "",
             env=self.env_name,
-            score=float(result.get("score", 0.0)),
+            score=score,
             latency_seconds=time.monotonic() - start_time,
             success=bool(result.get("success", False)),
             error=result.get("error"),

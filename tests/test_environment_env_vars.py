@@ -142,3 +142,100 @@ def test_build_result_removes_all_base_url_fields():
     assert "10.0.0.4" not in payload
     assert result.extra["nested"]["ok"] is True
     assert result.extra["request"]["model"] == "org/model"
+
+
+def test_terminal_build_result_uses_top_level_binary_score():
+    from affine.core import environments as env_mod
+
+    with patch.object(env_mod.SDKEnvironment, "_load_environment", return_value=None):
+        sdk = env_mod.SDKEnvironment("terminal")
+
+    result = sdk._build_result(
+        {
+            "score": 0.5,
+            "binary_score": 0.0,
+            "success": False,
+            "extra": {"binary_score": 1.0},
+        },
+        SimpleNamespace(hotkey="hk", revision="rev"),
+        {"task_id": 42},
+        time.monotonic(),
+    )
+
+    assert result.score == 0.0
+    assert result.extra["partial_score"] == 0.5
+    assert result.extra["binary_score"] == 0.0
+    assert result.extra["score_mode"] == "binary"
+
+
+def test_terminal_build_result_uses_extra_binary_score():
+    from affine.core import environments as env_mod
+
+    with patch.object(env_mod.SDKEnvironment, "_load_environment", return_value=None):
+        sdk = env_mod.SDKEnvironment("terminal")
+
+    result = sdk._build_result(
+        {
+            "score": 0.5,
+            "success": True,
+            "extra": {"binary_score": 1.0},
+        },
+        SimpleNamespace(hotkey="hk", revision="rev"),
+        {"task_id": 43},
+        time.monotonic(),
+    )
+
+    assert result.score == 1.0
+    assert result.extra["partial_score"] == 0.5
+    assert result.extra["binary_score"] == 1.0
+    assert result.extra["score_mode"] == "binary"
+
+
+@pytest.mark.parametrize(
+    ("raw_score", "expected_score"),
+    [
+        (0.98, 0.0),
+        (0.99, 1.0),
+        (1.0, 1.0),
+    ],
+)
+def test_terminal_build_result_falls_back_to_binary_threshold(raw_score, expected_score):
+    from affine.core import environments as env_mod
+
+    with patch.object(env_mod.SDKEnvironment, "_load_environment", return_value=None):
+        sdk = env_mod.SDKEnvironment("terminal")
+
+    result = sdk._build_result(
+        {"score": raw_score, "success": expected_score == 1.0, "extra": {}},
+        SimpleNamespace(hotkey="hk", revision="rev"),
+        {"task_id": 44},
+        time.monotonic(),
+    )
+
+    assert result.score == expected_score
+    assert result.extra["partial_score"] == raw_score
+    assert result.extra["binary_score"] == expected_score
+    assert result.extra["score_mode"] == "binary"
+
+
+def test_non_terminal_build_result_keeps_partial_score():
+    from affine.core import environments as env_mod
+
+    with patch.object(env_mod.SDKEnvironment, "_load_environment", return_value=None):
+        sdk = env_mod.SDKEnvironment("memory")
+
+    result = sdk._build_result(
+        {
+            "score": 0.5,
+            "binary_score": 0.0,
+            "success": False,
+            "extra": {"binary_score": 0.0},
+        },
+        SimpleNamespace(hotkey="hk", revision="rev"),
+        {"task_id": 45},
+        time.monotonic(),
+    )
+
+    assert result.score == 0.5
+    assert "partial_score" not in result.extra
+    assert "score_mode" not in result.extra
