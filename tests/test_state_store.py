@@ -123,6 +123,42 @@ async def test_get_scoring_environments_filters_independently_from_sampling():
 
 
 @pytest.mark.asyncio
+async def test_rank_display_includes_sampling_only_derived_env():
+    kv = InMemoryConfigStore()
+    kv.data["environments"] = {
+        "SWE-INFINITE": {
+            "display_name": "SWE",
+            "enabled_for_sampling": True,
+            "enabled_for_scoring": True,
+            "sampling": {
+                "sampling_count": 10,
+                "dataset_range": [[0, 100]],
+                "sampling_mode": "random",
+            },
+        },
+        "TOKEN-EFFICIENCY": {
+            "display_name": "TOKEN-EFFICIENCY",
+            "kind": "derived",
+            "derived_metric": "token_efficiency",
+            "enabled_for_sampling": True,
+            "enabled_for_scoring": False,
+            "scoring": {"min_pairs": 10},
+        },
+    }
+    store = StateStore(kv)
+
+    sampling = await store.get_environments()
+    scoring = await store.get_scoring_environments()
+    derived = await store.get_derived_environments()
+    display = await store.get_rank_display_environments()
+
+    assert set(sampling.keys()) == {"SWE-INFINITE"}
+    assert set(scoring.keys()) == {"SWE-INFINITE"}
+    assert set(derived.keys()) == {"TOKEN-EFFICIENCY"}
+    assert set(display.keys()) == {"SWE-INFINITE", "TOKEN-EFFICIENCY"}
+
+
+@pytest.mark.asyncio
 async def test_missing_sampling_gate_is_disabled():
     """Environment rows must explicitly opt into sampling."""
     kv = InMemoryConfigStore()

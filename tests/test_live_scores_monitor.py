@@ -7,6 +7,12 @@ from typing import Dict, List
 import pytest
 
 from affine.src.monitor.live_scores_monitor import LiveScoresMonitor
+from affine.src.scorer.token_efficiency import (
+    TOKEN_EFFICIENCY_ENV,
+    SampleMetric,
+    TokenEfficiencyConfig,
+    extract_token_usage,
+)
 from affine.src.scorer.window_state import TaskIdState
 
 
@@ -20,6 +26,25 @@ class _FakeSamplesAdapter:
     ) -> Dict[int, float]:
         bucket = self._by_subject.get((hotkey, revision, env), {})
         return {t: s for t, s in bucket.items() if t in task_ids}
+
+
+class _FakeMetricSamplesAdapter:
+    def __init__(self, by_subject: Dict[tuple, Dict[int, SampleMetric]]):
+        self._by_subject = by_subject
+
+    async def read_scores_for_tasks(
+        self, hotkey: str, revision: str, env: str,
+        task_ids: List[int], refresh_block: int,
+    ) -> Dict[int, float]:
+        bucket = self._by_subject.get((hotkey, revision, env), {})
+        return {t: m.score for t, m in bucket.items() if t in task_ids}
+
+    async def read_sample_metrics_for_tasks(
+        self, hotkey: str, revision: str, env: str,
+        task_ids: List[int], refresh_block: int, include_extra_usage: bool = False,
+    ) -> Dict[int, SampleMetric]:
+        bucket = self._by_subject.get((hotkey, revision, env), {})
+        return {t: m for t, m in bucket.items() if t in task_ids}
 
 
 def _make_monitor(samples_adapter) -> LiveScoresMonitor:
@@ -196,6 +221,64 @@ async def test_refresh_once_persists_per_miner_to_miner_stats():
     chal_env = by_hk["chal_hk"]["scores_by_env"]["ENV_A"]
     assert chal_env["count"] == 2 and chal_env["avg"] == pytest.approx(0.5)
     assert chal_env["champion_overlap_avg"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
+async def test_token_efficiency_sampling_only_is_added_to_live_scores():
+    from collections import namedtuple
+
+    Champ = namedtuple("Champ", ["uid", "hotkey", "revision"])
+    Miner = namedtuple("Miner", ["uid", "hotkey", "revision"])
+    Battle = namedtuple("Battle", ["challenger"])
+
+    samples = _FakeMetricSamplesAdapter({
+        ("champ_hk", "champ_rev", "SWE-INFINITE"): {
+            1: SampleMetric(
+                1.0,
+                extract_token_usage({"usage": {"total_tokens": 100}}),
+            ),
+            2: SampleMetric(
+                1.0,
+                extract_token_usage({"usage": {"total_tokens": 100}}),
+            ),
+        },
+        ("chal_hk", "chal_rev", "SWE-INFINITE"): {
+            1: SampleMetric(
+                1.0,
+                extract_token_usage({"usage": {"total_tokens": 50}}),
+            ),
+            2: SampleMetric(
+                1.0,
+                extract_token_usage({"usage": {"total_tokens": 50}}),
+            ),
+        },
+    })
+
+    out = await _make_monitor(samples)._compute_scores(
+        [
+            {"uid": 100, "hotkey": "champ_hk", "revision": "champ_rev"},
+            {"uid": 1, "hotkey": "chal_hk", "revision": "chal_rev"},
+        ],
+        ["SWE-INFINITE"],
+        TaskIdState(task_ids={"SWE-INFINITE": [1, 2]}, refreshed_at_block=10),
+        champion_uid=100,
+        champion=Champ(100, "champ_hk", "champ_rev"),
+        battle=Battle(Miner(1, "chal_hk", "chal_rev")),
+        token_config=TokenEfficiencyConfig(
+            enabled_for_sampling=True,
+            enabled_for_scoring=False,
+            min_pairs=1,
+        ),
+        token_runtime_envs=["SWE-INFINITE"],
+    )
+
+    champ_token = out["100"][TOKEN_EFFICIENCY_ENV]
+    chal_token = out["1"][TOKEN_EFFICIENCY_ENV]
+    assert champ_token["is_reference"] is True
+    assert champ_token["avg_tokens"] == pytest.approx(100.0)
+    assert chal_token["available"] is True
+    assert chal_token["avg_tokens"] == pytest.approx(50.0)
+    assert chal_token["verdict"] == "dominant"
 
 
 @pytest.mark.asyncio

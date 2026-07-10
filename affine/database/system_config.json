@@ -141,6 +141,19 @@
         ],
         "sampling_mode": "random"
       }
+    },
+    "TOKEN-EFFICIENCY": {
+      "display_name": "TOKEN-EFFICIENCY",
+      "kind": "derived",
+      "derived_metric": "token_efficiency",
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": false,
+      "scoring": {
+        "min_pairs": 100,
+        "savings_margin": 0.05,
+        "extra_token_tolerance": 0.02,
+        "max_score_ratio": 2.0
+      }
     }
   }
 }
