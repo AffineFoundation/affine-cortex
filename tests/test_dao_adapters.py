@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 import affine.database.client as db_client
@@ -36,6 +38,11 @@ class _FakeSampleDAO:
 
     def compress_data(self, payload):
         return payload.encode("utf-8")
+
+    def decompress_data(self, payload):
+        if isinstance(payload, bytes):
+            return payload.decode("utf-8")
+        return payload
 
     def _serialize(self, item):
         return item
@@ -96,6 +103,94 @@ async def test_sample_results_adapter_read_scores_uses_real_runtime_import(monke
     )
 
     assert scores == {1: 0.1}
+
+
+@pytest.mark.asyncio
+async def test_sample_metrics_skip_swe_codex_usage(monkeypatch):
+    dao = _FakeSampleDAO()
+    client = _FakeDynamoClient([
+        {
+            "Items": [
+                {
+                    "task_id": 1,
+                    "score": 0.1,
+                    "refresh_block": 10,
+                    "extra_compressed": dao.compress_data(json.dumps({
+                        "agent_type": "codex",
+                        "usage": {"total_tokens": 100},
+                    })),
+                },
+                {
+                    "task_id": 2,
+                    "score": 0.2,
+                    "refresh_block": 10,
+                    "extra_compressed": dao.compress_data(json.dumps({
+                        "agent_type": "affent",
+                        "usage": {"total_tokens": 200},
+                    })),
+                },
+            ]
+        }
+    ])
+    monkeypatch.setattr(
+        "affine.src.scorer.dao_adapters.get_client",
+        lambda: client,
+    )
+
+    adapter = SampleResultsAdapter(dao=dao)
+    metrics = await adapter.read_sample_metrics_for_tasks(
+        "hk", "rev", "SWE-INFINITE", [1, 2],
+        refresh_block=10,
+        include_extra_usage=True,
+    )
+
+    assert metrics[1].score == 0.1
+    assert metrics[1].usage is None
+    assert metrics[2].usage is not None
+    assert metrics[2].usage.token_count == 200
+
+
+@pytest.mark.asyncio
+async def test_sample_metrics_only_parse_supported_token_usage_envs(monkeypatch):
+    dao = _FakeSampleDAO()
+
+    async def read_metric(env, total_tokens):
+        client = _FakeDynamoClient([
+            {
+                "Items": [
+                    {
+                        "task_id": 1,
+                        "score": 0.1,
+                        "refresh_block": 10,
+                        "extra_compressed": dao.compress_data(json.dumps({
+                            "usage": {"total_tokens": total_tokens},
+                        })),
+                    },
+                ]
+            }
+        ])
+        monkeypatch.setattr(
+            "affine.src.scorer.dao_adapters.get_client",
+            lambda: client,
+        )
+
+        adapter = SampleResultsAdapter(dao=dao)
+        metrics = await adapter.read_sample_metrics_for_tasks(
+            "hk", "rev", env, [1],
+            refresh_block=10,
+            include_extra_usage=True,
+        )
+        return metrics[1].usage
+
+    terminal_usage = await read_metric("TERMINAL", 123)
+    memory_usage = await read_metric("MEMORY", 456)
+    distill_usage = await read_metric("DISTILL-V2", 789)
+
+    assert terminal_usage is not None
+    assert terminal_usage.token_count == 123
+    assert memory_usage is not None
+    assert memory_usage.token_count == 456
+    assert distill_usage is None
 
 
 class _MemoryMinerStatsDAO(MinerStatsDAO):

@@ -413,6 +413,8 @@ async def _enabled_envs() -> List[str]:
     for name, cfg in envs_raw.items():
         if not isinstance(cfg, dict):
             continue
+        if str(cfg.get("kind") or "runtime").lower() != "runtime":
+            continue
         sampling_flag = cfg.get("enabled_for_sampling", False)
         if sampling_flag:
             out.append(name)

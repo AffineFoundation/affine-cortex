@@ -69,6 +69,48 @@ def _as_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def _format_token_count(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "tok n/a"
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.2f}M tok"
+    if number >= 10_000:
+        return f"{number / 1_000:.1f}k tok"
+    if number >= 1_000:
+        return f"{number / 1_000:.2f}k tok"
+    return f"{number:.0f} tok"
+
+
+def _is_token_payload(payload: Any) -> bool:
+    return (
+        isinstance(payload, dict)
+        and (
+            payload.get("unit") == "tokens"
+            or payload.get("lower_is_better") is True
+        )
+    )
+
+
+def _token_env_cell(payload: Dict[str, Any]) -> str:
+    token_pairs = int(_as_float(payload.get("token_pairs", payload.get("count"))))
+    avg_tokens = payload.get("avg_tokens")
+    if avg_tokens is None:
+        coverage = _as_float(payload.get("coverage_ratio"))
+        return f"tok n/a({coverage * 100:.0f}%)/{token_pairs}"
+    token_text = _format_token_count(avg_tokens)
+    if payload.get("is_reference") is True:
+        return f"{token_text}/{token_pairs}"
+    saving_rate = payload.get("saving_rate")
+    if payload.get("available") is False:
+        coverage = _as_float(payload.get("coverage_ratio"))
+        return f"{token_text}(partial {coverage * 100:.0f}%)/{token_pairs}"
+    if isinstance(saving_rate, (int, float)):
+        return f"{token_text}({-saving_rate * 100:+.1f}%)/{token_pairs}"
+    return f"{token_text}/{token_pairs}"
+
+
 def _env_names(
     scores: List[Dict[str, Any]],
     *live_env_maps: Optional[Dict[str, Any]],
@@ -106,6 +148,7 @@ def _env_cell(
     env: Optional[str] = None,
     champion_live_avg: Optional[float] = None,
     terminal_entry: Optional[Dict[str, Any]] = None,
+    live_detail: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Render one env cell as ``{score%}[{lower%},{upper%}]/{n}``.
 
@@ -136,6 +179,11 @@ def _env_cell(
         ADDITIVE_MARGIN_ENVS, DEFAULT_ADDITIVE_MARGIN,
         DEFAULT_MARGIN, DEFAULT_NOT_WORSE_TOLERANCE, not_worse_lower_bound,
     )
+    if _is_token_payload(live_detail):
+        return _token_env_cell(live_detail)
+    if _is_token_payload(terminal_entry):
+        return _token_env_cell(terminal_entry)
+
     additive = env in ADDITIVE_MARGIN_ENVS
     upper_margin = DEFAULT_ADDITIVE_MARGIN if additive else DEFAULT_MARGIN
 
@@ -349,12 +397,14 @@ def _print_rank_table(
     # last-decided snapshot's 0.00 placeholder. None for miners not
     # currently in the sampling set.
     live_sample_averages = (window or {}).get("sample_averages") or {}
+    live_sample_details = (window or {}).get("sample_details") or {}
     # Build the env column set now that live maps are loaded, so sampling-only
     # envs (distill-v2: scoring disabled, absent from scores_by_env) still show.
     envs = _env_names(
         scores,
         live_sample_averages,
         live_sample_counts,
+        live_sample_details,
         enabled_envs=(window or {}).get("enabled_envs"),
     )
     # Per-row threshold basis. Prefer the comparator's decide-time
@@ -497,6 +547,7 @@ def _print_rank_table(
         row_live_avgs = live_sample_averages.get(uid_key) or {}
         row_overlap_avgs = champion_overlap_avgs.get(uid_key) or {}
         row_terminal = terminal_scores.get(uid_key) or {}
+        row_details = live_sample_details.get(uid_key) or {}
         is_champion_row = row.get("uid") == champion_uid
         for env in envs:
             live_count = row_live_counts.get(env)
@@ -511,9 +562,16 @@ def _print_rank_table(
                 champ_live = row_overlap_avgs.get(env)
                 if champ_live is None:
                     champ_live = champion_live_avgs.get(env)
-            row_parts.append(
-                f"{_env_cell(scores_by_env.get(env), live_count, live_avg, env=env, champion_live_avg=champ_live, terminal_entry=row_terminal.get(env)):>24}"
+            cell = _env_cell(
+                scores_by_env.get(env),
+                live_count,
+                live_avg,
+                env=env,
+                champion_live_avg=champ_live,
+                terminal_entry=row_terminal.get(env),
+                live_detail=row_details.get(env),
             )
+            row_parts.append(f"{cell:>24}")
         row_parts.append(
             _colored_status(status, is_invalid=(row.get("is_valid") is False))
         )

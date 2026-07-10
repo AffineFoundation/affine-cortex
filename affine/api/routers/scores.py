@@ -185,6 +185,7 @@ async def _build_score_rows_from_validity(
     snapshot_scores: List[Dict[str, Any]],
     scoring_envs: Optional[set],
     samples_dao: SampleResultsDAO,
+    aggregate_envs: Optional[set] = None,
 ) -> List[Dict[str, Any]]:
     """Score rows for *every* currently-valid miner.
 
@@ -209,6 +210,7 @@ async def _build_score_rows_from_validity(
     miner_meta = _preferred_miners_by_hotkey(await MinersDAO().get_all_miners())
 
     env_list = sorted(scoring_envs) if scoring_envs else []
+    aggregate_env_list = sorted(aggregate_envs) if aggregate_envs else env_list
 
     async def _row(hk: str) -> Dict[str, Any]:
         snap = snapshot_by_hk.get(hk) or {}
@@ -221,7 +223,7 @@ async def _build_score_rows_from_validity(
         # validity tuple: (is_valid, invalid_reason, challenge_status, ...)
         challenge_status = (validity.get(hk) or (None, None, None, None))[2]
         agg_scores, agg_total = await _avg_scores_for_miner(
-            samples_dao, hk, str(revision), env_list,
+            samples_dao, hk, str(revision), aggregate_env_list,
             cache_ttl_s=_ttl_for_status(challenge_status),
         )
         # Snapshot's scores_by_env wins when present (champion / previous
@@ -285,7 +287,26 @@ async def _scoring_env_names() -> set[str] | None:
         return None
     if not isinstance(raw, dict):
         return set()
-    envs = await StateStore(_StaticConfigStore({"environments": raw})).get_scoring_environments()
+    store = StateStore(_StaticConfigStore({"environments": raw}))
+    envs = await store.get_scoring_environments()
+    derived = await store.get_derived_environments()
+    names = set(envs.keys())
+    names.update(
+        env for env, cfg in derived.items()
+        if cfg.enabled_for_sampling and cfg.enabled_for_scoring
+    )
+    return names
+
+
+async def _runtime_scoring_env_names() -> set[str] | None:
+    raw = await SystemConfigDAO().get_param_value("environments", default=None)
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        return set()
+    envs = await StateStore(
+        _StaticConfigStore({"environments": raw})
+    ).get_scoring_environments()
     return set(envs.keys())
 
 
@@ -337,10 +358,12 @@ async def get_latest_scores(
             validity, snapshot_scores, champion_hotkey=champion_hotkey,
         )
         scoring_envs = await _scoring_env_names()
+        aggregate_envs = await _runtime_scoring_env_names()
         samples_dao = SampleResultsDAO()
 
         rows = await _build_score_rows_from_validity(
             validity, snapshot_scores, scoring_envs, samples_dao,
+            aggregate_envs=aggregate_envs,
         )
         rows.sort(key=lambda x: x.get("overall_score", 0.0), reverse=True)
         rows = rows[:top]
@@ -416,6 +439,7 @@ async def get_score_by_uid(
         ) or {}
 
         scoring_envs = await _scoring_env_names()
+        aggregate_envs = await _runtime_scoring_env_names()
         samples_dao = SampleResultsDAO()
 
         # Validity (and the terminated flag for cache short-circuit)
@@ -426,8 +450,9 @@ async def get_score_by_uid(
         ).get(hotkey, (None, None, None, None))
 
         env_list = sorted(scoring_envs) if scoring_envs else []
+        aggregate_env_list = sorted(aggregate_envs) if aggregate_envs else env_list
         agg_scores, agg_total = await _avg_scores_for_miner(
-            samples_dao, hotkey, revision, env_list,
+            samples_dao, hotkey, revision, aggregate_env_list,
             cache_ttl_s=_ttl_for_status(challenge_status),
         )
         snap_env = snap.get("scores_by_env") or {}

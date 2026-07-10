@@ -60,6 +60,7 @@ async def test_current_state_on_empty_state(monkeypatch):
         "enabled_envs": [],
         "sample_counts": {},
         "sample_averages": {},
+        "sample_details": {},
         "champion_overlap_avgs": {},
         "terminal_scores": {},
         "live_sampling_uids": [],
