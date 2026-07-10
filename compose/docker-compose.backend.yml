@@ -72,7 +72,12 @@ services:
     env_file:
       - .env
     volumes:
+      - ~/.ssh:/root/.ssh:ro
       - /var/log/affine/gpu_autoscaler:/var/log/affine/gpu_autoscaler
+    # Autoscaled SSH tunnels bind inside this container and are published on
+    # the backend host so remote affinetes workers can reach them.
+    ports:
+      - "8102-8120:8102-8120"
     command: ["-v", "servers", "gpu-autoscaler"]
 
   # GPU Autoscale Provider Wrapper — adapts GPU platforms to the small provider
