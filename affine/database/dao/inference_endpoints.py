@@ -262,10 +262,7 @@ class InferenceEndpointsDAO(BaseDAO):
             "#cond_model": "assigned_model",
             "#cond_revision": "assigned_revision",
         }
-        condition_values: Dict[str, Any] = {
-            ":active": True,
-            ":null_type": "NULL",
-        }
+        condition_values: Dict[str, Any] = {":active": True}
         conditions = [
             "(attribute_not_exists(#cond_active) OR #cond_active = :active)"
         ]
@@ -273,6 +270,7 @@ class InferenceEndpointsDAO(BaseDAO):
             conditions.append("#cond_token = :expected_token")
             condition_values[":expected_token"] = endpoint.assignment_token
         else:
+            condition_values[":null_type"] = "NULL"
             conditions.append(
                 "(attribute_not_exists(#cond_token) OR "
                 "attribute_type(#cond_token, :null_type))"
@@ -285,6 +283,7 @@ class InferenceEndpointsDAO(BaseDAO):
         }
         for idx, (field, value) in enumerate(expected_identity.items()):
             if value is None:
+                condition_values[":null_type"] = "NULL"
                 conditions.append(
                     f"(attribute_not_exists({field}) OR "
                     f"attribute_type({field}, :null_type))"
