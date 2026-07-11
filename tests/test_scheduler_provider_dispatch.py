@@ -32,6 +32,16 @@ class _UpdateRecordingClient:
         self.update_calls.append(kwargs)
 
 
+class _ScanRecordingClient:
+    def __init__(self, items):
+        self.items = items
+        self.scan_calls = []
+
+    async def scan(self, **kwargs):
+        self.scan_calls.append(kwargs)
+        return {"Items": self.items}
+
+
 class _ConfigDAOFake:
     def __init__(self, values):
         self.values = values
@@ -70,6 +80,30 @@ async def test_autoscaler_empty_provider_uses_system_config(monkeypatch):
     })
 
     assert await _gpu_autoscaler_empty_provider_kind(config_dao) == "ssh"
+
+
+@pytest.mark.asyncio
+async def test_endpoint_list_uses_consistent_scan(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    dao = InferenceEndpointsDAO()
+    item = dao._serialize({
+        "pk": "ENDPOINT#b300",
+        "kind": "ssh",
+        "active": True,
+        "assigned_uid": 170,
+    })
+    client = _ScanRecordingClient([item])
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    rows = await dao.list_all()
+
+    assert client.scan_calls == [{
+        "TableName": dao.table_name,
+        "ConsistentRead": True,
+    }]
+    assert rows[0].name == "b300"
+    assert rows[0].assigned_uid == 170
 
 
 def test_all_ssh_resolves_to_ssh():

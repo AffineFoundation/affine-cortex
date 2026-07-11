@@ -197,7 +197,13 @@ class InferenceEndpointsDAO(BaseDAO):
     async def list_all(self) -> List[Endpoint]:
         from affine.database.client import get_client
         client = get_client()
-        resp = await client.scan(TableName=self.table_name)
+        # Assignment fields coordinate scheduler deploy slots. The scheduler
+        # can write one assignment and immediately scan before filling the
+        # next predeploy slot, so this read must observe the write.
+        resp = await client.scan(
+            TableName=self.table_name,
+            ConsistentRead=True,
+        )
         items = [self._deserialize(item) for item in resp.get("Items", [])]
         return [Endpoint.from_row(it) for it in items]
 
