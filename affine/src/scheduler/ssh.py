@@ -92,6 +92,7 @@ ACTIVE_HF_INCOMPLETE_CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
 # ``docker rm -f`` is idempotent so start() always kicks off a fresh state.
 CONTAINER_NAME = "affine-sglang-current"
 RESTART_POLICY = "unless-stopped"
+DEPLOYMENT_ID_LABEL = "io.affine.deployment-id"
 
 # HuggingFace snapshot cache layout: model "<owner>/<name>" lives at
 # ``<cache>/models--<owner>--<name>/``. Both the prefix and the org/name
@@ -185,14 +186,33 @@ class SSHConfig:
         """Where env containers send their OpenAI chat completions."""
         return self.public_inference_url or f"http://{self.host}:{self.sglang_port}/v1"
 
-    def deployment_id(self) -> str:
-        """Stable identifier persisted in scheduler state.
-
-        Include endpoint name so a future multi-endpoint scheduler can tell
-        which machine owns the single-instance container.
-        """
+    def deployment_id(self, generation: Optional[str] = None) -> str:
+        """Return this endpoint's legacy or generation-specific deployment ID."""
         endpoint = self.endpoint_name or self.host
-        return f"ssh:{endpoint}:{CONTAINER_NAME}"
+        base = f"ssh:{endpoint}:{CONTAINER_NAME}"
+        if generation is None:
+            return base
+        generation = str(generation).strip()
+        if not generation or ":" in generation:
+            raise ValueError("deployment generation must be non-empty and colon-free")
+        return f"{base}:{generation}"
+
+    def owns_deployment_id(self, deployment_id: Optional[str]) -> bool:
+        """Whether ``deployment_id`` belongs to this endpoint.
+
+        The exact base ID is retained for containers created before deployment
+        generations were introduced. New IDs append the reservation token.
+        """
+        if not deployment_id:
+            return False
+        base = self.deployment_id()
+        if deployment_id == base:
+            return True
+        prefix = f"{base}:"
+        if not deployment_id.startswith(prefix):
+            return False
+        generation = deployment_id[len(prefix):]
+        return bool(generation) and ":" not in generation
 
 
 def _coerce_docker_args(value: Any) -> Tuple[str, ...]:
@@ -360,8 +380,15 @@ def _build_docker_run_cmd(
     config: "SSHConfig",
     *,
     disable_hf_xet: bool = False,
+    deployment_id: Optional[str] = None,
 ) -> str:
     """Full shell command: rm any existing container, then docker run sglang."""
+    deployment_id = deployment_id or config.deployment_id()
+    if not config.owns_deployment_id(deployment_id):
+        raise ValueError(
+            f"deployment_id {deployment_id!r} does not belong to "
+            f"endpoint {config.endpoint_name or config.host!r}"
+        )
     sglang_args = " ".join(shlex.quote(str(a)) for a in _build_sglang_args(target, config))
     labels = {
         "io.affine.endpoint": config.endpoint_name or config.host,
@@ -369,6 +396,7 @@ def _build_docker_run_cmd(
         "io.affine.hotkey": target.hotkey,
         "io.affine.model": target.model,
         "io.affine.revision": target.revision,
+        DEPLOYMENT_ID_LABEL: deployment_id,
     }
     label_flags = " ".join(
         f"--label {shlex.quote(k)}={shlex.quote(v)}"
@@ -644,11 +672,17 @@ def _parse_container_inspect_json(output: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _container_inspect(config: "SSHConfig") -> Optional[Dict[str, Any]]:
+async def _container_inspect(
+    config: "SSHConfig",
+    *,
+    log_failure: bool = True,
+) -> Optional[Dict[str, Any]]:
     fmt = "{{json .}}"
     cmd = f"docker inspect --format {shlex.quote(fmt)} {CONTAINER_NAME}"
     rc, out, err = await _ssh_exec(config, cmd)
     if rc != 0:
+        if not log_failure:
+            return None
         logger.warning(
             f"ssh-provider: docker inspect {CONTAINER_NAME!r} failed "
             f"on {config.host}: rc={rc} stderr={err!r}"
@@ -662,6 +696,7 @@ async def deployment_healthy(
     target: DeployTarget,
     *,
     base_url: Optional[str] = None,
+    deployment_id: Optional[str] = None,
 ) -> bool:
     """Return whether the remote container is still serving ``target``.
 
@@ -671,15 +706,23 @@ async def deployment_healthy(
     require both Docker labels and the OpenAI readiness probe to match.
     """
     probe_url = base_url or config.inference_url()
+    expected_deployment_id = deployment_id or config.deployment_id()
+    if not config.owns_deployment_id(expected_deployment_id):
+        logger.warning(
+            f"ssh-provider: deployment_id={expected_deployment_id!r} does not "
+            f"belong to endpoint={config.endpoint_name or config.host!r}"
+        )
+        return False
+    is_legacy_deployment = expected_deployment_id == config.deployment_id()
     try:
         info = await _container_inspect(config)
     except Exception as e:
         logger.warning(
-            f"ssh-provider: docker inspect health check raised on "
-            f"{config.host}; falling back to /v1/models only: "
+            f"ssh-provider: cannot verify deployment generation "
+            f"{expected_deployment_id!r} on {config.host}: "
             f"{type(e).__name__}: {e}"
         )
-        return await _probe_ready(probe_url)
+        return False
     if info is None:
         return False
 
@@ -698,6 +741,20 @@ async def deployment_healthy(
     labels = container_cfg.get("Labels") or {}
     if not isinstance(labels, dict):
         labels = {}
+    actual_deployment_id = str(labels.get(DEPLOYMENT_ID_LABEL) or "")
+    is_legacy_unlabelled = (
+        is_legacy_deployment and not actual_deployment_id
+    )
+    if (
+        actual_deployment_id != expected_deployment_id
+        and not is_legacy_unlabelled
+    ):
+        logger.warning(
+            f"ssh-provider: {CONTAINER_NAME} deployment generation mismatch "
+            f"on {config.host}: {actual_deployment_id!r}, "
+            f"expected={expected_deployment_id!r}"
+        )
+        return False
     expected_labels = {
         "io.affine.endpoint": config.endpoint_name or config.host,
         "io.affine.uid": str(target.uid),
@@ -759,7 +816,12 @@ async def _wait_ready(
 # ---- public API: deploy / teardown -----------------------------------------
 
 
-async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
+async def deploy(
+    config: SSHConfig,
+    target: DeployTarget,
+    *,
+    deployment_id: Optional[str] = None,
+) -> DeployResult:
     """Swap the remote host onto ``target``'s model.
 
     Steps:
@@ -773,6 +835,12 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
     On success returns ``DeployResult(deployment_id="ssh:<endpoint>:...", base_url=...)``.
     """
     base_url = config.inference_url()
+    deployment_id = deployment_id or config.deployment_id()
+    if not config.owns_deployment_id(deployment_id):
+        raise ValueError(
+            f"deployment_id {deployment_id!r} does not belong to "
+            f"endpoint {config.endpoint_name or config.host!r}"
+        )
 
     # Purge stale HF caches before the new container starts. The previous
     # container's open files keep its own model dir alive against the
@@ -782,7 +850,10 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
 
     disable_hf_xet = await _should_disable_hf_xet(target)
     cmd = _build_docker_run_cmd(
-        target, config, disable_hf_xet=disable_hf_xet,
+        target,
+        config,
+        disable_hf_xet=disable_hf_xet,
+        deployment_id=deployment_id,
     )
     logger.info(
         f"ssh-provider: deploying {target.model}@{target.revision[:8]} "
@@ -804,12 +875,12 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
         config=config,
     )
     return DeployResult(
-        deployment_id=config.deployment_id(),
+        deployment_id=deployment_id,
         base_url=base_url,
         deployments=[
             MachineDeployment(
                 endpoint_name=config.endpoint_name,
-                deployment_id=config.deployment_id(),
+                deployment_id=deployment_id,
                 base_url=base_url,
             )
         ],
@@ -819,18 +890,50 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
 async def teardown(config: SSHConfig, deployment_id: Optional[str]) -> None:
     """Stop and remove the sglang container on the remote host.
 
-    Idempotent — ``docker rm -f`` swallows the "not found" case. We
-    only act when ``deployment_id`` belongs to this endpoint. That keeps
-    endpoint ownership explicit once multiple SSH machines are active.
+    Inspect the generation label first and remove the captured container ID,
+    not the stable container name. A stale teardown therefore cannot delete a
+    newer generation that replaced the container between inspect and remove.
     """
-    if deployment_id and deployment_id != config.deployment_id():
+    expected_deployment_id = deployment_id or config.deployment_id()
+    if not config.owns_deployment_id(expected_deployment_id):
         logger.info(
             f"ssh-provider: skip teardown for deployment_id={deployment_id!r}; "
-            f"this endpoint owns {config.deployment_id()!r}"
+            f"this endpoint owns {config.deployment_id()!r} and its generations"
         )
         return
-    cmd = f"docker rm -f {CONTAINER_NAME} 2>/dev/null || true"
     try:
+        info = await _container_inspect(config, log_failure=False)
+        if info is None:
+            return
+        container_cfg = (
+            info.get("Config") if isinstance(info.get("Config"), dict) else {}
+        )
+        labels = container_cfg.get("Labels") or {}
+        if not isinstance(labels, dict):
+            labels = {}
+        actual_deployment_id = str(labels.get(DEPLOYMENT_ID_LABEL) or "")
+        is_legacy_unlabelled = (
+            expected_deployment_id == config.deployment_id()
+            and not actual_deployment_id
+        )
+        if (
+            actual_deployment_id != expected_deployment_id
+            and not is_legacy_unlabelled
+        ):
+            logger.info(
+                f"ssh-provider: skip stale teardown on {config.host}: "
+                f"container generation={actual_deployment_id!r}, "
+                f"requested={expected_deployment_id!r}"
+            )
+            return
+        container_id = str(info.get("Id") or "").strip()
+        if not container_id:
+            logger.warning(
+                f"ssh-provider: skip teardown for {CONTAINER_NAME} on "
+                f"{config.host}: docker inspect returned no container ID"
+            )
+            return
+        cmd = f"docker rm -f {shlex.quote(container_id)} 2>/dev/null || true"
         rc, out, err = await _ssh_exec(config, cmd)
         if rc != 0:
             logger.warning(

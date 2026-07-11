@@ -283,15 +283,17 @@ class InferenceEndpointsDAO(BaseDAO):
             "#cond_model": endpoint.assigned_model,
             "#cond_revision": endpoint.assigned_revision,
         }
-        for idx, (field, value) in enumerate(expected_identity.items()):
+        for idx, (attribute_name, value) in enumerate(
+            expected_identity.items()
+        ):
             if value is None:
                 conditions.append(
-                    f"(attribute_not_exists({field}) OR "
-                    f"attribute_type({field}, :null_type))"
+                    f"(attribute_not_exists({attribute_name}) OR "
+                    f"attribute_type({attribute_name}, :null_type))"
                 )
                 continue
             value_key = f":expected_identity_{idx}"
-            conditions.append(f"{field} = {value_key}")
+            conditions.append(f"{attribute_name} = {value_key}")
             condition_values[value_key] = value
 
         return await self._update_endpoint_fields(
@@ -398,6 +400,32 @@ class InferenceEndpointsDAO(BaseDAO):
             },
         )
 
+    async def clear_assignment_if_deployment(
+        self,
+        name: str,
+        *,
+        deployment_id: str,
+        updated_by: str = "scheduler",
+    ) -> bool:
+        """Clear runtime state only while ``deployment_id`` still owns it."""
+        now = int(time.time())
+        return await self._update_endpoint_fields(
+            name,
+            set_values={
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            remove_fields=_ASSIGNMENT_FIELDS,
+            condition_expression="#cond_deployment_id = :deployment_id",
+            condition_names={
+                "#cond_deployment_id": "deployment_id",
+            },
+            condition_values={
+                ":deployment_id": deployment_id,
+            },
+            return_false_on_condition_failure=True,
+        )
+
     async def activate_autoscaled_endpoint(
         self,
         endpoint: Endpoint,
@@ -416,8 +444,8 @@ class InferenceEndpointsDAO(BaseDAO):
 
         payload = asdict(endpoint)
         payload.pop("name", None)
-        for field in _ASSIGNMENT_FIELDS:
-            payload.pop(field, None)
+        for assignment_field in _ASSIGNMENT_FIELDS:
+            payload.pop(assignment_field, None)
         payload.update({
             "active": True,
             "generation": generation,
@@ -528,17 +556,17 @@ class InferenceEndpointsDAO(BaseDAO):
         names: Dict[str, str] = {}
         values: Dict[str, Dict[str, Any]] = {}
         set_parts = []
-        for idx, (field, value) in enumerate(set_values.items()):
+        for idx, (attribute_name, value) in enumerate(set_values.items()):
             name_key = f"#s{idx}"
             value_key = f":v{idx}"
-            names[name_key] = field
+            names[name_key] = attribute_name
             values[value_key] = self._serialize({"value": value})["value"]
             set_parts.append(f"{name_key} = {value_key}")
 
         remove_parts = []
-        for idx, field in enumerate(remove_fields):
+        for idx, attribute_name in enumerate(remove_fields):
             name_key = f"#r{idx}"
-            names[name_key] = field
+            names[name_key] = attribute_name
             remove_parts.append(name_key)
 
         names.update(condition_names or {})

@@ -207,6 +207,56 @@ async def test_live_endpoint_reservation_cannot_be_taken_over(monkeypatch):
     assert client.update_calls == []
 
 
+@pytest.mark.asyncio
+async def test_endpoint_assignment_clear_is_fenced_by_deployment_id(
+    monkeypatch,
+):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    cleared = await InferenceEndpointsDAO().clear_assignment_if_deployment(
+        "b300",
+        deployment_id="ssh:b300:affine-sglang-current:generation-170",
+    )
+
+    assert cleared is True
+    call = client.update_calls[0]
+    assert call["ConditionExpression"] == (
+        "#cond_deployment_id = :deployment_id"
+    )
+    assert call["ExpressionAttributeNames"]["#cond_deployment_id"] == (
+        "deployment_id"
+    )
+    assert call["ExpressionAttributeValues"][":deployment_id"] == {
+        "S": "ssh:b300:affine-sglang-current:generation-170"
+    }
+    removed_fields = set(call["ExpressionAttributeNames"].values())
+    assert "assigned_uid" in removed_fields
+    assert "assignment_token" in removed_fields
+    assert "deployment_id" in removed_fields
+
+
+@pytest.mark.asyncio
+async def test_stale_deployment_cannot_clear_new_endpoint_assignment(
+    monkeypatch,
+):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: _ConditionalFailureClient(),
+    )
+
+    cleared = await InferenceEndpointsDAO().clear_assignment_if_deployment(
+        "b300",
+        deployment_id="ssh:b300:affine-sglang-current:old-generation",
+    )
+
+    assert cleared is False
+
+
 def test_all_ssh_resolves_to_ssh():
     eps = [_Ep("b300", "ssh"), _Ep("b300-2", "ssh")]
     kind, ssh, targon = _resolve_provider_kind(eps)
@@ -388,6 +438,7 @@ class _EndpointsDAOFake:
         self.assignments = []
         self.reservations = []
         self.releases = []
+        self.conditional_clears = []
 
     async def list_active(self, kind=None):
         return [
@@ -397,6 +448,15 @@ class _EndpointsDAOFake:
 
     async def clear_assignment(self, name):
         self.cleared.append(name)
+
+    async def clear_assignment_if_deployment(self, name, *, deployment_id):
+        self.conditional_clears.append((name, deployment_id))
+        endpoint = next(ep for ep in self.endpoints if ep.name == name)
+        if endpoint.deployment_id != deployment_id:
+            return False
+        endpoint.deployment_id = None
+        endpoint.assigned_uid = None
+        return True
 
     async def try_reserve_assignment(self, endpoint, **kwargs):
         self.reservations.append((endpoint.name, kwargs))
@@ -503,7 +563,7 @@ async def test_ssh_deploy_failure_clears_assignment_and_reports_deployment(
     )
     dao = _EndpointsDAOFake([endpoint])
 
-    async def fail_deploy(config, target):
+    async def fail_deploy(config, target, *, deployment_id=None):
         raise RuntimeError("docker run failed")
 
     monkeypatch.setattr(
@@ -516,8 +576,11 @@ async def test_ssh_deploy_failure_clears_assignment_and_reports_deployment(
 
     assert [name for name, _token in dao.releases] == ["b300"]
     assert dao.assignments == []
+    reservation_token = dao.reservations[0][1]["token"]
     assert excinfo.value.invalidated_deployment_ids == (
-        "ssh:b300:affine-sglang-current",
+        SSHConfig(host="b300", endpoint_name="b300").deployment_id(
+            reservation_token
+        ),
     )
 
 
@@ -538,10 +601,10 @@ async def test_ssh_deploy_refreshes_cached_endpoint_config(monkeypatch):
         )
     }
 
-    async def deploy(config, target):
+    async def deploy(config, target, *, deployment_id=None):
         assert config.key_path == "/root/.ssh/new-key"
         return DeployResult(
-            deployment_id=config.deployment_id(),
+            deployment_id=deployment_id,
             base_url=config.inference_url(),
         )
 
@@ -553,6 +616,33 @@ async def test_ssh_deploy_refreshes_cached_endpoint_config(monkeypatch):
     await _deploy_ssh_target(dao, ssh_configs, _target(), role="challenger")
 
     assert ssh_configs["b300"].key_path == "/root/.ssh/new-key"
+
+
+@pytest.mark.asyncio
+async def test_ssh_deploy_rejects_provider_generation_mismatch(monkeypatch):
+    endpoint = Endpoint(
+        name="b300",
+        kind="ssh",
+        ssh_url="ssh://root@b300",
+    )
+    dao = _EndpointsDAOFake([endpoint])
+
+    async def deploy(config, target, *, deployment_id=None):
+        return DeployResult(
+            deployment_id=config.deployment_id("wrong-generation"),
+            base_url=config.inference_url(),
+        )
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.main.ssh_lifecycle.deploy",
+        deploy,
+    )
+
+    with pytest.raises(DeploymentStateInvalidatedError):
+        await _deploy_ssh_target(dao, {}, _target(), role="challenger")
+
+    assert [name for name, _token in dao.releases] == ["b300"]
+    assert dao.assignments == []
 
 
 @pytest.mark.asyncio
@@ -570,9 +660,9 @@ async def test_ssh_deploy_skips_non_scoring_endpoints(monkeypatch):
     )
     dao = _EndpointsDAOFake([anticopy, scoring])
 
-    async def deploy(config, target):
+    async def deploy(config, target, *, deployment_id=None):
         return DeployResult(
-            deployment_id=config.deployment_id(),
+            deployment_id=deployment_id,
             base_url=config.inference_url(),
         )
 
@@ -583,7 +673,12 @@ async def test_ssh_deploy_skips_non_scoring_endpoints(monkeypatch):
 
     result = await _deploy_ssh_target(dao, {}, _target(), role="champion")
 
-    assert result.deployment_id == "ssh:b300:affine-sglang-current"
+    reservation_token = dao.reservations[0][1]["token"]
+    expected_deployment_id = SSHConfig(
+        host="b300",
+        endpoint_name="b300",
+    ).deployment_id(reservation_token)
+    assert result.deployment_id == expected_deployment_id
     assert dao.assignments == [
         (
             "b300",
@@ -592,7 +687,7 @@ async def test_ssh_deploy_skips_non_scoring_endpoints(monkeypatch):
                 "hotkey": "hk42",
                 "model": "Qwen/Qwen3-30B-A22B",
                 "revision": "rev42",
-                "deployment_id": "ssh:b300:affine-sglang-current",
+                "deployment_id": expected_deployment_id,
                 "base_url": "http://b300:10001/v1",
                 "role": "champion",
             },
@@ -611,10 +706,10 @@ async def test_stale_endpoint_read_cannot_overwrite_predeploy_reservation(
     dao = _StaleReadEndpointsDAOFake(endpoints)
     deployed_uids = []
 
-    async def deploy(config, target):
+    async def deploy(config, target, *, deployment_id=None):
         deployed_uids.append(target.uid)
         return DeployResult(
-            deployment_id=config.deployment_id(),
+            deployment_id=deployment_id,
             base_url=config.inference_url(),
         )
 
@@ -647,11 +742,11 @@ async def test_lost_reservation_does_not_clear_new_endpoint_owner(monkeypatch):
     )
     dao = _EndpointsDAOFake([endpoint])
 
-    async def deploy(config, target):
+    async def deploy(config, target, *, deployment_id=None):
         endpoint.assignment_token = "new-owner"
         endpoint.assigned_uid = 194
         return DeployResult(
-            deployment_id=config.deployment_id(),
+            deployment_id=deployment_id,
             base_url=config.inference_url(),
         )
 

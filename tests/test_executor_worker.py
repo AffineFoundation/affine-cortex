@@ -471,6 +471,9 @@ def test_host_slot_acquire_is_atomic_and_tracks_env_owner():
 def test_host_from_deployment_parses_ssh_only():
     from affine.src.executor.worker import _host_from_deployment
     assert _host_from_deployment("ssh:b300:affine-sglang-current") == "b300"
+    assert _host_from_deployment(
+        "ssh:b300:affine-sglang-current:generation-42"
+    ) == "b300"
     assert _host_from_deployment("ssh:b300_2:affine-sglang-current") == "b300_2"
     assert _host_from_deployment("wrk-001") is None
     assert _host_from_deployment("targon:abc") is None
