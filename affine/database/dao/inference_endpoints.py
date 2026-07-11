@@ -19,6 +19,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
+from botocore.exceptions import ClientError
+
 from affine.database.base_dao import BaseDAO
 from affine.database.schema import get_table_name
 
@@ -41,8 +43,9 @@ class Endpoint:
     role: Optional[str] = None
 
     # Runtime assignment. Provider-agnostic: one endpoint/machine may be
-    # serving one miner model at a time. Scheduler writes these fields after
-    # deploy/adopt and clears them on teardown.
+    # serving one miner model at a time. Scheduler reserves these fields
+    # before deploy, finalizes them after readiness, and clears them on
+    # teardown.
     assigned_uid: Optional[int] = None
     assigned_hotkey: Optional[str] = None
     assigned_model: Optional[str] = None
@@ -51,6 +54,9 @@ class Endpoint:
     base_url: Optional[str] = None
     assignment_role: Optional[str] = None
     assigned_at: int = 0
+    assignment_token: Optional[str] = None
+    assignment_status: Optional[str] = None
+    assignment_expires_at: int = 0
 
     # ssh-kind extras
     ssh_url: Optional[str] = None
@@ -131,6 +137,9 @@ _ASSIGNMENT_FIELDS = (
     "base_url",
     "assignment_role",
     "assigned_at",
+    "assignment_token",
+    "assignment_status",
+    "assignment_expires_at",
 )
 
 
@@ -218,42 +227,150 @@ class InferenceEndpointsDAO(BaseDAO):
             out.append(ep)
         return out
 
-    async def set_assignment(
+    async def try_reserve_assignment(
         self,
-        name: str,
+        endpoint: Endpoint,
         *,
+        token: str,
         uid: int,
         hotkey: str,
         model: str,
         revision: str,
+        role: str,
+        expires_at: int,
+        updated_by: str = "scheduler",
+    ) -> bool:
+        """Atomically reserve ``endpoint`` for one deployment attempt.
+
+        ``endpoint`` is the row snapshot used during selection. The condition
+        prevents a stale scan or another scheduler from claiming the same
+        machine after that snapshot was read. A live ``deploying`` reservation
+        is never taken over; an expired one may be replaced via its token.
+        """
+        now = int(time.time())
+        if (
+            endpoint.assignment_status == "deploying"
+            and int(endpoint.assignment_expires_at or 0) > now
+        ):
+            return False
+
+        condition_names = {
+            "#cond_active": "active",
+            "#cond_token": "assignment_token",
+            "#cond_uid": "assigned_uid",
+            "#cond_hotkey": "assigned_hotkey",
+            "#cond_model": "assigned_model",
+            "#cond_revision": "assigned_revision",
+        }
+        condition_values: Dict[str, Any] = {
+            ":active": True,
+            ":null_type": "NULL",
+        }
+        conditions = [
+            "(attribute_not_exists(#cond_active) OR #cond_active = :active)"
+        ]
+        if endpoint.assignment_token:
+            conditions.append("#cond_token = :expected_token")
+            condition_values[":expected_token"] = endpoint.assignment_token
+        else:
+            conditions.append(
+                "(attribute_not_exists(#cond_token) OR "
+                "attribute_type(#cond_token, :null_type))"
+            )
+        expected_identity = {
+            "#cond_uid": endpoint.assigned_uid,
+            "#cond_hotkey": endpoint.assigned_hotkey,
+            "#cond_model": endpoint.assigned_model,
+            "#cond_revision": endpoint.assigned_revision,
+        }
+        for idx, (field, value) in enumerate(expected_identity.items()):
+            if value is None:
+                conditions.append(
+                    f"(attribute_not_exists({field}) OR "
+                    f"attribute_type({field}, :null_type))"
+                )
+                continue
+            value_key = f":expected_identity_{idx}"
+            conditions.append(f"{field} = {value_key}")
+            condition_values[value_key] = value
+
+        return await self._update_endpoint_fields(
+            endpoint.name,
+            set_values={
+                "assigned_uid": uid,
+                "assigned_hotkey": hotkey,
+                "assigned_model": model,
+                "assigned_revision": revision,
+                "assignment_role": role,
+                "assigned_at": now,
+                "assignment_token": token,
+                "assignment_status": "deploying",
+                "assignment_expires_at": int(expires_at),
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            remove_fields=("deployment_id", "base_url"),
+            condition_expression=" AND ".join(conditions),
+            condition_names=condition_names,
+            condition_values=condition_values,
+            return_false_on_condition_failure=True,
+        )
+
+    async def finalize_assignment(
+        self,
+        name: str,
+        *,
+        token: str,
         deployment_id: str,
         base_url: str,
-        role: str,
         updated_by: str = "scheduler",
-    ) -> None:
-        from affine.database.client import get_client
-        client = get_client()
-        await client.update_item(
-            TableName=self.table_name,
-            Key={"pk": {"S": self._make_pk(name)}},
-            UpdateExpression=(
-                "SET assigned_uid = :uid, assigned_hotkey = :hotkey, "
-                "assigned_model = :model, assigned_revision = :revision, "
-                "deployment_id = :deployment_id, base_url = :base_url, "
-                "assignment_role = :role, assigned_at = :now, "
-                "updated_at = :now, updated_by = :updated_by"
-            ),
-            ExpressionAttributeValues={
-                ":uid": {"N": str(uid)},
-                ":hotkey": {"S": hotkey},
-                ":model": {"S": model},
-                ":revision": {"S": revision},
-                ":deployment_id": {"S": deployment_id},
-                ":base_url": {"S": base_url},
-                ":role": {"S": role},
-                ":now": {"N": str(int(time.time()))},
-                ":updated_by": {"S": updated_by},
+    ) -> bool:
+        """Publish a ready deployment only while ``token`` owns the slot."""
+        now = int(time.time())
+        return await self._update_endpoint_fields(
+            name,
+            set_values={
+                "deployment_id": deployment_id,
+                "base_url": base_url,
+                "assignment_status": "ready",
+                "updated_at": now,
+                "updated_by": updated_by,
             },
+            remove_fields=("assignment_expires_at",),
+            condition_expression=(
+                "#cond_token = :token AND #cond_status = :deploying"
+            ),
+            condition_names={
+                "#cond_token": "assignment_token",
+                "#cond_status": "assignment_status",
+            },
+            condition_values={
+                ":token": token,
+                ":deploying": "deploying",
+            },
+            return_false_on_condition_failure=True,
+        )
+
+    async def release_assignment(
+        self,
+        name: str,
+        *,
+        token: str,
+        updated_by: str = "scheduler",
+    ) -> bool:
+        """Clear an assignment only when ``token`` still owns it."""
+        now = int(time.time())
+        return await self._update_endpoint_fields(
+            name,
+            set_values={
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            remove_fields=_ASSIGNMENT_FIELDS,
+            condition_expression="#cond_token = :token",
+            condition_names={"#cond_token": "assignment_token"},
+            condition_values={":token": token},
+            return_false_on_condition_failure=True,
         )
 
     async def clear_assignment(
@@ -272,7 +389,8 @@ class InferenceEndpointsDAO(BaseDAO):
                 "SET updated_at = :now, updated_by = :updated_by "
                 "REMOVE assigned_uid, assigned_hotkey, assigned_model, "
                 "assigned_revision, deployment_id, base_url, "
-                "assignment_role, assigned_at"
+                "assignment_role, assigned_at, assignment_token, "
+                "assignment_status, assignment_expires_at"
             ),
             ExpressionAttributeValues={
                 ":now": {"N": str(now)},
@@ -403,7 +521,8 @@ class InferenceEndpointsDAO(BaseDAO):
         condition_expression: Optional[str] = None,
         condition_names: Optional[Dict[str, str]] = None,
         condition_values: Optional[Dict[str, Any]] = None,
-    ) -> None:
+        return_false_on_condition_failure: bool = False,
+    ) -> bool:
         from affine.database.client import get_client
 
         names: Dict[str, str] = {}
@@ -443,4 +562,14 @@ class InferenceEndpointsDAO(BaseDAO):
             params["ConditionExpression"] = condition_expression
 
         client = get_client()
-        await client.update_item(**params)
+        try:
+            await client.update_item(**params)
+        except ClientError as e:
+            if (
+                return_false_on_condition_failure
+                and e.response.get("Error", {}).get("Code")
+                == "ConditionalCheckFailedException"
+            ):
+                return False
+            raise
+        return True
