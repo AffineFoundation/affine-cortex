@@ -19,6 +19,7 @@ from affine.src.scheduler.ssh import (
     ACTIVE_HF_INCOMPLETE_CACHE_MAX_AGE_SECONDS,
     CONTAINER_NAME,
     DEFAULT_HF_METADATA_TIMEOUT_SEC,
+    DEPLOYMENT_ID_LABEL,
     HF_XET_MAX_NON_XET_FILE_BYTES,
     HF_ORG_SEPARATOR,
     HF_SNAPSHOT_PREFIX,
@@ -36,6 +37,7 @@ from affine.src.scheduler.ssh import (
     _should_disable_hf_xet,
     deployment_healthy,
     deploy,
+    teardown,
 )
 from affine.src.scheduler.targon import DeployTarget
 
@@ -117,6 +119,21 @@ def test_inference_url_uses_public_override():
 def test_deployment_id_includes_endpoint_name():
     cfg = SSHConfig(host="b300", endpoint_name="ssh_b300")
     assert cfg.deployment_id() == f"ssh:ssh_b300:{CONTAINER_NAME}"
+
+
+def test_deployment_id_distinguishes_generations():
+    cfg = SSHConfig(host="b300", endpoint_name="ssh_b300")
+    first = cfg.deployment_id("generation-1")
+    second = cfg.deployment_id("generation-2")
+
+    assert first != second
+    assert cfg.owns_deployment_id(first)
+    assert cfg.owns_deployment_id(second)
+    assert cfg.owns_deployment_id(cfg.deployment_id())
+    assert not cfg.owns_deployment_id(
+        f"ssh:other-endpoint:{CONTAINER_NAME}:generation-1"
+    )
+    assert not cfg.owns_deployment_id(f"{first}:unexpected-suffix")
 
 
 # ---- sglang args + docker cmd ---------------------------------------------
@@ -388,6 +405,23 @@ def test_docker_cmd_labels_current_machine_assignment():
     assert "--label io.affine.hotkey=abc123def" in cmd
     assert "--label io.affine.model=Qwen/Qwen3-30B-A22B" in cmd
     assert "--label io.affine.revision=abcdef01234567" in cmd
+    assert (
+        f"--label {DEPLOYMENT_ID_LABEL}=ssh:ssh_b300:{CONTAINER_NAME}"
+        in cmd
+    )
+
+
+def test_docker_cmd_labels_deployment_generation():
+    cfg = _config(endpoint_name="ssh_b300")
+    deployment_id = cfg.deployment_id("generation-42")
+
+    cmd = _build_docker_run_cmd(
+        _target(),
+        cfg,
+        deployment_id=deployment_id,
+    )
+
+    assert f"--label {DEPLOYMENT_ID_LABEL}={deployment_id}" in cmd
 
 
 def test_docker_cmd_uses_host_network_and_ipc():
@@ -549,12 +583,14 @@ def test_parse_container_inspect_json_tolerates_targon_banner():
 async def test_deployment_healthy_requires_matching_running_container(monkeypatch):
     target = _target()
     cfg = _config(endpoint_name="ssh_b300")
+    deployment_id = cfg.deployment_id("generation-42")
     labels = {
         "io.affine.endpoint": "ssh_b300",
         "io.affine.uid": str(target.uid),
         "io.affine.hotkey": target.hotkey,
         "io.affine.model": target.model,
         "io.affine.revision": target.revision,
+        DEPLOYMENT_ID_LABEL: deployment_id,
     }
     inspect_payload = {
         "State": {"Status": "running", "ExitCode": 0},
@@ -574,9 +610,103 @@ async def test_deployment_healthy_requires_matching_running_container(monkeypatc
     monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
 
     assert await deployment_healthy(
-        cfg, target, base_url="http://edge.example/v1",
+        cfg,
+        target,
+        base_url="http://edge.example/v1",
+        deployment_id=deployment_id,
     )
     assert probed == ["http://edge.example/v1"]
+
+
+@pytest.mark.asyncio
+async def test_deployment_healthy_accepts_unlabelled_legacy_container(monkeypatch):
+    target = _target()
+    cfg = _config(endpoint_name="ssh_b300")
+    inspect_payload = {
+        "State": {"Status": "running", "ExitCode": 0},
+        "Config": {
+            "Labels": {
+                "io.affine.endpoint": "ssh_b300",
+                "io.affine.uid": str(target.uid),
+                "io.affine.hotkey": target.hotkey,
+                "io.affine.model": target.model,
+                "io.affine.revision": target.revision,
+            }
+        },
+    }
+
+    async def fake_ssh_exec(config, command):
+        return 0, json.dumps(inspect_payload), ""
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        return True
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+
+    assert await deployment_healthy(
+        cfg,
+        target,
+        deployment_id=cfg.deployment_id(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_deployment_healthy_rejects_previous_generation(monkeypatch):
+    target = _target()
+    cfg = _config(endpoint_name="ssh_b300")
+    inspect_payload = {
+        "State": {"Status": "running", "ExitCode": 0},
+        "Config": {
+            "Labels": {
+                "io.affine.endpoint": "ssh_b300",
+                "io.affine.uid": str(target.uid),
+                "io.affine.hotkey": target.hotkey,
+                "io.affine.model": target.model,
+                "io.affine.revision": target.revision,
+                DEPLOYMENT_ID_LABEL: cfg.deployment_id("generation-new"),
+            }
+        },
+    }
+
+    async def fake_ssh_exec(config, command):
+        return 0, json.dumps(inspect_payload), ""
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        raise AssertionError("readiness probe should not run for a stale generation")
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+
+    assert not await deployment_healthy(
+        cfg,
+        target,
+        deployment_id=cfg.deployment_id("generation-old"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_generated_deployment_health_does_not_fallback_on_inspect_error(
+    monkeypatch,
+):
+    cfg = _config(endpoint_name="ssh_b300")
+
+    async def fake_ssh_exec(config, command):
+        raise RuntimeError("ssh transport unavailable")
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        raise AssertionError(
+            "HTTP alone cannot authenticate a generated deployment"
+        )
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+
+    assert not await deployment_healthy(
+        cfg,
+        _target(),
+        deployment_id=cfg.deployment_id("generation-42"),
+    )
 
 
 @pytest.mark.asyncio
@@ -702,6 +832,7 @@ async def test_deploy_always_cleans_existing_container_before_start(monkeypatch)
 
     monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
     monkeypatch.setattr("affine.src.scheduler.ssh._wait_ready", fake_wait_ready)
+
     async def fake_should_disable_hf_xet(target):
         return False
 
@@ -720,6 +851,125 @@ async def test_deploy_always_cleans_existing_container_before_start(monkeypatch)
     assert "docker inspect" not in "\n".join(calls)
     assert "for d in" in calls[0] and "rm -rf" in calls[0]
     assert calls[1].startswith(f"docker rm -f {CONTAINER_NAME}")
+    assert f"--label {DEPLOYMENT_ID_LABEL}={result.deployment_id}" in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_deploy_returns_requested_generation(monkeypatch):
+    calls = []
+
+    async def fake_ssh_exec(config, command):
+        calls.append(command)
+        return 0, "container1234567890", ""
+
+    async def fake_wait_ready(*args, **kwargs):
+        return None
+
+    async def fake_should_disable_hf_xet(target):
+        return False
+
+    async def fake_cleanup_stale_caches(config, target):
+        return None
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+    monkeypatch.setattr("affine.src.scheduler.ssh._wait_ready", fake_wait_ready)
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._cleanup_stale_caches",
+        fake_cleanup_stale_caches,
+    )
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._should_disable_hf_xet",
+        fake_should_disable_hf_xet,
+    )
+
+    cfg = _config(endpoint_name="ssh_b300")
+    deployment_id = cfg.deployment_id("generation-42")
+    result = await deploy(cfg, _target(), deployment_id=deployment_id)
+
+    assert result.deployment_id == deployment_id
+    assert result.deployments[0].deployment_id == deployment_id
+    assert f"--label {DEPLOYMENT_ID_LABEL}={deployment_id}" in calls[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("requested_generation", [None, "generation-old"])
+async def test_stale_teardown_does_not_remove_new_generation(
+    monkeypatch,
+    requested_generation,
+):
+    cfg = _config(endpoint_name="ssh_b300")
+    old_deployment_id = cfg.deployment_id(requested_generation)
+    inspect_payload = {
+        "Id": "new-container-id",
+        "Config": {
+            "Labels": {
+                DEPLOYMENT_ID_LABEL: cfg.deployment_id("generation-new"),
+            }
+        },
+    }
+    calls = []
+
+    async def fake_ssh_exec(config, command):
+        calls.append(command)
+        if command.startswith("docker inspect"):
+            return 0, json.dumps(inspect_payload), ""
+        raise AssertionError("stale teardown must not issue docker rm")
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+
+    await teardown(cfg, old_deployment_id)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_teardown_removes_matching_generation_by_container_id(monkeypatch):
+    cfg = _config(endpoint_name="ssh_b300")
+    deployment_id = cfg.deployment_id("generation-42")
+    inspect_payload = {
+        "Id": "matching-container-id",
+        "Config": {"Labels": {DEPLOYMENT_ID_LABEL: deployment_id}},
+    }
+    calls = []
+
+    async def fake_ssh_exec(config, command):
+        calls.append(command)
+        if command.startswith("docker inspect"):
+            return 0, json.dumps(inspect_payload), ""
+        if command.startswith("docker rm -f matching-container-id"):
+            return 0, "matching-container-id", ""
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+
+    await teardown(cfg, deployment_id)
+
+    assert len(calls) == 2
+    assert CONTAINER_NAME not in calls[1]
+
+
+@pytest.mark.asyncio
+async def test_teardown_supports_unlabelled_legacy_container(monkeypatch):
+    cfg = _config(endpoint_name="ssh_b300")
+    inspect_payload = {
+        "Id": "legacy-container-id",
+        "Config": {"Labels": {}},
+    }
+    calls = []
+
+    async def fake_ssh_exec(config, command):
+        calls.append(command)
+        if command.startswith("docker inspect"):
+            return 0, json.dumps(inspect_payload), ""
+        if command.startswith("docker rm -f legacy-container-id"):
+            return 0, "legacy-container-id", ""
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
+
+    await teardown(cfg, cfg.deployment_id())
+
+    assert len(calls) == 2
 
 
 @pytest.mark.asyncio

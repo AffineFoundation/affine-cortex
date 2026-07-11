@@ -189,8 +189,8 @@ async def _deploy_ssh_target(
     for ep in selected:
         cfg = ssh_lifecycle.SSHConfig.from_endpoint(ep)
         ssh_configs[ep.name] = cfg
-        deployment_id = cfg.deployment_id()
         reservation_token = uuid.uuid4().hex
+        deployment_id = cfg.deployment_id(reservation_token)
         reservation_expires_at = (
             int(time.time())
             + max(60, int(ep.ready_timeout_sec))
@@ -215,7 +215,16 @@ async def _deploy_ssh_target(
                 raise NoSpareEndpoint(message)
             raise EndpointReservationConflict(message)
         try:
-            result = await ssh_lifecycle.deploy(cfg, target)
+            result = await ssh_lifecycle.deploy(
+                cfg,
+                target,
+                deployment_id=deployment_id,
+            )
+            if result.deployment_id != deployment_id:
+                raise RuntimeError(
+                    f"ssh endpoint={ep.name!r} returned deployment_id="
+                    f"{result.deployment_id!r}, expected={deployment_id!r}"
+                )
             finalized = await endpoints_dao.finalize_assignment(
                 ep.name,
                 token=reservation_token,
@@ -363,7 +372,7 @@ async def _run() -> None:
             there. Fall back to a live ``list_active`` so teardown can
             still find a cfg to docker-rm + clear_assignment on."""
             for name, cfg in ssh_configs.items():
-                if deployment_id == cfg.deployment_id():
+                if cfg.owns_deployment_id(deployment_id):
                     try:
                         endpoint = await endpoints_dao.get(name)
                         if (
@@ -392,7 +401,7 @@ async def _run() -> None:
                 return None, None
             for ep in live:
                 cfg = ssh_lifecycle.SSHConfig.from_endpoint(ep)
-                if deployment_id == cfg.deployment_id():
+                if cfg.owns_deployment_id(deployment_id):
                     ssh_configs[ep.name] = cfg  # cache for next time
                     return ep.name, cfg
             return None, None
@@ -413,18 +422,24 @@ async def _run() -> None:
                     f"skipping teardown"
                 )
                 return
-            # clear_assignment runs in finally so a transient ssh
+            # Conditional clear runs in finally so a transient ssh
             # failure can't leave the endpoint's assigned_uid pointing
             # at a dead miner — that would starve pre-deploy capacity
-            # on this endpoint until restart. The DB row tracks the
-            # scheduler's intent; the next deploy reconciles any
-            # container the host might still be running
-            # (``ssh_lifecycle.deploy`` is idempotent — ``docker rm -f``
-            # step at the top).
+            # on this endpoint until restart. It is fenced by deployment ID:
+            # a stale teardown must never clear a newer assignment.
             try:
                 await ssh_lifecycle.teardown(cfg, deployment_id)
             finally:
-                await endpoints_dao.clear_assignment(name)
+                cleared = await endpoints_dao.clear_assignment_if_deployment(
+                    name,
+                    deployment_id=deployment_id,
+                )
+                if not cleared:
+                    logger.info(
+                        f"scheduler: endpoint={name!r} assignment no longer "
+                        f"belongs to deployment_id={deployment_id!r}; "
+                        f"skipping stale DB clear"
+                    )
 
         async def deployment_health_fn(champion):
             if not champion.deployment_id:
@@ -445,7 +460,10 @@ async def _run() -> None:
                 model_type=champion.model_type,
             )
             return await ssh_lifecycle.deployment_healthy(
-                cfg, target, base_url=champion.base_url,
+                cfg,
+                target,
+                base_url=champion.base_url,
+                deployment_id=champion.deployment_id,
             )
 
         async def list_active_ssh_endpoint_names():
