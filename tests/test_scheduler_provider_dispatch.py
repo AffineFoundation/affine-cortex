@@ -9,13 +9,18 @@ provider selection.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
+from botocore.exceptions import ClientError
 
 from affine.database.dao.inference_endpoints import Endpoint
-from affine.src.scheduler.flow import DeploymentStateInvalidatedError
+from affine.src.scheduler.flow import (
+    DeploymentStateInvalidatedError,
+    NoSpareEndpoint,
+)
 from affine.src.scheduler.main import (
+    EndpointReservationConflict,
     _deploy_ssh_target,
     _gpu_autoscaler_empty_provider_kind,
     _resolve_provider_kind,
@@ -30,6 +35,26 @@ class _UpdateRecordingClient:
 
     async def update_item(self, **kwargs):
         self.update_calls.append(kwargs)
+
+
+class _ConditionalFailureClient:
+    async def update_item(self, **kwargs):
+        raise ClientError(
+            error_response={
+                "Error": {"Code": "ConditionalCheckFailedException"},
+            },
+            operation_name="UpdateItem",
+        )
+
+
+class _ScanRecordingClient:
+    def __init__(self, items):
+        self.items = items
+        self.scan_calls = []
+
+    async def scan(self, **kwargs):
+        self.scan_calls.append(kwargs)
+        return {"Items": self.items}
 
 
 class _ConfigDAOFake:
@@ -70,6 +95,116 @@ async def test_autoscaler_empty_provider_uses_system_config(monkeypatch):
     })
 
     assert await _gpu_autoscaler_empty_provider_kind(config_dao) == "ssh"
+
+
+@pytest.mark.asyncio
+async def test_endpoint_list_uses_consistent_scan(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    dao = InferenceEndpointsDAO()
+    item = dao._serialize({
+        "pk": "ENDPOINT#b300",
+        "kind": "ssh",
+        "active": True,
+        "assigned_uid": 170,
+    })
+    client = _ScanRecordingClient([item])
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    rows = await dao.list_all()
+
+    assert client.scan_calls == [{
+        "TableName": dao.table_name,
+        "ConsistentRead": True,
+    }]
+    assert rows[0].name == "b300"
+    assert rows[0].assigned_uid == 170
+
+
+@pytest.mark.asyncio
+async def test_endpoint_reservation_rejects_stale_free_snapshot(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    endpoint = Endpoint(name="b300", kind="ssh", active=True)
+    client = _ConditionalFailureClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    reserved = await InferenceEndpointsDAO().try_reserve_assignment(
+        endpoint,
+        token="attempt-2",
+        uid=194,
+        hotkey="hk194",
+        model="org/model-194",
+        revision="rev194",
+        role="pre_challenger",
+        expires_at=2_000_000_000,
+    )
+
+    assert reserved is False
+
+
+@pytest.mark.asyncio
+async def test_endpoint_reservation_sets_owner_before_deploy(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    endpoint = Endpoint(name="b300", kind="ssh", active=True)
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    reserved = await InferenceEndpointsDAO().try_reserve_assignment(
+        endpoint,
+        token="attempt-170",
+        uid=170,
+        hotkey="hk170",
+        model="org/model-170",
+        revision="rev170",
+        role="pre_challenger",
+        expires_at=2_000_000_000,
+    )
+
+    assert reserved is True
+    call = client.update_calls[0]
+    assert "attribute_type(#cond_token, :null_type)" in call[
+        "ConditionExpression"
+    ]
+    assert "attribute_type(#cond_uid, :null_type)" in call[
+        "ConditionExpression"
+    ]
+    assert call["ExpressionAttributeValues"][":null_type"] == {"S": "NULL"}
+    serialized_values = list(call["ExpressionAttributeValues"].values())
+    assert {"S": "attempt-170"} in serialized_values
+    assert {"S": "deploying"} in serialized_values
+
+
+@pytest.mark.asyncio
+async def test_live_endpoint_reservation_cannot_be_taken_over(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    endpoint = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        assigned_uid=170,
+        assignment_token="attempt-170",
+        assignment_status="deploying",
+        assignment_expires_at=4_000_000_000,
+    )
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    reserved = await InferenceEndpointsDAO().try_reserve_assignment(
+        endpoint,
+        token="attempt-194",
+        uid=194,
+        hotkey="hk194",
+        model="org/model-194",
+        revision="rev194",
+        role="pre_challenger",
+        expires_at=4_000_000_100,
+    )
+
+    assert reserved is False
+    assert client.update_calls == []
 
 
 def test_all_ssh_resolves_to_ssh():
@@ -241,6 +376,9 @@ async def test_deactivate_autoscaled_endpoint_is_conditioned_on_instance(
     assert "assigned_uid" in removed_fields
     assert "assigned_hotkey" in removed_fields
     assert "deployment_id" in removed_fields
+    assert "assignment_token" in removed_fields
+    assert "assignment_status" in removed_fields
+    assert "assignment_expires_at" in removed_fields
 
 
 class _EndpointsDAOFake:
@@ -248,6 +386,8 @@ class _EndpointsDAOFake:
         self.endpoints = endpoints
         self.cleared = []
         self.assignments = []
+        self.reservations = []
+        self.releases = []
 
     async def list_active(self, kind=None):
         return [
@@ -258,8 +398,85 @@ class _EndpointsDAOFake:
     async def clear_assignment(self, name):
         self.cleared.append(name)
 
-    async def set_assignment(self, name, **kwargs):
-        self.assignments.append((name, kwargs))
+    async def try_reserve_assignment(self, endpoint, **kwargs):
+        self.reservations.append((endpoint.name, kwargs))
+        endpoint.assigned_uid = kwargs["uid"]
+        endpoint.assigned_hotkey = kwargs["hotkey"]
+        endpoint.assigned_model = kwargs["model"]
+        endpoint.assigned_revision = kwargs["revision"]
+        endpoint.assignment_role = kwargs["role"]
+        endpoint.assignment_token = kwargs["token"]
+        endpoint.assignment_status = "deploying"
+        return True
+
+    async def finalize_assignment(self, name, **kwargs):
+        endpoint = next(ep for ep in self.endpoints if ep.name == name)
+        if endpoint.assignment_token != kwargs["token"]:
+            return False
+        endpoint.deployment_id = kwargs["deployment_id"]
+        endpoint.base_url = kwargs["base_url"]
+        endpoint.assignment_status = "ready"
+        self.assignments.append((name, {
+            "uid": endpoint.assigned_uid,
+            "hotkey": endpoint.assigned_hotkey,
+            "model": endpoint.assigned_model,
+            "revision": endpoint.assigned_revision,
+            "deployment_id": kwargs["deployment_id"],
+            "base_url": kwargs["base_url"],
+            "role": endpoint.assignment_role,
+        }))
+        return True
+
+    async def release_assignment(self, name, *, token):
+        endpoint = next(ep for ep in self.endpoints if ep.name == name)
+        self.releases.append((name, token))
+        if endpoint.assignment_token != token:
+            return False
+        endpoint.assigned_uid = None
+        endpoint.assigned_hotkey = None
+        endpoint.assigned_model = None
+        endpoint.assigned_revision = None
+        endpoint.assignment_token = None
+        endpoint.assignment_status = None
+        return True
+
+
+class _StaleReadEndpointsDAOFake(_EndpointsDAOFake):
+    """Always returns the original free row while preserving atomic owner."""
+
+    def __init__(self, endpoints):
+        super().__init__(endpoints)
+        self._reservation_owner = None
+
+    async def list_active(self, kind=None):
+        return [
+            replace(
+                ep,
+                assigned_uid=None,
+                assigned_hotkey=None,
+                assigned_model=None,
+                assigned_revision=None,
+                assignment_token=None,
+                assignment_status=None,
+            )
+            for ep in self.endpoints
+            if ep.active and (kind is None or ep.kind == kind)
+        ]
+
+    async def try_reserve_assignment(self, endpoint, **kwargs):
+        self.reservations.append((endpoint.name, kwargs))
+        if self._reservation_owner is not None:
+            return False
+        self._reservation_owner = kwargs["token"]
+        actual = next(ep for ep in self.endpoints if ep.name == endpoint.name)
+        actual.assigned_uid = kwargs["uid"]
+        actual.assigned_hotkey = kwargs["hotkey"]
+        actual.assigned_model = kwargs["model"]
+        actual.assigned_revision = kwargs["revision"]
+        actual.assignment_role = kwargs["role"]
+        actual.assignment_token = kwargs["token"]
+        actual.assignment_status = "deploying"
+        return True
 
 
 def _target():
@@ -297,7 +514,7 @@ async def test_ssh_deploy_failure_clears_assignment_and_reports_deployment(
     with pytest.raises(DeploymentStateInvalidatedError) as excinfo:
         await _deploy_ssh_target(dao, {}, _target(), role="challenger")
 
-    assert dao.cleared == ["b300"]
+    assert [name for name, _token in dao.releases] == ["b300"]
     assert dao.assignments == []
     assert excinfo.value.invalidated_deployment_ids == (
         "ssh:b300:affine-sglang-current",
@@ -381,3 +598,71 @@ async def test_ssh_deploy_skips_non_scoring_endpoints(monkeypatch):
             },
         )
     ]
+
+
+@pytest.mark.asyncio
+async def test_stale_endpoint_read_cannot_overwrite_predeploy_reservation(
+    monkeypatch,
+):
+    endpoints = [
+        Endpoint(name="a-primary", kind="ssh", ssh_url="ssh://root@primary"),
+        Endpoint(name="b-spare", kind="ssh", ssh_url="ssh://root@spare"),
+    ]
+    dao = _StaleReadEndpointsDAOFake(endpoints)
+    deployed_uids = []
+
+    async def deploy(config, target):
+        deployed_uids.append(target.uid)
+        return DeployResult(
+            deployment_id=config.deployment_id(),
+            base_url=config.inference_url(),
+        )
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.main.ssh_lifecycle.deploy",
+        deploy,
+    )
+
+    first = _target()
+    await _deploy_ssh_target(dao, {}, first, role="pre_challenger")
+    second = DeployTarget(
+        uid=194,
+        hotkey="hk194",
+        model="org/model-194",
+        revision="rev194",
+    )
+    with pytest.raises(NoSpareEndpoint):
+        await _deploy_ssh_target(dao, {}, second, role="pre_challenger")
+
+    assert deployed_uids == [42]
+    assert endpoints[1].assigned_uid == 42
+
+
+@pytest.mark.asyncio
+async def test_lost_reservation_does_not_clear_new_endpoint_owner(monkeypatch):
+    endpoint = Endpoint(
+        name="b300",
+        kind="ssh",
+        ssh_url="ssh://root@b300",
+    )
+    dao = _EndpointsDAOFake([endpoint])
+
+    async def deploy(config, target):
+        endpoint.assignment_token = "new-owner"
+        endpoint.assigned_uid = 194
+        return DeployResult(
+            deployment_id=config.deployment_id(),
+            base_url=config.inference_url(),
+        )
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.main.ssh_lifecycle.deploy",
+        deploy,
+    )
+
+    with pytest.raises(EndpointReservationConflict):
+        await _deploy_ssh_target(dao, {}, _target(), role="challenger")
+
+    assert endpoint.assignment_token == "new-owner"
+    assert endpoint.assigned_uid == 194
+    assert dao.assignments == []

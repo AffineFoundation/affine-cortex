@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import time
+import uuid
 from typing import Dict, List, Optional
 
 import click
@@ -51,6 +53,7 @@ from .flow import (
     FlowConfig,
     FlowScheduler,
     NoSpareEndpoint,
+    TransientDeployError,
 )
 
 
@@ -60,6 +63,11 @@ TICK_INTERVAL_SEC = float(os.getenv("SCHEDULER_TICK_INTERVAL_SEC", "12"))
 ORPHAN_SWEEP_INTERVAL_SEC = int(
     os.getenv("SCHEDULER_ORPHAN_SWEEP_INTERVAL_SEC", "600")
 )
+SSH_RESERVATION_GRACE_SEC = 300
+
+
+class EndpointReservationConflict(TransientDeployError):
+    """The selected SSH endpoint changed before this deploy owned it."""
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -182,32 +190,66 @@ async def _deploy_ssh_target(
         cfg = ssh_lifecycle.SSHConfig.from_endpoint(ep)
         ssh_configs[ep.name] = cfg
         deployment_id = cfg.deployment_id()
+        reservation_token = uuid.uuid4().hex
+        reservation_expires_at = (
+            int(time.time())
+            + max(60, int(ep.ready_timeout_sec))
+            + SSH_RESERVATION_GRACE_SEC
+        )
+        reserved = await endpoints_dao.try_reserve_assignment(
+            ep,
+            token=reservation_token,
+            uid=target.uid,
+            hotkey=target.hotkey,
+            model=target.model,
+            revision=target.revision,
+            role=role,
+            expires_at=reservation_expires_at,
+        )
+        if not reserved:
+            message = (
+                f"ssh endpoint={ep.name!r} changed or is already reserved "
+                f"before role={role!r} target_uid={target.uid} could claim it"
+            )
+            if role == "pre_challenger":
+                raise NoSpareEndpoint(message)
+            raise EndpointReservationConflict(message)
         try:
             result = await ssh_lifecycle.deploy(cfg, target)
+            finalized = await endpoints_dao.finalize_assignment(
+                ep.name,
+                token=reservation_token,
+                deployment_id=result.deployment_id,
+                base_url=result.base_url,
+            )
+            if not finalized:
+                raise EndpointReservationConflict(
+                    f"ssh endpoint={ep.name!r} reservation was replaced "
+                    f"before deployment finalize for target_uid={target.uid}"
+                )
         except Exception as e:
+            released = False
             try:
-                await endpoints_dao.clear_assignment(ep.name)
+                released = await endpoints_dao.release_assignment(
+                    ep.name,
+                    token=reservation_token,
+                )
             except Exception as clear_error:
                 logger.warning(
-                    f"scheduler: failed to clear assignment for ssh "
+                    f"scheduler: failed to release assignment reservation for ssh "
                     f"endpoint={ep.name!r} after deploy failure: "
                     f"{type(clear_error).__name__}: {clear_error}"
                 )
+            if isinstance(e, EndpointReservationConflict) or not released:
+                raise EndpointReservationConflict(
+                    f"ssh endpoint={ep.name!r} reservation ownership was lost "
+                    f"while deploying target_uid={target.uid}"
+                ) from e
             raise DeploymentStateInvalidatedError(
                 f"ssh deploy failed on endpoint={ep.name!r}; "
                 f"deployment_id={deployment_id!r} invalidated",
                 deployment_ids=[deployment_id],
             ) from e
-        await endpoints_dao.set_assignment(
-            ep.name,
-            uid=target.uid,
-            hotkey=target.hotkey,
-            model=target.model,
-            revision=target.revision,
-            deployment_id=result.deployment_id,
-            base_url=result.base_url,
-            role=role,
-        )
         deployments.append(
             targon_lifecycle.MachineDeployment(
                 endpoint_name=ep.name,
