@@ -231,9 +231,8 @@ TeardownFn = Callable[[Optional[str]], Awaitable[None]]
 ListActiveEndpointNamesFn = Callable[[], Awaitable[set]]
 """Return the set of currently-active endpoint names. Used by the
 pre-deploy invalidation sweep to drop records whose endpoint has been
-removed from ``inference_endpoints`` while the scheduler was down
-(``af db set-endpoint --no-active`` or row deletion). Optional —
-non-ssh providers don't need it."""
+marked inactive while the scheduler was down. Optional — non-ssh providers
+don't need it."""
 
 ListActiveEndpointActivationsFn = Callable[[], Awaitable[Dict[str, int]]]
 """Return currently-active endpoint names mapped to ``activated_at`` unix
@@ -1168,9 +1167,7 @@ class FlowScheduler:
         # ``None`` is fine for cold-start ticks.
         champion = await self.state.get_champion()
         champion_uid = champion.uid if champion is not None else None
-        # An endpoint that's been removed from ``inference_endpoints``
-        # (``af db set-endpoint --no-active`` or row deletion) is no
-        # longer ours to teardown — the cfg may not even exist anymore.
+        # An endpoint marked inactive is no longer ours to teardown.
         # Drop the record so the executor stops dispatching to a
         # base_url the operator removed.
         active_endpoints: Optional[set] = None
