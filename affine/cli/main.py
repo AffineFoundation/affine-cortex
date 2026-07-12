@@ -34,6 +34,7 @@ Database Commands:
 
 Operator Commands:
 - af gpu replace-endpoint : Rent a replacement GPU endpoint
+- af gpu remove-endpoint  : Stop and deactivate an autoscaled GPU endpoint
 """
 
 import sys
@@ -231,6 +232,32 @@ def gpu_replace_endpoint(old_endpoint_name, new_slot, keep_old, dry_run, yes):
         old_endpoint_name=old_endpoint_name,
         new_slot_name=new_slot,
         keep_old=keep_old,
+        dry_run=dry_run,
+        yes=yes,
+    ))
+
+
+@gpu.command("remove-endpoint")
+@click.option(
+    "--name",
+    "endpoint_name",
+    required=True,
+    help="Autoscaled endpoint to stop and deactivate.",
+)
+@click.option(
+    "--keep-slot",
+    is_flag=True,
+    help="Keep the autoscaler slot, allowing it to be rented again later.",
+)
+@click.option("--dry-run", is_flag=True, help="Print the plan without changes.")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
+def gpu_remove_endpoint(endpoint_name, keep_slot, dry_run, yes):
+    """Stop an autoscaled GPU endpoint and remove its slot by default."""
+    from affine.src.scheduler.gpu_autoscaler import remove_endpoint_command
+
+    asyncio.run(remove_endpoint_command(
+        endpoint_name=endpoint_name,
+        keep_slot=keep_slot,
         dry_run=dry_run,
         yes=yes,
     ))
