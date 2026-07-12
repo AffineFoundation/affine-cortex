@@ -58,17 +58,23 @@ def test_delete_refuses_owned_pod_with_wrong_purpose():
 def test_delete_allows_matching_purpose_and_legacy_without_expected_purpose():
     lium = _load_wrapper()
     client = lium.LiumClient.__new__(lium.LiumClient)
-    pods = [
-        {"uid": "pod-1", "pod_name": "affine-autoscale-eval-a"},
-        {"uid": "pod-2", "pod_name": "affine-autoscale-a"},
-    ]
+    pods = {
+        "pod-1": {"uid": "pod-1", "pod_name": "affine-autoscale-eval-a"},
+        "pod-2": {"uid": "pod-2", "pod_name": "affine-autoscale-a"},
+    }
     deleted = []
 
     def request(method, path, **kwargs):
-        if method == "GET":
-            return pods.pop(0)
-        deleted.append(path)
-        return {}
+        if (method, path) == ("GET", "/pods"):
+            return {"pods": list(pods.values())}
+        if method == "GET" and path.startswith("/pods/"):
+            return pods[path.rsplit("/", 1)[-1]]
+        if method == "DELETE" and path.startswith("/pods/"):
+            uid = path.rsplit("/", 1)[-1]
+            pods.pop(uid)
+            deleted.append(path)
+            return {}
+        raise AssertionError((method, path))
 
     client.request = request
 
@@ -150,6 +156,97 @@ def test_delete_treats_missing_owned_pod_as_success():
     client.request = request
 
     assert client.delete("pod-1") is True
+
+
+def test_get_pod_falls_back_to_list_when_detail_route_returns_404():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+    calls = []
+
+    def request(method, path, **kwargs):
+        calls.append((method, path))
+        if path == "/pods/pod-1":
+            raise lium.LiumHTTPError(method, path, 404, "missing")
+        if path == "/pods":
+            return {
+                "pods": [
+                    {
+                        "uid": "pod-1",
+                        "pod_name": "affine-autoscale-eval-a",
+                        "status": "running",
+                    }
+                ]
+            }
+        raise AssertionError((method, path))
+
+    client.request = request
+
+    pod = client.get_pod("pod-1")
+
+    assert pod["pod_name"] == "affine-autoscale-eval-a"
+    assert calls == [("GET", "/pods/pod-1"), ("GET", "/pods")]
+
+
+def test_delete_uses_list_fallback_before_deleting_owned_pod():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+    deleted = []
+
+    present = True
+
+    def request(method, path, **kwargs):
+        nonlocal present
+        if (method, path) == ("GET", "/pods/pod-1"):
+            raise lium.LiumHTTPError(method, path, 404, "missing")
+        if (method, path) == ("GET", "/pods"):
+            return {
+                "pods": ([{
+                    "uid": "pod-1",
+                    "pod_name": "affine-autoscale-eval-a",
+                    "status": "running",
+                }] if present else [])
+            }
+        if (method, path) == ("DELETE", "/pods/pod-1"):
+            present = False
+            deleted.append(path)
+            return {}
+        raise AssertionError((method, path))
+
+    client.request = request
+
+    assert client.delete("pod-1", expected_purpose="eval") is True
+    assert deleted == ["/pods/pod-1"]
+
+
+def test_delete_fails_when_pod_remains_in_provider_list(monkeypatch):
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+    monkeypatch.setattr(lium, "DELETE_VERIFY_ATTEMPTS", 1)
+
+    def request(method, path, **kwargs):
+        if (method, path) in {
+            ("GET", "/pods/pod-1"),
+            ("GET", "/pods"),
+        }:
+            if path == "/pods/pod-1":
+                return {
+                    "uid": "pod-1",
+                    "pod_name": "affine-autoscale-eval-a",
+                    "status": "running",
+                }
+            return {"pods": [{
+                "uid": "pod-1",
+                "pod_name": "affine-autoscale-eval-a",
+                "status": "running",
+            }]}
+        if (method, path) == ("DELETE", "/pods/pod-1"):
+            return {}
+        raise AssertionError((method, path))
+
+    client.request = request
+
+    with pytest.raises(lium.LiumProviderError, match="still present"):
+        client.delete("pod-1", expected_purpose="eval")
 
 
 def test_status_returns_normalized_pod_state():

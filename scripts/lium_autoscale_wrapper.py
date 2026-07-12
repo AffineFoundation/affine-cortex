@@ -46,6 +46,12 @@ TERMINATION_HOURS = int(_env("LIUM_TERMINATION_HOURS", "8") or "8")
 PORT = int(_env("LIUM_SGLANG_PORT", "10001") or "10001")
 WAIT_TIMEOUT = int(_env("LIUM_CREATE_WAIT_TIMEOUT_SEC", "900") or "900")
 POLL_SECONDS = int(_env("LIUM_CREATE_POLL_SECONDS", "15") or "15")
+DELETE_VERIFY_ATTEMPTS = int(
+    _env("LIUM_DELETE_VERIFY_ATTEMPTS", "10") or "10"
+)
+DELETE_VERIFY_INTERVAL_SECONDS = float(
+    _env("LIUM_DELETE_VERIFY_INTERVAL_SECONDS", "2") or "2"
+)
 ENDPOINT_SCHEME = _env("LIUM_ENDPOINT_SCHEME", "http").rstrip(":/") or "http"
 PUBLIC_INFERENCE_URL = _env("LIUM_PUBLIC_INFERENCE_URL")
 NAME_PREFIX = _env("LIUM_POD_NAME_PREFIX", "affine-autoscale")
@@ -317,11 +323,26 @@ class LiumClient:
             time.sleep(1)
         return ""
 
+    def find_pod_by_uid(self, uid: str) -> Optional[dict]:
+        try:
+            pods = self.items(self.request("GET", "/pods"))
+        except LiumHTTPError as e:
+            if e.status_code == 404:
+                return None
+            raise
+        for pod in pods:
+            if _instance_id(pod) == uid:
+                return pod
+        return None
+
     def wait_ready(self, uid: str) -> dict:
         start = time.time()
         last: Optional[dict] = None
         while time.time() - start < WAIT_TIMEOUT:
-            pod = self.request("GET", f"/pods/{uid}")
+            pod = self.get_pod(uid)
+            if pod is None:
+                time.sleep(POLL_SECONDS)
+                continue
             if isinstance(pod, dict):
                 last = pod
             status = _status(pod)
@@ -357,13 +378,20 @@ class LiumClient:
         try:
             pod = self.request("GET", f"/pods/{uid}")
         except LiumHTTPError as e:
-            if e.status_code == 404:
-                return None
-            raise
+            if e.status_code != 404:
+                raise
+
+            # Some Lium deployments list a running pod from ``GET /pods``
+            # while their detail route returns 404 for the same UUID.  A
+            # detail-only lookup would therefore make delete() report success
+            # without ever issuing DELETE, leaving the rental bill running.
+            return self.find_pod_by_uid(uid)
         return pod if isinstance(pod, dict) else {}
 
     def status(self, uid: str) -> dict:
-        pod = self.request("GET", f"/pods/{uid}")
+        pod = self.get_pod(uid)
+        if pod is None:
+            raise LiumHTTPError("GET", f"/pods/{uid}", 404, "not found")
         return {
             "instance_id": uid,
             "lease_expires_at": _lease_expires_at(pod),
@@ -399,10 +427,20 @@ class LiumClient:
         try:
             self.request("DELETE", f"/pods/{uid}")
         except LiumHTTPError as e:
-            if e.status_code == 404:
+            if e.status_code != 404:
+                raise
+
+        for attempt in range(max(1, DELETE_VERIFY_ATTEMPTS)):
+            remaining = self.find_pod_by_uid(uid)
+            if remaining is None or _terminal_status(_status(remaining)):
                 return True
-            raise
-        return True
+            if attempt + 1 < DELETE_VERIFY_ATTEMPTS:
+                time.sleep(max(0.0, DELETE_VERIFY_INTERVAL_SECONDS))
+        raise LiumProviderError(
+            f"Pod {uid} is still present after provider delete",
+            code="provider_delete_not_confirmed",
+            http_status=502,
+        )
 
     def renew(self, uid: str) -> dict:
         if TERMINATION_HOURS <= 0:

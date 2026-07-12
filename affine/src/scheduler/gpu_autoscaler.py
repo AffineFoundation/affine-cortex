@@ -1999,6 +1999,22 @@ def _validate_autoscaled_endpoint(endpoint: Endpoint) -> None:
         )
 
 
+def _config_without_endpoint_slot(
+    payload: Mapping[str, Any], endpoint_name: str,
+) -> tuple[Dict[str, Any], bool]:
+    """Return a config payload without ``endpoint_name``'s managed slot."""
+    updated = dict(payload)
+    slots = payload.get("endpoints")
+    if not isinstance(slots, list):
+        return updated, False
+    kept = [
+        slot for slot in slots
+        if not isinstance(slot, Mapping) or slot.get("name") != endpoint_name
+    ]
+    updated["endpoints"] = kept
+    return updated, len(kept) != len(slots)
+
+
 async def replace_endpoint_command(
     *,
     old_endpoint_name: str,
@@ -2091,6 +2107,129 @@ async def replace_endpoint_command(
                 f"old_deleted={result.old_deleted}"
             )
         return result
+    finally:
+        await close_client()
+
+
+async def remove_endpoint_command(
+    *,
+    endpoint_name: str,
+    keep_slot: bool = False,
+    dry_run: bool = False,
+    yes: bool = False,
+) -> bool:
+    """Stop one autoscaled provider instance and deactivate its endpoint.
+
+    The managed slot is removed from ``gpu_autoscaler`` by default so the
+    next autoscaler tick cannot immediately rent the same endpoint again.
+    A manual-operation lock covers provider deletion and the config update.
+    On failure the lock is intentionally retained for its normal TTL, matching
+    endpoint replacement behavior and preventing an unsafe automatic retry.
+    """
+    await init_client()
+    try:
+        config_dao = SystemConfigDAO()
+        config_item = await config_dao.get_param(CONFIG_KEY)
+        payload = (
+            config_item.get("param_value")
+            if isinstance(config_item, Mapping)
+            else None
+        )
+        if not isinstance(payload, Mapping) or not payload:
+            raise click.ClickException("gpu_autoscaler config is missing")
+        config = GPUAutoscalerConfig.from_mapping(payload)
+
+        endpoints_dao = InferenceEndpointsDAO()
+        endpoint = await endpoints_dao.get(endpoint_name)
+        if endpoint is None:
+            raise click.ClickException(
+                f"endpoint {endpoint_name!r} does not exist"
+            )
+        try:
+            _validate_autoscaled_endpoint(endpoint)
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+
+        next_payload, slot_present = _config_without_endpoint_slot(
+            payload, endpoint_name,
+        )
+        click.echo("GPU endpoint removal plan:")
+        click.echo(f"  endpoint      : {endpoint_name}")
+        click.echo(
+            "  instance      : "
+            f"{endpoint.autoscale_provider} / {endpoint.autoscale_instance_id}"
+        )
+        click.echo("  action        : drain, delete rental, deactivate endpoint")
+        if keep_slot:
+            click.echo("  config slot   : keep (autoscaler may rent it again)")
+        elif slot_present:
+            click.echo("  config slot   : remove")
+        else:
+            click.echo("  config slot   : already absent")
+        if dry_run:
+            click.echo("  mode          : dry-run")
+            click.echo("dry-run complete; no provider or database changes made")
+            return True
+
+        if not yes:
+            click.confirm("Proceed with GPU endpoint removal?", abort=True)
+
+        kv = SystemConfigKVAdapter(
+            config_dao,
+            updated_by="cli:gpu-remove-endpoint",
+        )
+        autoscaler = GPUAutoscaler(
+            queue=ChallengerQueue(MinersQueueAdapter(MinersDAO())),
+            endpoints_dao=endpoints_dao,
+            state_store=StateStore(kv),
+            kv_store=kv,
+            samples_adapter=SampleResultsAdapter(
+                dao=SampleResultsDAO(),
+                validator_hotkey="gpu-remove-endpoint",
+            ),
+        )
+        lock = await autoscaler._acquire_manual_replacement_lock(
+            old_endpoint_name=endpoint_name,
+            new_slot_name=endpoint_name,
+            updated_by="cli:gpu-remove-endpoint",
+            ttl_seconds=DEFAULT_MANUAL_REPLACEMENT_TTL_SECONDS,
+        )
+        try:
+            deleted = await autoscaler._scale_down_endpoint(
+                config,
+                endpoint,
+                updated_by="cli:gpu-remove-endpoint",
+                deactivate_before_delete=True,
+            )
+            if not deleted:
+                raise RuntimeError(
+                    f"failed to delete endpoint {endpoint_name!r}"
+                )
+            if not keep_slot and slot_present:
+                await config_dao.set_param(
+                    param_name=CONFIG_KEY,
+                    param_value=next_payload,
+                    param_type="dict",
+                    description=str(config_item.get("description") or ""),
+                    updated_by="cli:gpu-remove-endpoint",
+                )
+        except Exception as e:
+            logger.warning(
+                "gpu-autoscaler: keeping manual removal lock for "
+                "endpoint=%s until expires_at=%s",
+                endpoint_name,
+                lock.get("expires_at"),
+            )
+            raise click.ClickException(str(e)) from e
+        else:
+            await autoscaler._clear_manual_replacement_lock(lock)
+
+        click.echo(
+            "removal complete: "
+            f"endpoint={endpoint_name} instance={endpoint.autoscale_instance_id} "
+            f"slot_removed={not keep_slot and slot_present}"
+        )
+        return True
     finally:
         await close_client()
 
