@@ -268,6 +268,7 @@ MINER_STATS_SCHEMA = {
 #   ssh_key_path           optional path to private key
 #   sglang_port            port sglang listens on inside the docker container
 #   sglang_dp              data-parallel size
+#   sglang_load_balance_method DP request routing strategy
 #   sglang_image           docker image (default lmsysorg/sglang:latest)
 #   sglang_cache_dir       host mount for HF cache
 #   sglang_context_len     context length passed to sglang
@@ -376,4 +377,3 @@ ANTICOPY_STATE_SCHEMA = {
     ],
     "BillingMode": "PAY_PER_REQUEST",
 }
-

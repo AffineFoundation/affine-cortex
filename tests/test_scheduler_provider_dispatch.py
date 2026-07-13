@@ -330,11 +330,23 @@ def test_endpoint_activation_bumps_on_enable_or_runtime_config_change():
         ssh_url="ssh://old-host",
         assigned_uid=123,
     )
+    rebalanced = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://old-host",
+        sglang_load_balance_method="round_robin",
+        generation=1,
+        activated_at=100,
+    )
 
     assert InferenceEndpointsDAO._activation_bump_required(None, enabled)
     assert InferenceEndpointsDAO._activation_bump_required(disabled, enabled)
     assert InferenceEndpointsDAO._activation_bump_required(legacy_active, enabled)
     assert InferenceEndpointsDAO._activation_bump_required(enabled, moved)
+    assert InferenceEndpointsDAO._activation_bump_required(
+        current_active, rebalanced
+    )
     assert not InferenceEndpointsDAO._activation_bump_required(current_active, assigned)
     assert not InferenceEndpointsDAO._activation_bump_required(current_active, Endpoint(
         name="b300",
@@ -342,6 +354,16 @@ def test_endpoint_activation_bumps_on_enable_or_runtime_config_change():
         active=False,
         ssh_url="ssh://old-host",
     ))
+
+
+def test_legacy_endpoint_defaults_to_token_load_balancing():
+    endpoint = Endpoint.from_row({
+        "pk": "ENDPOINT#legacy-b300",
+        "kind": "ssh",
+        "ssh_url": "ssh://old-host",
+    })
+
+    assert endpoint.sglang_load_balance_method == "total_tokens"
 
 
 @pytest.mark.asyncio
