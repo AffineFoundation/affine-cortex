@@ -177,6 +177,42 @@ async def test_endpoint_reservation_sets_owner_before_deploy(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_endpoint_reservation_replaces_fully_assigned_snapshot(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    endpoint = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        assigned_uid=210,
+        assigned_hotkey="hk210",
+        assigned_model="org/model-210",
+        assigned_revision="rev210",
+        assignment_token="attempt-210",
+        assignment_status="ready",
+    )
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    reserved = await InferenceEndpointsDAO().try_reserve_assignment(
+        endpoint,
+        token="attempt-197",
+        uid=197,
+        hotkey="hk197",
+        model="org/model-197",
+        revision="rev197",
+        role="challenger",
+        expires_at=2_000_000_000,
+    )
+
+    assert reserved is True
+    call = client.update_calls[0]
+    assert "#cond_token = :expected_token" in call["ConditionExpression"]
+    assert "attribute_type(" not in call["ConditionExpression"]
+    assert ":null_type" not in call["ExpressionAttributeValues"]
+
+
+@pytest.mark.asyncio
 async def test_live_endpoint_reservation_cannot_be_taken_over(monkeypatch):
     from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
 
