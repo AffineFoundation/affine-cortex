@@ -65,6 +65,7 @@ _ENDPOINT_OVERRIDE_FIELDS = {
     "ssh_url",
     "sglang_port",
     "sglang_dp",
+    "sglang_load_balance_method",
     "sglang_image",
     "sglang_cache_dir",
     "sglang_context_len",

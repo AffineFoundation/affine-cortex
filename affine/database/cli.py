@@ -688,7 +688,12 @@ async def _cmd_list_endpoints() -> None:
                     f"created_at={ep.autoscale_created_at or '-'}"
                 )
             if ep.kind == "ssh":
-                print(f"  sglang              : port={ep.sglang_port} dp={ep.sglang_dp} image={ep.sglang_image}")
+                print(
+                    "  sglang              : "
+                    f"port={ep.sglang_port} dp={ep.sglang_dp} "
+                    f"load_balance={ep.sglang_load_balance_method} "
+                    f"image={ep.sglang_image}"
+                )
                 print(
                     "  sglang args         : "
                     f"context={ep.sglang_context_len} "
@@ -727,6 +732,7 @@ async def _cmd_list_endpoints() -> None:
 async def _cmd_set_endpoint(
     name: str, kind: str, ssh_url: Optional[str], ssh_key_path: Optional[str],
     public_inference_url: Optional[str], sglang_port: int, sglang_dp: int,
+    sglang_load_balance_method: str,
     sglang_image: str, sglang_cache_dir: str, sglang_context_len: int,
     sglang_mem_fraction: float, sglang_chunked_prefill: int,
     sglang_tool_call_parser: str, sglang_docker_arg: tuple[str, ...],
@@ -743,6 +749,7 @@ async def _cmd_set_endpoint(
             ssh_url=ssh_url, ssh_key_path=ssh_key_path,
             public_inference_url=public_inference_url,
             sglang_port=sglang_port, sglang_dp=sglang_dp,
+            sglang_load_balance_method=sglang_load_balance_method,
             sglang_image=sglang_image, sglang_cache_dir=sglang_cache_dir,
             sglang_context_len=sglang_context_len,
             sglang_mem_fraction=sglang_mem_fraction,
@@ -785,6 +792,14 @@ def list_endpoints():
                    "use http://<host>:<sglang_port>/v1.")
 @click.option("--sglang-port", type=int, default=10001)
 @click.option("--sglang-dp", type=int, default=8)
+@click.option(
+    "--sglang-load-balance-method",
+    type=click.Choice([
+        "auto", "round_robin", "total_requests", "total_tokens",
+    ]),
+    default="total_tokens",
+    show_default=True,
+)
 @click.option("--sglang-image", default="lmsysorg/sglang:latest")
 @click.option("--sglang-cache-dir", default="/data")
 @click.option("--sglang-context-len", type=int, default=65536)
@@ -800,7 +815,8 @@ def list_endpoints():
 @click.option("--notes", default=None)
 def set_endpoint(
     name, kind, ssh_url, ssh_key_path, public_inference_url,
-    sglang_port, sglang_dp, sglang_image, sglang_cache_dir,
+    sglang_port, sglang_dp, sglang_load_balance_method, sglang_image,
+    sglang_cache_dir,
     sglang_context_len, sglang_mem_fraction, sglang_chunked_prefill,
     sglang_tool_call_parser, sglang_docker_arg, ready_timeout_sec,
     poll_interval_sec, active, notes,
@@ -812,6 +828,7 @@ def set_endpoint(
         name=name, kind=kind, ssh_url=ssh_url, ssh_key_path=ssh_key_path,
         public_inference_url=public_inference_url,
         sglang_port=sglang_port, sglang_dp=sglang_dp,
+        sglang_load_balance_method=sglang_load_balance_method,
         sglang_image=sglang_image, sglang_cache_dir=sglang_cache_dir,
         sglang_context_len=sglang_context_len,
         sglang_mem_fraction=sglang_mem_fraction,

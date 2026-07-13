@@ -229,6 +229,7 @@ def test_sglang_args_include_required_perf_flags():
         ("--chunked-prefill-size", "4096"),
         ("--tool-call-parser", "qwen"),
         ("--dp", "8"),
+        ("--load-balance-method", "total_tokens"),
     ]
     for flag, value in must_have_pairs:
         assert flag in args, f"missing {flag}"
@@ -621,6 +622,15 @@ def test_dp_disabled_when_one():
     """Single-GPU configs (DP=1) must not pass ``--dp`` at all."""
     args = _build_sglang_args(_target(), _config(sglang_dp=1))
     assert "--dp" not in args
+    assert "--load-balance-method" not in args
+
+
+def test_invalid_dp_load_balance_method_raises():
+    with pytest.raises(ValueError, match="unsupported SGLang load-balance"):
+        _build_sglang_args(
+            _target(),
+            _config(sglang_load_balance_method="least_connections"),
+        )
 
 
 def _qwen36_target():
@@ -654,6 +664,7 @@ def test_config_from_endpoint_overrides_module_defaults():
         ssh_url="ssh://root@1.2.3.4:10300",
         public_inference_url="http://val:31000/v1",
         sglang_port=31000, sglang_dp=4,
+        sglang_load_balance_method="total_requests",
         sglang_image="ghcr.io/custom/sglang:custom",
         sglang_cache_dir="/srv/cache",
         sglang_context_len=32768,
@@ -679,6 +690,10 @@ def test_config_from_endpoint_overrides_module_defaults():
     assert args[args.index("--mem-fraction-static") + 1] == "0.7"
     assert args[args.index("--chunked-prefill-size") + 1] == "2048"
     assert args[args.index("--dp") + 1] == "4"
+    assert (
+        args[args.index("--load-balance-method") + 1]
+        == "total_requests"
+    )
     assert "--tool-call-parser" not in args
     # inference_url uses the public override, not host:port
     assert cfg.inference_url() == "http://val:31000/v1"

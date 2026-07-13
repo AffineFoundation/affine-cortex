@@ -371,13 +371,15 @@ async def test_load_config_uses_autoscaler_env_when_system_config_absent(
     assert [slot.name for slot in cfg.slots] == ["lium-b200-1"]
 
 
-def test_managed_endpoint_slot_accepts_sglang_docker_args_override():
+def test_managed_endpoint_slot_accepts_sglang_runtime_overrides():
     slot = ManagedEndpointSlot.from_mapping({
         "name": "targon-b200-autoscale-1",
         "provider": "targon",
+        "sglang_load_balance_method": "total_requests",
         "sglang_docker_args": ["--cgroupns=host"],
     })
 
+    assert slot.endpoint["sglang_load_balance_method"] == "total_requests"
     assert slot.endpoint["sglang_docker_args"] == ["--cgroupns=host"]
 
 

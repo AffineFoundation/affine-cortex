@@ -63,6 +63,7 @@ class Endpoint:
     ssh_key_path: Optional[str] = None
     sglang_port: int = 10001
     sglang_dp: int = 8
+    sglang_load_balance_method: str = "total_tokens"
     sglang_image: str = "lmsysorg/sglang:latest"
     sglang_cache_dir: str = "/data"
     sglang_context_len: int = 65536
@@ -115,6 +116,7 @@ _ENDPOINT_RUNTIME_IDENTITY_FIELDS = (
     "ssh_key_path",
     "sglang_port",
     "sglang_dp",
+    "sglang_load_balance_method",
     "sglang_image",
     "sglang_cache_dir",
     "sglang_context_len",

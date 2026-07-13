@@ -19,6 +19,7 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
                           (defaults to http://<host>:<sglang_port>/v1)
   sglang_port             sglang listen port (default 10001)
   sglang_dp               data-parallel size (8)
+  sglang_load_balance_method DP request routing strategy (total_tokens)
   sglang_cache_dir        HF cache mount point (/data)
   sglang_image            (lmsysorg/sglang:latest)
   sglang_context_len      legacy field; deployment no longer passes --context-length
@@ -77,6 +78,13 @@ DEFAULT_DOCKER_IMAGE = "lmsysorg/sglang:latest"
 DEFAULT_CACHE_DIR = "/data"
 DEFAULT_PORT = 10001
 DEFAULT_DP = 8
+DEFAULT_LOAD_BALANCE_METHOD = "total_tokens"
+SUPPORTED_LOAD_BALANCE_METHODS = (
+    "auto",
+    "round_robin",
+    "total_requests",
+    "total_tokens",
+)
 DEFAULT_CONTEXT_LEN = 65536
 DEFAULT_MEM_FRACTION = 0.85
 DEFAULT_CHUNKED_PREFILL = 4096
@@ -121,6 +129,7 @@ class SSHConfig:
     public_inference_url: Optional[str] = None
     sglang_port: int = DEFAULT_PORT
     sglang_dp: int = DEFAULT_DP
+    sglang_load_balance_method: str = DEFAULT_LOAD_BALANCE_METHOD
     sglang_image: str = DEFAULT_DOCKER_IMAGE
     sglang_cache_dir: str = DEFAULT_CACHE_DIR
     sglang_context_len: int = DEFAULT_CONTEXT_LEN
@@ -168,6 +177,11 @@ class SSHConfig:
             public_inference_url=endpoint.public_inference_url,
             sglang_port=endpoint.sglang_port,
             sglang_dp=endpoint.sglang_dp,
+            sglang_load_balance_method=getattr(
+                endpoint,
+                "sglang_load_balance_method",
+                DEFAULT_LOAD_BALANCE_METHOD,
+            ),
             sglang_image=endpoint.sglang_image,
             sglang_cache_dir=endpoint.sglang_cache_dir,
             sglang_context_len=endpoint.sglang_context_len,
@@ -230,7 +244,20 @@ def _build_sglang_args(target: DeployTarget, config: "SSHConfig") -> List[str]:
     if parser and parser.lower() != "none":
         args += ["--tool-call-parser", parser]
     if config.sglang_dp > 1:
-        args += ["--dp", str(config.sglang_dp)]
+        load_balance_method = str(
+            config.sglang_load_balance_method or ""
+        ).strip().lower()
+        if load_balance_method not in SUPPORTED_LOAD_BALANCE_METHODS:
+            supported = ", ".join(SUPPORTED_LOAD_BALANCE_METHODS)
+            raise ValueError(
+                "unsupported SGLang load-balance method "
+                f"{config.sglang_load_balance_method!r}; expected one of: "
+                f"{supported}"
+            )
+        args += [
+            "--dp", str(config.sglang_dp),
+            "--load-balance-method", load_balance_method,
+        ]
     return args
 
 
