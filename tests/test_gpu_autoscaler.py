@@ -15,6 +15,7 @@ from affine.src.scheduler.gpu_autoscaler import (
     MANUAL_REPLACEMENT_STATE_KEY,
     ManagedEndpointSlot,
     STATE_KEY,
+    _config_without_endpoint_slot,
     load_config,
 )
 from affine.src.scorer.window_state import (
@@ -411,6 +412,29 @@ def test_managed_endpoint_slot_accepts_tunnel_config():
         "bind_host": "0.0.0.0",
         "target_port": 10001,
     }
+
+
+def test_config_without_endpoint_slot_removes_only_requested_slot():
+    payload = {
+        "enabled": True,
+        "endpoints": [
+            {"name": "lium-b200-1", "provider": "lium"},
+            {"name": "lium-b200-temp-2", "provider": "lium"},
+            {"name": "targon-b200-3", "provider": "targon"},
+        ],
+        "providers": {"lium": {"api_url": "http://lium"}},
+    }
+
+    updated, removed = _config_without_endpoint_slot(
+        payload, "lium-b200-temp-2",
+    )
+
+    assert removed is True
+    assert [slot["name"] for slot in updated["endpoints"]] == [
+        "lium-b200-1",
+        "targon-b200-3",
+    ]
+    assert payload["endpoints"][1]["name"] == "lium-b200-temp-2"
 
 
 def test_instance_api_url_falls_back_to_provider_api_url(monkeypatch):

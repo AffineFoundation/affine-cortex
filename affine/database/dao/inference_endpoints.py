@@ -195,14 +195,6 @@ class InferenceEndpointsDAO(BaseDAO):
             return None
         return Endpoint.from_row(row)
 
-    async def delete(self, name: str) -> None:
-        from affine.database.client import get_client
-        client = get_client()
-        await client.delete_item(
-            TableName=self.table_name,
-            Key={"pk": {"S": self._make_pk(name)}},
-        )
-
     async def list_all(self) -> List[Endpoint]:
         from affine.database.client import get_client
         client = get_client()

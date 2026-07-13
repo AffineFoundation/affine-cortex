@@ -759,16 +759,6 @@ async def _cmd_set_endpoint(
         await close_client()
 
 
-async def _cmd_delete_endpoint(name: str) -> None:
-    await init_client()
-    try:
-        from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
-        await InferenceEndpointsDAO().delete(name)
-        print(f"✓ deleted endpoint {name!r}")
-    finally:
-        await close_client()
-
-
 @db.command("list-endpoints")
 def list_endpoints():
     """List registered inference endpoints."""
@@ -822,13 +812,6 @@ def set_endpoint(
         poll_interval_sec=poll_interval_sec,
         active=active, notes=notes,
     ))
-
-
-@db.command("delete-endpoint")
-@click.option("--name", required=True)
-def delete_endpoint(name):
-    """Delete an inference endpoint registration."""
-    asyncio.run(_cmd_delete_endpoint(name))
 
 
 # --------------------------------------------------------------------------- #
