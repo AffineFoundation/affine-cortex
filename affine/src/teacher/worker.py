@@ -225,7 +225,7 @@ class TeacherWorker:
             # Collect env vars; override UVICORN_WORKERS=1 for teacher
             env_vars = dict(config.env_vars)
             env_vars["UVICORN_WORKERS"] = "1"
-            if self.api_key:
+            if self.api_key and config.forward_api_key:
                 env_vars["API_KEY"] = self.api_key
             if "task_type" in config.eval_params:
                 env_vars["ENV_NAME"] = config.eval_params["task_type"]

@@ -127,6 +127,22 @@
         "sampling_mode": "random"
       }
     },
+    "INSTRUCTION-GYM": {
+      "display_name": "INSTRUCTION-GYM",
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
+      "sampling": {
+        "sampling_count": 100,
+        "priority": 1,
+        "dataset_range": [
+          [
+            0,
+            102636151
+          ]
+        ],
+        "sampling_mode": "random"
+      }
+    },
     "TERMINAL": {
       "display_name": "TERMINAL",
       "enabled_for_sampling": true,
