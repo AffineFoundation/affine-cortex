@@ -20,8 +20,16 @@ the online configuration store.
   seed.
 - The environment is Docker-only. Basilica is rejected before cache lookup or
   `affinetes.load_env` in SDK, miner-eval, and teacher paths.
+- `UVICORN_WORKERS=1` matches the clean-tag image, SDK, validator and isolated
+  E2E evidence. Raising the worker count requires a separate local concurrency,
+  memory and cleanup gate before changing production registration.
 - Shared validator API keys are not forwarded into the environment container.
   Teacher/logprob rollouts are rejected for InstructionGym.
+- Consequently, the production model endpoint must be privately reachable
+  without a shared validator application token. The local E2E may use an
+  ephemeral per-call key for its loopback stub; that does not prove an
+  authenticated production endpoint is usable. If production requires a token,
+  add and review a least-privilege credential channel before activation.
 
 ## Local-only validation
 
@@ -57,7 +65,11 @@ Do not enable either runtime flag until all of the following are true:
    least two valid IDs and the exclusive upper boundary `102636151`.
 5. The same digest passes the affine-cortex end-to-end gate without production
    credentials or online state changes.
-6. Sampling can then be enabled for a bake-in window while scoring remains
+6. The approved model endpoint is confirmed by its owner to be privately
+   reachable without a shared validator application token, or a separately
+   reviewed least-privilege credential channel is in place. Do not probe the
+   online endpoint from this local release gate.
+7. Sampling can then be enabled for a bake-in window while scoring remains
    disabled. Scoring is a separate operator decision after the accumulated
    results and infrastructure-failure rate are reviewed.
 

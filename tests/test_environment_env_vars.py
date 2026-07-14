@@ -76,7 +76,7 @@ def test_instruction_gym_never_forwards_global_api_credentials():
         env_name="instruction-gym",
     )
 
-    assert env_vars == {"UVICORN_WORKERS": "4"}
+    assert env_vars == {"UVICORN_WORKERS": "1"}
 
 
 def test_liveweb_requires_dashscope_api_key_and_validator_base_url():
