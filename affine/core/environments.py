@@ -61,19 +61,20 @@ def _remove_base_url_fields(value: Any) -> Any:
 
 # ========================= Utility Functions =========================
 
+
 def convert_memory_format(mem_limit: str, mode: str) -> str:
     """Convert memory format between Docker and Kubernetes formats.
-    
+
     Docker format: 10g, 8g, 512m
     Kubernetes format: 10Gi, 8Gi, 512Mi
-    
+
     Args:
         mem_limit: Memory limit string
         mode: Execution mode ('docker' or 'basilica')
-        
+
     Returns:
         Converted memory limit string
-        
+
     Examples:
         >>> convert_memory_format("10g", "docker")
         "10g"
@@ -93,9 +94,11 @@ def convert_memory_format(mem_limit: str, mode: str) -> str:
 
 # ========================= Configuration =========================
 
+
 @dataclass
 class EnvConfig:
     """Environment-specific configuration"""
+
     name: str
     docker_image: str
     env_type: str = "affine"
@@ -108,10 +111,12 @@ class EnvConfig:
     optional_env_vars: List[str] = field(default_factory=list)
     mem_limit: str = "10g"
     volumes: Optional[Dict[str, Dict[str, str]]] = None
-    eval_params: Dict[str, Any] = field(default_factory=lambda: {
-        "temperature": 0.0,
-        "timeout": 600,
-    })
+    eval_params: Dict[str, Any] = field(
+        default_factory=lambda: {
+            "temperature": 0.0,
+            "timeout": 600,
+        }
+    )
     proxy_timeout: int = 600
 
     # Basilica mode configuration (optional)
@@ -123,6 +128,39 @@ class EnvConfig:
     # an arbitrary base_url. Such environments may accept an explicitly
     # caller-provided per-call key instead.
     forward_api_key: bool = True
+    # Appended fields preserve the positional ABI above. Evaluation-only
+    # environments must not enter the teacher/logprobs training path.
+    supports_teacher_rollouts: bool = True
+    # Public backends cannot provide the local trust boundary required by
+    # environments that execute a provider-supplied model endpoint. The
+    # loader validates this allowlist before consulting/reusing its cache.
+    trusted_execution_modes: tuple[str, ...] = ("docker", "basilica")
+
+
+SUPPORTED_EXECUTION_MODES = ("docker", "basilica")
+
+
+def validate_execution_mode(config: EnvConfig, mode: Any) -> str:
+    """Fail closed unless ``mode`` is supported and trusted for ``config``.
+
+    Every Affinetes loader in affine-cortex must call this helper before it
+    consults a cache or invokes ``affinetes.load_env``.  Keeping the policy in
+    one place prevents direct/debug/teacher loaders from silently bypassing an
+    evaluation environment's trust boundary.
+    """
+
+    if not isinstance(mode, str) or mode not in SUPPORTED_EXECUTION_MODES:
+        raise ValueError(
+            f"Invalid mode: {mode}. Must be one of "
+            f"{', '.join(SUPPORTED_EXECUTION_MODES)}"
+        )
+    if mode not in config.trusted_execution_modes:
+        raise ValueError(
+            f"Environment {config.name!r} refuses untrusted execution "
+            f"mode {mode!r}; allowed modes: "
+            f"{', '.join(config.trusted_execution_modes)}"
+        )
+    return mode
 
 
 # ========================= Environment Configurations =========================
@@ -133,6 +171,9 @@ INSTRUCTION_GYM_UNIVERSE_ID = (
 )
 INSTRUCTION_GYM_SUITE_ID = "instruction_gym_ifeval_templates_v4"
 INSTRUCTION_GYM_TASK_ID_END = 102_636_151
+INSTRUCTION_GYM_SAMPLING_MANIFEST_SHA256 = (
+    "6814c3037bb198dc80d25596ea689e05f0bf50b4c4833c598a51071d09bf02b3"
+)
 
 
 # Canonical environment configurations
@@ -157,7 +198,6 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 600,
         },
     ),
-    
     # PrimeIntellect environments (no task_type)
     "cde": EnvConfig(
         name="cde",
@@ -203,7 +243,6 @@ _ENV_CONFIGS_CANONICAL = {
         cpu_limit="2000m",
         mem_limit="8g",
     ),
-    
     # SWE-bench Pro environment (requires DOOD)
     "swe-pro": EnvConfig(
         name="swe-pro",
@@ -212,10 +251,7 @@ _ENV_CONFIGS_CANONICAL = {
         env_vars={"UVICORN_WORKERS": "8"},
         mem_limit="10g",
         volumes={
-            "/var/run/docker.sock": {
-                "bind": "/var/run/docker.sock",
-                "mode": "rw"
-            }
+            "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}
         },
         eval_params={
             "max_iterations": 200,
@@ -233,10 +269,7 @@ _ENV_CONFIGS_CANONICAL = {
         required_env_vars=["DOCKER_HUB_USERNAME", "DOCKER_HUB_TOKEN", "HF_TOKEN"],
         mem_limit="10g",
         volumes={
-            "/var/run/docker.sock": {
-                "bind": "/var/run/docker.sock",
-                "mode": "rw"
-            }
+            "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}
         },
         eval_params={
             "max_iterations": 30,
@@ -267,10 +300,7 @@ _ENV_CONFIGS_CANONICAL = {
         ],
         mem_limit="10g",
         volumes={
-            "/var/run/docker.sock": {
-                "bind": "/var/run/docker.sock",
-                "mode": "rw"
-            }
+            "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"}
         },
         eval_params={
             "max_iterations": 50,
@@ -300,7 +330,6 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=620,
     ),
-
     # LiveWeb Arena environment (browser-based web interaction evaluation)
     "liveweb": EnvConfig(
         name="liveweb",
@@ -326,7 +355,6 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=1260,
     ),
-
     # LogProbs evaluation environment
     "logprobs": EnvConfig(
         name="logprobs",
@@ -337,7 +365,6 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 600,
         },
     ),
-
     # Knowledge-eval — multi-benchmark (GPQA / MMLU-Pro / HLE / IFEval)
     # environment used by the teacher worker to produce high-quality
     # rollouts with logprobs. Not enabled for the regular executor
@@ -352,7 +379,6 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 600,
         },
     ),
-
     # Corpus-eval — teacher-only prompt source backed by
     # ``karpathy/climbmix-400b-shuffle``. Given a task_id, returns a
     # deterministic raw-corpus prompt + teacher 512-token continuation
@@ -368,7 +394,6 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 600,
         },
     ),
-
     # Distill environment — evaluates student against teacher rollouts
     # (produced by teacher_worker) stored in R2. The student does a
     # /v1/completions forward pass with echo=True to get per-token logprobs,
@@ -384,7 +409,6 @@ _ENV_CONFIGS_CANONICAL = {
             "timeout": 600,
         },
     ),
-
     # Distill-V2 environment — per-cell GRPO/REINFORCE-style CE scoring
     # against teacher rollouts published by ``af servers generator-publisher``
     # (off-policy rollout generator) into a public R2 bucket. The
@@ -420,7 +444,6 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=1260,
     ),
-
     # MemoryGym environment (LLM memory management evaluation)
     # Evaluates: information intake, storage decisions, retrieval, change tracking, reasoning.
     # Each evaluation runs a full episode (~10-40 min depending on model).
@@ -438,17 +461,20 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=7260,
     ),
-
     # InstructionGym IFEval-template v4. Keep the source contract explicit:
     # task_id is the sole prompt address, while seed only controls model
-    # sampling. The environment remains disabled in system_config until a
-    # provider-bound image is published; replace the tag with its immutable
-    # registry digest before enabling production sampling.
+    # sampling. The scheduler's manifest-pinned template_stratified_v1 mode
+    # selects these global IDs without remapping them in the container. The
+    # environment remains disabled in system_config until a provider-bound
+    # image is published; replace the tag with its immutable registry digest
+    # before enabling production sampling.
     "instruction-gym": EnvConfig(
         name="instruction-gym",
         docker_image="affinefoundation/instruction-gym:latest",
         env_vars={"UVICORN_WORKERS": "4"},
         forward_api_key=False,
+        supports_teacher_rollouts=False,
+        trusted_execution_modes=("docker",),
         mem_limit="4g",
         eval_params={
             "protocol_version": "1.0",
@@ -459,7 +485,6 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=660,
     ),
-
     "terminal": EnvConfig(
         name="terminal",
         docker_image="affinefoundation/terminal:latest",
@@ -478,7 +503,6 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=3720,
     ),
-
     # NavWorld Travel Planning environment (anti-hack hardened scoring)
     # Uses MCP tool servers (AMap + Transport) for real tool invocation.
     # Scoring: 50/50 code-LLM split, 7 problem types, 15 tool steps max.
@@ -515,80 +539,64 @@ _ENV_ALIASES = {
     "affine:abd": "affine:abd-v2",
     "abd": "affine:abd-v2",
     "abd-v2": "affine:abd-v2",
-    
     # DED aliases - all point to v2
     "affine:ded": "affine:ded-v2",
     "ded": "affine:ded-v2",
     "ded-v2": "affine:ded-v2",
-    
     # SAT aliases
     "sat": "affine:sat",
-    
     # PrimeIntellect aliases (uppercase versions)
     "CDE": "cde",
     "LGC": "lgc",
     "LGC-V2": "lgc-v2",
     "LGC-v2": "lgc-v2",
     "GAME": "game",
-    
     # SWE-bench aliases
     "SWE-PRO": "swe-pro",
     "SWE-SYNTH": "swe-synth",
     "SWE-INFINITE": "swe-infinite",
-    
     # Print aliases
     "PRINT": "print",
-
     # ARC-GEN aliases
     "ARC-GEN": "arc-gen",
     "ARCGEN": "arc-gen",
-
     # LiveWeb Arena aliases
     "LIVEWEB": "liveweb",
     "liveweb-arena": "liveweb",
-
     # Memory aliases
     "MEMORY": "memory",
     "Memory": "memory",
     "memorygym": "memory",
     "MemoryGym": "memory",
-
     # InstructionGym aliases
     "INSTRUCTION-GYM": "instruction-gym",
     "InstructionGym": "instruction-gym",
     "instructiongym": "instruction-gym",
     "instruction_gym": "instruction-gym",
     "INSTRUCTION_GYM": "instruction-gym",
-
     # NavWorld aliases
     "NAVWORLD": "navworld",
     "NavWorld": "navworld",
-
     # Terminel aliases
     "TERMINAL": "terminal",
     "Terminal": "terminal",
     "terminel": "terminal",
     "Terminel": "terminal",
     "TERMINEL": "terminal",
-
     # LogProbs aliases
     "LOGPROBS": "logprobs",
     "LogProbs": "logprobs",
-
     # Knowledge-eval aliases (teacher_worker-only)
     "KNOWLEDGE-EVAL": "knowledge-eval",
     "knowledge_eval": "knowledge-eval",
     "KNOWLEDGE_EVAL": "knowledge-eval",
-
     # Corpus-eval aliases (teacher_worker-only)
     "CORPUS-EVAL": "corpus-eval",
     "corpus_eval": "corpus-eval",
     "CORPUS_EVAL": "corpus-eval",
-
     # Distill aliases
     "DISTILL": "distill",
     "Distill": "distill",
-
     # Distill-V2 aliases
     "DISTILL-V2": "distill-v2",
     "Distill-V2": "distill-v2",
@@ -609,12 +617,13 @@ for alias, canonical in _ENV_ALIASES.items():
 
 # ========================= Base Environment =========================
 
+
 class SDKEnvironment:
     """Unified SDK environment implementation"""
-    
+
     def __init__(self, env_name: str, mode: Optional[str] = None):
         """Initialize SDK environment
-        
+
         Args:
             env_name: Environment name
             mode: Execution mode override ('docker' or 'basilica').
@@ -622,24 +631,24 @@ class SDKEnvironment:
         """
         if env_name not in ENV_CONFIGS:
             raise ValueError(f"Unknown environment: {env_name}")
-        
+
         self.config = ENV_CONFIGS[env_name]
         self._mode_override = mode
         self._env = self._load_environment()
         self._env_lock = asyncio.Lock()
-    
+
     @property
     def env_name(self) -> str:
         return self.config.name
-    
+
     @property
     def env_type(self) -> str:
         return self.config.env_type
-    
+
     @property
     def docker_image(self) -> str:
         return self.config.docker_image
-    
+
     def _get_env_vars(self) -> Dict[str, str]:
         """Get environment variables for this environment"""
         env_vars: Dict[str, str] = {}
@@ -680,13 +689,13 @@ class SDKEnvironment:
         # Add ENV_NAME for affine environments (from task_type in eval_params)
         if "task_type" in self.config.eval_params:
             env_vars["ENV_NAME"] = self.config.eval_params["task_type"]
-        
+
         env_vars.update(self.config.env_vars)
         return env_vars
-    
+
     def _load_hosts_config(self) -> Dict[str, Any]:
         """Load hosts configuration from file
-        
+
         Format:
         {
             "env_name": {
@@ -706,28 +715,30 @@ class SDKEnvironment:
             Path.home() / ".affine" / "hosts.json",
             Path("/etc/affine/hosts.json"),
         ]
-        
+
         for config_path in config_paths:
             if config_path.exists() and config_path.is_file():
                 try:
-                    with open(config_path, 'r') as f:
+                    with open(config_path, "r") as f:
                         config = json.load(f)
                     logger.debug(f"Loaded hosts config from: {config_path}")
                     return config
                 except Exception as e:
-                    logger.warning(f"Failed to load hosts config from {config_path}: {e}")
-        
+                    logger.warning(
+                        f"Failed to load hosts config from {config_path}: {e}"
+                    )
+
         return {}
-    
+
     def _get_hosts_and_mode(self) -> tuple[List[str], str]:
         """Get hosts and execution mode for this environment
-        
+
         Returns:
             (hosts, mode): hosts list and execution mode ('docker' or 'basilica')
         """
         # Try config file first
         config = self._load_hosts_config()
-        
+
         if config:
             # Check for environment-specific config
             if self.env_name in config:
@@ -735,25 +746,33 @@ class SDKEnvironment:
                 if isinstance(env_config, dict):
                     hosts = env_config.get("hosts", ["localhost"])
                     mode = env_config.get("mode", "docker")
-                    logger.debug(f"Using config for {self.env_name}: hosts={hosts}, mode={mode}")
+                    logger.debug(
+                        f"Using config for {self.env_name}: hosts={hosts}, mode={mode}"
+                    )
                     return hosts, mode
                 elif isinstance(env_config, list):
                     # Backward compatibility: ["host1", "host2"]
-                    logger.debug(f"Using config hosts for {self.env_name}: {env_config}")
+                    logger.debug(
+                        f"Using config hosts for {self.env_name}: {env_config}"
+                    )
                     return env_config, "docker"
-            
+
             # Fall back to default config
             if "default" in config:
                 default_config = config["default"]
                 if isinstance(default_config, dict):
                     hosts = default_config.get("hosts", ["localhost"])
                     mode = default_config.get("mode", "docker")
-                    logger.debug(f"Using default config for {self.env_name}: hosts={hosts}, mode={mode}")
+                    logger.debug(
+                        f"Using default config for {self.env_name}: hosts={hosts}, mode={mode}"
+                    )
                     return hosts, mode
                 elif isinstance(default_config, list):
-                    logger.debug(f"Using default hosts for {self.env_name}: {default_config}")
+                    logger.debug(
+                        f"Using default hosts for {self.env_name}: {default_config}"
+                    )
                     return default_config, "docker"
-        
+
         # Fall back to environment variable (for backward compatibility)
         hosts_env = os.getenv("AFFINETES_HOSTS", "").strip()
         if hosts_env:
@@ -761,12 +780,12 @@ class SDKEnvironment:
             if hosts:
                 logger.debug(f"Using env var hosts for {self.env_name}: {hosts}")
                 return hosts, "docker"
-        
+
         return ["localhost"], "docker"
-    
+
     def _load_environment(self) -> Any:
         """Load or get cached environment instance
-        
+
         Mode selection priority:
         1. mode parameter passed to __init__
         2. mode from affinetes_hosts.json
@@ -774,16 +793,9 @@ class SDKEnvironment:
         4. default to 'docker'
         """
         with _ENV_LOCK:
-            if self.env_name in _ENV_CACHE:
-                cached = _ENV_CACHE[self.env_name]
-                if cached.is_ready():
-                    logger.debug(f"Reusing cached environment: {self.env_name}")
-                    return cached
-                del _ENV_CACHE[self.env_name]
-            
             # Determine execution mode
             hosts, config_mode = self._get_hosts_and_mode()
-            
+
             # Priority: parameter > config > env var > default
             if self._mode_override:
                 mode = self._mode_override
@@ -794,13 +806,23 @@ class SDKEnvironment:
             else:
                 mode = os.getenv("AFFINETES_MODE", "docker")
                 logger.info(f"Using mode from env/default: {mode}")
-            
-            # Validate mode
-            if mode not in ["docker", "basilica"]:
-                raise ValueError(f"Invalid mode: {mode}. Must be 'docker' or 'basilica'")
-            
+
+            mode = validate_execution_mode(self.config, mode)
+
+            # Resolve and validate the requested backend before cache reuse.
+            # Otherwise a cached local instance could make an explicit public
+            # backend override appear to succeed without enforcing policy.
+            if self.env_name in _ENV_CACHE:
+                cached = _ENV_CACHE[self.env_name]
+                if cached.is_ready():
+                    logger.debug(f"Reusing cached environment: {self.env_name}")
+                    return cached
+                del _ENV_CACHE[self.env_name]
+
             # Load environment
-            logger.info(f"Loading environment: {self.env_name} (image={self.docker_image}, mode={mode}, hosts={hosts or 'local'}, mem_limit={self.config.mem_limit})")
+            logger.info(
+                f"Loading environment: {self.env_name} (image={self.docker_image}, mode={mode}, hosts={hosts or 'local'}, mem_limit={self.config.mem_limit})"
+            )
 
             # Convert memory format for the selected mode
             mem_limit = convert_memory_format(self.config.mem_limit, mode)
@@ -813,56 +835,67 @@ class SDKEnvironment:
                 "mem_limit": mem_limit,
                 "pull": True,
             }
-            
+
             if mode == "docker":
                 # Docker mode specific parameters
-                load_kwargs.update({
-                    "replicas": len(hosts),
-                    "hosts": hosts,
-                    "container_name": self.env_name.replace(":", "-"),
-                    "force_recreate": True,
-                })
+                load_kwargs.update(
+                    {
+                        "replicas": len(hosts),
+                        "hosts": hosts,
+                        "container_name": self.env_name.replace(":", "-"),
+                        "force_recreate": True,
+                    }
+                )
             elif mode == "basilica":
                 # Basilica mode specific parameters
                 ttl_buffer = self.config.proxy_timeout
                 cpu_limit = self.config.cpu_limit or "2000m"
-                
-                load_kwargs.update({
-                    "cpu_limit": cpu_limit,
-                    "ttl_buffer": ttl_buffer,
-                })
-            
+
+                load_kwargs.update(
+                    {
+                        "cpu_limit": cpu_limit,
+                        "ttl_buffer": ttl_buffer,
+                    }
+                )
+
             # Add volumes if configured (both modes)
             if self.config.volumes:
                 load_kwargs["volumes"] = self.config.volumes
-            
+
             env = af_env.load_env(**load_kwargs)
-            
+
             _ENV_CACHE[self.env_name] = env
             logger.debug(f"Cached environment: {self.env_name} (mode={mode})")
             return env
-    
+
     def _generate_seed(self, task_id: int) -> int:
         """Generate deterministic seed"""
         seed_string = f"{self.env_name}:{task_id}"
         hash_bytes = hashlib.sha256(seed_string.encode()).digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder='big') % (2**32)
-    
+        return int.from_bytes(hash_bytes, byteorder="big") % (2**32)
+
     def _prepare_eval_kwargs(self, **kwargs) -> Dict[str, Any]:
         """Prepare evaluation kwargs based on environment configuration"""
         if "task_id" not in kwargs:
             raise ValueError("task_id is required for evaluation")
-        
+        if not self.config.supports_teacher_rollouts and kwargs.get(
+            "collect_logprobs"
+        ) not in (None, False):
+            raise ValueError(
+                f"Environment {self.env_name!r} is evaluation-only and "
+                "refuses collect_logprobs teacher rollouts"
+            )
+
         # Generate seed if not provided
         if "seed" not in kwargs:
             kwargs["seed"] = self._generate_seed(kwargs["task_id"])
-        
+
         # Merge eval_params from config (user-provided kwargs take precedence)
         for key, value in self.config.eval_params.items():
             kwargs.setdefault(key, value)
-        
+
         return kwargs
-    
+
     async def _evaluate_single(self, miner: Optional["Miner"], **kwargs) -> Result:
         """Evaluate single miner"""
         start = time.monotonic()
@@ -880,10 +913,12 @@ class SDKEnvironment:
                     "inference now requires an explicit provider-supplied URL"
                 )
             served_model = inference_model or miner.model
-            payload.update({
-                "model": served_model,
-                "base_url": base_url,
-            })
+            payload.update(
+                {
+                    "model": served_model,
+                    "base_url": base_url,
+                }
+            )
             # Distill-family envs run tokenizer-aware scoring against
             # rollouts published under (student, revision) keys, so they
             # need the miner identity + HF repo to load the right
@@ -898,17 +933,22 @@ class SDKEnvironment:
                 payload.setdefault("arch", "qwen")
 
         result = await self._env.evaluate(_timeout=self.config.proxy_timeout, **payload)
-        
+
         return self._build_result(result, miner, payload, start)
-    
-    def _build_result(self, result: Dict[str, Any], miner: Optional["Miner"],
-                     payload: Dict[str, Any], start_time: float) -> Result:
+
+    def _build_result(
+        self,
+        result: Dict[str, Any],
+        miner: Optional["Miner"],
+        payload: Dict[str, Any],
+        start_time: float,
+    ) -> Result:
         """Build Result object from evaluation result."""
         extra = _remove_sensitive_request_fields(result.get("extra", {}) or {})
         extra["image"] = self.docker_image
         sanitized = _remove_sensitive_request_fields(payload)
         extra["request"] = sanitized
-        
+
         return Result(
             miner_hotkey=miner.hotkey if miner else "",
             model_revision=miner.revision if miner else "",
@@ -919,11 +959,12 @@ class SDKEnvironment:
             error=result.get("error"),
             task_id=payload.get("task_id"),
             extra=extra,
-            timestamp=time.time()
+            timestamp=time.time(),
         )
-    
-    async def evaluate(self, miner: Optional[Union["Miner", Dict[str, "Miner"]]] = None, 
-                      **kwargs) -> Union[Result, Dict[str, Result]]:
+
+    async def evaluate(
+        self, miner: Optional[Union["Miner", Dict[str, "Miner"]]] = None, **kwargs
+    ) -> Union[Result, Dict[str, Result]]:
         """Evaluate miner(s)"""
         if isinstance(miner, dict):
             results = {}
@@ -935,13 +976,14 @@ class SDKEnvironment:
             return results
         else:
             return await self._evaluate_single(miner, **kwargs)
-    
-    async def evaluate_batch(self, miners: List[Union["Miner", Dict[str, Any]]], 
-                            **kwargs) -> List[Result]:
+
+    async def evaluate_batch(
+        self, miners: List[Union["Miner", Dict[str, Any]]], **kwargs
+    ) -> List[Result]:
         """Evaluate multiple miners in parallel"""
         tasks = [self.evaluate(m, **kwargs) for m in miners]
         return await asyncio.gather(*tasks)
-    
+
     @staticmethod
     def _validate_miner(miner: Any) -> bool:
         """Validate miner object."""
@@ -952,9 +994,10 @@ class SDKEnvironment:
 
 # ========================= Factory Functions =========================
 
+
 def create_environment(env_name: str, mode: Optional[str] = None) -> SDKEnvironment:
     """Create environment by name
-    
+
     Args:
         env_name: Environment name
         mode: Execution mode ('docker' or 'basilica'). If not specified, uses config/default.
@@ -968,10 +1011,10 @@ def list_available_environments() -> Dict[str, List[str]]:
     for name, config in ENV_CONFIGS.items():
         env_type = config.env_type
         result.setdefault(env_type, []).append(name)
-    
+
     for env_type in result:
         result[env_type].sort()
-    
+
     return result
 
 
@@ -987,7 +1030,7 @@ def cleanup_all_environments():
                 logger.debug(f"Cleaned up environment: {name}")
             except Exception as e:
                 logger.warning(f"Error cleaning up environment {name}: {e}")
-        
+
         _ENV_CACHE.clear()
 
 
@@ -1044,6 +1087,7 @@ LOGPROBS = LOGPROBS_factory
 # Memory factory
 MEMORY_factory = lambda mode=None: create_environment("memory", mode=mode)
 MEMORY = MEMORY_factory
+
 
 # InstructionGym factory
 def INSTRUCTION_GYM_factory(mode=None):

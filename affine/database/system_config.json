@@ -140,7 +140,8 @@
             102636151
           ]
         ],
-        "sampling_mode": "random"
+        "sampling_mode": "template_stratified_v1",
+        "sampling_manifest_sha256": "6814c3037bb198dc80d25596ea689e05f0bf50b4c4833c598a51071d09bf02b3"
       }
     },
     "TERMINAL": {

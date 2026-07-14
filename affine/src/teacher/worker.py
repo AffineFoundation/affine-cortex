@@ -198,6 +198,33 @@ class TeacherWorker:
         Creates its own container (1 replica on the first available host)
         so the teacher runs independently from executor workers.
         """
+        from affine.core.environments import ENV_CONFIGS
+
+        config = ENV_CONFIGS.get(env_name)
+        if config is None:
+            logger.error(f"[TEACHER] Unknown environment: {env_name}")
+            return None
+        if not config.supports_teacher_rollouts:
+            logger.error(
+                f"[TEACHER] Environment {env_name} is evaluation-only and "
+                "does not support teacher rollouts"
+            )
+            return None
+
+        from affine.core.environments import (
+            SDKEnvironment,
+            convert_memory_format,
+            validate_execution_mode,
+        )
+
+        # Resolve and validate the backend before consulting the teacher cache,
+        # matching SDKEnvironment's fail-closed cache semantics.
+        tmp = SDKEnvironment.__new__(SDKEnvironment)
+        tmp.config = config
+        tmp._mode_override = None
+        hosts, mode = tmp._get_hosts_and_mode()
+        mode = validate_execution_mode(config, mode)
+
         if env_name in self._env_instances:
             return self._env_instances[env_name]
 
@@ -206,21 +233,6 @@ class TeacherWorker:
                 return self._env_instances[env_name]
 
             import affinetes as af_env
-            from affine.core.environments import (
-                SDKEnvironment, ENV_CONFIGS, convert_memory_format,
-            )
-
-            if env_name not in ENV_CONFIGS:
-                logger.error(f"[TEACHER] Unknown environment: {env_name}")
-                return None
-
-            config = ENV_CONFIGS[env_name]
-
-            # Reuse host/mode discovery from SDKEnvironment
-            tmp = SDKEnvironment.__new__(SDKEnvironment)
-            tmp.config = config
-            tmp._mode_override = None
-            hosts, mode = tmp._get_hosts_and_mode()
 
             # Collect env vars; override UVICORN_WORKERS=1 for teacher
             env_vars = dict(config.env_vars)
@@ -273,6 +285,14 @@ class TeacherWorker:
         # Pick env with available sampling_list
         random.shuffle(self.envs)
         for env_name in self.envs:
+            from affine.core.environments import ENV_CONFIGS
+
+            config = ENV_CONFIGS.get(env_name)
+            if config is None or not config.supports_teacher_rollouts:
+                logger.error(
+                    f"[TEACHER] Environment {env_name} is unavailable for teacher rollouts"
+                )
+                continue
             sampling_list = await self._get_sampling_list(env_name)
             if not sampling_list:
                 continue
@@ -285,13 +305,15 @@ class TeacherWorker:
                 if env is None:
                     continue
 
-                result = await env.evaluate(
-                    task_id=task_id,
-                    model=self.teacher_model,
-                    base_url=self.teacher_base_url,
-                    api_key=self.api_key,
-                    collect_logprobs=True,
-                )
+                evaluate_kwargs = {
+                    "task_id": task_id,
+                    "model": self.teacher_model,
+                    "base_url": self.teacher_base_url,
+                    "collect_logprobs": True,
+                }
+                if self.api_key and config.forward_api_key:
+                    evaluate_kwargs["api_key"] = self.api_key
+                result = await env.evaluate(**evaluate_kwargs)
 
                 # URL mode returns dict directly
                 if isinstance(result, dict):

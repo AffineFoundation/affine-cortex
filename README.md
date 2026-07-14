@@ -68,6 +68,8 @@ Learn how to:
 ### Additional Resources
 
 - 📚 **[FAQ](docs/FAQ.md)** - Frequently asked questions
+- **[InstructionGym integration](docs/INSTRUCTION_GYM.md)** - Evaluation-only
+  sampling, trust boundaries, local validation, and production activation gates
 
 ## SDK Usage
 

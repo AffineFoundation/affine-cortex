@@ -578,6 +578,7 @@ class FlowScheduler:
                 sampling_count=math.ceil(cfg.sampling_count * (1 + SAMPLE_BUFFER_RATIO)),
                 dataset_range=resolved_range,
                 mode=cfg.sampling_mode,
+                sampling_manifest_sha256=cfg.sampling_manifest_sha256,
             )
         task_ids = self.sampler.generate(
             window_id=current_block // self.cfg.window_blocks,

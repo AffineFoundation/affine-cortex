@@ -137,7 +137,7 @@ class EnvConfig:
     enabled_for_sampling: bool
     sampling_count: int
     dataset_range: List[List[int]]
-    sampling_mode: str = "random"  # 'random' | 'latest'
+    sampling_mode: str = "random"  # 'random' | 'latest' | 'template_stratified_v1'
     enabled_for_scoring: bool = True
     kind: str = "runtime"
     derived_metric: str = ""
@@ -148,6 +148,8 @@ class EnvConfig:
     # task_ids (SWE-INFINITE, DISTILL) always sample the freshest tail.
     # Shape: ``{"url": str, "field": str, "range_type": "zero_to_value"}``.
     dataset_range_source: Optional[Dict[str, Any]] = None
+    # Immutable identity of a vendored layout used by manifest-backed modes.
+    sampling_manifest_sha256: str = ""
 
 
 # ---- store protocol -------------------------------------------------------
@@ -607,6 +609,7 @@ def _env_from_payload(payload: Any) -> EnvConfig:
         dataset_range=list(sampling.get("dataset_range", []) or []),
         sampling_mode=str(sampling.get("sampling_mode", "random")),
         dataset_range_source=src if isinstance(src, dict) else None,
+        sampling_manifest_sha256=str(sampling.get("sampling_manifest_sha256", "")),
         kind=str(payload.get("kind") or "runtime").lower(),
         derived_metric=str(payload.get("derived_metric") or ""),
         scoring=dict(scoring),

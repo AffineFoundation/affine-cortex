@@ -46,6 +46,7 @@ MANIFEST
 *.manifest
 *.spec
 *.json
+!affine/core/data/*.json
 
 # Installer logs
 pip-log.txt
