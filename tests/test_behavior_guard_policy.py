@@ -9,6 +9,7 @@ from affine.src.behavior_guard import (
     SampleOutcomeEvidence,
     VerdictStatus,
     aggregate_probe_results,
+    classify_runtime_timeout_outcome,
     classify_sample_invariant,
     deployment_fingerprint,
     parse_behavior_gate_config,
@@ -101,6 +102,57 @@ def test_runtime_invariant_requires_repeated_distinct_tasks() -> None:
     config = parse_behavior_gate_config({"runtime_violations_to_fail": 1})
 
     assert config.runtime_violations_to_fail == 2
+
+
+def test_runtime_timeout_policy_requires_a_bounded_denominator_and_two_events() -> None:
+    config = parse_behavior_gate_config(
+        {
+            "runtime_timeout_rate_to_fail": 0,
+            "runtime_timeout_min_samples": 1,
+            "runtime_timeout_min_timeouts": 1,
+        }
+    )
+
+    assert config.runtime_timeout_rate_to_fail == 0.01
+    assert config.runtime_timeout_min_samples == 10
+    assert config.runtime_timeout_min_timeouts == 2
+
+
+def test_runtime_timeout_thresholds_change_policy_identity() -> None:
+    baseline = BehaviorGateConfig()
+    stricter = BehaviorGateConfig(runtime_timeout_rate_to_fail=0.2)
+
+    assert baseline.policy_identity != stricter.policy_identity
+
+
+def test_runtime_timeout_classifier_counts_only_model_attributed_timeouts() -> None:
+    assert classify_runtime_timeout_outcome(
+        extra={
+            "timed_out": True,
+            "harness_failure": False,
+            "failure_mode": "model_timeout",
+        },
+        error="model exceeded deadline",
+        success=False,
+    ) is ProbeClassification.MODEL_NO_PROGRESS
+    assert classify_runtime_timeout_outcome(
+        extra={
+            "timed_out": True,
+            "harness_failure": True,
+            "failure_mode": "harness_timeout",
+        },
+        error="environment exceeded deadline",
+        success=False,
+    ) is ProbeClassification.INFRA_FAILURE
+    assert classify_runtime_timeout_outcome(
+        extra={"timed_out": True},
+        error="request exceeded deadline",
+        success=False,
+    ) is ProbeClassification.UNKNOWN
+    assert classify_runtime_timeout_outcome(
+        extra={},
+        success=True,
+    ) is ProbeClassification.CLEAN
 
 
 def test_bounded_quality_failures_are_admissible_but_not_clean() -> None:

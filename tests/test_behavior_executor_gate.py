@@ -27,9 +27,11 @@ class _GateDAO:
         self.promotion_sealed_at = promotion_sealed_at
         self.calls = 0
         self.runtime_observations = []
+        self.runtime_timeout_observations = []
         self.runtime_failures = []
         self.runtime_results = list(runtime_results or [])
         self._runtime_tasks = {}
+        self._runtime_timeout_tasks = {}
 
     async def get_verdict(self, *_args):
         self.calls += 1
@@ -47,6 +49,19 @@ class _GateDAO:
         tasks = self._runtime_tasks.setdefault(key, set())
         tasks.add(kwargs["task_hash"])
         return min(len(tasks), kwargs["threshold"])
+
+    async def record_runtime_timeout_outcome(self, *args, **kwargs):
+        self.runtime_timeout_observations.append((args, kwargs))
+        key = (*args, kwargs["environment_hash"])
+        tasks = self._runtime_timeout_tasks.setdefault(key, {})
+        tasks.setdefault(kwargs["task_hash"], kwargs["classification"])
+        return {
+            "eligible_samples": len(tasks),
+            "model_timeout_count": sum(
+                outcome == "model_no_progress"
+                for outcome in tasks.values()
+            ),
+        }
 
     async def fail_runtime_invariant(self, *args, **kwargs):
         self.runtime_failures.append((args, kwargs))
@@ -214,6 +229,26 @@ def _zero_activity_extra(**overrides):
     return extra
 
 
+def _model_timeout_extra():
+    return {
+        "timed_out": True,
+        "harness_failure": False,
+        "failure_mode": "model_timeout",
+        "terminated_reason": "model_timeout",
+        "error": "model exceeded deadline",
+    }
+
+
+def _infra_timeout_extra():
+    return {
+        "timed_out": True,
+        "harness_failure": True,
+        "failure_mode": "harness_timeout",
+        "terminated_reason": "harness_timeout",
+        "error": "environment exceeded deadline",
+    }
+
+
 class _ResultEnv:
     def __init__(self, *, score=1.0, extra=None, error=None, task_id=101):
         self.result = Result(
@@ -327,6 +362,91 @@ async def _run_battle_attempt(
         miner_obj=object(),
         expected_deployment_id=battle.deployment_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_runtime_timeout_rate_requires_minimum_denominator():
+    worker, dao, samples = await _run_runtime_result(
+        task_id=101,
+        extra=_model_timeout_extra(),
+    )
+
+    await _run_battle_attempt(
+        worker,
+        task_id=102,
+        extra=_model_timeout_extra(),
+    )
+
+    assert len(dao.runtime_timeout_observations) == 2
+    assert dao.runtime_failures == []
+    assert samples.persist_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ten_percent_model_timeout_rate_fails_gate():
+    worker, dao, samples = await _run_runtime_result(
+        task_id=101,
+        extra={},
+    )
+    for task_id in range(102, 119):
+        await _run_battle_attempt(worker, task_id=task_id, extra={})
+
+    await _run_battle_attempt(
+        worker,
+        task_id=119,
+        extra=_model_timeout_extra(),
+    )
+    assert dao.runtime_failures == []
+
+    await _run_battle_attempt(
+        worker,
+        task_id=120,
+        extra=_model_timeout_extra(),
+    )
+
+    assert len(dao.runtime_timeout_observations) == 20
+    assert len(dao.runtime_failures) == 1
+    _args, kwargs = dao.runtime_failures[0]
+    assert kwargs["reason_code"] == "runtime_model_timeout_rate"
+    assert kwargs["counts"] == {
+        "total": 20,
+        "eligible_samples": 20,
+        "model_timeout_count": 2,
+        "model_no_progress": 2,
+    }
+    assert kwargs["evidence"]["timeout_rate"] == 0.1
+    assert dao.status == "failed"
+    assert len(samples.persist_calls) == 18
+
+
+@pytest.mark.asyncio
+async def test_infrastructure_timeout_is_excluded_from_runtime_rate():
+    _worker, dao, samples = await _run_runtime_result(
+        task_id=101,
+        extra=_infra_timeout_extra(),
+    )
+
+    assert dao.runtime_timeout_observations == []
+    assert dao.runtime_failures == []
+    assert samples.persist_calls == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_timeout_retry_is_deduplicated_by_task():
+    worker, dao, _samples = await _run_runtime_result(
+        task_id=101,
+        extra=_model_timeout_extra(),
+    )
+
+    await _run_battle_attempt(
+        worker,
+        task_id=101,
+        extra=_model_timeout_extra(),
+    )
+
+    assert len(dao.runtime_timeout_observations) == 2
+    assert len(next(iter(dao._runtime_timeout_tasks.values()))) == 1
+    assert dao.runtime_failures == []
 
 
 @pytest.mark.asyncio

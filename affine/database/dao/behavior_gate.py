@@ -68,16 +68,21 @@ class BehaviorGateDAO(BaseDAO):
         "content_chars",
         "done_received",
         "elapsed_ms",
+        "eligible_samples",
         "environment",
         "error_type",
         "estimated_tokens",
+        "failure_mode",
         "finish_reason",
         "first_action_ms",
         "first_response_ms",
+        "harness_failure",
         "http_status",
+        "infra_failure",
         "invariant_name",
         "llm_call_count",
         "model",
+        "model_timeout_count",
         "prompt_tokens",
         "protocol_error",
         "probe_type",
@@ -90,6 +95,9 @@ class BehaviorGateDAO(BaseDAO):
         "stream_completed",
         "task_id",
         "terminated_reason",
+        "timed_out",
+        "timeout_rate",
+        "timeout_source",
         "tool_call_valid",
         "total_tokens",
         "transport_phase",
@@ -573,6 +581,91 @@ class BehaviorGateDAO(BaseDAO):
             ConsistentRead=True,
         )
         return min(required, max(0, int(response.get("Count") or 0)))
+
+    async def record_runtime_timeout_outcome(
+        self,
+        hotkey: str,
+        revision: str,
+        policy_version: str,
+        deployment_fingerprint: str,
+        *,
+        environment_hash: str,
+        task_hash: str,
+        classification: str,
+        evidence: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, int]:
+        """Record one distinct-task timeout outcome and return durable totals.
+
+        Runtime-rate rows are scoped by deployment and environment.  The task
+        digest makes retries idempotent, while a strongly consistent query
+        ensures a concurrent writer sees every completed observation before
+        deciding whether the circuit breaker has reached its threshold.
+        Infrastructure and ambiguous outcomes must be filtered by the caller
+        and cannot enter this denominator.
+        """
+        environment = str(environment_hash).lower()
+        task = str(task_hash).lower()
+        digest_re = re.compile(r"^[0-9a-f]{32,64}$")
+        if not digest_re.fullmatch(environment):
+            raise ValueError(
+                "environment_hash must be a 32-64 character hex digest"
+            )
+        if not digest_re.fullmatch(task):
+            raise ValueError("task_hash must be a 32-64 character hex digest")
+        if classification not in {"clean", "model_no_progress"}:
+            raise ValueError(
+                "runtime timeout classification must be clean or "
+                "model_no_progress"
+            )
+
+        await self.record_attempt(
+            hotkey,
+            revision,
+            policy_version,
+            deployment_fingerprint,
+            probe_id=f"runtime-rate-{environment}-{task}",
+            classification=classification,
+            evidence=evidence,
+        )
+
+        params: Dict[str, Any] = {
+            "TableName": self.table_name,
+            "KeyConditionExpression": "pk = :pk AND begins_with(sk, :sk)",
+            "ExpressionAttributeValues": {
+                ":pk": {"S": self.make_partition_key(
+                    hotkey,
+                    revision,
+                    policy_version,
+                    deployment_fingerprint,
+                )},
+                ":sk": {"S": f"ATTEMPT#runtime-rate-{environment}-"},
+            },
+            "ProjectionExpression": "#classification",
+            "ExpressionAttributeNames": {
+                "#classification": "classification",
+            },
+            "ConsistentRead": True,
+        }
+        eligible_samples = 0
+        model_timeout_count = 0
+        while True:
+            response = await get_client().query(**params)
+            for raw_item in response.get("Items", []):
+                outcome = self._deserialize(raw_item).get("classification")
+                if outcome not in {"clean", "model_no_progress"}:
+                    continue
+                eligible_samples += 1
+                if outcome == "model_no_progress":
+                    model_timeout_count += 1
+            last_key = response.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            params["ExclusiveStartKey"] = last_key
+
+        return {
+            "eligible_samples": eligible_samples,
+            "model_timeout_count": model_timeout_count,
+        }
 
     async def seal_for_promotion(
         self,

@@ -28,7 +28,9 @@ from affine.src.behavior_guard.gate import (
     record_deployment_fingerprint,
 )
 from affine.src.behavior_guard.models import (
+    ProbeClassification,
     SampleOutcomeEvidence,
+    classify_runtime_timeout_outcome,
     classify_sample_invariant,
     parse_behavior_gate_config,
 )
@@ -1124,6 +1126,152 @@ class ExecutorWorker:
         )
         return config.enforces
 
+    async def _runtime_timeout_rate_blocks_persist(
+        self,
+        *,
+        miner: MinerSnapshot,
+        task_id: int,
+        expected_deployment_id: Optional[str],
+        score: float,
+        success: bool,
+        error: Any,
+        extra: Dict[str, Any],
+    ) -> bool:
+        """Trip the gate when model-attributable timeout rate is excessive.
+
+        The durable denominator contains one outcome per distinct task for
+        this deployment and environment.  Explicit infrastructure failures
+        and ambiguous errors are excluded.  Two model timeouts and a minimum
+        denominator are required before the configured rate can fail the
+        deployment, so one noisy sample can never decide a battle.
+        """
+        # A UID208-style impossible positive row belongs to the stronger
+        # cross-field invariant, not the timeout-rate denominator.  This also
+        # prevents shadow mode from recording invalid evidence as clean.
+        sample_evidence = _sample_outcome_evidence(score=score, extra=extra)
+        if classify_sample_invariant(sample_evidence) is not None:
+            return False
+
+        classification = classify_runtime_timeout_outcome(
+            extra=extra,
+            error=error,
+            success=success,
+        )
+        if classification not in {
+            ProbeClassification.CLEAN,
+            ProbeClassification.MODEL_NO_PROGRESS,
+        }:
+            return False
+
+        config = await self._behavior_gate_config()
+        if not config.gates_environment(self.env):
+            return False
+        record = await self._current_challenger_record(
+            miner=miner,
+            expected_deployment_id=expected_deployment_id,
+        )
+        if record is None:
+            return False
+
+        fingerprint = record_deployment_fingerprint(record, config)
+        observation_evidence = _runtime_timeout_evidence(
+            environment=self.env,
+            classification=classification,
+            extra=extra,
+        )
+        environment_hash = _runtime_environment_hash(self.env)
+        task_hash = _runtime_task_hash(
+            environment=self.env,
+            task_id=task_id,
+        )
+        try:
+            if self._behavior_gate_dao is None:
+                raise RuntimeError("behavior gate DAO unavailable")
+            stats = await self._behavior_gate_dao.record_runtime_timeout_outcome(
+                miner.hotkey,
+                miner.revision,
+                config.policy_version,
+                fingerprint,
+                environment_hash=environment_hash,
+                task_hash=task_hash,
+                classification=classification.value,
+                evidence=observation_evidence,
+            )
+            eligible_samples = max(0, int(stats.get("eligible_samples") or 0))
+            model_timeout_count = max(
+                0, int(stats.get("model_timeout_count") or 0)
+            )
+        except Exception as exc:
+            logger.error(
+                f"[{self.env}] runtime timeout observation write failed "
+                f"uid={miner.uid}: {type(exc).__name__}"
+            )
+            # Normal completed samples remain usable if accounting is
+            # temporarily unavailable.  A known model timeout remains invalid
+            # benchmark evidence in enforce mode and will be retried.
+            return (
+                config.enforces
+                and classification is ProbeClassification.MODEL_NO_PROGRESS
+            )
+
+        timeout_rate = (
+            model_timeout_count / eligible_samples
+            if eligible_samples > 0
+            else 0.0
+        )
+        threshold_reached = (
+            eligible_samples >= config.runtime_timeout_min_samples
+            and model_timeout_count >= config.runtime_timeout_min_timeouts
+            and timeout_rate + 1e-12 >= config.runtime_timeout_rate_to_fail
+        )
+        if not threshold_reached:
+            if classification is ProbeClassification.MODEL_NO_PROGRESS:
+                logger.warning(
+                    f"[{self.env}] model timeout uid={miner.uid} "
+                    f"task_id={task_id} timeouts={model_timeout_count}/"
+                    f"{eligible_samples} rate={timeout_rate:.3f}; "
+                    f"kill_at={config.runtime_timeout_rate_to_fail:.3f} "
+                    f"after>={config.runtime_timeout_min_samples} samples and "
+                    f">={config.runtime_timeout_min_timeouts} timeouts"
+                )
+            return (
+                config.enforces
+                and classification is ProbeClassification.MODEL_NO_PROGRESS
+            )
+
+        reason = "runtime_model_timeout_rate"
+        failure_evidence = {
+            **observation_evidence,
+            "eligible_samples": eligible_samples,
+            "model_timeout_count": model_timeout_count,
+            "timeout_rate": round(timeout_rate, 6),
+        }
+        failure = {
+            "uid": miner.uid,
+            "hotkey": miner.hotkey,
+            "revision": miner.revision,
+            "policy_version": config.policy_version,
+            "reason_code": reason,
+            "evidence": failure_evidence,
+            "counts": {
+                "total": eligible_samples,
+                "eligible_samples": eligible_samples,
+                "model_timeout_count": model_timeout_count,
+                ProbeClassification.MODEL_NO_PROGRESS.value: (
+                    model_timeout_count
+                ),
+            },
+        }
+        await self._write_runtime_invariant_failure(fingerprint, failure)
+        logger.warning(
+            f"[{self.env}] runtime timeout circuit breaker uid={miner.uid} "
+            f"task_id={task_id} reason={reason} "
+            f"timeouts={model_timeout_count}/{eligible_samples} "
+            f"rate={timeout_rate:.3f}; mode={config.mode.value}; "
+            f"persist={'blocked' if config.enforces else 'shadow-allowed'}"
+        )
+        return config.enforces
+
     async def _evaluate_and_persist_gated(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, miner_obj: "_Miner",
@@ -1196,6 +1344,17 @@ class ExecutorWorker:
             task_id=task_id,
             expected_deployment_id=expected_deployment_id,
             score=score,
+            extra=extra,
+        ):
+            self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            return
+        if await self._runtime_timeout_rate_blocks_persist(
+            miner=miner,
+            task_id=task_id,
+            expected_deployment_id=expected_deployment_id,
+            score=score,
+            success=success,
+            error=error,
             extra=extra,
         ):
             self.metrics.record_completion(success=False, latency_ms=latency_ms)
@@ -1363,6 +1522,38 @@ def _runtime_task_hash(*, environment: str, task_id: int) -> str:
         "environment": environment,
         "task_id": int(task_id),
     })
+
+
+def _runtime_environment_hash(environment: str) -> str:
+    """Hash an environment namespace for timeout-rate attempt keys."""
+    return _stable_runtime_hash({
+        "kind": "runtime-timeout-environment-v1",
+        "environment": str(environment),
+    })
+
+
+def _runtime_timeout_evidence(
+    *,
+    environment: str,
+    classification: ProbeClassification,
+    extra: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Return only compact scalar timeout evidence safe for gate storage."""
+    evidence: Dict[str, Any] = {
+        "environment": str(environment),
+        "classification": classification.value,
+    }
+    for field in ("timed_out", "harness_failure", "infra_failure"):
+        value = extra.get(field)
+        if isinstance(value, bool):
+            evidence[field] = value
+    for field in ("timeout_source", "failure_mode", "terminated_reason"):
+        value = extra.get(field)
+        if isinstance(value, str):
+            evidence[field] = (
+                value.replace("\n", " ").replace("\r", " ")[:128]
+            )
+    return evidence
 
 
 def _stable_runtime_hash(payload: Dict[str, Any]) -> str:

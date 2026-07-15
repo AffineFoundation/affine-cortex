@@ -266,6 +266,59 @@ async def test_runtime_observations_count_distinct_tasks_per_signature(fake_clie
 
 
 @pytest.mark.asyncio
+async def test_runtime_timeout_rate_counts_distinct_eligible_tasks(fake_client):
+    dao = BehaviorGateDAO()
+    environment = "a" * 64
+
+    latest = None
+    for index in range(10):
+        latest = await dao.record_runtime_timeout_outcome(
+            "hk",
+            "rev",
+            "v1",
+            "dep",
+            environment_hash=environment,
+            task_hash=f"{index + 1:064x}",
+            classification=(
+                "model_no_progress" if index in {0, 1} else "clean"
+            ),
+            evidence={
+                "timed_out": index in {0, 1},
+                "timeout_source": "model" if index in {0, 1} else None,
+                "content": "raw output must not be stored",
+            },
+        )
+
+    duplicate = await dao.record_runtime_timeout_outcome(
+        "hk",
+        "rev",
+        "v1",
+        "dep",
+        environment_hash=environment,
+        task_hash=f"{1:064x}",
+        classification="model_no_progress",
+    )
+
+    assert latest == {
+        "eligible_samples": 10,
+        "model_timeout_count": 2,
+    }
+    assert duplicate == latest
+    assert len(fake_client.items) == 10
+    rate_query = fake_client.query_calls[-1]
+    assert rate_query["ConsistentRead"] is True
+    assert rate_query["ProjectionExpression"] == "#classification"
+    assert rate_query["ExpressionAttributeNames"] == {
+        "#classification": "classification",
+    }
+    first = dao._deserialize(next(iter(fake_client.items.values())))
+    assert first["evidence"] == {
+        "timed_out": True,
+        "timeout_source": "model",
+    }
+
+
+@pytest.mark.asyncio
 async def test_promotion_seal_wins_atomic_race_against_runtime_failure(fake_client):
     dao = BehaviorGateDAO()
     key = dao._key("hk", "rev", "v1", "dep", "VERDICT")

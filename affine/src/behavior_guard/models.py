@@ -54,6 +54,45 @@ ADMISSIBLE_COMPLETION_CLASSIFICATIONS = frozenset(
     {ProbeClassification.CLEAN, ProbeClassification.QUALITY_FAILURE}
 )
 
+_RUNTIME_INFRA_TIMEOUT_SOURCES = frozenset({
+    "environment",
+    "endpoint",
+    "gpu",
+    "harness",
+    "infra",
+    "network",
+    "proxy",
+    "transport",
+    "upstream",
+})
+_RUNTIME_INFRA_TIMEOUT_CODES = frozenset({
+    "endpoint_error",
+    "endpoint_timeout",
+    "environment_error",
+    "environment_timeout",
+    "gpu_timeout",
+    "harness_failure",
+    "harness_timeout",
+    "infra_failure",
+    "infra_timeout",
+    "network_timeout",
+    "proxy_error",
+    "proxy_timeout",
+    "transport_error",
+    "transport_timeout",
+    "upstream_timeout",
+})
+_RUNTIME_MODEL_TIMEOUT_SOURCES = frozenset({"agent", "llm", "miner", "model"})
+_RUNTIME_MODEL_TIMEOUT_CODES = frozenset({
+    "agent_timeout",
+    "llm_timeout",
+    "model_no_progress",
+    "model_timeout",
+    "no_progress",
+    "repeated_tool_cycle",
+    "tool_call_loop",
+})
+
 
 class VerdictStatus(str, Enum):
     """Persistable aggregate state for one deployment fingerprint."""
@@ -78,6 +117,9 @@ class BehaviorGateConfig:
     clean_to_pass: int = 2
     violations_to_fail: int = 2
     runtime_violations_to_fail: int = 2
+    runtime_timeout_rate_to_fail: float = 0.10
+    runtime_timeout_min_samples: int = 10
+    runtime_timeout_min_timeouts: int = 2
     action_proofs_to_pass: int = 2
     suspected_rounds_to_fail: int = 2
     max_infra_retries: int = 2
@@ -124,6 +166,9 @@ class BehaviorGateConfig:
             "clean_to_pass": self.clean_to_pass,
             "violations_to_fail": self.violations_to_fail,
             "runtime_violations_to_fail": self.runtime_violations_to_fail,
+            "runtime_timeout_rate_to_fail": self.runtime_timeout_rate_to_fail,
+            "runtime_timeout_min_samples": self.runtime_timeout_min_samples,
+            "runtime_timeout_min_timeouts": self.runtime_timeout_min_timeouts,
             "action_proofs_to_pass": self.action_proofs_to_pass,
             "suspected_rounds_to_fail": self.suspected_rounds_to_fail,
             "max_infra_retries": self.max_infra_retries,
@@ -218,6 +263,18 @@ class BehaviorGateConfig:
         max_infra_retries = _bounded_int(
             raw.get("max_infra_retries"), 2, minimum=0, maximum=5
         )
+        runtime_timeout_min_timeouts = _bounded_int(
+            raw.get("runtime_timeout_min_timeouts"),
+            2,
+            minimum=2,
+            maximum=100,
+        )
+        runtime_timeout_min_samples = _bounded_int(
+            raw.get("runtime_timeout_min_samples"),
+            10,
+            minimum=max(10, runtime_timeout_min_timeouts),
+            maximum=1_000,
+        )
         lease_seconds = _bounded_int(
             raw.get("lease_seconds"), 360, minimum=1, maximum=86_400
         )
@@ -244,6 +301,14 @@ class BehaviorGateConfig:
                 minimum=2,
                 maximum=5,
             ),
+            runtime_timeout_rate_to_fail=_bounded_float(
+                raw.get("runtime_timeout_rate_to_fail"),
+                0.10,
+                minimum=0.01,
+                maximum=1.0,
+            ),
+            runtime_timeout_min_samples=runtime_timeout_min_samples,
+            runtime_timeout_min_timeouts=runtime_timeout_min_timeouts,
             action_proofs_to_pass=min(
                 action_proofs_to_pass, max(1, probe_count - 1),
             ),
@@ -503,6 +568,64 @@ def classify_sample_invariant(
     return None
 
 
+def classify_runtime_timeout_outcome(
+    *,
+    extra: Mapping[str, Any],
+    error: object | None = None,
+    success: bool | None = None,
+) -> ProbeClassification:
+    """Classify one benchmark result for the runtime timeout denominator.
+
+    Only explicit attribution is actionable.  A generic request exception or
+    an unattributed ``timed_out`` flag may be caused by the environment,
+    transport, proxy, or endpoint and is therefore excluded as ``UNKNOWN``.
+    Environments can identify a miner/model timeout with ``timeout_source`` or
+    a model-specific ``failure_mode``/``terminated_reason``.  They can also
+    pair ``timed_out=true`` with an explicit negative infra/harness flag.
+    """
+
+    if not isinstance(extra, Mapping):
+        extra = {}
+
+    timed_out = _optional_bool(extra.get("timed_out"))
+    harness_failure = _optional_bool(extra.get("harness_failure"))
+    infra_failure = _optional_bool(extra.get("infra_failure"))
+    timeout_source = _normalize_runtime_code(extra.get("timeout_source"))
+    failure_mode = _normalize_runtime_code(extra.get("failure_mode"))
+    terminated_reason = _normalize_runtime_code(extra.get("terminated_reason"))
+
+    if (
+        harness_failure is True
+        or infra_failure is True
+        or timeout_source in _RUNTIME_INFRA_TIMEOUT_SOURCES
+        or failure_mode in _RUNTIME_INFRA_TIMEOUT_CODES
+        or terminated_reason in _RUNTIME_INFRA_TIMEOUT_CODES
+    ):
+        return ProbeClassification.INFRA_FAILURE
+
+    explicitly_model_attributed = (
+        timeout_source in _RUNTIME_MODEL_TIMEOUT_SOURCES
+        or failure_mode in _RUNTIME_MODEL_TIMEOUT_CODES
+        or terminated_reason in _RUNTIME_MODEL_TIMEOUT_CODES
+    )
+    explicitly_not_infra = (
+        harness_failure is False or infra_failure is False
+    )
+    if explicitly_model_attributed or (
+        timed_out is True and explicitly_not_infra
+    ):
+        return ProbeClassification.MODEL_NO_PROGRESS
+
+    if (
+        timed_out is True
+        or error is not None
+        or extra.get("error") is not None
+        or success is False
+    ):
+        return ProbeClassification.UNKNOWN
+    return ProbeClassification.CLEAN
+
+
 def _coerce_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -515,6 +638,26 @@ def _coerce_bool(value: Any, default: bool) -> bool:
         if normalized in {"false", "0", "no", "off"}:
             return False
     return default
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    return None
+
+
+def _normalize_runtime_code(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().casefold()).strip("_")
 
 
 def _bounded_int(value: Any, default: int, *, minimum: int, maximum: int) -> int:
