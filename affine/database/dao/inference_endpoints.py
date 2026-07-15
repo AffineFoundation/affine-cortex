@@ -388,16 +388,16 @@ class InferenceEndpointsDAO(BaseDAO):
             "#cond_model": endpoint.assigned_model,
             "#cond_revision": endpoint.assigned_revision,
         }
-        for idx, (field_name, value) in enumerate(expected_identity.items()):
+        for idx, (field, value) in enumerate(expected_identity.items()):
             if value is None:
                 condition_values[":null_type"] = "NULL"
                 conditions.append(
-                    f"(attribute_not_exists({field_name}) OR "
-                    f"attribute_type({field_name}, :null_type))"
+                    f"(attribute_not_exists({field}) OR "
+                    f"attribute_type({field}, :null_type))"
                 )
                 continue
             value_key = f":expected_identity_{idx}"
-            conditions.append(f"{field_name} = {value_key}")
+            conditions.append(f"{field} = {value_key}")
             condition_values[value_key] = value
 
         return await self._update_endpoint_fields(
@@ -522,8 +522,8 @@ class InferenceEndpointsDAO(BaseDAO):
 
         payload = asdict(endpoint)
         payload.pop("name", None)
-        for field_name in _ASSIGNMENT_FIELDS:
-            payload.pop(field_name, None)
+        for field in _ASSIGNMENT_FIELDS:
+            payload.pop(field, None)
         payload.update({
             "active": True,
             "generation": generation,
@@ -634,17 +634,17 @@ class InferenceEndpointsDAO(BaseDAO):
         names: Dict[str, str] = {}
         values: Dict[str, Dict[str, Any]] = {}
         set_parts = []
-        for idx, (field_name, value) in enumerate(set_values.items()):
+        for idx, (field, value) in enumerate(set_values.items()):
             name_key = f"#s{idx}"
             value_key = f":v{idx}"
-            names[name_key] = field_name
+            names[name_key] = field
             values[value_key] = self._serialize({"value": value})["value"]
             set_parts.append(f"{name_key} = {value_key}")
 
         remove_parts = []
-        for idx, field_name in enumerate(remove_fields):
+        for idx, field in enumerate(remove_fields):
             name_key = f"#r{idx}"
-            names[name_key] = field_name
+            names[name_key] = field
             remove_parts.append(name_key)
 
         names.update(condition_names or {})
