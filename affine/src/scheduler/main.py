@@ -126,7 +126,8 @@ def _resolve_provider_kind(
     if not active:
         raise RuntimeError(
             "no active inference endpoints registered; configure one with "
-            "`af db set-endpoint --kind ssh --ssh-url ssh://user@host[:port] ...` "
+            "`af db register-static-endpoint --kind ssh "
+            "--ssh-url ssh://user@host[:port] ...` "
             "or `--kind targon --targon-api-url https://...`"
         )
     ssh_active = [ep for ep in active if ep.kind == "ssh"]

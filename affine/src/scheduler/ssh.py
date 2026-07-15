@@ -492,6 +492,33 @@ async def _ssh_exec(config: SSHConfig, command: str) -> Tuple[int, str, str]:
         ) from e
 
 
+async def probe_host(config: SSHConfig) -> int:
+    """Verify that a static SSH endpoint can run GPU Docker workloads.
+
+    This is intentionally read-only: registration should validate the same
+    SSH, Docker, and NVIDIA prerequisites the scheduler needs without pulling
+    an image or starting a container.
+    """
+    command = "docker info >/dev/null 2>&1 && nvidia-smi -L"
+    rc, out, err = await _ssh_exec(config, command)
+    if rc != 0:
+        detail = err or out or "preflight command failed"
+        raise RuntimeError(
+            f"static endpoint preflight failed on {config.host}:{config.port}: "
+            f"rc={rc} {detail}"
+        )
+    gpu_count = sum(
+        1 for line in out.splitlines()
+        if line.strip().lower().startswith("gpu ")
+    )
+    if gpu_count <= 0:
+        raise RuntimeError(
+            f"static endpoint preflight found no NVIDIA GPUs on "
+            f"{config.host}:{config.port}"
+        )
+    return gpu_count
+
+
 def _hf_cache_dir_name(model: str) -> str:
     """HuggingFace's snapshot dir convention: ``<prefix><owner><sep><name>``
     (the org separator ``/`` is flattened to ``--``)."""

@@ -33,6 +33,7 @@ Database Commands:
 - af db : Database management commands
 
 Operator Commands:
+- af gpu add-endpoint     : Rent an additional GPU endpoint
 - af gpu replace-endpoint : Rent a replacement GPU endpoint
 - af gpu remove-endpoint  : Stop and deactivate an autoscaled GPU endpoint
 """
@@ -205,6 +206,26 @@ def gpu():
     pass
 
 
+@gpu.command("add-endpoint")
+@click.option(
+    "--slot",
+    "slot_name",
+    required=True,
+    help="Autoscaler slot to rent, e.g. lium-b200-autoscale-2",
+)
+@click.option("--dry-run", is_flag=True, help="Print the plan without changes.")
+@click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
+def gpu_add_endpoint(slot_name, dry_run, yes):
+    """Rent and activate an additional autoscaled endpoint."""
+    from affine.src.scheduler.gpu_autoscaler import add_endpoint_command
+
+    asyncio.run(add_endpoint_command(
+        slot_name=slot_name,
+        dry_run=dry_run,
+        yes=yes,
+    ))
+
+
 @gpu.command("replace-endpoint")
 @click.option(
     "--old",
@@ -217,21 +238,15 @@ def gpu():
     default=None,
     help="Autoscaler slot to rent. Defaults to --old for same-slot replacement.",
 )
-@click.option(
-    "--keep-old",
-    is_flag=True,
-    help="Create the new slot but leave the old endpoint active.",
-)
 @click.option("--dry-run", is_flag=True, help="Print the plan without changes.")
 @click.option("--yes", is_flag=True, help="Skip confirmation prompt.")
-def gpu_replace_endpoint(old_endpoint_name, new_slot, keep_old, dry_run, yes):
+def gpu_replace_endpoint(old_endpoint_name, new_slot, dry_run, yes):
     """Rent a GPU instance and replace an autoscaled endpoint."""
     from affine.src.scheduler.gpu_autoscaler import replace_endpoint_command
 
     asyncio.run(replace_endpoint_command(
         old_endpoint_name=old_endpoint_name,
         new_slot_name=new_slot,
-        keep_old=keep_old,
         dry_run=dry_run,
         yes=yes,
     ))
