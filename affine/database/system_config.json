@@ -1,5 +1,29 @@
 {
   "validator_burn_percentage": 0.0,
+  "behavior_gate": {
+    "enabled": false,
+    "mode": "shadow",
+    "policy_version": "v1",
+    "gated_environments": [
+      "*"
+    ],
+    "probe_count": 3,
+    "clean_to_pass": 2,
+    "violations_to_fail": 2,
+    "runtime_violations_to_fail": 2,
+    "action_proofs_to_pass": 2,
+    "suspected_rounds_to_fail": 2,
+    "max_infra_retries": 2,
+    "probe_concurrency": 1,
+    "first_response_deadline_seconds": 60,
+    "first_action_deadline_seconds": 90,
+    "probe_timeout_seconds": 120,
+    "admission_timeout_seconds": 390,
+    "max_tokens_without_progress": 4096,
+    "max_completion_tokens": 8192,
+    "lease_seconds": 420,
+    "retry_backoff_seconds": 60
+  },
   "environments": {
     "SWE-INFINITE": {
       "display_name": "SWE",

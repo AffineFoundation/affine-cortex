@@ -9,6 +9,7 @@ from affine.database.dao.anticopy import (
     AntiCopyScoresIndexDAO,
     AntiCopyStateDAO,
 )
+from affine.database.dao.behavior_gate import BehaviorGateDAO
 from affine.database.dao.execution_logs import ExecutionLogsDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
 from affine.database.dao.miners import MinersDAO
@@ -21,6 +22,7 @@ __all__ = [
     "AntiCopyRolloutsDAO",
     "AntiCopyScoresIndexDAO",
     "AntiCopyStateDAO",
+    "BehaviorGateDAO",
     "ExecutionLogsDAO",
     "MinerStatsDAO",
     "MinersDAO",

@@ -81,6 +81,38 @@ EXECUTION_LOGS_TTL = {
 }
 
 
+# Behavior Gate Table
+#
+# One partition represents one exact model deployment under one behavior
+# policy.  Keeping the deployment fingerprint in the key is intentional: a
+# pass for an old endpoint/process must never authorize a replacement
+# deployment implicitly.
+#
+#   PK: SUBJECT#{hotkey}#REV#{revision}#POLICY#{policy_version}
+#       #DEPLOY#{deployment_fingerprint}
+#   SK: VERDICT                         (lease + aggregate decision)
+#       ATTEMPT#{probe_id}              (idempotent probe evidence)
+#
+# Probe-attempt rows have a short TTL.  Verdict rows omit ``ttl`` and remain
+# available as an audit record and as the executor/scheduler gate.
+BEHAVIOR_GATE_SCHEMA = {
+    "TableName": get_table_name("behavior_gate"),
+    "KeySchema": [
+        {"AttributeName": "pk", "KeyType": "HASH"},
+        {"AttributeName": "sk", "KeyType": "RANGE"},
+    ],
+    "AttributeDefinitions": [
+        {"AttributeName": "pk", "AttributeType": "S"},
+        {"AttributeName": "sk", "AttributeType": "S"},
+    ],
+    "BillingMode": "PAY_PER_REQUEST",
+}
+
+BEHAVIOR_GATE_TTL = {
+    "AttributeName": "ttl",
+}
+
+
 # Scores Table
 SCORES_SCHEMA = {
     "TableName": get_table_name("scores"),
@@ -376,4 +408,3 @@ ANTICOPY_STATE_SCHEMA = {
     ],
     "BillingMode": "PAY_PER_REQUEST",
 }
-
