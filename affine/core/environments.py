@@ -471,7 +471,10 @@ _ENV_CONFIGS_CANONICAL = {
     "instruction-gym": EnvConfig(
         name="instruction-gym",
         docker_image="affinefoundation/instruction-gym:latest",
-        env_vars={"UVICORN_WORKERS": "4"},
+        # The clean-tag image, SDK smoke, afs validator and isolated E2E all
+        # qualify one worker. Keep production registration on that proven
+        # topology until a separate multi-worker concurrency/memory gate lands.
+        env_vars={"UVICORN_WORKERS": "1"},
         forward_api_key=False,
         supports_teacher_rollouts=False,
         trusted_execution_modes=("docker",),

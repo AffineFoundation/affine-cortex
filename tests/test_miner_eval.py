@@ -91,7 +91,7 @@ def test_load_environment_uses_override_without_pull_and_host_network(
     assert captured["pull"] is False
     assert captured["host_network"] is True
     assert "network_mode" not in captured
-    assert captured["env_vars"] == {"UVICORN_WORKERS": "4"}
+    assert captured["env_vars"] == {"UVICORN_WORKERS": "1"}
 
     asyncio.run(
         wrapped.evaluate(
