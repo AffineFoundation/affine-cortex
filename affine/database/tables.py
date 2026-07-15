@@ -87,6 +87,7 @@ async def init_tables():
         ANTICOPY_ROLLOUTS_SCHEMA, ANTICOPY_ROLLOUTS_TTL,
         ANTICOPY_SCORES_INDEX_SCHEMA,
         ANTICOPY_STATE_SCHEMA,
+        BEHAVIOR_GATE_SCHEMA, BEHAVIOR_GATE_TTL,
         EXECUTION_LOGS_SCHEMA, EXECUTION_LOGS_TTL,
         INFERENCE_ENDPOINTS_SCHEMA,
         MINER_STATS_SCHEMA,
@@ -111,6 +112,10 @@ async def init_tables():
         create_table(ANTICOPY_ROLLOUTS_SCHEMA, ttl_attribute=ANTICOPY_ROLLOUTS_TTL["AttributeName"]),
         create_table(ANTICOPY_SCORES_INDEX_SCHEMA),
         create_table(ANTICOPY_STATE_SCHEMA),
+        create_table(
+            BEHAVIOR_GATE_SCHEMA,
+            ttl_attribute=BEHAVIOR_GATE_TTL["AttributeName"],
+        ),
     )
 
     print("All tables initialized successfully")

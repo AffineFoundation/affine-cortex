@@ -38,6 +38,7 @@ from affine.src.scorer.dao_adapters import SampleResultsAdapter
 
 HEALTH_CHECK_INTERVAL_SEC = 10
 STATUS_PRINT_INTERVAL_SEC = 60
+BEHAVIOR_PREFLIGHT_RESTART_DELAY_SEC = 1.0
 
 
 def _as_uid(raw: Any) -> Optional[int]:
@@ -106,6 +107,7 @@ class ExecutorManager:
         self._last_status_at: float = 0.0
         self._last_done: Dict[tuple, int] = {}
         self._last_subject_set: frozenset = frozenset()
+        self._preflight_task: Optional[asyncio.Task] = None
         self.running = False
         logger.info(
             f"ExecutorManager init: envs={envs}, "
@@ -132,18 +134,78 @@ class ExecutorManager:
             wp.start()
             self.workers.append(wp)
         self.running = True
+        self._preflight_task = asyncio.create_task(
+            self._supervise_behavior_preflight(),
+            name="behavior-preflight",
+        )
         asyncio.create_task(self._health_checker())
         asyncio.create_task(self._status_printer())
         logger.info(f"Spawned {len(self.workers)} worker subprocesses")
 
     async def stop(self) -> None:
         self.running = False
+        if self._preflight_task is not None:
+            self._preflight_task.cancel()
+            await asyncio.gather(self._preflight_task, return_exceptions=True)
+            self._preflight_task = None
         for wp in self.workers:
             try:
                 wp.terminate()
             except Exception as e:
                 logger.warning(f"terminate({wp.env}) raised: {e}")
         self.workers.clear()
+
+    async def _run_behavior_preflight(self) -> None:
+        """Run the independent CPU-side admission probes.
+
+        This task intentionally lives in the manager rather than an env
+        subprocess: benchmark workers may be restarted independently, while a
+        single coordinator and DynamoDB lease keep probe concurrency at one.
+        """
+        from affine.database.dao.behavior_gate import BehaviorGateDAO
+        from affine.src.executor.preflight import BehaviorPreflightCoordinator
+        from affine.src.scorer.window_state import (
+            StateStore,
+            SystemConfigKVAdapter,
+        )
+
+        coordinator = BehaviorPreflightCoordinator(
+            state=StateStore(
+                SystemConfigKVAdapter(
+                    SystemConfigDAO(), updated_by="executor-preflight",
+                )
+            ),
+            dao=BehaviorGateDAO(),
+        )
+        await coordinator.run()
+
+    async def _supervise_behavior_preflight(self) -> None:
+        """Keep the admission coordinator alive until manager shutdown.
+
+        Enforce-mode workers intentionally fail closed while the coordinator is
+        unavailable, so an unobserved task exception would otherwise leave all
+        challenger sampling blocked forever.  Cancellation is never treated as
+        a crash: :meth:`stop` cancels this supervisor and the signal propagates
+        through the active coordinator unchanged.
+        """
+        while self.running:
+            try:
+                await self._run_behavior_preflight()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(
+                    "behavior preflight coordinator crashed; restarting: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                if self.running:
+                    logger.error(
+                        "behavior preflight coordinator exited unexpectedly; "
+                        "restarting"
+                    )
+            if self.running:
+                await asyncio.sleep(BEHAVIOR_PREFLIGHT_RESTART_DELAY_SEC)
 
     async def _health_checker(self) -> None:
         while self.running:

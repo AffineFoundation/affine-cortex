@@ -39,6 +39,15 @@ from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tupl
 
 from affine.core.setup import logger
 from affine.database.dao.miners import select_preferred_hotkey_row
+from affine.src.behavior_guard.gate import (
+    GateSnapshot,
+    read_gate_snapshot,
+    record_deployment_fingerprint,
+)
+from affine.src.behavior_guard.models import (
+    VerdictStatus,
+    parse_behavior_gate_config,
+)
 
 from affine.src.scorer.challenger_queue import (
     ChallengerQueue,
@@ -297,6 +306,7 @@ class FlowScheduler:
         ] = None,
         deployment_health_fn: Optional[DeploymentHealthFn] = None,
         sample_metrics_reader: Optional[SampleMetricsReader] = None,
+        behavior_gate_dao: Any = None,
     ):
         self.cfg = config
         self.state = state
@@ -316,6 +326,8 @@ class FlowScheduler:
             list_active_endpoint_activations_fn
         )
         self._deployment_health = deployment_health_fn
+        self._behavior_gate_dao = behavior_gate_dao
+        self._last_behavior_gate_log: Dict[str, str] = {}
         self._last_no_endpoint_log_at = 0.0
 
     # ---- entry point ------------------------------------------------------
@@ -324,6 +336,17 @@ class FlowScheduler:
         """Battle phase, then pre-sample phase, then orphan reaper.
         The latter two are guarded so a flaky teardown / DDB scan
         can't block the next tick."""
+        # Run this before the main phase so a failed pre-deployed miner cannot
+        # be adopted and redeployed onto the primary before its gate verdict
+        # is consumed.
+        try:
+            await self._predeploy_behavior_gate_sweep()
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: predeploy behavior-gate sweep error "
+                f"(non-fatal, will retry next tick): "
+                f"{type(e).__name__}: {e}"
+            )
         await self._tick_main(current_block)
         try:
             await self._predeploy_phase(current_block)
@@ -407,6 +430,20 @@ class FlowScheduler:
             if battle.challenger.uid not in valid_uids:
                 await self._decide_invalidation_lost(champion, battle)
                 return
+
+            gate_snapshot = await self._active_behavior_gate_snapshot(
+                battle, envs,
+            )
+            if gate_snapshot is not None:
+                if gate_snapshot.failed:
+                    await self._decide_behavior_gate_lost(
+                        champion, battle, gate_snapshot.reason,
+                    )
+                    return
+                if not gate_snapshot.passed:
+                    # pending/running/suspected/deferred all keep the model's
+                    # lifecycle intact while benchmark fan-out remains zero.
+                    return
 
         # Runtime health reconciliation. The deployment_id/base_url pair
         # says what the scheduler last *successfully* started, but not
@@ -1040,6 +1077,242 @@ class FlowScheduler:
             await self.state.set_champion(champion)
         await self.state.clear_battle()
 
+    async def _active_behavior_gate_snapshot(
+        self,
+        battle: BattleRecord,
+        envs: Mapping[str, EnvConfig],
+    ) -> Optional[GateSnapshot]:
+        config = parse_behavior_gate_config(
+            await self.state.get_behavior_gate_config()
+        )
+        if not config.enforces or not any(
+            config.gates_environment(env) for env in envs
+        ):
+            return None
+        if self._behavior_gate_dao is None:
+            snapshot = GateSnapshot(
+                status=VerdictStatus.PENDING,
+                reason="behavior_gate_dao_unavailable",
+                deployment_fingerprint=record_deployment_fingerprint(
+                    battle, config,
+                ),
+            )
+        else:
+            try:
+                snapshot = await read_gate_snapshot(
+                    self._behavior_gate_dao, battle, config,
+                )
+            except Exception as exc:
+                # A control-plane read error blocks progress but can never
+                # turn into a model loss.
+                snapshot = GateSnapshot(
+                    status=VerdictStatus.PENDING,
+                    reason=f"behavior_gate_read_error:{type(exc).__name__}",
+                    deployment_fingerprint=record_deployment_fingerprint(
+                        battle, config,
+                    ),
+                )
+        self._log_behavior_gate_snapshot(battle, snapshot)
+        return snapshot
+
+    async def _seal_behavior_gate_for_promotion(
+        self,
+        battle: BattleRecord,
+        envs: Mapping[str, EnvConfig],
+    ) -> Tuple[bool, Optional[GateSnapshot]]:
+        """Atomically fence a passed gate immediately before promotion.
+
+        A plain strongly-consistent read cannot close the race with a runtime
+        invariant failure: the verdict can flip after the read but before the
+        challenger becomes the canonical champion.  ``seal_for_promotion``
+        performs that final passed->sealed transition conditionally in DDB.
+
+        ``False`` and transport errors are never interpreted as a model loss.
+        They are followed by a strong verdict read so only a confirmed FAILED
+        row loses; every other state pauses promotion for a later tick.
+        """
+        config = parse_behavior_gate_config(
+            await self.state.get_behavior_gate_config()
+        )
+        if not config.enforces or not any(
+            config.gates_environment(env) for env in envs
+        ):
+            return True, None
+
+        fingerprint = record_deployment_fingerprint(battle, config)
+        if self._behavior_gate_dao is None:
+            snapshot = GateSnapshot(
+                status=VerdictStatus.PENDING,
+                reason="behavior_gate_dao_unavailable",
+                deployment_fingerprint=fingerprint,
+            )
+            self._log_behavior_gate_snapshot(battle, snapshot)
+            return False, snapshot
+
+        try:
+            sealed = await self._behavior_gate_dao.seal_for_promotion(
+                battle.challenger.hotkey,
+                battle.challenger.revision,
+                config.policy_version,
+                fingerprint,
+            )
+        except Exception as exc:
+            sealed = False
+            logger.warning(
+                "FlowScheduler: behavior gate promotion seal error "
+                f"uid={battle.challenger.uid}: {type(exc).__name__}"
+            )
+
+        if sealed:
+            snapshot = GateSnapshot(
+                status=VerdictStatus.PASSED,
+                reason="promotion_sealed",
+                deployment_fingerprint=fingerprint,
+            )
+            self._log_behavior_gate_snapshot(battle, snapshot)
+            return True, snapshot
+
+        try:
+            snapshot = await read_gate_snapshot(
+                self._behavior_gate_dao, battle, config,
+            )
+        except Exception as exc:
+            snapshot = GateSnapshot(
+                status=VerdictStatus.PENDING,
+                reason=f"behavior_gate_read_error:{type(exc).__name__}",
+                deployment_fingerprint=fingerprint,
+            )
+        self._log_behavior_gate_snapshot(battle, snapshot)
+        return False, snapshot
+
+    async def _clear_champion_deployment_state(
+        self,
+        champion: ChampionRecord,
+    ) -> None:
+        """Forget a champion workload immediately after it is torn down."""
+        champion.deployment_id = None
+        champion.base_url = None
+        champion.deployments = []
+        await self.state.set_champion(champion)
+
+    async def _rollback_failed_promotion_recovery(
+        self,
+        promoted: ChampionRecord,
+        battle: BattleRecord,
+        *,
+        reason: str,
+        current_block: int,
+    ) -> None:
+        """Undo an unsealed promotion after a durable runtime failure.
+
+        This handles the legacy/crash shape where ``set_champion(new)`` was
+        persisted before the gate was sealed.  Teardown comes first so any
+        transient failure leaves the battle marker intact and retryable.
+        """
+        logger.warning(
+            "FlowScheduler: rolling back failed unsealed promotion "
+            f"uid={promoted.uid} reason={reason}"
+        )
+        await self._teardown_record(battle)
+        await self.queue.mark_terminated(
+            promoted.uid,
+            OUTCOME_LOST,
+            reason=f"model_behavior:{reason}:promotion_recovery",
+            hotkey=promoted.hotkey,
+            revision=promoted.revision,
+            model=promoted.model,
+        )
+
+        previous = battle.previous_champion
+        previous_ready = (
+            previous is not None
+            and previous.uid != promoted.uid
+            and bool(previous.hotkey)
+            and bool(previous.revision)
+        )
+        if previous_ready:
+            assert previous is not None
+            restored = ChampionRecord(
+                uid=previous.uid,
+                hotkey=previous.hotkey,
+                revision=previous.revision,
+                model=previous.model,
+                model_type=previous.model_type,
+                # The old workload was torn down before the seal attempt.
+                # Step 5 will deploy it again from this cleared state.
+                deployment_id=None,
+                base_url=None,
+                deployments=[],
+                since_block=current_block,
+            )
+            await self.queue.mark_terminated(
+                previous.uid,
+                OUTCOME_WON,
+                hotkey=previous.hotkey,
+                revision=previous.revision,
+                model=previous.model,
+            )
+            # Write the rollback weight before changing canonical state.  If
+            # the external write fails, champion==challenger still selects
+            # this recovery branch on the next tick and retries it.
+            await self._write_weights(restored, current_block, None)
+            await self.state.set_champion(restored)
+        else:
+            logger.warning(
+                "FlowScheduler: failed promotion recovery has no usable "
+                "previous_champion; clearing canonical champion safely"
+            )
+            await self.state.clear_champion()
+
+        await self.state.clear_battle()
+
+    def _log_behavior_gate_snapshot(
+        self,
+        record: BattleRecord,
+        snapshot: GateSnapshot,
+    ) -> None:
+        key = snapshot.deployment_fingerprint
+        marker = f"{snapshot.status.value}:{snapshot.reason}"
+        if self._last_behavior_gate_log.get(key) == marker:
+            return
+        self._last_behavior_gate_log[key] = marker
+        log = logger.info if snapshot.passed else logger.warning
+        log(
+            f"FlowScheduler: behavior gate uid={record.challenger.uid} "
+            f"status={snapshot.status.value} reason={snapshot.reason}"
+        )
+
+    async def _decide_behavior_gate_lost(
+        self,
+        champion: ChampionRecord,
+        battle: BattleRecord,
+        reason: str,
+    ) -> None:
+        """Consume a confirmed strong behavior violation as LOST."""
+        logger.warning(
+            f"FlowScheduler: challenger uid={battle.challenger.uid} "
+            f"failed behavior preflight ({reason}); terminating lifecycle"
+        )
+        # Teardown first so a transient teardown error leaves the challenger
+        # IN_PROGRESS with its battle record intact.  The next tick then reads
+        # the same final gate verdict and retries without overwriting the
+        # model-behavior termination reason through the invalidation path.
+        await self._teardown_record(battle)
+        await self.queue.mark_terminated(
+            battle.challenger.uid,
+            OUTCOME_LOST,
+            reason=f"model_behavior:{reason}",
+            hotkey=battle.challenger.hotkey,
+            revision=battle.challenger.revision,
+            model=battle.challenger.model,
+        )
+        if self.cfg.single_instance_provider:
+            champion.deployment_id = None
+            champion.base_url = None
+            champion.deployments = []
+            await self.state.set_champion(champion)
+        await self.state.clear_battle()
+
     # ---- invariant reaper -------------------------------------------------
 
     async def _reap_in_progress_orphans(self) -> None:
@@ -1140,6 +1413,77 @@ class FlowScheduler:
         return "stale_claim_endpoint_stable"
 
     # ---- pre-sample phase -------------------------------------------------
+
+    async def _predeploy_behavior_gate_sweep(self) -> None:
+        """Terminate pre-deployed records with a confirmed failed gate.
+
+        Pending, suspected, and infrastructure-deferred rows stay deployed so
+        the independent coordinator can retry.  They still dispatch no gated
+        benchmark work in executor enforce mode.
+        """
+        records = await self.state.get_predeployed_challengers()
+        if not records:
+            return
+        config = parse_behavior_gate_config(
+            await self.state.get_behavior_gate_config()
+        )
+        envs = await self.state.get_environments()
+        if not config.enforces or not any(
+            config.gates_environment(env) for env in envs
+        ):
+            return
+
+        kept: List[BattleRecord] = []
+        changed = False
+        for record in records:
+            if self._behavior_gate_dao is None:
+                kept.append(record)
+                continue
+            try:
+                snapshot = await read_gate_snapshot(
+                    self._behavior_gate_dao, record, config,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"FlowScheduler: behavior-gate read failed for "
+                    f"pre-deployed uid={record.challenger.uid}; keeping "
+                    f"blocked for retry: {type(exc).__name__}"
+                )
+                kept.append(record)
+                continue
+            self._log_behavior_gate_snapshot(record, snapshot)
+            if not snapshot.failed:
+                kept.append(record)
+                continue
+
+            try:
+                # Keep the queue row IN_PROGRESS until teardown succeeds so a
+                # transient provider error can be retried without replacing
+                # the durable model-behavior reason via orphan recovery.
+                await self._teardown_record(record)
+                await self.queue.mark_terminated(
+                    record.challenger.uid,
+                    OUTCOME_LOST,
+                    reason=f"model_behavior:{snapshot.reason}:predeploy",
+                    hotkey=record.challenger.hotkey,
+                    revision=record.challenger.revision,
+                    model=record.challenger.model,
+                )
+            except Exception as exc:
+                logger.error(
+                    f"FlowScheduler: failed to consume behavior-gate loss "
+                    f"for pre-deployed uid={record.challenger.uid}: "
+                    f"{type(exc).__name__}: {exc} — keeping for retry"
+                )
+                kept.append(record)
+                continue
+            changed = True
+            logger.warning(
+                f"FlowScheduler: pre-deployed uid={record.challenger.uid} "
+                f"LOST by behavior preflight ({snapshot.reason})"
+            )
+        if changed:
+            await self.state.set_predeployed_challengers(kept)
 
     async def _predeploy_phase(self, current_block: int) -> None:
         """Invalidation sweep, early-loss sweep, fill spare. No-op until
@@ -1570,6 +1914,37 @@ class FlowScheduler:
         # down + demote the freshly-crowned champion. Detect that case
         # explicitly and just finalize the bookkeeping.
         if champion.uid == battle.challenger.uid:
+            gate_envs = await self.state.get_runtime_environments()
+            sealed, gate_snapshot = (
+                await self._seal_behavior_gate_for_promotion(
+                    battle, gate_envs,
+                )
+            )
+            if not sealed:
+                if gate_snapshot is not None and gate_snapshot.failed:
+                    await self._rollback_failed_promotion_recovery(
+                        champion,
+                        battle,
+                        reason=gate_snapshot.reason,
+                        current_block=current_block,
+                    )
+                else:
+                    status = (
+                        gate_snapshot.status.value
+                        if gate_snapshot is not None
+                        else VerdictStatus.PENDING.value
+                    )
+                    reason = (
+                        gate_snapshot.reason
+                        if gate_snapshot is not None
+                        else "promotion_seal_not_committed"
+                    )
+                    logger.warning(
+                        "FlowScheduler: post-promotion recovery paused by "
+                        f"behavior gate uid={champion.uid} status={status} "
+                        f"reason={reason}"
+                    )
+                return
             logger.info(
                 f"FlowScheduler: detected post-promotion crash recovery "
                 f"for uid={champion.uid}; finalizing bookkeeping without "
@@ -1764,7 +2139,62 @@ class FlowScheduler:
             setattr(result, "token_efficiency", token_sidecar)
 
         if result.winner == "challenger":
+            # Fence the promotion with a fresh strongly-consistent read.  A
+            # real sample can invalidate a previously-passed preflight while
+            # this tick is awaiting score reads/comparison; promoting from the
+            # earlier snapshot would make that final failure unreachable once
+            # the subject becomes champion.
+            gate_envs = await self.state.get_runtime_environments()
+            gate_snapshot = await self._active_behavior_gate_snapshot(
+                battle, gate_envs,
+            )
+            if gate_snapshot is not None:
+                if gate_snapshot.failed:
+                    await self._decide_behavior_gate_lost(
+                        champion, battle, gate_snapshot.reason,
+                    )
+                    return
+                if not gate_snapshot.passed:
+                    logger.warning(
+                        "FlowScheduler: challenger promotion paused by "
+                        f"behavior gate uid={battle.challenger.uid} "
+                        f"status={gate_snapshot.status.value} "
+                        f"reason={gate_snapshot.reason}"
+                    )
+                    return
             await self._teardown_record(champion)
+            # The old workload is now gone.  Persist that fact before the
+            # atomic seal so a failed/uncertain seal can never leave a stale
+            # champion URL dispatchable while promotion is paused.
+            await self._clear_champion_deployment_state(champion)
+            sealed, gate_snapshot = (
+                await self._seal_behavior_gate_for_promotion(
+                    battle, gate_envs,
+                )
+            )
+            if not sealed:
+                if gate_snapshot is not None and gate_snapshot.failed:
+                    await self._decide_behavior_gate_lost(
+                        champion, battle, gate_snapshot.reason,
+                    )
+                    return
+                status = (
+                    gate_snapshot.status.value
+                    if gate_snapshot is not None
+                    else VerdictStatus.PENDING.value
+                )
+                reason = (
+                    gate_snapshot.reason
+                    if gate_snapshot is not None
+                    else "promotion_seal_not_committed"
+                )
+                logger.warning(
+                    "FlowScheduler: challenger promotion paused after old "
+                    "champion teardown because behavior gate was not sealed "
+                    f"uid={battle.challenger.uid} status={status} "
+                    f"reason={reason}"
+                )
+                return
             new_champion = ChampionRecord(
                 uid=battle.challenger.uid,
                 hotkey=battle.challenger.hotkey,

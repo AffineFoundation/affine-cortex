@@ -14,6 +14,8 @@ missing.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import random
 import time
 from typing import Any, Dict, List, Optional
@@ -21,6 +23,15 @@ from typing import Any, Dict, List, Optional
 from affine.core.setup import logger
 from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.system_config import SystemConfigDAO
+from affine.src.behavior_guard.gate import (
+    read_gate_snapshot,
+    record_deployment_fingerprint,
+)
+from affine.src.behavior_guard.models import (
+    SampleOutcomeEvidence,
+    classify_sample_invariant,
+    parse_behavior_gate_config,
+)
 from affine.src.executor.logging_utils import safe_log
 from affine.src.executor.metrics import WorkerMetrics
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
@@ -53,6 +64,7 @@ class ExecutorWorker:
         per_host_in_flight: Optional[Dict[str, Any]] = None,
         per_env_host_in_flight: Optional[Dict[str, Any]] = None,
         per_host_budget: int = 0,
+        behavior_gate_dao: Any = None,
     ):
         self.worker_id = worker_id
         self.env = env
@@ -100,8 +112,17 @@ class ExecutorWorker:
         self._env_executor = None
         self._state: Optional[StateStore] = None
         self._samples: Optional[SampleResultsAdapter] = None
+        # Injected in focused tests; production initializes the DynamoDB
+        # adapter after the subprocess has created its async client.
+        self._behavior_gate_dao = behavior_gate_dao
 
         self._tasks_by_deployment: Dict[str, set] = {}
+        self._last_behavior_gate_log: Dict[str, str] = {}
+        # Repeated distinct-task runtime invariants can revoke a passed
+        # preflight.  If that final control-plane write is temporarily
+        # unavailable, keep the exact deployment fingerprint fail-closed and
+        # retry before any later gate read can release traffic.
+        self._runtime_gate_quarantine: Dict[str, Dict[str, Any]] = {}
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -122,6 +143,9 @@ class ExecutorWorker:
             dao=SampleResultsDAO(),
             validator_hotkey=f"executor-{self.env}",
         )
+        if self._behavior_gate_dao is None:
+            from affine.database.dao.behavior_gate import BehaviorGateDAO
+            self._behavior_gate_dao = BehaviorGateDAO()
         await self._init_env_executor()
         safe_log(f"[{self.env}] worker ready", "INFO")
 
@@ -364,6 +388,28 @@ class ExecutorWorker:
             _collect_current_deployment_ids(champion, battle, predeployed)
         )
 
+        # Challenger deployments must pass the independent, bounded protocol
+        # probe before this env can fan out benchmark tasks.  Champion traffic
+        # is deliberately unaffected: the gate is an admission check for a
+        # newly deployed challenger, not a global inference kill switch.
+        gate_config = await self._behavior_gate_config()
+        battle_allowed = True
+        blocked_deployment_ids: set[str] = set()
+        if battle is not None:
+            battle_allowed = await self._behavior_gate_allows(
+                battle, gate_config,
+            )
+            if not battle_allowed:
+                blocked_deployment_ids.update(_record_deployment_ids(battle))
+        allowed_predeployed = []
+        for record in predeployed:
+            if await self._behavior_gate_allows(record, gate_config):
+                allowed_predeployed.append(record)
+            else:
+                blocked_deployment_ids.update(_record_deployment_ids(record))
+        if blocked_deployment_ids:
+            self._cancel_dispatches_for_deployments(blocked_deployment_ids)
+
         # Single-instance providers deliberately clear champion.deployment_id
         # at battle start (the host is now serving the challenger). In that
         # state we still need to dispatch challenger samples. Still run the
@@ -371,7 +417,7 @@ class ExecutorWorker:
         # already-launched work before there are any new serving URLs.
         predeployed_urls = [
             url
-            for record in predeployed
+            for record in allowed_predeployed
             for url in _base_urls(record.deployments, record.base_url)
         ]
         if not champion_urls and not battle_urls and not predeployed_urls:
@@ -419,7 +465,7 @@ class ExecutorWorker:
         # empty and the overlap-gated loop below skips every task.
         is_shadow = not env_cfg.enabled_for_scoring
 
-        if battle is not None and battle_urls:
+        if battle is not None and battle_urls and battle_allowed:
             chal_done = await self._samples.read_scores_for_tasks(
                 battle.challenger.hotkey, battle.challenger.revision,
                 self.env, task_ids, refresh_block=refresh_block,
@@ -448,7 +494,7 @@ class ExecutorWorker:
 
         # Pre-deployed challengers: same gating as ``battle.challenger``,
         # each on its own non-primary endpoint.
-        for record in predeployed:
+        for record in allowed_predeployed:
             pre_urls = _base_urls(
                 record.deployments, record.base_url,
             )
@@ -521,6 +567,111 @@ class ExecutorWorker:
             )
         finally:
             in_flight_keys.discard(key)
+
+    async def _behavior_gate_config(self):
+        getter = getattr(self._state, "get_behavior_gate_config", None)
+        raw = await getter() if getter is not None else {}
+        return parse_behavior_gate_config(raw)
+
+    async def _behavior_gate_allows(self, record, config) -> bool:
+        """Return whether ``record`` may dispatch in this worker's env.
+
+        Shadow and disabled modes are fail-open by definition.  Enforce mode
+        is fail-closed for a configured env: a missing table row, transient DB
+        read error, or non-final verdict keeps expensive tasks at zero rather
+        than recreating the 600-way timeout fan-out.
+        """
+        if not config.enforces or not config.gates_environment(self.env):
+            return True
+        fingerprint = record_deployment_fingerprint(record, config)
+        pending_failure = self._runtime_gate_quarantine.get(fingerprint)
+        if pending_failure is not None:
+            write_outcome = await self._write_runtime_invariant_failure(
+                fingerprint,
+                pending_failure,
+            )
+            if write_outcome == "sealed":
+                self._log_behavior_gate_state(
+                    record,
+                    "sealed",
+                    "promotion_sealed",
+                )
+                # The scheduler has established the challenger-evidence
+                # cutoff.  Do not launch work whose result can no longer
+                # affect that decision; the record will shortly become the
+                # champion or remain blocked for crash recovery.
+                return False
+            self._log_behavior_gate_state(
+                record,
+                "failed" if write_outcome == "failed" else "quarantined",
+                (
+                    pending_failure["reason_code"]
+                    if write_outcome == "failed"
+                    else "runtime_invariant_write_pending"
+                ),
+            )
+            # A successful retry durably changed the verdict to failed; an
+            # unsuccessful retry remains locally quarantined.  Neither state
+            # may release more benchmark work.
+            return False
+        if self._behavior_gate_dao is None:
+            status = "dao_unavailable"
+            self._log_behavior_gate_state(record, status, "awaiting_preflight")
+            return False
+        try:
+            snapshot = await read_gate_snapshot(
+                self._behavior_gate_dao, record, config,
+            )
+        except Exception as exc:
+            self._log_behavior_gate_state(
+                record,
+                "read_error",
+                type(exc).__name__,
+            )
+            return False
+        self._log_behavior_gate_state(
+            record, snapshot.status.value, snapshot.reason,
+        )
+        if snapshot.row and snapshot.row.get("promotion_sealed_at") is not None:
+            self._log_behavior_gate_state(
+                record, "sealed", "promotion_sealed",
+            )
+            return False
+        return snapshot.passed
+
+    def _log_behavior_gate_state(
+        self, record, status: str, reason: str,
+    ) -> None:
+        key = (
+            f"{record.challenger.hotkey}:{record.challenger.revision}:"
+            f"{record.deployment_id}"
+        )
+        marker = f"{status}:{reason}"
+        if self._last_behavior_gate_log.get(key) == marker:
+            return
+        self._last_behavior_gate_log[key] = marker
+        log = logger.info if status == "passed" else logger.warning
+        log(
+            f"[{self.env}] behavior gate uid={record.challenger.uid} "
+            f"status={status} reason={reason}; "
+            f"dispatch={'allowed' if status == 'passed' else 'blocked'}"
+        )
+
+    def _cancel_dispatches_for_deployments(self, deployment_ids: set[str]) -> None:
+        """Cancel shadow-launched calls when enforce mode becomes active."""
+        for deployment_id in deployment_ids:
+            bucket = self._tasks_by_deployment.pop(deployment_id, set())
+            cancelled = 0
+            for task in bucket:
+                if not task.done():
+                    task.cancel()
+                    cancelled += 1
+            if cancelled:
+                logger.warning(
+                    f"[{self.env}] cancelled {cancelled} dispatch"
+                    f"{'es' if cancelled != 1 else ''} while behavior gate "
+                    f"blocks deployment={deployment_id}"
+                )
 
     def _cancel_stale_dispatches(self, current_ids: set) -> None:
         """Cancel tasks for any deployment_id not in ``current_ids``;
@@ -767,6 +918,212 @@ class ExecutorWorker:
         )
         return False
 
+    async def _current_challenger_record(
+        self,
+        *,
+        miner: MinerSnapshot,
+        expected_deployment_id: Optional[str],
+    ) -> Any:
+        """Return the current battle/predeploy record for this exact rollout.
+
+        Runtime invariants are admission evidence, so they must never mutate a
+        champion's gate row.  Requiring a deployment token also keeps legacy
+        URL-only dispatches from turning unverifiable telemetry into a loss.
+        This lookup intentionally happens after ``_validate_or_drop`` and
+        re-validates the role/token immediately before the gate write.
+        """
+        if expected_deployment_id is None:
+            return None
+
+        champion = await self._state.get_champion()
+        if champion is not None and _same_subject(champion, miner):
+            return None
+
+        battle = await self._state.get_battle()
+        if (
+            battle is not None
+            and _same_subject(battle.challenger, miner)
+            and _record_has_deployment(battle, expected_deployment_id)
+        ):
+            return battle
+
+        for record in await self._state.get_predeployed_challengers():
+            if (
+                _same_subject(record.challenger, miner)
+                and _record_has_deployment(record, expected_deployment_id)
+            ):
+                return record
+        return None
+
+    async def _write_runtime_invariant_failure(
+        self,
+        fingerprint: str,
+        failure: Dict[str, Any],
+    ) -> str:
+        """Commit a runtime failure or resolve a promotion-seal race.
+
+        Returns ``failed`` when the terminal failure is durable, ``sealed``
+        when promotion's atomic cutoff won, and ``pending`` when neither
+        outcome can be confirmed and local quarantine must remain active.
+        """
+        try:
+            if self._behavior_gate_dao is None:
+                raise RuntimeError("behavior gate DAO unavailable")
+            committed = await self._behavior_gate_dao.fail_runtime_invariant(
+                failure["hotkey"],
+                failure["revision"],
+                failure["policy_version"],
+                fingerprint,
+                reason_code=failure["reason_code"],
+                evidence=failure["evidence"],
+                counts=failure["counts"],
+            )
+            if not committed:
+                verdict = await self._behavior_gate_dao.get_verdict(
+                    failure["hotkey"],
+                    failure["revision"],
+                    failure["policy_version"],
+                    fingerprint,
+                )
+                if (
+                    verdict
+                    and verdict.get("status") == "passed"
+                    and verdict.get("promotion_sealed_at") is not None
+                ):
+                    self._runtime_gate_quarantine.pop(fingerprint, None)
+                    logger.info(
+                        f"[{self.env}] runtime invariant cutoff already sealed "
+                        f"uid={failure['uid']}"
+                    )
+                    return "sealed"
+                raise RuntimeError("runtime invariant write was not confirmed")
+        except Exception as exc:
+            self._runtime_gate_quarantine[fingerprint] = failure
+            # Evidence and exception text can contain model-controlled data;
+            # expose only stable identifiers and the exception class.
+            logger.error(
+                f"[{self.env}] runtime invariant gate write failed "
+                f"uid={failure['uid']}: {type(exc).__name__}"
+            )
+            return "pending"
+
+        self._runtime_gate_quarantine.pop(fingerprint, None)
+        return "failed"
+
+    async def _runtime_invariant_blocks_persist(
+        self,
+        *,
+        miner: MinerSnapshot,
+        task_id: int,
+        expected_deployment_id: Optional[str],
+        score: float,
+        extra: Dict[str, Any],
+    ) -> bool:
+        """Record a UID208-style impossible positive result.
+
+        Missing or non-numeric telemetry is unknown rather than zero.  Every
+        anomaly is recorded as a distinct-task observation; only a repeated
+        identical signature closes the gate.  Shadow mode preserves the
+        sample, while enforce mode suppresses invalid evidence immediately.
+        """
+        evidence = _sample_outcome_evidence(score=score, extra=extra)
+        classification = classify_sample_invariant(evidence)
+        if classification is None:
+            return False
+
+        config = await self._behavior_gate_config()
+        if not config.gates_environment(self.env):
+            return False
+        record = await self._current_challenger_record(
+            miner=miner,
+            expected_deployment_id=expected_deployment_id,
+        )
+        if record is None:
+            return False
+
+        fingerprint = record_deployment_fingerprint(record, config)
+        observation_evidence = {
+            "environment": self.env,
+            "score": score,
+            "commands_executed": evidence.commands_executed,
+            "llm_call_count": evidence.llm_call_count,
+            "total_tokens": evidence.total_tokens,
+            "output_bytes": evidence.output_bytes,
+        }
+        signature_hash = _runtime_signature_hash(
+            environment=self.env,
+            evidence=evidence,
+            classification=classification.value,
+        )
+        task_hash = _runtime_task_hash(
+            environment=self.env,
+            task_id=task_id,
+        )
+        threshold = config.runtime_violations_to_fail
+        try:
+            if self._behavior_gate_dao is None:
+                raise RuntimeError("behavior gate DAO unavailable")
+            observation_count = int(
+                await self._behavior_gate_dao.record_runtime_invariant_observation(
+                    miner.hotkey,
+                    miner.revision,
+                    config.policy_version,
+                    fingerprint,
+                    signature_hash=signature_hash,
+                    task_hash=task_hash,
+                    classification=classification.value,
+                    evidence=observation_evidence,
+                    threshold=threshold,
+                )
+            )
+        except Exception as exc:
+            # The invalid sample still cannot become benchmark evidence in
+            # enforce mode, but one uncertain observation is not sufficient
+            # to quarantine or terminally fail the deployment.
+            logger.error(
+                f"[{self.env}] runtime invariant observation write failed "
+                f"uid={miner.uid}: {type(exc).__name__}"
+            )
+            return config.enforces
+
+        reason = "runtime_positive_score_zero_activity"
+        if observation_count < threshold:
+            logger.warning(
+                f"[{self.env}] runtime invariant uid={miner.uid} "
+                f"task_id={task_id} reason={reason} "
+                f"observations={observation_count}/{threshold}; "
+                f"mode={config.mode.value}; "
+                f"persist={'blocked' if config.enforces else 'shadow-allowed'}"
+            )
+            return config.enforces
+
+        failure = {
+            "uid": miner.uid,
+            "hotkey": miner.hotkey,
+            "revision": miner.revision,
+            "policy_version": config.policy_version,
+            "reason_code": reason,
+            # Keep the retry payload to the same compact, allowlisted scalar
+            # evidence accepted by BehaviorGateDAO.  Raw output, errors,
+            # prompts, and tool arguments never enter the quarantine.
+            "evidence": observation_evidence,
+            "counts": {
+                "total": observation_count,
+                "strikes": observation_count,
+                classification.value: observation_count,
+            },
+        }
+        await self._write_runtime_invariant_failure(fingerprint, failure)
+
+        logger.warning(
+            f"[{self.env}] runtime invariant uid={miner.uid} "
+            f"task_id={task_id} reason={reason} "
+            f"observations={observation_count}/{threshold}; "
+            f"mode={config.mode.value}; "
+            f"persist={'blocked' if config.enforces else 'shadow-allowed'}"
+        )
+        return config.enforces
+
     async def _evaluate_and_persist_gated(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, miner_obj: "_Miner",
@@ -827,15 +1184,25 @@ class ExecutorWorker:
         error = getattr(result, "error", None)
         extra = dict(getattr(result, "extra", {}) or {})
         latency_ms = int((time.monotonic() - started) * 1000)
+        if not await self._validate_or_drop(
+            miner=miner,
+            task_id=task_id,
+            expected_deployment_id=expected_deployment_id,
+            latency_ms=latency_ms,
+        ):
+            return
+        if await self._runtime_invariant_blocks_persist(
+            miner=miner,
+            task_id=task_id,
+            expected_deployment_id=expected_deployment_id,
+            score=score,
+            extra=extra,
+        ):
+            self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            return
         if error or extra.get("error"):
             error_brief = str(error or extra.get("error")).replace("\n", " ").replace("\r", " ")[:200]
             if _is_zero_score_error(Exception(error_brief)):
-                if not await self._validate_or_drop(
-                    miner=miner, task_id=task_id,
-                    expected_deployment_id=expected_deployment_id,
-                    latency_ms=latency_ms,
-                ):
-                    return
                 await self._samples.persist(
                     miner_hotkey=miner.hotkey,
                     model_revision=miner.revision,
@@ -858,12 +1225,6 @@ class ExecutorWorker:
                 f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {error_brief}"
             )
             self.metrics.record_completion(success=False, latency_ms=latency_ms)
-            return
-        if not await self._validate_or_drop(
-            miner=miner, task_id=task_id,
-            expected_deployment_id=expected_deployment_id,
-            latency_ms=latency_ms,
-        ):
             return
         await self._samples.persist(
             miner_hotkey=miner.hotkey,
@@ -932,6 +1293,87 @@ def _collect_current_deployment_ids(champion, battle, predeployed) -> set:
             if d.deployment_id:
                 ids.add(d.deployment_id)
     return ids
+
+
+def _record_deployment_ids(record) -> set[str]:
+    return _collect_current_deployment_ids(None, record, [])
+
+
+def _same_subject(left: Any, right: Any) -> bool:
+    return (
+        getattr(left, "hotkey", None) == getattr(right, "hotkey", None)
+        and getattr(left, "revision", None) == getattr(right, "revision", None)
+    )
+
+
+def _record_has_deployment(record: Any, deployment_id: str) -> bool:
+    if getattr(record, "deployment_id", None) == deployment_id:
+        return True
+    return any(
+        getattr(deployment, "deployment_id", None) == deployment_id
+        for deployment in (getattr(record, "deployments", ()) or ())
+    )
+
+
+def _sample_outcome_evidence(
+    *, score: float, extra: Dict[str, Any],
+) -> SampleOutcomeEvidence:
+    usage = extra.get("usage")
+    total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+    return SampleOutcomeEvidence(
+        score=score,
+        commands_executed=extra.get("commands_executed"),
+        llm_call_count=extra.get("llm_call_count"),
+        total_tokens=total_tokens,
+        output_bytes=extra.get("output_bytes"),
+        terminated_reason=extra.get("terminated_reason"),
+    )
+
+
+def _runtime_signature_hash(
+    *,
+    environment: str,
+    evidence: SampleOutcomeEvidence,
+    classification: str,
+) -> str:
+    """Hash the complete invariant signature without retaining raw fields."""
+    return _stable_runtime_hash({
+        "kind": "runtime-invariant-signature-v1",
+        "environment": environment,
+        "score": evidence.score,
+        "terminated_reason": (
+            str(evidence.terminated_reason)
+            .replace("\n", " ")
+            .replace("\r", " ")[:256]
+            if evidence.terminated_reason is not None
+            else None
+        ),
+        "commands_executed": evidence.commands_executed,
+        "llm_call_count": evidence.llm_call_count,
+        "total_tokens": evidence.total_tokens,
+        "output_bytes": evidence.output_bytes,
+        "classification": classification,
+    })
+
+
+def _runtime_task_hash(*, environment: str, task_id: int) -> str:
+    """Hash task identity separately so retries dedupe without raw IDs."""
+    return _stable_runtime_hash({
+        "kind": "runtime-invariant-task-v1",
+        "environment": environment,
+        "task_id": int(task_id),
+    })
+
+
+def _stable_runtime_hash(payload: Dict[str, Any]) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _pick_url(urls: List[str], task_id: int, index: int) -> str:

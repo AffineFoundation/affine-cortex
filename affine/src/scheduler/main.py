@@ -26,6 +26,7 @@ import click
 
 from affine.core.setup import logger, setup_logging
 from affine.database import close_client, init_client
+from affine.database.dao.behavior_gate import BehaviorGateDAO
 from affine.utils.subtensor import get_subtensor
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.sample_results import SampleResultsDAO
@@ -520,6 +521,7 @@ async def _run() -> None:
         ),
         deployment_health_fn=deployment_health_fn,
         sample_metrics_reader=sample_metrics_reader,
+        behavior_gate_dao=BehaviorGateDAO(),
     )
 
     stop_event = asyncio.Event()

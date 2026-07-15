@@ -188,6 +188,7 @@ class StateStore:
     KEY_TASK_IDS = "current_task_ids"
     KEY_WINDOW_ROTATION = "window_rotation_request"
     KEY_ENVIRONMENTS = "environments"
+    KEY_BEHAVIOR_GATE = "behavior_gate"
 
     def __init__(self, kv: ConfigKVStore):
         self._kv = kv
@@ -340,6 +341,18 @@ class StateStore:
 
     async def get_environment_payloads(self) -> Dict[str, Any]:
         raw = await self._kv.get(self.KEY_ENVIRONMENTS, default={}) or {}
+        return raw if isinstance(raw, dict) else {}
+
+    async def get_behavior_gate_config(self) -> Dict[str, Any]:
+        """Return the live preflight behavior-gate configuration.
+
+        Keep this accessor payload-oriented instead of importing the guard's
+        policy dataclass here.  ``StateStore`` is shared by scheduler,
+        executor, API readers, and tests; the behavior-guard package owns
+        validation/defaults while this layer only provides the cross-service
+        config value.
+        """
+        raw = await self._kv.get(self.KEY_BEHAVIOR_GATE, default={}) or {}
         return raw if isinstance(raw, dict) else {}
 
 

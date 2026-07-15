@@ -33,6 +33,7 @@ from affine.src.scorer.comparator import WindowComparator
 from affine.src.scorer.sampler import WindowSampler
 from affine.src.scorer.weight_writer import WeightWriter
 from affine.src.scorer.window_state import (
+    BattleRecord,
     InMemoryConfigStore,
     MinerSnapshot,
     StateStore,
@@ -310,7 +311,7 @@ def _build_scheduler(
     window_blocks=WINDOW_BLOCKS, deployment_health_fn=None,
     list_active_endpoint_names_fn=None,
     list_active_endpoint_activations_fn=None,
-    task_pool_refresh_blocks=None, config=None,
+    task_pool_refresh_blocks=None, config=None, behavior_gate_dao=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -345,6 +346,7 @@ def _build_scheduler(
             list_active_endpoint_activations_fn
         ),
         deployment_health_fn=deployment_health_fn,
+        behavior_gate_dao=behavior_gate_dao,
     )
     return scheduler, state, weight_writer
 
@@ -388,6 +390,351 @@ def test_flow_config_task_pool_refresh_rejects_zero_env(monkeypatch):
 
     with pytest.raises(ValueError, match="positive integer"):
         FlowConfig(window_blocks=123)
+
+
+class _BehaviorGateFake:
+    def __init__(
+        self,
+        status: str | List[str],
+        reason: str = "test_reason",
+        *,
+        seal_results: Optional[List[bool | BaseException]] = None,
+    ):
+        self.statuses = [status] if isinstance(status, str) else list(status)
+        if not self.statuses:
+            raise ValueError("at least one behavior-gate status is required")
+        self.reason = reason
+        self.calls = []
+        self.seal_calls = []
+        self.seal_results = list(seal_results or [])
+
+    async def get_verdict(self, *identity):
+        self.calls.append(identity)
+        index = min(len(self.calls) - 1, len(self.statuses) - 1)
+        return {"status": self.statuses[index], "reason_code": self.reason}
+
+    async def seal_for_promotion(self, *identity):
+        self.seal_calls.append(identity)
+        if self.seal_results:
+            result = self.seal_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+        # Default fake semantics mirror the DAO: a currently-passed row can
+        # be sealed, and repeating the seal is idempotent.
+        index = max(0, min(len(self.calls) - 1, len(self.statuses) - 1))
+        return self.statuses[index] == "passed"
+
+
+async def _build_active_behavior_gate_case(
+    *,
+    status: str | List[str],
+    mode: str = "enforce",
+    seal_results: Optional[List[bool | BaseException]] = None,
+):
+    kv = _seed_state(sampling_count=1)
+    kv.data["behavior_gate"] = {
+        "enabled": True,
+        "mode": mode,
+        "policy_version": "test-v1",
+        "gated_environments": ["*"],
+    }
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [11], "ENV_B": [22]},
+        "refreshed_at_block": 10,
+    }
+    kv.data["champion"].update({
+        "deployment_id": "dep-champion",
+        "base_url": "https://champion.invalid/v1",
+    })
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 1, status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+        _make_miner(
+            2, "chal_hk", 2, status=STATUS_IN_PROGRESS,
+            revision="chal_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+    gate = _BehaviorGateFake(
+        status,
+        reason="strike_threshold:model_protocol_failure",
+        seal_results=seal_results,
+    )
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=samples,
+        task_pool_refresh_blocks=100,
+        behavior_gate_dao=gate,
+    )
+    await state.set_battle(BattleRecord(
+        challenger=MinerSnapshot(
+            uid=2,
+            hotkey="chal_hk",
+            revision="chal_rev",
+            model="org/challenger",
+        ),
+        deployment_id="dep-challenger",
+        base_url="https://challenger.invalid/v1",
+        started_at_block=12,
+    ))
+    return scheduler, state, miner_store, deployer, gate, samples
+
+
+def _fill_behavior_gate_winning_samples(samples: _SamplesFake) -> None:
+    for env, task_id in (("ENV_A", 11), ("ENV_B", 22)):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, [task_id],
+            score=0.1, refresh_block=10,
+        )
+        samples.set_samples(
+            "chal_hk", "chal_rev", env, [task_id],
+            score=0.9, refresh_block=10,
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_behavior_gate_marks_active_challenger_lost_and_tears_down():
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(status="failed")
+    )
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miners.rows[2]["termination_reason"] == (
+        "model_behavior:strike_threshold:model_protocol_failure"
+    )
+    assert deployer.teardowns == ["dep-challenger"]
+    assert len(gate.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending", "running", "suspected", "deferred"])
+async def test_nonfinal_behavior_gate_blocks_decision_without_model_loss(status):
+    scheduler, state, miners, deployer, _gate, _samples = (
+        await _build_active_behavior_gate_case(status=status)
+    )
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert deployer.teardowns == []
+
+
+@pytest.mark.asyncio
+async def test_shadow_behavior_gate_never_blocks_or_auto_loses():
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(status="failed", mode="shadow")
+    )
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert deployer.teardowns == []
+    assert gate.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("second_status", "expected_terminal"),
+    [("failed", True), ("pending", False)],
+)
+async def test_challenger_promotion_is_fenced_by_fresh_gate_snapshot(
+    second_status,
+    expected_terminal,
+):
+    scheduler, state, miners, deployer, gate, samples = (
+        await _build_active_behavior_gate_case(
+            status=["passed", second_status],
+        )
+    )
+    _fill_behavior_gate_winning_samples(samples)
+
+    battle = await state.get_battle()
+    champion = await state.get_champion()
+    task_state = await state.get_task_state()
+    scoring_envs = await state.get_scoring_environments()
+    assert battle is not None and champion is not None and task_state is not None
+    first_snapshot = await scheduler._active_behavior_gate_snapshot(
+        battle, scoring_envs,
+    )
+    assert first_snapshot is not None and first_snapshot.passed
+
+    await scheduler._decide(
+        champion, battle, scoring_envs, task_state, current_block=20,
+    )
+
+    champion = await state.get_champion()
+    assert champion is not None and champion.uid == 1
+    assert len(gate.calls) == 2
+    if expected_terminal:
+        assert await state.get_battle() is None
+        assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
+        assert miners.rows[2]["termination_reason"].startswith("model_behavior:")
+        assert deployer.teardowns == ["dep-challenger"]
+    else:
+        assert await state.get_battle() is not None
+        assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+        assert deployer.teardowns == []
+
+
+@pytest.mark.asyncio
+async def test_promotion_seals_after_old_champion_teardown(monkeypatch):
+    scheduler, state, miners, deployer, gate, samples = (
+        await _build_active_behavior_gate_case(status="passed")
+    )
+    _fill_behavior_gate_winning_samples(samples)
+    events = []
+    original_teardown = scheduler._teardown_record
+    original_seal = gate.seal_for_promotion
+
+    async def tracked_teardown(record):
+        events.append(f"teardown:{record.deployment_id}")
+        await original_teardown(record)
+
+    async def tracked_seal(*identity):
+        events.append("seal")
+        return await original_seal(*identity)
+
+    monkeypatch.setattr(scheduler, "_teardown_record", tracked_teardown)
+    monkeypatch.setattr(gate, "seal_for_promotion", tracked_seal)
+
+    champion = await state.get_champion()
+    battle = await state.get_battle()
+    task_state = await state.get_task_state()
+    envs = await state.get_scoring_environments()
+    assert champion is not None and battle is not None and task_state is not None
+
+    await scheduler._decide(
+        champion, battle, envs, task_state, current_block=20,
+    )
+
+    promoted = await state.get_champion()
+    assert promoted is not None and promoted.uid == 2
+    assert events[:2] == ["teardown:dep-champion", "seal"]
+    assert len(gate.seal_calls) == 1
+    assert miners.rows[2]["challenge_status"] == STATUS_CHAMPION
+    assert deployer.teardowns == ["dep-champion"]
+
+
+@pytest.mark.asyncio
+async def test_gate_failure_during_teardown_window_rolls_back_promotion():
+    scheduler, state, miners, deployer, gate, samples = (
+        await _build_active_behavior_gate_case(
+            status=["passed", "failed"],
+            seal_results=[False],
+        )
+    )
+    _fill_behavior_gate_winning_samples(samples)
+    champion = await state.get_champion()
+    battle = await state.get_battle()
+    task_state = await state.get_task_state()
+    envs = await state.get_scoring_environments()
+    assert champion is not None and battle is not None and task_state is not None
+
+    await scheduler._decide(
+        champion, battle, envs, task_state, current_block=20,
+    )
+
+    retained = await state.get_champion()
+    assert retained is not None and retained.uid == 1
+    assert retained.deployment_id is None
+    assert retained.base_url is None
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miners.rows[2]["termination_reason"].startswith("model_behavior:")
+    assert deployer.teardowns == ["dep-champion", "dep-challenger"]
+    assert len(gate.seal_calls) == 1
+    assert len(gate.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_pending_promotion_seal_pauses_with_old_deployment_cleared():
+    scheduler, state, miners, deployer, gate, samples = (
+        await _build_active_behavior_gate_case(
+            status=["passed", "pending"],
+            seal_results=[False],
+        )
+    )
+    _fill_behavior_gate_winning_samples(samples)
+    champion = await state.get_champion()
+    battle = await state.get_battle()
+    task_state = await state.get_task_state()
+    envs = await state.get_scoring_environments()
+    assert champion is not None and battle is not None and task_state is not None
+
+    await scheduler._decide(
+        champion, battle, envs, task_state, current_block=20,
+    )
+
+    retained = await state.get_champion()
+    assert retained is not None and retained.uid == 1
+    assert retained.deployment_id is None
+    assert retained.base_url is None
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert deployer.teardowns == ["dep-champion"]
+    assert len(gate.seal_calls) == 1
+    assert len(gate.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_behavior_gate_loss_retries_teardown_before_marking_terminal(
+    monkeypatch,
+):
+    scheduler, state, miners, _deployer, _gate, _samples = (
+        await _build_active_behavior_gate_case(status="failed")
+    )
+    attempts = 0
+
+    async def flaky_teardown(_record):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("transient teardown failure")
+
+    monkeypatch.setattr(scheduler, "_teardown_record", flaky_teardown)
+
+    with pytest.raises(RuntimeError, match="transient teardown failure"):
+        await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+
+    await scheduler.tick(current_block=21)
+
+    assert attempts == 2
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miners.rows[2]["termination_reason"].startswith("model_behavior:")
+
+
+@pytest.mark.asyncio
+async def test_failed_predeployed_gate_tears_down_and_marks_lost():
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(status="failed")
+    )
+    record = await state.get_battle()
+    assert record is not None
+    await state.clear_battle()
+    await state.set_predeployed_challengers([record])
+
+    await scheduler._predeploy_behavior_gate_sweep()
+
+    assert await state.get_predeployed_challengers() == []
+    assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miners.rows[2]["termination_reason"].endswith(":predeploy")
+    assert deployer.teardowns == ["dep-challenger"]
+    assert len(gate.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -1320,6 +1667,149 @@ async def test_recovery_terminates_old_champion_and_writes_weights():
     assert weight_writer.calls, "recovery must re-emit weights"
     # Battle cleared.
     assert await state.get_battle() is None
+
+
+@pytest.mark.asyncio
+async def test_post_promotion_recovery_failed_gate_restores_previous_champion():
+    kv = _seed_state(sampling_count=1)
+    kv.data["behavior_gate"] = {
+        "enabled": True,
+        "mode": "enforce",
+        "policy_version": "test-v1",
+        "gated_environments": ["*"],
+    }
+    kv.data["champion"] = {
+        "uid": 2,
+        "hotkey": "winner_hk",
+        "revision": "winner_rev",
+        "model": "org/m2",
+        "deployment_id": "wrk-002",
+        "base_url": "https://t/wrk-002",
+        "since_block": 50,
+    }
+    kv.data["current_battle"] = {
+        "challenger": {
+            "uid": 2,
+            "hotkey": "winner_hk",
+            "revision": "winner_rev",
+            "model": "org/m2",
+        },
+        "deployment_id": "wrk-002",
+        "base_url": "https://t/wrk-002",
+        "started_at_block": 40,
+        "previous_champion": {
+            "uid": 1,
+            "hotkey": "loser_hk",
+            "revision": "loser_rev",
+            "model": "org/m1",
+        },
+    }
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1], "ENV_B": [2]},
+        "refreshed_at_block": 10,
+    }
+    miners = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "loser_hk",
+            100,
+            status=STATUS_TERMINATED,
+            revision="loser_rev",
+        ),
+        _make_miner(
+            2,
+            "winner_hk",
+            200,
+            status=STATUS_CHAMPION,
+            revision="winner_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    weights = _WeightWriterFake()
+    gate = _BehaviorGateFake("failed", seal_results=[False])
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miners,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        weight_writer=weights,
+        behavior_gate_dao=gate,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    restored = await state.get_champion()
+    assert restored is not None and restored.uid == 1
+    assert restored.deployment_id is None
+    assert restored.base_url is None
+    assert await state.get_battle() is None
+    assert miners.rows[1]["challenge_status"] == STATUS_CHAMPION
+    assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert miners.rows[2]["termination_reason"].startswith("model_behavior:")
+    assert deployer.teardowns == ["wrk-002"]
+    assert gate.seal_calls
+    assert gate.calls
+    assert weights.calls
+
+
+@pytest.mark.asyncio
+async def test_post_promotion_recovery_failed_gate_without_previous_clears_champion():
+    kv = _seed_state(sampling_count=1)
+    kv.data["behavior_gate"] = {
+        "enabled": True,
+        "mode": "enforce",
+        "policy_version": "test-v1",
+        "gated_environments": ["*"],
+    }
+    kv.data["champion"] = {
+        "uid": 2,
+        "hotkey": "winner_hk",
+        "revision": "winner_rev",
+        "model": "org/m2",
+        "deployment_id": "wrk-002",
+        "base_url": "https://t/wrk-002",
+        "since_block": 50,
+    }
+    kv.data["current_battle"] = {
+        "challenger": {
+            "uid": 2,
+            "hotkey": "winner_hk",
+            "revision": "winner_rev",
+            "model": "org/m2",
+        },
+        "deployment_id": "wrk-002",
+        "base_url": "https://t/wrk-002",
+        "started_at_block": 40,
+    }
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1], "ENV_B": [2]},
+        "refreshed_at_block": 10,
+    }
+    miners = _InMemoryMinerStore([
+        _make_miner(
+            2,
+            "winner_hk",
+            200,
+            status=STATUS_CHAMPION,
+            revision="winner_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    gate = _BehaviorGateFake("failed", seal_results=[False])
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miners,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        behavior_gate_dao=gate,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    assert await state.get_champion() is None
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
+    assert deployer.teardowns == ["wrk-002"]
 
 
 @pytest.mark.asyncio

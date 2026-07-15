@@ -1,3 +1,9 @@
+import asyncio
+import logging
+
+import pytest
+
+import affine.src.executor.main as executor_main
 from affine.src.executor.worker import (
     _base_urls,
     _is_zero_score_error,
@@ -54,6 +60,75 @@ def test_executor_manager_recovers_stale_slots_after_worker_death():
     assert acquired == manager.total_budget
     for _ in range(acquired):
         manager.global_sem.release()
+
+
+@pytest.mark.asyncio
+async def test_behavior_preflight_supervisor_restarts_after_crash(
+    monkeypatch, caplog,
+):
+    manager = ExecutorManager([])
+    manager.running = True
+    calls = 0
+    restarted = asyncio.Event()
+    keep_running = asyncio.Event()
+
+    async def fake_preflight():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("test crash")
+        restarted.set()
+        await keep_running.wait()
+
+    monkeypatch.setattr(
+        executor_main, "BEHAVIOR_PREFLIGHT_RESTART_DELAY_SEC", 0,
+    )
+    monkeypatch.setattr(manager, "_run_behavior_preflight", fake_preflight)
+    with caplog.at_level(logging.ERROR, logger="affine"):
+        task = asyncio.create_task(manager._supervise_behavior_preflight())
+        manager._preflight_task = task
+        try:
+            await asyncio.wait_for(restarted.wait(), timeout=1)
+        finally:
+            manager.running = False
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert calls == 2
+    assert task.cancelled()
+    assert "coordinator crashed; restarting: RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_manager_stop_cancels_preflight_without_restarting(monkeypatch):
+    manager = ExecutorManager([])
+    manager.running = True
+    calls = 0
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def fake_preflight():
+        nonlocal calls
+        calls += 1
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(manager, "_run_behavior_preflight", fake_preflight)
+    task = asyncio.create_task(manager._supervise_behavior_preflight())
+    manager._preflight_task = task
+    await asyncio.wait_for(started.wait(), timeout=1)
+
+    await manager.stop()
+    await asyncio.sleep(0)
+
+    assert calls == 1
+    assert cancelled.is_set()
+    assert task.cancelled()
+    assert manager._preflight_task is None
 
 
 def test_base_urls_prefers_deployments_and_dedupes():
