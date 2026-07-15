@@ -53,7 +53,7 @@ from .flow import (
     DeploymentStateInvalidatedError,
     FlowConfig,
     FlowScheduler,
-    NoSpareEndpoint,
+    NoEndpointCapacity,
     TransientDeployError,
 )
 
@@ -107,6 +107,23 @@ def _is_scoring_endpoint(endpoint) -> bool:
     return (getattr(endpoint, "role", None) or "scoring") == "scoring"
 
 
+def _endpoint_is_available(endpoint) -> bool:
+    """Return whether an endpoint can be atomically reserved now."""
+    unassigned = (
+        getattr(endpoint, "assigned_uid", None) is None
+        and not getattr(endpoint, "assignment_token", None)
+        and not getattr(endpoint, "deployment_id", None)
+        and not getattr(endpoint, "assignment_status", None)
+    )
+    if unassigned:
+        return True
+    return (
+        getattr(endpoint, "assignment_status", None) == "deploying"
+        and int(getattr(endpoint, "assignment_expires_at", 0) or 0)
+        <= int(time.time())
+    )
+
+
 def _resolve_provider_kind(
     active: List[object],
     *,
@@ -146,29 +163,36 @@ def _resolve_provider_kind(
 
 
 def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List[object]:
-    """``endpoints[0]`` is the primary — champion + current challenger
-    time-share it. ``pre_challenger`` claims a free non-primary endpoint
-    or raises :exc:`NoSpareEndpoint`. Existing assignment for the same
-    miner is reused."""
+    """Choose an endpoint by runtime ownership rather than slot position.
+
+    An existing assignment for the same model identity is stable. Otherwise
+    every role may use the first free endpoint. A direct challenger deploy
+    may replace the champion only when no free endpoint exists, preserving
+    single-endpoint operation without allowing it to evict another queued or
+    active challenger.
+    """
     if not endpoints:
         raise RuntimeError("no active ssh endpoints")
     matching = [ep for ep in endpoints if _endpoint_matches_target(ep, target)]
     if matching:
         return matching
 
-    primary = endpoints[0]
-    if role == "pre_challenger":
-        candidates = [
-            ep for ep in endpoints[1:] if ep.assigned_uid is None
-        ]
-        if not candidates:
-            raise NoSpareEndpoint(
-                f"no free non-primary ssh endpoint for pre_challenger "
-                f"target_uid={target.uid}"
-            )
-        return [candidates[0]]
+    free = [ep for ep in endpoints if _endpoint_is_available(ep)]
+    if free:
+        return [free[0]]
 
-    return [primary]
+    if role == "challenger":
+        champions = [
+            ep for ep in endpoints
+            if getattr(ep, "assignment_role", None) in ("champion", "active")
+        ]
+        if champions:
+            return [champions[0]]
+
+    message = f"no free ssh endpoint for role={role} target_uid={target.uid}"
+    if role == "pre_challenger":
+        raise NoEndpointCapacity(message)
+    raise EndpointReservationConflict(message)
 
 
 async def _deploy_ssh_target(
@@ -213,7 +237,7 @@ async def _deploy_ssh_target(
                 f"before role={role!r} target_uid={target.uid} could claim it"
             )
             if role == "pre_challenger":
-                raise NoSpareEndpoint(message)
+                raise NoEndpointCapacity(message)
             raise EndpointReservationConflict(message)
         try:
             result = await ssh_lifecycle.deploy(cfg, target)
@@ -258,10 +282,10 @@ async def _deploy_ssh_target(
                 base_url=result.base_url,
             )
         )
-    primary = deployments[0]
+    representative = deployments[0]
     return targon_lifecycle.DeployResult(
-        deployment_id=primary.deployment_id,
-        base_url=primary.base_url,
+        deployment_id=representative.deployment_id,
+        base_url=representative.base_url,
         deployments=deployments,
     )
 
@@ -427,6 +451,34 @@ async def _run() -> None:
             finally:
                 await endpoints_dao.clear_assignment(name)
 
+        async def promote_deployment_fn(record):
+            deployment_ids = [
+                dep.deployment_id for dep in (record.deployments or [])
+                if dep.deployment_id
+            ]
+            if record.deployment_id:
+                deployment_ids.append(record.deployment_id)
+            deployment_ids = list(dict.fromkeys(deployment_ids))
+            if not deployment_ids:
+                return False
+
+            for deployment_id in deployment_ids:
+                name, _cfg = await _resolve_ssh_cfg(deployment_id)
+                if name is None:
+                    return False
+                promoted = await endpoints_dao.promote_assignment(
+                    name,
+                    uid=record.challenger.uid,
+                    hotkey=record.challenger.hotkey,
+                    model=record.challenger.model,
+                    revision=record.challenger.revision,
+                    deployment_id=deployment_id,
+                    role="challenger",
+                )
+                if not promoted:
+                    return False
+            return True
+
         async def deployment_health_fn(champion):
             if not champion.deployment_id:
                 return False
@@ -462,8 +514,8 @@ async def _run() -> None:
                 if _is_scoring_endpoint(ep)
             }
 
-        # SSH primary always time-shares champion + current challenger,
-        # so the flag is True regardless of endpoint count.
+        # Each SSH endpoint hosts one sglang model at a time. Runtime roles
+        # move between otherwise-equivalent active endpoints.
         flow_config = FlowConfig(single_instance_provider=True)
         targon_client = None
         logger.info(
@@ -494,6 +546,7 @@ async def _run() -> None:
             await targon_lifecycle.teardown(targon_client, deployment_id)
 
         deployment_health_fn = None
+        promote_deployment_fn = None
         list_active_ssh_endpoint_names = None
         list_active_ssh_endpoint_activations = None
         flow_config = FlowConfig()
@@ -520,6 +573,7 @@ async def _run() -> None:
             list_active_ssh_endpoint_activations
         ),
         deployment_health_fn=deployment_health_fn,
+        promote_deployment_fn=promote_deployment_fn,
         sample_metrics_reader=sample_metrics_reader,
         behavior_gate_dao=BehaviorGateDAO(),
     )

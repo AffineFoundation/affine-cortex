@@ -20,7 +20,6 @@ from affine.src.scheduler.flow import (
 from affine.src.scheduler.targon import (
     DeployResult,
     DeployTarget,
-    MachineDeployment,
 )
 from affine.src.scorer.challenger_queue import (
     ChallengerQueue,
@@ -31,7 +30,6 @@ from affine.src.scorer.challenger_queue import (
 )
 from affine.src.scorer.comparator import WindowComparator
 from affine.src.scorer.sampler import WindowSampler
-from affine.src.scorer.weight_writer import WeightWriter
 from affine.src.scorer.window_state import (
     BattleRecord,
     InMemoryConfigStore,
@@ -122,46 +120,36 @@ class _DeployTracker:
     deploys: List[DeployTarget] = field(default_factory=list)
     teardowns: List[Optional[str]] = field(default_factory=list)
     fail_on_deploy: bool = False
-    # Default: simulate a single-endpoint deployment — no spare for
-    # pre-sampling. ``_predeploy_fill_spare`` stops cleanly on this
-    # ``NoSpareEndpoint`` exactly like ``_select_ssh_endpoints`` would
+    # Default: simulate a single-endpoint deployment — no free capacity for
+    # pre-sampling. ``_predeploy_fill_available`` stops cleanly on this
+    # ``NoEndpointCapacity`` exactly like ``_select_ssh_endpoints`` would
     # report under one endpoint. Tests that want pre-sample slots set
     # ``pre_challenger_slots`` to allow that many extra deploys.
     pre_challenger_slots: int = 0
     next_deployment_id: int = 0
     predeploys: List[DeployTarget] = field(default_factory=list)
-    # uids that should raise a non-NoSpareEndpoint error on pre-deploy
+    promotions: List[str] = field(default_factory=list)
+    # uids that should raise a non-capacity error on pre-deploy
     # (simulates a real ssh / docker failure). The fill loop must
     # ``mark_terminated(FAILED)`` and advance to the next candidate.
     predeploy_failures: set = field(default_factory=set)
-    # Optional endpoint-name pool. Index 0 → champion/active deploys;
-    # index 1.. → successive pre-deploys. Empty (default) keeps the
-    # legacy behavior where ``deployments[*].endpoint_name`` is "" (from
-    # ``DeployResult.__post_init__``) — most existing tests rely on
-    # that. Tests exercising endpoint-reconciliation supply real names.
-    primary_endpoint: str = ""
-    spare_endpoints: List[str] = field(default_factory=list)
-    # deployment_id → endpoint_name, populated as deploys happen. Used
-    # by ``teardown_with_assignment_clear`` to simulate the production
-    # behavior where teardown also clears the endpoint's assigned_uid.
-    _ep_by_dep: Dict[str, str] = field(default_factory=dict)
     # uids whose teardown should raise on the FIRST attempt only.
-    teardown_failures_once: Set[int] = field(default_factory=set)
+    teardown_failures_once: Set[str] = field(default_factory=set)
     _teardown_attempts: Dict[str, int] = field(default_factory=dict)
 
     async def deploy(self, target: DeployTarget, role: str = "active") -> DeployResult:
         if role == "pre_challenger":
             if target.uid in self.predeploy_failures:
-                # Real deploy failure — distinct from 'no spare'. ssh.py's
+                # Real deploy failure — distinct from 'no capacity'. ssh.py's
                 # ``deploy`` raises generic ``RuntimeError`` on docker
                 # errors; we use that exact shape here.
                 raise RuntimeError(
                     f"simulated ssh deploy failure for uid={target.uid}"
                 )
             if len(self.predeploys) >= self.pre_challenger_slots:
-                from affine.src.scheduler.flow import NoSpareEndpoint
-                raise NoSpareEndpoint(
-                    "no free non-primary ssh endpoint for pre_challenger"
+                from affine.src.scheduler.flow import NoEndpointCapacity
+                raise NoEndpointCapacity(
+                    "no free ssh endpoint for pre_challenger"
                 )
             self.predeploys.append(target)
         else:
@@ -171,29 +159,6 @@ class _DeployTracker:
         self.next_deployment_id += 1
         did = f"wrk-{self.next_deployment_id:03d}"
         base_url = f"https://t/{did}"
-        # If the test supplied endpoint names, embed one in the
-        # MachineDeployment so reconciliation can find it. Pre-deploys
-        # consume the spare pool in order; active deploys use primary.
-        ep_name = ""
-        if role == "pre_challenger" and self.spare_endpoints:
-            idx = len(self.predeploys) - 1
-            if 0 <= idx < len(self.spare_endpoints):
-                ep_name = self.spare_endpoints[idx]
-        elif role != "pre_challenger" and self.primary_endpoint:
-            ep_name = self.primary_endpoint
-        if ep_name:
-            self._ep_by_dep[did] = ep_name
-            return DeployResult(
-                deployment_id=did,
-                base_url=base_url,
-                deployments=[
-                    MachineDeployment(
-                        endpoint_name=ep_name,
-                        deployment_id=did,
-                        base_url=base_url,
-                    )
-                ],
-            )
         return DeployResult(deployment_id=did, base_url=base_url)
 
     async def teardown(self, deployment_id: Optional[str]) -> None:
@@ -201,14 +166,8 @@ class _DeployTracker:
         # Optional: simulate a flaky teardown by raising once for a
         # configured uid. Test resets ``teardown_failures_once`` after
         # the expected retry boundary.
-        ep_name = self._ep_by_dep.get(deployment_id or "")
         attempts = self._teardown_attempts.get(deployment_id or "", 0) + 1
         self._teardown_attempts[deployment_id or ""] = attempts
-        if ep_name and attempts == 1:
-            # Look up by endpoint identity, not deployment, so tests can
-            # arm a failure before the deployment_id is known.
-            ep_uid_map = {v: k for k, v in self._ep_by_dep.items()}
-            del ep_uid_map  # noqa — kept for readability
         if attempts == 1 and deployment_id in {
             f"wrk-{i:03d}" for i in range(self.next_deployment_id + 1)
         }:
@@ -218,6 +177,10 @@ class _DeployTracker:
                 raise RuntimeError(
                     f"simulated teardown failure for {deployment_id}"
                 )
+
+    async def promote(self, record: BattleRecord) -> bool:
+        self.promotions.append(record.deployment_id)
+        return True
 
 
 class _SamplesFake:
@@ -312,6 +275,7 @@ def _build_scheduler(
     list_active_endpoint_names_fn=None,
     list_active_endpoint_activations_fn=None,
     task_pool_refresh_blocks=None, config=None, behavior_gate_dao=None,
+    promote_deployment_fn=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -347,6 +311,9 @@ def _build_scheduler(
         ),
         deployment_health_fn=deployment_health_fn,
         behavior_gate_dao=behavior_gate_dao,
+        promote_deployment_fn=(
+            promote_deployment_fn or deployer.promote
+        ),
     )
     return scheduler, state, weight_writer
 
@@ -1006,7 +973,7 @@ async def test_unhealthy_champion_deployment_is_cleared_and_redeployed():
     kv.data["champion"]["base_url"] = "https://t/stale"
     kv.data["champion"]["deployments"] = [
         {
-            "endpoint_name": "primary",
+            "endpoint_name": "endpoint-1",
             "deployment_id": "wrk-stale",
             "base_url": "https://t/stale",
         }
@@ -2332,7 +2299,6 @@ async def test_winning_challenger_must_top_up_samples_before_next_battle():
     just-promoted champion must therefore complete supplementary
     sampling — step 6 must block step 7 until the new champion reaches
     the champion threshold."""
-    from affine.src.scheduler.flow import FlowConfig
     kv = _seed_state(sampling_count=4)
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -3293,7 +3259,7 @@ async def test_no_early_invalidation_when_challenger_still_valid():
 
 
 @pytest.mark.asyncio
-async def test_predeploy_fills_spare_endpoints_in_fifo_order():
+async def test_predeploy_fills_available_capacity_in_fifo_order():
     """With pre-sample capacity, queued miners are pre-deployed in
     ``(first_block, uid)`` order. Champion is excluded; the active
     battle's challenger (if any) is also excluded."""
@@ -3321,7 +3287,42 @@ async def test_predeploy_fills_spare_endpoints_in_fifo_order():
 
 
 @pytest.mark.asyncio
-async def test_predeploy_stops_cleanly_when_no_spare_endpoint():
+async def test_single_model_provider_deploys_champion_before_prechallenger():
+    """Dynamic placement must not let predeployment consume the only free
+    endpoint before the champion has a serving runtime."""
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=1)
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+    )
+
+    await scheduler.tick(current_block=50)
+
+    assert deployer.predeploys == []
+    assert (await state.get_predeployed_challengers()) == []
+
+    await scheduler.tick(current_block=51)
+
+    assert [target.uid for target in deployer.deploys] == [1]
+    assert [target.uid for target in deployer.predeploys] == [2]
+
+
+@pytest.mark.asyncio
+async def test_predeploy_stops_cleanly_when_no_capacity():
     """Default single-machine config (``pre_challenger_slots=0``)
     surfaces ``RuntimeError`` on the first attempt; the scheduler must
     bail without leaving partial state."""
@@ -3381,7 +3382,7 @@ async def test_predeploy_invalidation_sweep_tears_down_without_status_write():
 async def test_predeploy_invalidation_sweep_drops_record_matching_champion():
     """Crash mid-``_adopt_predeployed_if_present`` can leave a stale
     record whose uid is the newly-installed champion. Sweep must tear
-    it down so the spare endpoint can be filled again."""
+    it down so the endpoint can be filled again."""
     from affine.src.scorer.window_state import (
         BattleRecord, ChampionRecord, DeploymentRecord, MinerSnapshot,
     )
@@ -3428,6 +3429,65 @@ async def test_predeploy_invalidation_sweep_drops_record_matching_champion():
 
     assert (await state.get_predeployed_challengers()) == []
     assert stale_dep_id in deployer.teardowns
+
+
+@pytest.mark.asyncio
+async def test_predeploy_sweep_keeps_promoted_champion_runtime_alive():
+    """A crash can leave the in-place promoted deployment in both champion
+    and predeployed state after current_battle has been cleared."""
+    from affine.src.scorer.window_state import (
+        ChampionRecord, DeploymentRecord,
+    )
+
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            7, "winner_hk", 50,
+            status=STATUS_CHAMPION, revision="r7",
+        ),
+    ])
+    deployer = _DeployTracker()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+    )
+    deployment = DeploymentRecord(
+        endpoint_name="endpoint-2",
+        deployment_id="wrk-promoted",
+        base_url="https://t/wrk-promoted",
+    )
+    await state.set_champion(ChampionRecord(
+        uid=7,
+        hotkey="winner_hk",
+        revision="r7",
+        model="org/m7",
+        deployment_id=deployment.deployment_id,
+        base_url=deployment.base_url,
+        deployments=[deployment],
+        since_block=50,
+    ))
+    await state.set_predeployed_challengers([
+        BattleRecord(
+            challenger=MinerSnapshot(
+                uid=7,
+                hotkey="winner_hk",
+                revision="r7",
+                model="org/m7",
+            ),
+            deployment_id=deployment.deployment_id,
+            base_url=deployment.base_url,
+            started_at_block=40,
+            deployments=[deployment],
+        ),
+    ])
+
+    await scheduler._predeploy_invalidation_sweep()
+
+    assert (await state.get_predeployed_challengers()) == []
+    assert deployer.teardowns == []
+    assert (await state.get_champion()).deployment_id == "wrk-promoted"
 
 
 @pytest.mark.asyncio
@@ -3485,8 +3545,8 @@ async def test_predeploy_early_loss_terminates_sure_loser():
 @pytest.mark.asyncio
 async def test_start_battle_adopts_predeployed_record():
     """When ``pick_next`` selects a miner that was pre-deployed, the
-    pre-sample slot is torn down (one extra teardown) and the active
-    battle deploys on the primary."""
+    running deployment is promoted in place. The old champion's distinct
+    endpoint is released only after current_battle is durable."""
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -3496,14 +3556,20 @@ async def test_start_battle_adopts_predeployed_record():
     samples = _SamplesFake()
     scheduler, state, _ = _build_scheduler(
         kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
     )
 
-    # Refresh + champion deploy + predeploy uid=2 on a spare slot.
+    # Refresh, then champion deploy + predeploy uid=2 on a free endpoint.
     await scheduler.tick(current_block=50)
     await scheduler.tick(current_block=51)
     pre = await state.get_predeployed_challengers()
     assert [p.challenger.uid for p in pre] == [2]
     pre_dep_id = pre[0].deployment_id
+    champion_dep_id = (await state.get_champion()).deployment_id
+    active_deploys_before = len(deployer.deploys)
     teardowns_before = len(deployer.teardowns)
 
     # Complete champion baseline so step 7 fires _start_battle.
@@ -3518,11 +3584,285 @@ async def test_start_battle_adopts_predeployed_record():
 
     battle = await state.get_battle()
     assert battle is not None and battle.challenger.uid == 2
-    assert pre_dep_id in deployer.teardowns
-    # Pre-sample slot freed before active deploy went out.
+    assert battle.deployment_id == pre_dep_id
+    assert deployer.promotions == [pre_dep_id]
+    assert len(deployer.deploys) == active_deploys_before
+    assert pre_dep_id not in deployer.teardowns
+    assert champion_dep_id in deployer.teardowns
     assert len(deployer.teardowns) > teardowns_before
-    # No longer in pre-list (adopted).
     assert (await state.get_predeployed_challengers()) == []
+    champion = await state.get_champion()
+    assert champion.deployment_id is None
+    assert champion.base_url is None
+    assert champion.deployments == []
+
+
+@pytest.mark.asyncio
+async def test_stale_predeployment_promotion_drops_state_without_teardown():
+    from affine.src.scorer.window_state import ChampionRecord
+
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker()
+    samples = _SamplesFake()
+
+    async def reject_stale_assignment(_record):
+        return False
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=samples,
+        promote_deployment_fn=reject_stale_assignment,
+    )
+    champion = ChampionRecord(
+        uid=1,
+        hotkey="champ_hk",
+        revision="champ_rev",
+        model="org/m1",
+        deployment_id="wrk-champion",
+        base_url="https://t/wrk-champion",
+    )
+    await state.set_champion(champion)
+    stale = BattleRecord(
+        challenger=MinerSnapshot(
+            uid=2,
+            hotkey="chal_hk",
+            revision="chal_rev",
+            model="org/m2",
+        ),
+        deployment_id="wrk-stale",
+        base_url="https://t/wrk-stale",
+        started_at_block=40,
+    )
+    await state.set_predeployed_challengers([stale])
+
+    await scheduler._start_battle(champion, current_block=50)
+
+    assert await state.get_battle() is None
+    assert (await state.get_predeployed_challengers()) == []
+    assert miner_store.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert deployer.teardowns == []
+
+
+@pytest.mark.asyncio
+async def test_battle_retries_champion_runtime_release_after_teardown_error():
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=1)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=samples,
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    champion_dep_id = (await state.get_champion()).deployment_id
+    deployer.teardown_failures_once.add(champion_dep_id)
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_state.task_ids[env],
+            refresh_block=task_state.refreshed_at_block,
+        )
+
+    await scheduler.tick(current_block=52)
+
+    assert (await state.get_battle()) is not None
+    assert (await state.get_champion()).deployment_id == champion_dep_id
+
+    await scheduler.tick(current_block=53)
+
+    assert (await state.get_champion()).deployment_id is None
+    assert deployer.teardowns.count(champion_dep_id) == 2
+
+
+@pytest.mark.asyncio
+async def test_predeploy_waits_while_champion_runtime_release_is_pending():
+    """A failed SSH teardown may clear DB assignment ownership before its
+    retry succeeds. Persistent champion runtime state must keep that endpoint
+    from being reassigned in the interim."""
+    from affine.src.scorer.window_state import ChampionRecord
+
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(
+            2, "active_hk", 200,
+            status=STATUS_IN_PROGRESS, revision="active_rev",
+        ),
+        _make_miner(3, "queued_hk", 300, revision="queued_rev"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=1)
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+    )
+    champion = ChampionRecord(
+        uid=1,
+        hotkey="champ_hk",
+        revision="champ_rev",
+        model="org/m1",
+        deployment_id="wrk-champ-pending-cleanup",
+        base_url="https://t/wrk-champ-pending-cleanup",
+    )
+    await state.set_champion(champion)
+    await state.set_battle(BattleRecord(
+        challenger=MinerSnapshot(
+            uid=2,
+            hotkey="active_hk",
+            revision="active_rev",
+            model="org/m2",
+        ),
+        deployment_id="wrk-active",
+        base_url="https://t/wrk-active",
+        started_at_block=50,
+    ))
+
+    await scheduler._predeploy_fill_available(champion, current_block=51)
+
+    assert deployer.predeploys == []
+    assert (await state.get_predeployed_challengers()) == []
+
+
+@pytest.mark.asyncio
+async def test_single_endpoint_model_swap_does_not_teardown_active_challenger():
+    from affine.src.scorer.window_state import ChampionRecord, DeploymentRecord
+
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(
+            2, "chal_hk", 200,
+            status=STATUS_IN_PROGRESS, revision="chal_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+    )
+    shared = DeploymentRecord(
+        endpoint_name="only-endpoint",
+        deployment_id="ssh:only-endpoint:affine-sglang-current",
+        base_url="https://only-endpoint/v1",
+    )
+    champion = ChampionRecord(
+        uid=1,
+        hotkey="champ_hk",
+        revision="champ_rev",
+        model="org/m1",
+        deployment_id=shared.deployment_id,
+        base_url=shared.base_url,
+        deployments=[shared],
+    )
+    await state.set_champion(champion)
+    battle = BattleRecord(
+        challenger=MinerSnapshot(
+            uid=2,
+            hotkey="chal_hk",
+            revision="chal_rev",
+            model="org/m2",
+        ),
+        deployment_id=shared.deployment_id,
+        base_url=shared.base_url,
+        deployments=[shared],
+        started_at_block=50,
+    )
+
+    released = await scheduler._release_champion_runtime_for_battle(
+        champion, battle,
+    )
+
+    assert released is True
+    assert deployer.teardowns == []
+    persisted = await state.get_champion()
+    assert persisted.deployment_id is None
+    assert persisted.deployments == []
+
+
+@pytest.mark.asyncio
+async def test_predeploy_sweep_drops_active_battle_duplicate_without_teardown():
+    from affine.src.scorer.window_state import DeploymentRecord
+
+    kv = _seed_state()
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(
+            2, "chal_hk", 200,
+            status=STATUS_IN_PROGRESS, revision="chal_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+    )
+    deployment = DeploymentRecord(
+        endpoint_name="endpoint-2",
+        deployment_id="wrk-shared",
+        base_url="https://t/wrk-shared",
+    )
+    record = BattleRecord(
+        challenger=MinerSnapshot(
+            uid=2, hotkey="chal_hk", revision="chal_rev", model="org/m2",
+        ),
+        deployment_id=deployment.deployment_id,
+        base_url=deployment.base_url,
+        started_at_block=50,
+        deployments=[deployment],
+    )
+    await state.set_battle(record)
+    await state.set_predeployed_challengers([record])
+
+    await scheduler._predeploy_invalidation_sweep()
+
+    assert (await state.get_predeployed_challengers()) == []
+    assert deployer.teardowns == []
+    assert (await state.get_battle()).deployment_id == "wrk-shared"
 
 
 @pytest.mark.asyncio
@@ -3590,8 +3930,8 @@ async def test_predeploy_phase_noop_without_champion():
 @pytest.mark.asyncio
 async def test_predeploy_excludes_active_battle_challenger():
     """The active ``current_battle.challenger`` must never appear in
-    the pre-deployed list — they occupy the primary endpoint, not a
-    spare. The exclusion lives in :meth:`_predeploy_fill_spare`."""
+    the pre-deployed list. The exclusion lives in
+    :meth:`_predeploy_fill_available`."""
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
@@ -3663,19 +4003,19 @@ async def test_predeploy_deploy_failure_keeps_candidate_and_advances():
 
 
 @pytest.mark.asyncio
-async def test_predeploy_no_spare_does_not_mark_failed():
-    """``NoSpareEndpoint`` is a clean termination signal — the
+async def test_predeploy_no_capacity_does_not_mark_failed():
+    """``NoEndpointCapacity`` is a clean termination signal — the
     candidate miner must NOT be marked FAILED (they're a valid
     candidate, just no host for them right now). This is the
-    asymmetry between 'no spare' and 'real deploy error' that
-    motivated introducing ``NoSpareEndpoint`` as a distinct
+    asymmetry between 'no capacity' and 'real deploy error' that
+    motivated introducing ``NoEndpointCapacity`` as a distinct
     exception class."""
     kv = _seed_state()
     miner_store = _InMemoryMinerStore([
         _make_miner(1, "champ_hk", 100, status=STATUS_CHAMPION, revision="champ_rev"),
         _make_miner(2, "queued", 50, revision="r2"),
     ])
-    deployer = _DeployTracker()  # 0 pre-sample slots → NoSpareEndpoint
+    deployer = _DeployTracker()  # 0 pre-sample slots → NoEndpointCapacity
     samples = _SamplesFake()
     scheduler, state, _ = _build_scheduler(
         kv=kv, miner_store=miner_store, deployer=deployer, samples=samples,
@@ -3718,7 +4058,7 @@ async def test_reaper_skips_old_orphan_without_endpoint_snapshot():
 def test_orphan_release_reason_uses_endpoint_lifecycle():
     assert FlowScheduler._orphan_release_reason(
         claimed_at=100,
-        endpoint_activations={"primary": 200},
+        endpoint_activations={"endpoint-1": 200},
     ).startswith("endpoint_reactivated_after_claim:")
     assert FlowScheduler._orphan_release_reason(
         claimed_at=100,
@@ -3726,7 +4066,7 @@ def test_orphan_release_reason_uses_endpoint_lifecycle():
     ) == "no_active_endpoint"
     assert FlowScheduler._orphan_release_reason(
         claimed_at=200,
-        endpoint_activations={"primary": 100},
+        endpoint_activations={"endpoint-1": 100},
     ) == "stale_claim_endpoint_stable"
     assert FlowScheduler._orphan_release_reason(
         claimed_at=200,
@@ -3771,7 +4111,7 @@ async def test_reaper_releases_orphan_after_endpoint_reactivation():
     miner_store.rows[99]["challenge_claimed_at"] = 100
 
     async def endpoint_activations():
-        return {"primary": 200}
+        return {"endpoint-1": 200}
 
     scheduler, state, _ = _build_scheduler(
         kv=kv, miner_store=miner_store,
@@ -3796,7 +4136,7 @@ async def test_reaper_releases_old_orphan_when_endpoint_stayed_stable():
     miner_store.rows[99]["challenge_claimed_at"] = 200
 
     async def endpoint_activations():
-        return {"primary": 100}
+        return {"endpoint-1": 100}
 
     scheduler, _, _ = _build_scheduler(
         kv=kv, miner_store=miner_store,

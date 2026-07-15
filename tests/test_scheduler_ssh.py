@@ -47,6 +47,11 @@ class _EndpointStub:
     assigned_hotkey: str | None = None
     assigned_model: str | None = None
     assigned_revision: str | None = None
+    deployment_id: str | None = None
+    assignment_role: str | None = None
+    assignment_token: str | None = None
+    assignment_status: str | None = None
+    assignment_expires_at: int = 0
 
 
 # ---- SSHConfig.from_endpoint ----------------------------------------------
@@ -151,11 +156,7 @@ def test_select_ssh_endpoints_reuses_matching_assignment():
     assert _select_ssh_endpoints(endpoints, target, role="champion") == [endpoints[1]]
 
 
-def test_select_ssh_endpoints_battle_roles_pin_to_primary():
-    """Champion and current-challenger always run on the primary
-    endpoint (single-instance time-share semantics — see
-    ``flow_config.single_instance_provider``). The pre-sample slot is
-    what consumes the other endpoints."""
+def test_select_ssh_endpoints_all_roles_take_first_free_endpoint():
     target = _target()
     endpoints = [_EndpointStub("a"), _EndpointStub("b"), _EndpointStub("c")]
 
@@ -165,50 +166,153 @@ def test_select_ssh_endpoints_battle_roles_pin_to_primary():
     challenger = _select_ssh_endpoints(endpoints, target, role="challenger")
     assert [ep.name for ep in challenger] == ["a"]
 
+    pre = _select_ssh_endpoints(endpoints, target, role="pre_challenger")
+    assert [ep.name for ep in pre] == ["a"]
 
-def test_select_ssh_endpoints_pre_challenger_takes_first_free_non_primary():
+
+def test_select_ssh_endpoints_skips_busy_endpoints_without_fixed_slots():
     target = _target()
-    endpoints = [_EndpointStub("a"), _EndpointStub("b"), _EndpointStub("c")]
+    endpoints = [
+        _EndpointStub(
+            "a",
+            assigned_uid=999,
+            assignment_role="champion",
+            assignment_token="owner-a",
+            assignment_status="ready",
+            deployment_id="dep-a",
+        ),
+        _EndpointStub(
+            "b",
+            assignment_token="reserving-b",
+            assignment_status="deploying",
+            assignment_expires_at=4_000_000_000,
+        ),
+        _EndpointStub("c"),
+    ]
 
     pre = _select_ssh_endpoints(endpoints, target, role="pre_challenger")
-    assert [ep.name for ep in pre] == ["b"]
-
-    endpoints[1].assigned_uid = 999
-    pre2 = _select_ssh_endpoints(endpoints, target, role="pre_challenger")
-    assert [ep.name for ep in pre2] == ["c"]
+    assert [ep.name for ep in pre] == ["c"]
 
 
-def test_select_ssh_endpoints_pre_challenger_raises_no_spare_endpoint():
-    """Single-endpoint deployments have no spare for pre-sampling, and
+def test_select_ssh_endpoints_challenger_can_replace_champion_when_full():
+    target = _target()
+    endpoints = [
+        _EndpointStub(
+            "a",
+            assigned_uid=10,
+            assignment_role="pre_challenger",
+            assignment_token="owner-a",
+            assignment_status="ready",
+            deployment_id="dep-a",
+        ),
+        _EndpointStub(
+            "b",
+            assigned_uid=1,
+            assignment_role="champion",
+            assignment_token="owner-b",
+            assignment_status="ready",
+            deployment_id="dep-b",
+        ),
+    ]
+
+    selected = _select_ssh_endpoints(endpoints, target, role="challenger")
+
+    assert [ep.name for ep in selected] == ["b"]
+
+
+def test_select_ssh_endpoints_challenger_replaces_legacy_active_role():
+    endpoint = _EndpointStub(
+        "only-endpoint",
+        assigned_uid=1,
+        assignment_role="active",
+        assignment_token="legacy-owner",
+        assignment_status="ready",
+        deployment_id="legacy-deployment",
+    )
+
+    selected = _select_ssh_endpoints(
+        [endpoint], _target(), role="challenger",
+    )
+
+    assert selected == [endpoint]
+
+
+def test_select_ssh_endpoints_can_reclaim_expired_reservation():
+    expired = _EndpointStub(
+        "expired",
+        assigned_uid=99,
+        assignment_role="pre_challenger",
+        assignment_token="expired-owner",
+        assignment_status="deploying",
+        assignment_expires_at=1,
+    )
+
+    selected = _select_ssh_endpoints(
+        [expired], _target(), role="pre_challenger",
+    )
+
+    assert selected == [expired]
+
+
+def test_select_ssh_endpoints_pre_challenger_raises_when_none_free():
+    """Single-endpoint deployments have no capacity for pre-sampling, and
     pre-deploy attempts must surface the structured
-    :class:`NoSpareEndpoint` so the scheduler's fill loop can tell
-    'no spare' (terminate cleanly) apart from real deploy failures
+    :class:`NoEndpointCapacity` so the scheduler's fill loop can tell
+    'no capacity' (terminate cleanly) apart from real deploy failures
     (mark FAILED and advance).
 
     Subclassing ``RuntimeError`` keeps backward compatibility for any
     caller catching the broader type — verified by both
     ``isinstance`` checks below."""
-    from affine.src.scheduler.flow import NoSpareEndpoint
+    from affine.src.scheduler.flow import NoEndpointCapacity
 
     target = _target()
-    endpoints = [_EndpointStub("a")]
+    endpoints = [_EndpointStub(
+        "a",
+        assigned_uid=1,
+        assignment_role="champion",
+        assignment_token="owner-a",
+        assignment_status="ready",
+        deployment_id="dep-a",
+    )]
 
     try:
         _select_ssh_endpoints(endpoints, target, role="pre_challenger")
-    except NoSpareEndpoint as e:
-        assert isinstance(e, RuntimeError)
-    else:
-        raise AssertionError("expected NoSpareEndpoint for no spare endpoint")
-
-    endpoints2 = [_EndpointStub("a"), _EndpointStub("b", assigned_uid=99)]
-    try:
-        _select_ssh_endpoints(endpoints2, target, role="pre_challenger")
-    except NoSpareEndpoint as e:
+    except NoEndpointCapacity as e:
         assert isinstance(e, RuntimeError)
     else:
         raise AssertionError(
-            "expected NoSpareEndpoint when only spare is assigned"
+            "expected NoEndpointCapacity when endpoint is busy"
         )
+
+    endpoints2 = [
+        _EndpointStub("a", assigned_uid=98),
+        _EndpointStub("b", assigned_uid=99),
+    ]
+    try:
+        _select_ssh_endpoints(endpoints2, target, role="pre_challenger")
+    except NoEndpointCapacity as e:
+        assert isinstance(e, RuntimeError)
+    else:
+        raise AssertionError(
+            "expected NoEndpointCapacity when every endpoint is assigned"
+        )
+
+
+def test_select_ssh_endpoints_does_not_evict_non_champion_assignment():
+    from affine.src.scheduler.main import EndpointReservationConflict
+
+    endpoints = [_EndpointStub(
+        "a",
+        assigned_uid=99,
+        assignment_role="pre_challenger",
+        assignment_token="owner-a",
+        assignment_status="ready",
+        deployment_id="dep-a",
+    )]
+
+    with pytest.raises(EndpointReservationConflict, match="no free ssh endpoint"):
+        _select_ssh_endpoints(endpoints, _target(), role="challenger")
 
 
 def test_sglang_args_carry_model_and_revision():
@@ -743,8 +847,7 @@ async def test_wait_ready_raises_early_on_container_exit(monkeypatch):
     seconds after ``docker run``. ``_wait_ready`` polls container status
     next to the HTTP probe and raises immediately on a non-running
     container — without this it would silently spin until the full
-    ``ready_timeout_sec`` (30 min default), blocking the spare endpoint."""
-    import asyncio
+    ``ready_timeout_sec`` (30 min default), blocking the assigned endpoint."""
     from affine.src.scheduler.ssh import _wait_ready
 
     async def fake_probe_ready(base_url, *, timeout_sec=5.0):
@@ -772,7 +875,6 @@ async def test_wait_ready_raises_early_on_container_exit(monkeypatch):
 async def test_wait_ready_does_not_probe_container_when_config_omitted(monkeypatch):
     """Backward-compat: call sites that don't pass ``config`` skip the
     container poll (legacy behavior — pure HTTP wait until timeout)."""
-    import asyncio
     from affine.src.scheduler.ssh import _wait_ready
 
     async def fake_probe_ready(base_url, *, timeout_sec=5.0):
