@@ -110,6 +110,28 @@ def test_load_environment_uses_override_without_pull_and_host_network(
     assert request["api_key"] == "per-call-secret"
 
 
+def test_load_environment_rejects_untrusted_basilica_before_affinetes_load(
+    monkeypatch,
+):
+    load_calls = []
+
+    monkeypatch.setitem(
+        sys.modules,
+        "affinetes",
+        SimpleNamespace(load_env=lambda **kwargs: load_calls.append(kwargs)),
+    )
+    monkeypatch.setenv("BASILICA_API_TOKEN", "test-only-token")
+
+    with pytest.raises(ValueError, match="refuses untrusted execution mode 'basilica'"):
+        eval_mod._load_environment(
+            "instruction-gym",
+            network_host=False,
+            basilica=True,
+        )
+
+    assert load_calls == []
+
+
 def test_evaluate_one_preserves_environment_failure_and_redacts_nested_secrets():
     original = {
         "score": 0.0,

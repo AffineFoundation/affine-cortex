@@ -238,10 +238,13 @@ def _load_environment(
     """Bring up one affinetes env container and return a thin wrapper that
     forwards ``evaluate(**)`` plus the env's per-call timeout."""
     import affinetes as af_env
-    from affine.core.environments import ENV_CONFIGS
+    from affine.core.environments import ENV_CONFIGS, validate_execution_mode
 
     config = ENV_CONFIGS[env_name]
-    mode = "basilica" if basilica else "docker"
+    mode = validate_execution_mode(
+        config,
+        "basilica" if basilica else "docker",
+    )
     env_vars = dict(config.env_vars or {})
     api_key = os.getenv("API_KEY")
     if config.forward_api_key:

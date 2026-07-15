@@ -1,7 +1,7 @@
 """
 Window sampler
 
-Picks a fixed set of task_ids from each env's dataset_range. Two modes:
+Picks a fixed set of task_ids from each env's dataset_range. Three modes:
 
 - ``mode='latest'`` (SWE / DISTILL): take the highest N task_ids in
   ``dataset_range`` (the dataset's tail). These datasets append-only
@@ -10,6 +10,9 @@ Picks a fixed set of task_ids from each env's dataset_range. Two modes:
   N distinct task_ids weighted by range size. The generated pool is persisted
   by the scheduler, so restarts reuse the stored task ids instead of
   re-sampling.
+- ``mode='template_stratified_v1'`` (InstructionGym): use a pinned release
+  manifest to balance templates, then sample assignments within each selected
+  template. The resulting values remain direct global task IDs.
 """
 
 import random
@@ -17,11 +20,13 @@ import secrets
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
 
+from affine.core.instruction_gym_sampling import load_sampling_manifest, sample_task_ids
 from affine.core.range_set import RangeSet
 
 
 SAMPLING_MODE_LATEST = "latest"
 SAMPLING_MODE_RANDOM = "random"
+SAMPLING_MODE_TEMPLATE_STRATIFIED_V1 = "template_stratified_v1"
 
 
 @dataclass(frozen=True)
@@ -30,6 +35,7 @@ class EnvSamplingConfig:
     dataset_range: List[List[int]]
     sampling_count: int
     mode: str = SAMPLING_MODE_RANDOM
+    sampling_manifest_sha256: str = ""
 
 
 class WindowSampler:
@@ -124,9 +130,35 @@ class WindowSampler:
             elif cfg.mode == SAMPLING_MODE_RANDOM:
                 rng = self._rng()
                 result[env] = self._sample_one_env(ranges, cfg.sampling_count, rng)
+            elif cfg.mode == SAMPLING_MODE_TEMPLATE_STRATIFIED_V1:
+                manifest = load_sampling_manifest(cfg.sampling_manifest_sha256)
+                from affine.core.environments import (
+                    INSTRUCTION_GYM_TASK_ID_END,
+                    INSTRUCTION_GYM_UNIVERSE_ID,
+                )
+
+                if (
+                    manifest.universe_id != INSTRUCTION_GYM_UNIVERSE_ID
+                    or manifest.case_id_end != INSTRUCTION_GYM_TASK_ID_END
+                ):
+                    raise ValueError(
+                        "InstructionGym sampling manifest does not match the Actor contract"
+                    )
+                expected_ranges = [(0, manifest.case_id_end)]
+                if ranges != expected_ranges:
+                    raise ValueError(
+                        f"dataset_range for env={env!r} must exactly match the "
+                        f"InstructionGym manifest range {expected_ranges}"
+                    )
+                result[env] = sample_task_ids(
+                    manifest,
+                    cfg.sampling_count,
+                    self._rng(),
+                )
             else:
                 raise ValueError(
                     f"unknown sampling mode {cfg.mode!r} for env={env!r}; "
-                    f"expected {SAMPLING_MODE_LATEST!r} or {SAMPLING_MODE_RANDOM!r}"
+                    f"expected {SAMPLING_MODE_LATEST!r}, {SAMPLING_MODE_RANDOM!r}, "
+                    f"or {SAMPLING_MODE_TEMPLATE_STRATIFIED_V1!r}"
                 )
         return result
