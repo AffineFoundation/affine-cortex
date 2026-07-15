@@ -21,27 +21,42 @@ _ENV_CACHE: Dict[str, Any] = {}
 _ENV_LOCK = Lock()
 
 
-def _is_base_url_key(key: Any) -> bool:
-    return "".join(ch for ch in str(key).lower() if ch.isalnum()) == "baseurl"
+def _normalized_field_name(key: Any) -> str:
+    return "".join(ch for ch in str(key).lower() if ch.isalnum())
 
 
-def _remove_base_url_fields(value: Any) -> Any:
-    """Return ``value`` without any base_url fields.
+def _is_sensitive_request_key(key: Any) -> bool:
+    normalized = _normalized_field_name(key)
+    return (
+        normalized == "baseurl"
+        or normalized.endswith("apikey")
+        or normalized.endswith("authorization")
+    )
 
-    The inference endpoint is wire-only routing metadata. It must not become
-    part of persisted sample extras or public/debug sample surfaces.
+
+def _remove_sensitive_request_fields(value: Any) -> Any:
+    """Recursively remove endpoint routing and credential fields.
+
+    These values are wire-only request metadata. They must not become part of
+    persisted sample extras, including when an environment echoes a nested
+    request or headers mapping.
     """
     if isinstance(value, dict):
         return {
-            key: _remove_base_url_fields(item)
+            key: _remove_sensitive_request_fields(item)
             for key, item in value.items()
-            if not _is_base_url_key(key)
+            if not _is_sensitive_request_key(key)
         }
     if isinstance(value, list):
-        return [_remove_base_url_fields(item) for item in value]
+        return [_remove_sensitive_request_fields(item) for item in value]
     if isinstance(value, tuple):
-        return tuple(_remove_base_url_fields(item) for item in value)
+        return tuple(_remove_sensitive_request_fields(item) for item in value)
     return value
+
+
+def _remove_base_url_fields(value: Any) -> Any:
+    """Backward-compatible alias for recursive request sanitization."""
+    return _remove_sensitive_request_fields(value)
 
 
 # ========================= Utility Functions =========================
@@ -101,9 +116,24 @@ class EnvConfig:
 
     # Basilica mode configuration (optional)
     cpu_limit: Optional[str] = None  # e.g., "4000m" for basilica mode
+    # Appended to preserve the positional ABI of the pre-existing fields.
+    # Most legacy environments consume the validator's global model API key
+    # from their process environment. Environments that route each call to a
+    # dynamic miner endpoint must opt out so a shared secret cannot be sent to
+    # an arbitrary base_url. Such environments may accept an explicitly
+    # caller-provided per-call key instead.
+    forward_api_key: bool = True
 
 
 # ========================= Environment Configurations =========================
+
+INSTRUCTION_GYM_UNIVERSE_ID = (
+    "ifeval_templates_v4:"
+    "6678152f3da165d389353a00c8b397a3fbf556f66e92e34bc1dcb194d1a6de53"
+)
+INSTRUCTION_GYM_SUITE_ID = "instruction_gym_ifeval_templates_v4"
+INSTRUCTION_GYM_TASK_ID_END = 102_636_151
+
 
 # Canonical environment configurations
 _ENV_CONFIGS_CANONICAL = {
@@ -409,6 +439,27 @@ _ENV_CONFIGS_CANONICAL = {
         proxy_timeout=7260,
     ),
 
+    # InstructionGym IFEval-template v4. Keep the source contract explicit:
+    # task_id is the sole prompt address, while seed only controls model
+    # sampling. The environment remains disabled in system_config until a
+    # provider-bound image is published; replace the tag with its immutable
+    # registry digest before enabling production sampling.
+    "instruction-gym": EnvConfig(
+        name="instruction-gym",
+        docker_image="affinefoundation/instruction-gym:latest",
+        env_vars={"UVICORN_WORKERS": "4"},
+        forward_api_key=False,
+        mem_limit="4g",
+        eval_params={
+            "protocol_version": "1.0",
+            "universe_id": INSTRUCTION_GYM_UNIVERSE_ID,
+            "suite_id": INSTRUCTION_GYM_SUITE_ID,
+            "temperature": 0.0,
+            "timeout": 600,
+        },
+        proxy_timeout=660,
+    ),
+
     "terminal": EnvConfig(
         name="terminal",
         docker_image="affinefoundation/terminal:latest",
@@ -502,6 +553,13 @@ _ENV_ALIASES = {
     "memorygym": "memory",
     "MemoryGym": "memory",
 
+    # InstructionGym aliases
+    "INSTRUCTION-GYM": "instruction-gym",
+    "InstructionGym": "instruction-gym",
+    "instructiongym": "instruction-gym",
+    "instruction_gym": "instruction-gym",
+    "INSTRUCTION_GYM": "instruction-gym",
+
     # NavWorld aliases
     "NAVWORLD": "navworld",
     "NavWorld": "navworld",
@@ -586,22 +644,23 @@ class SDKEnvironment:
         """Get environment variables for this environment"""
         env_vars: Dict[str, str] = {}
         api_key = os.getenv("API_KEY")
-        if api_key:
-            env_vars["API_KEY"] = api_key
-        # Legacy / SDK-name aliases for env containers that haven't been
-        # rebuilt to consume ``API_KEY`` directly. Each maps to ``API_KEY``
-        # by default; an explicit host-side value wins.
-        #
-        #   - ``CHUTES_API_KEY``  — pre-PR-#449 affine env images (e.g.
-        #     ``swebench:infinite``) check this on the request path and
-        #     reject the call with HTTP 500 if unset.
-        #   - ``OPENAI_API_KEY``  — env images using ``openai-python`` (e.g.
-        #     ``liveweb-arena``) raise ``OpenAIError`` if unset, falling
-        #     into retry storms.
-        for alias in ("CHUTES_API_KEY", "OPENAI_API_KEY"):
-            val = os.getenv(alias) or api_key
-            if val:
-                env_vars[alias] = val
+        if self.config.forward_api_key:
+            if api_key:
+                env_vars["API_KEY"] = api_key
+            # Legacy / SDK-name aliases for env containers that haven't been
+            # rebuilt to consume ``API_KEY`` directly. Each maps to ``API_KEY``
+            # by default; an explicit host-side value wins.
+            #
+            #   - ``CHUTES_API_KEY``  — pre-PR-#449 affine env images (e.g.
+            #     ``swebench:infinite``) check this on the request path and
+            #     reject the call with HTTP 500 if unset.
+            #   - ``OPENAI_API_KEY``  — env images using ``openai-python`` (e.g.
+            #     ``liveweb-arena``) raise ``OpenAIError`` if unset, falling
+            #     into retry storms.
+            for alias in ("CHUTES_API_KEY", "OPENAI_API_KEY"):
+                val = os.getenv(alias) or api_key
+                if val:
+                    env_vars[alias] = val
 
         # Forward any required host env vars into the container for this environment
         for key in self.config.required_env_vars:
@@ -845,9 +904,9 @@ class SDKEnvironment:
     def _build_result(self, result: Dict[str, Any], miner: Optional["Miner"],
                      payload: Dict[str, Any], start_time: float) -> Result:
         """Build Result object from evaluation result."""
-        extra = _remove_base_url_fields(result.get("extra", {}) or {})
+        extra = _remove_sensitive_request_fields(result.get("extra", {}) or {})
         extra["image"] = self.docker_image
-        sanitized = _remove_base_url_fields(payload)
+        sanitized = _remove_sensitive_request_fields(payload)
         extra["request"] = sanitized
         
         return Result(
@@ -985,6 +1044,13 @@ LOGPROBS = LOGPROBS_factory
 # Memory factory
 MEMORY_factory = lambda mode=None: create_environment("memory", mode=mode)
 MEMORY = MEMORY_factory
+
+# InstructionGym factory
+def INSTRUCTION_GYM_factory(mode=None):
+    return create_environment("instruction-gym", mode=mode)
+
+
+INSTRUCTION_GYM = INSTRUCTION_GYM_factory
 
 # Terminel factory
 TERMINAL_factory = lambda mode=None: create_environment("terminal", mode=mode)

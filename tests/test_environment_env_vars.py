@@ -66,6 +66,19 @@ def test_no_api_key_set_no_aliases_emitted():
     assert "OPENAI_API_KEY" not in env_vars
 
 
+def test_instruction_gym_never_forwards_global_api_credentials():
+    env_vars = _get_env_vars_with(
+        {
+            "API_KEY": "global-secret",
+            "CHUTES_API_KEY": "chutes-secret",
+            "OPENAI_API_KEY": "openai-secret",
+        },
+        env_name="instruction-gym",
+    )
+
+    assert env_vars == {"UVICORN_WORKERS": "4"}
+
+
 def test_liveweb_requires_dashscope_api_key_and_validator_base_url():
     with pytest.raises(ValueError, match="DASHSCOPE_API_KEY"):
         _get_env_vars_with(
@@ -116,8 +129,13 @@ def test_build_result_removes_all_base_url_fields():
             "extra": {
                 "base_url": "http://10.0.0.1:8000/v1",
                 "baseUrl": "http://10.0.0.2:8000/v1",
+                "API_KEY": "environment-secret",
                 "nested": {
                     "base-url": "http://10.0.0.3:8000/v1",
+                    "headers": {
+                        "Authorization": "Bearer nested-secret",
+                        "X-API-Key": "nested-api-secret",
+                    },
                     "ok": True,
                 },
             },
@@ -127,6 +145,7 @@ def test_build_result_removes_all_base_url_fields():
             "task_id": 123,
             "model": "org/model",
             "base_url": "http://10.0.0.4:8000/v1",
+            "api_key": "request-secret",
         },
         time.monotonic(),
     )
@@ -135,10 +154,17 @@ def test_build_result_removes_all_base_url_fields():
     assert "base_url" not in result.extra
     assert "baseUrl" not in result.extra
     assert "base-url" not in result.extra["nested"]
+    assert "headers" in result.extra["nested"]
+    assert result.extra["nested"]["headers"] == {}
     assert "base_url" not in result.extra["request"]
+    assert "api_key" not in result.extra["request"]
     assert "10.0.0.1" not in payload
     assert "10.0.0.2" not in payload
     assert "10.0.0.3" not in payload
     assert "10.0.0.4" not in payload
+    assert "environment-secret" not in payload
+    assert "nested-secret" not in payload
+    assert "nested-api-secret" not in payload
+    assert "request-secret" not in payload
     assert result.extra["nested"]["ok"] is True
     assert result.extra["request"]["model"] == "org/model"
