@@ -43,6 +43,7 @@ from affine.src.scorer.dao_adapters import (
 from affine.src.scorer.sampler import WindowSampler
 from affine.src.scorer.weight_writer import WeightWriter
 from affine.src.scorer.window_state import (
+    BattleRecord,
     StateStore,
     SystemConfigKVAdapter,
 )
@@ -50,6 +51,7 @@ from affine.src.scorer.window_state import (
 from . import ssh as ssh_lifecycle
 from . import targon as targon_lifecycle
 from .flow import (
+    DeploymentRoleTransitionResult,
     DeploymentStateInvalidatedError,
     FlowConfig,
     FlowScheduler,
@@ -122,6 +124,104 @@ def _endpoint_is_available(endpoint) -> bool:
         and int(getattr(endpoint, "assignment_expires_at", 0) or 0)
         <= int(time.time())
     )
+
+
+_DEPLOYMENT_ROLE_PREDECESSORS = {
+    "challenger": ("pre_challenger",),
+    # ``active`` is the legacy role used by deployments created before role
+    # tracking was split into champion/challenger assignments.
+    "champion": ("challenger", "active"),
+}
+
+
+async def _transition_ssh_deployment_role(
+    endpoints_dao,
+    ssh_configs: Dict[str, ssh_lifecycle.SSHConfig],
+    record: BattleRecord,
+    role: str,
+) -> DeploymentRoleTransitionResult:
+    """Fence an SSH runtime role change and classify failures for flow."""
+    expected_roles = _DEPLOYMENT_ROLE_PREDECESSORS.get(role)
+    if expected_roles is None:
+        raise ValueError(
+            f"unsupported deployment role transition target: {role!r}"
+        )
+
+    deployment_names: Dict[str, Optional[str]] = {}
+    for deployment in record.deployments or []:
+        if deployment.deployment_id:
+            deployment_names[deployment.deployment_id] = (
+                deployment.endpoint_name or None
+            )
+    if record.deployment_id:
+        deployment_names.setdefault(record.deployment_id, None)
+    if not deployment_names:
+        return DeploymentRoleTransitionResult.STALE
+
+    cached_names = {
+        cfg.deployment_id(): name for name, cfg in ssh_configs.items()
+    }
+    for deployment_id, name in tuple(deployment_names.items()):
+        if name is None:
+            deployment_names[deployment_id] = cached_names.get(deployment_id)
+
+    unresolved = [
+        deployment_id
+        for deployment_id, name in deployment_names.items()
+        if name is None
+    ]
+    if unresolved:
+        try:
+            live = await endpoints_dao.list_active(kind="ssh")
+        except Exception as e:
+            logger.warning(
+                "scheduler: live endpoint lookup failed during role "
+                f"transition uid={record.challenger.uid} role={role}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        live_names: Dict[str, str] = {}
+        try:
+            for endpoint in live:
+                if not _is_scoring_endpoint(endpoint):
+                    continue
+                cfg = ssh_lifecycle.SSHConfig.from_endpoint(endpoint)
+                ssh_configs[endpoint.name] = cfg
+                live_names[cfg.deployment_id()] = endpoint.name
+        except Exception as e:
+            logger.warning(
+                "scheduler: active endpoint config could not be resolved "
+                f"during role transition uid={record.challenger.uid} "
+                f"role={role}: {type(e).__name__}: {e}"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        for deployment_id in unresolved:
+            deployment_names[deployment_id] = live_names.get(deployment_id)
+        if any(name is None for name in deployment_names.values()):
+            return DeploymentRoleTransitionResult.STALE
+
+    for deployment_id, name in deployment_names.items():
+        try:
+            promoted = await endpoints_dao.promote_assignment(
+                name,
+                uid=record.challenger.uid,
+                hotkey=record.challenger.hotkey,
+                model=record.challenger.model,
+                revision=record.challenger.revision,
+                deployment_id=deployment_id,
+                role=role,
+                expected_roles=expected_roles,
+            )
+        except Exception as e:
+            logger.warning(
+                "scheduler: provider assignment update failed during role "
+                f"transition uid={record.challenger.uid} role={role} "
+                f"endpoint={name!r}: {type(e).__name__}: {e}"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        if not promoted:
+            return DeploymentRoleTransitionResult.STALE
+    return DeploymentRoleTransitionResult.UPDATED
 
 
 def _resolve_provider_kind(
@@ -452,41 +552,12 @@ async def _run() -> None:
                 await endpoints_dao.clear_assignment(name)
 
         async def transition_deployment_role_fn(record, role):
-            expected_roles = {
-                "challenger": "pre_challenger",
-                "champion": "challenger",
-            }
-            if role not in expected_roles:
-                raise ValueError(
-                    f"unsupported deployment role transition target: {role!r}"
-                )
-            deployment_ids = [
-                dep.deployment_id for dep in (record.deployments or [])
-                if dep.deployment_id
-            ]
-            if record.deployment_id:
-                deployment_ids.append(record.deployment_id)
-            deployment_ids = list(dict.fromkeys(deployment_ids))
-            if not deployment_ids:
-                return False
-
-            for deployment_id in deployment_ids:
-                name, _cfg = await _resolve_ssh_cfg(deployment_id)
-                if name is None:
-                    return False
-                promoted = await endpoints_dao.promote_assignment(
-                    name,
-                    uid=record.challenger.uid,
-                    hotkey=record.challenger.hotkey,
-                    model=record.challenger.model,
-                    revision=record.challenger.revision,
-                    deployment_id=deployment_id,
-                    role=role,
-                    expected_role=expected_roles[role],
-                )
-                if not promoted:
-                    return False
-            return True
+            return await _transition_ssh_deployment_role(
+                endpoints_dao,
+                ssh_configs,
+                record,
+                role,
+            )
 
         async def deployment_health_fn(champion):
             if not champion.deployment_id:

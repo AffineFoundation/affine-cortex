@@ -37,6 +37,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from affine.core.setup import logger
@@ -128,6 +129,14 @@ class DeploymentStateInvalidatedError(RuntimeError):
         self.invalidated_deployment_ids = tuple(
             did for did in deployment_ids if did
         )
+
+
+class DeploymentRoleTransitionResult(str, Enum):
+    """Outcome of fencing a runtime role change in provider state."""
+
+    UPDATED = "updated"
+    RETRYABLE = "retryable"
+    STALE = "stale"
 
 
 SYSTEM_MINER_MIN_UID = 1000
@@ -239,10 +248,12 @@ ListCurrentMinersFn = Callable[[], Awaitable[List[Dict[str, Any]]]]
 DeployFn = Callable[[targon_lifecycle.DeployTarget, str],
                     Awaitable[targon_lifecycle.DeployResult]]
 TeardownFn = Callable[[Optional[str]], Awaitable[None]]
-TransitionDeploymentRoleFn = Callable[[BattleRecord, str], Awaitable[bool]]
+TransitionDeploymentRoleFn = Callable[
+    [BattleRecord, str], Awaitable[DeploymentRoleTransitionResult]
+]
 """Move an already-running deployment to the requested runtime role.
-Returns False when the persisted provider assignment no longer owns the
-deployment; raises for transient provider/control-plane failures."""
+The result distinguishes a durable update, a transient control-plane failure,
+and a permanently stale provider assignment."""
 
 ListActiveEndpointNamesFn = Callable[[], Awaitable[set]]
 """Return the set of currently-active endpoint names. Used by the
@@ -1885,46 +1896,44 @@ class FlowScheduler:
             remaining.append(record)
 
         if adopted is not None:
-            if self._transition_deployment_role is not None:
+            transition = await self._transition_runtime_role(
+                adopted, "challenger",
+            )
+            if transition is DeploymentRoleTransitionResult.RETRYABLE:
+                released = await self.queue.release_claim(
+                    candidate.uid,
+                    hotkey=candidate.hotkey,
+                    revision=candidate.revision,
+                )
+                logger.warning(
+                    f"FlowScheduler: pre-deployment promotion temporarily "
+                    f"failed for uid={candidate.uid}; retaining runtime and "
+                    f"releasing claim={released} for retry"
+                )
+                return
+            if transition is DeploymentRoleTransitionResult.STALE:
+                # The provider assignment has moved to another owner.
+                # Drop only the stale state reference; tearing it down by
+                # endpoint-stable deployment id could kill that new owner.
                 try:
-                    promoted = await self._transition_deployment_role(
-                        adopted, "challenger",
-                    )
+                    await self.state.set_predeployed_challengers(remaining)
                 except Exception as e:
                     logger.error(
-                        f"FlowScheduler: pre-deployment promotion failed "
-                        f"for uid={candidate.uid}; retaining runtime and "
-                        f"releasing claim for retry: {type(e).__name__}: {e}"
+                        f"FlowScheduler: failed to drop stale pre-"
+                        f"deployment uid={candidate.uid}: "
+                        f"{type(e).__name__}: {e}"
                     )
-                    await self.queue.release_claim(
-                        candidate.uid,
-                        hotkey=candidate.hotkey,
-                        revision=candidate.revision,
-                    )
-                    return
-                if not promoted:
-                    # The provider assignment has moved to another owner.
-                    # Drop only the stale state reference; tearing it down by
-                    # endpoint-stable deployment id could kill that new owner.
-                    try:
-                        await self.state.set_predeployed_challengers(remaining)
-                    except Exception as e:
-                        logger.error(
-                            f"FlowScheduler: failed to drop stale pre-"
-                            f"deployment uid={candidate.uid}: "
-                            f"{type(e).__name__}: {e}"
-                        )
-                    released = await self.queue.release_claim(
-                        candidate.uid,
-                        hotkey=candidate.hotkey,
-                        revision=candidate.revision,
-                    )
-                    logger.warning(
-                        f"FlowScheduler: pre-deployed uid={candidate.uid} "
-                        f"no longer owns its provider assignment; dropped "
-                        f"stale record and released claim={released}"
-                    )
-                    return
+                released = await self.queue.release_claim(
+                    candidate.uid,
+                    hotkey=candidate.hotkey,
+                    revision=candidate.revision,
+                )
+                logger.warning(
+                    f"FlowScheduler: pre-deployed uid={candidate.uid} "
+                    f"no longer owns its provider assignment; dropped "
+                    f"stale record and released claim={released}"
+                )
+                return
 
             battle = BattleRecord(
                 challenger=adopted.challenger,
@@ -2032,33 +2041,47 @@ class FlowScheduler:
             f"vs champion uid={champion.uid}"
         )
 
-    async def _promote_runtime_to_champion(
-        self, battle: BattleRecord,
-    ) -> bool:
-        """Fence canonical champion state behind the provider role update."""
+    async def _transition_runtime_role(
+        self, record: BattleRecord, role: str,
+    ) -> DeploymentRoleTransitionResult:
         if self._transition_deployment_role is None:
-            return True
+            return DeploymentRoleTransitionResult.UPDATED
         try:
-            promoted = await self._transition_deployment_role(
-                battle, "champion",
-            )
+            result = await self._transition_deployment_role(record, role)
         except Exception as e:
             logger.error(
-                "FlowScheduler: challenger-to-champion provider role "
-                f"transition failed for uid={battle.challenger.uid}; "
-                "retaining battle for retry: "
+                f"FlowScheduler: provider role transition failed "
+                f"for uid={record.challenger.uid} role={role}; "
                 f"{type(e).__name__}: {e}"
             )
-            return False
-        if not promoted:
+            return DeploymentRoleTransitionResult.RETRYABLE
+        if not isinstance(result, DeploymentRoleTransitionResult):
+            logger.error(
+                f"FlowScheduler: provider role transition returned invalid "
+                f"result={result!r} for uid={record.challenger.uid} "
+                f"role={role}; retrying without changing scheduler state"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        return result
+
+    async def _promote_runtime_to_champion(
+        self, battle: BattleRecord,
+    ) -> DeploymentRoleTransitionResult:
+        """Fence runtime reuse behind the provider's persisted assignment."""
+        result = await self._transition_runtime_role(battle, "champion")
+        if result is DeploymentRoleTransitionResult.RETRYABLE:
             logger.error(
                 "FlowScheduler: challenger-to-champion provider role "
-                f"transition rejected for uid={battle.challenger.uid}; "
-                "persisted assignment no longer matches the battle, "
-                "retaining battle for retry"
+                f"transition temporarily failed for uid="
+                f"{battle.challenger.uid}; retaining battle for retry"
             )
-            return False
-        return True
+        elif result is DeploymentRoleTransitionResult.STALE:
+            logger.warning(
+                "FlowScheduler: challenger-to-champion provider role "
+                f"transition rejected for uid={battle.challenger.uid}; "
+                "winner remains valid but its stale runtime will not be reused"
+            )
+        return result
 
     async def _deployment_capacity_available(self, role: str) -> bool:
         """Return whether an SSH/single-instance deployment can start now.
@@ -2156,8 +2179,15 @@ class FlowScheduler:
                         f"reason={reason}"
                     )
                 return
-            if not await self._promote_runtime_to_champion(battle):
+            transition = await self._promote_runtime_to_champion(battle)
+            if transition is DeploymentRoleTransitionResult.RETRYABLE:
                 return
+            if transition is DeploymentRoleTransitionResult.STALE:
+                # The winner was already made canonical before the crash, but
+                # its provider assignment has since disappeared or changed
+                # owner. Preserve the evaluation result and force a clean
+                # champion deploy on a later tick.
+                await self._clear_champion_deployment_state(champion)
             logger.info(
                 f"FlowScheduler: detected post-promotion crash recovery "
                 f"for uid={champion.uid}; finalizing bookkeeping without "
@@ -2408,17 +2438,25 @@ class FlowScheduler:
                     f"reason={reason}"
                 )
                 return
-            if not await self._promote_runtime_to_champion(battle):
+            transition = await self._promote_runtime_to_champion(battle)
+            if transition is DeploymentRoleTransitionResult.RETRYABLE:
                 return
+            reuse_runtime = (
+                transition is DeploymentRoleTransitionResult.UPDATED
+            )
             new_champion = ChampionRecord(
                 uid=battle.challenger.uid,
                 hotkey=battle.challenger.hotkey,
                 revision=battle.challenger.revision,
                 model=battle.challenger.model,
                 model_type=battle.challenger.model_type,
-                deployment_id=battle.deployment_id,
-                base_url=battle.base_url,
-                deployments=list(battle.deployments),
+                deployment_id=(
+                    battle.deployment_id if reuse_runtime else None
+                ),
+                base_url=battle.base_url if reuse_runtime else None,
+                deployments=(
+                    list(battle.deployments) if reuse_runtime else []
+                ),
                 since_block=current_block,
             )
             # Order: write the canonical champion record FIRST so any

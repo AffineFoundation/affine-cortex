@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 from botocore.exceptions import ClientError
 
@@ -354,17 +354,33 @@ class InferenceEndpointsDAO(BaseDAO):
         revision: str,
         deployment_id: str,
         role: str = "challenger",
-        expected_role: str = "pre_challenger",
+        expected_roles: Sequence[str] = ("pre_challenger",),
         updated_by: str = "scheduler",
     ) -> bool:
         """Atomically change a ready deployment's runtime role.
 
         The full model identity and deployment id fence the update so an old
-        state record cannot relabel a newer owner of the same endpoint. Both
-        ``expected_role`` and the target ``role`` are accepted, making the
+        state record cannot relabel a newer owner of the same endpoint. The
+        expected predecessor roles and target role are accepted, making the
         transition idempotent without accepting unrelated runtime roles.
         """
         now = int(time.time())
+        accepted_roles = tuple(dict.fromkeys((*expected_roles, role)))
+        role_conditions = []
+        condition_values: Dict[str, Any] = {
+            ":active": True,
+            ":uid": uid,
+            ":hotkey": hotkey,
+            ":model": model,
+            ":revision": revision,
+            ":deployment": deployment_id,
+            ":ready": "ready",
+        }
+        for index, accepted_role in enumerate(accepted_roles):
+            value_key = f":accepted_role_{index}"
+            role_conditions.append(f"#cond_role = {value_key}")
+            condition_values[value_key] = accepted_role
+
         return await self._update_endpoint_fields(
             name,
             set_values={
@@ -378,7 +394,7 @@ class InferenceEndpointsDAO(BaseDAO):
                 "#cond_uid = :uid AND #cond_hotkey = :hotkey AND "
                 "#cond_model = :model AND #cond_revision = :revision AND "
                 "#cond_deployment = :deployment AND #cond_status = :ready "
-                "AND (#cond_role = :expected_role OR #cond_role = :role)"
+                f"AND ({' OR '.join(role_conditions)})"
             ),
             condition_names={
                 "#cond_active": "active",
@@ -390,17 +406,7 @@ class InferenceEndpointsDAO(BaseDAO):
                 "#cond_status": "assignment_status",
                 "#cond_role": "assignment_role",
             },
-            condition_values={
-                ":active": True,
-                ":uid": uid,
-                ":hotkey": hotkey,
-                ":model": model,
-                ":revision": revision,
-                ":deployment": deployment_id,
-                ":ready": "ready",
-                ":expected_role": expected_role,
-                ":role": role,
-            },
+            condition_values=condition_values,
             return_false_on_condition_failure=True,
         )
 

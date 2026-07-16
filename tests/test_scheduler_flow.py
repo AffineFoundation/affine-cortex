@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import pytest
 
 from affine.src.scheduler.flow import (
+    DeploymentRoleTransitionResult,
     DeploymentStateInvalidatedError,
     FlowConfig,
     FlowScheduler,
@@ -129,6 +130,9 @@ class _DeployTracker:
     next_deployment_id: int = 0
     predeploys: List[DeployTarget] = field(default_factory=list)
     promotions: List[Tuple[str, str]] = field(default_factory=list)
+    transition_results: List[
+        DeploymentRoleTransitionResult
+    ] = field(default_factory=list)
     # uids that should raise a non-capacity error on pre-deploy
     # (simulates a real ssh / docker failure). The fill loop must
     # ``mark_terminated(FAILED)`` and advance to the next candidate.
@@ -178,9 +182,13 @@ class _DeployTracker:
                     f"simulated teardown failure for {deployment_id}"
                 )
 
-    async def transition_role(self, record: BattleRecord, role: str) -> bool:
+    async def transition_role(
+        self, record: BattleRecord, role: str,
+    ) -> DeploymentRoleTransitionResult:
         self.promotions.append((record.deployment_id, role))
-        return True
+        if self.transition_results:
+            return self.transition_results.pop(0)
+        return DeploymentRoleTransitionResult.UPDATED
 
 
 @dataclass
@@ -192,7 +200,9 @@ class _SingleEndpointDeployTracker:
     transitions: List[Tuple[str, str]] = field(default_factory=list)
     endpoint_role: Optional[str] = None
     deployment_id: str = "ssh:only-endpoint:affine-sglang-current"
-    champion_transition_failures: int = 0
+    champion_transition_results: List[
+        DeploymentRoleTransitionResult
+    ] = field(default_factory=list)
 
     async def deploy(
         self, target: DeployTarget, role: str = "active",
@@ -222,21 +232,23 @@ class _SingleEndpointDeployTracker:
 
     async def transition_role(
         self, record: BattleRecord, role: str,
-    ) -> bool:
-        expected_role = {
-            "challenger": "pre_challenger",
-            "champion": "challenger",
+    ) -> DeploymentRoleTransitionResult:
+        expected_roles = {
+            "challenger": ("pre_challenger",),
+            "champion": ("challenger", "active"),
         }[role]
-        if role == "champion" and self.champion_transition_failures > 0:
-            self.champion_transition_failures -= 1
-            return False
+        if role == "champion" and self.champion_transition_results:
+            result = self.champion_transition_results.pop(0)
+            if result is DeploymentRoleTransitionResult.STALE:
+                self.endpoint_role = None
+            return result
         if record.deployment_id != self.deployment_id:
-            return False
-        if self.endpoint_role not in (expected_role, role):
-            return False
+            return DeploymentRoleTransitionResult.STALE
+        if self.endpoint_role not in (*expected_roles, role):
+            return DeploymentRoleTransitionResult.STALE
         self.endpoint_role = role
         self.transitions.append((record.deployment_id, role))
-        return True
+        return DeploymentRoleTransitionResult.UPDATED
 
 
 class _SamplesFake:
@@ -1552,7 +1564,16 @@ async def test_idempotent_state_within_tick_storm():
 
 
 @pytest.mark.asyncio
-async def test_post_promotion_crash_recovery_does_not_self_demote():
+@pytest.mark.parametrize(
+    "transition_result",
+    [
+        DeploymentRoleTransitionResult.UPDATED,
+        DeploymentRoleTransitionResult.STALE,
+    ],
+)
+async def test_post_promotion_crash_recovery_does_not_self_demote(
+    transition_result,
+):
     """If the scheduler crashes between ``set_champion(new)`` and
     ``clear_battle()``, the saved state has ``champion.uid ==
     battle.challenger.uid`` (the new champion is also the in-flight
@@ -1591,7 +1612,7 @@ async def test_post_promotion_crash_recovery_does_not_self_demote():
         "task_ids": {"ENV_A": [1, 2, 3, 4, 5], "ENV_B": [6, 7, 8, 9, 10]},
         "refreshed_at_block": 0,
     }
-    deployer = _DeployTracker()
+    deployer = _DeployTracker(transition_results=[transition_result])
     samples = _SamplesFake()
     for env, tids in [("ENV_A", [1, 2, 3, 4, 5]), ("ENV_B", [6, 7, 8, 9, 10])]:
         samples.set_samples("winner_hk", "winner_rev", env, tids, score=0.5)
@@ -1608,6 +1629,12 @@ async def test_post_promotion_crash_recovery_does_not_self_demote():
     assert champ is not None and champ.uid == 2, (
         f"recovery wrongly demoted the just-promoted champion: got {champ}"
     )
+    if transition_result is DeploymentRoleTransitionResult.STALE:
+        assert champ.deployment_id is None
+        assert champ.base_url is None
+        assert champ.deployments == []
+    else:
+        assert champ.deployment_id == "wrk-002"
     # Battle cleared.
     assert await state.get_battle() is None
     assert deployer.promotions == [("wrk-002", "champion")]
@@ -2348,9 +2375,9 @@ async def test_decided_battle_snapshot_outcome_persists_battle_rules():
         assert abs(env_row["delta"] - 0.4) < 1e-9
 
 
-@pytest.mark.asyncio
-async def test_single_endpoint_win_relabels_runtime_before_next_battle():
-    """A winner is canonical only after its endpoint role is durable."""
+async def _single_endpoint_battle_ready_for_challenger_win(
+    transition_results: List[DeploymentRoleTransitionResult],
+):
     kv = _seed_state(sampling_count=4)
     miner_store = _InMemoryMinerStore([
         _make_miner(
@@ -2361,7 +2388,9 @@ async def test_single_endpoint_win_relabels_runtime_before_next_battle():
         _make_miner(3, "next_hk", 300, revision="next_rev"),
     ])
     samples = _SamplesFake()
-    deployer = _SingleEndpointDeployTracker(champion_transition_failures=1)
+    deployer = _SingleEndpointDeployTracker(
+        champion_transition_results=list(transition_results),
+    )
     scheduler, state, _ = _build_scheduler(
         kv=kv,
         miner_store=miner_store,
@@ -2392,6 +2421,17 @@ async def test_single_endpoint_win_relabels_runtime_before_next_battle():
             "chal_hk", "chal_rev", env, task_state.task_ids[env],
             score=0.9, refresh_block=refresh_block,
         )
+    return scheduler, state, deployer, miner_store
+
+
+@pytest.mark.asyncio
+async def test_single_endpoint_win_relabels_runtime_before_next_battle():
+    """A transient provider error retains the battle for a clean retry."""
+    scheduler, state, deployer, _ = (
+        await _single_endpoint_battle_ready_for_challenger_win([
+            DeploymentRoleTransitionResult.RETRYABLE,
+        ])
+    )
 
     await scheduler.tick(current_block=53)
 
@@ -2412,6 +2452,34 @@ async def test_single_endpoint_win_relabels_runtime_before_next_battle():
     ]
 
     await scheduler.tick(current_block=55)
+
+    battle = await state.get_battle()
+    assert battle is not None and battle.challenger.uid == 3
+    assert deployer.endpoint_role == "challenger"
+
+
+@pytest.mark.asyncio
+async def test_stale_winner_runtime_does_not_block_next_battle():
+    """A removed endpoint loses runtime reuse, not the evaluation result."""
+    scheduler, state, deployer, miner_store = (
+        await _single_endpoint_battle_ready_for_challenger_win([
+            DeploymentRoleTransitionResult.STALE,
+        ])
+    )
+
+    await scheduler.tick(current_block=53)
+
+    champion = await state.get_champion()
+    assert champion.uid == 2
+    assert champion.deployment_id is None
+    assert champion.base_url is None
+    assert champion.deployments == []
+    assert await state.get_battle() is None
+    assert miner_store.rows[2]["challenge_status"] == STATUS_CHAMPION
+    assert miner_store.rows[1]["challenge_status"] == STATUS_TERMINATED
+    assert deployer.endpoint_role is None
+
+    await scheduler.tick(current_block=54)
 
     battle = await state.get_battle()
     assert battle is not None and battle.challenger.uid == 3
@@ -3740,7 +3808,7 @@ async def test_stale_predeployment_promotion_drops_state_without_teardown():
     samples = _SamplesFake()
 
     async def reject_stale_assignment(_record, _role):
-        return False
+        return DeploymentRoleTransitionResult.STALE
 
     scheduler, state, _ = _build_scheduler(
         kv=kv,
