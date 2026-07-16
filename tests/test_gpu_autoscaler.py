@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from affine.core.providers.instance_api_client import (
@@ -9,13 +11,27 @@ from affine.core.providers.instance_api_client import (
 )
 from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.gpu_autoscaler import (
+    CONFIG_KEY,
+    EndpointAddResult,
+    EndpointReplaceResult,
     GPUAutoscaler,
     GPUAutoscalerConfig,
+    MANUAL_ENDPOINT_OPERATION_ADD,
+    MANUAL_ENDPOINT_OPERATION_REMOVE,
+    MANUAL_ENDPOINT_OPERATION_REPLACE,
     MANUAL_REPLACEMENT_LOCK_KEY,
+    MANUAL_REPLACEMENT_REQUEST_VERSION,
     MANUAL_REPLACEMENT_STATE_KEY,
     ManagedEndpointSlot,
+    SSHTunnelManager,
     STATE_KEY,
+    TunnelSpec,
     _config_without_endpoint_slot,
+    _enqueue_manual_add_request,
+    _enqueue_manual_remove_request,
+    _enqueue_manual_replacement_request,
+    _manual_endpoint_result_key,
+    _wait_for_manual_endpoint_result,
     load_config,
 )
 from affine.src.scorer.window_state import (
@@ -312,6 +328,27 @@ def _config(
     )
 
 
+def _config_payload():
+    return {
+        "enabled": True,
+        "pending_threshold_per_instance": 1,
+        "max_gpu_down_wait_seconds": 0,
+        "min_instances": 0,
+        "max_instances": 2,
+        "providers": {
+            "lium": {
+                "api_url": "https://lium.example.com",
+                "create_path": "/instances",
+                "delete_path": "/instances/{instance_id}",
+            }
+        },
+        "endpoints": [
+            {"name": "lium-b200-1", "provider": "lium"},
+            {"name": "lium-b200-2", "provider": "lium"},
+        ],
+    }
+
+
 def _autoscaler(queue, endpoints, kv, *, now=1000, samples=None, tunnels=None):
     if hasattr(endpoints, "now"):
         endpoints.now = now
@@ -437,6 +474,34 @@ def test_config_without_endpoint_slot_removes_only_requested_slot():
         "targon-b200-3",
     ]
     assert payload["endpoints"][1]["name"] == "lium-b200-temp-2"
+
+
+@pytest.mark.asyncio
+async def test_tunnel_manager_refuses_port_owned_by_unmanaged_process(
+    monkeypatch,
+):
+    async def port_is_open(host, port):
+        return True
+
+    async def unexpected_subprocess(*args, **kwargs):
+        raise AssertionError("ssh process must not start on an occupied port")
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.gpu_autoscaler._local_port_is_open",
+        port_is_open,
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_subprocess)
+    manager = SSHTunnelManager()
+    spec = TunnelSpec(
+        endpoint_name="lium-b200-1",
+        instance_id="new-inst",
+        ssh_url="ssh://root@new.example.com:22",
+        ssh_key_path="/root/.ssh/id_ed25519",
+        public_url="http://validator.example.com:8102/v1",
+    )
+
+    with pytest.raises(RuntimeError, match="unmanaged process"):
+        await manager.ensure(spec)
 
 
 def test_instance_api_url_falls_back_to_provider_api_url(monkeypatch):
@@ -681,28 +746,259 @@ async def test_scale_up_does_not_reuse_stale_lease_from_inactive_endpoint():
 
 
 @pytest.mark.asyncio
-async def test_manual_replacement_lock_pauses_scale_up_for_locked_slot():
+async def test_enqueue_manual_replacement_only_writes_request():
     kv = InMemoryConfigStore()
-    await kv.set(MANUAL_REPLACEMENT_LOCK_KEY, {
-        "old_endpoint_name": "lium-b200-1",
-        "new_slot_name": "lium-b200-1",
-        "started_at": 900,
-        "expires_at": 1100,
-        "token": "replace-1",
-    })
+    request = await _enqueue_manual_replacement_request(
+        kv,
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-1",
+        updated_by="test",
+        now=1000,
+    )
+
+    stored = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+    assert stored == request
+    assert stored["request_version"] == MANUAL_REPLACEMENT_REQUEST_VERSION
+    assert stored["status"] == "requested"
+    assert stored["operation"] == MANUAL_ENDPOINT_OPERATION_REPLACE
+    assert _Client.events == []
+    assert _Client.create_calls == []
+    assert _Client.deleted == []
+
+
+@pytest.mark.asyncio
+async def test_enqueue_manual_add_only_writes_request():
+    kv = InMemoryConfigStore()
+    request = await _enqueue_manual_add_request(
+        kv,
+        slot_name="lium-b200-2",
+        updated_by="test",
+        now=1000,
+    )
+
+    stored = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+    assert stored == request
+    assert stored["operation"] == MANUAL_ENDPOINT_OPERATION_ADD
+    assert stored["old_endpoint_name"] == ""
+    assert stored["new_slot_name"] == "lium-b200-2"
+    assert _Client.events == []
+
+
+@pytest.mark.asyncio
+async def test_enqueue_manual_remove_only_writes_request():
+    kv = InMemoryConfigStore()
+    request = await _enqueue_manual_remove_request(
+        kv,
+        endpoint_name="lium-b200-1",
+        keep_slot=True,
+        updated_by="test",
+        now=1000,
+    )
+
+    stored = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+    assert stored == request
+    assert stored["operation"] == MANUAL_ENDPOINT_OPERATION_REMOVE
+    assert stored["old_endpoint_name"] == "lium-b200-1"
+    assert stored["new_slot_name"] == ""
+    assert stored["keep_slot"] is True
+    assert _Client.events == []
+
+
+@pytest.mark.asyncio
+async def test_daemon_executes_add_without_replacing_an_endpoint():
+    kv = InMemoryConfigStore()
     endpoints = _Endpoints()
     autoscaler = _autoscaler(
-        _Queue(pending=1),
+        _Queue(pending=10),
         endpoints,
         kv,
         now=1000,
+    )
+    request = await _enqueue_manual_add_request(
+        kv,
+        slot_name="lium-b200-2",
+        updated_by="test",
+        now=1000,
+    )
+
+    result = await autoscaler.tick(_config())
+
+    assert result.action == "manual-add:completed"
+    assert _Client.events == [
+        ("create", "lium-b200-2"),
+        ("activate", "lium-b200-2"),
+    ]
+    assert endpoints.endpoints["lium-b200-2"].active is True
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+    payload = await kv.get(_manual_endpoint_result_key(request["token"]))
+    assert payload["status"] == "completed"
+    assert payload["result"] == {
+        "endpoint_name": "lium-b200-2",
+        "slot_name": "lium-b200-2",
+        "instance_id": "inst-lium-b200-2",
+        "created": True,
+        "dry_run": False,
+    }
+    state = await kv.get(STATE_KEY)
+    assert state["last_action"] == "manual-add:completed"
+
+
+@pytest.mark.asyncio
+async def test_daemon_executes_remove_and_removes_slot():
+    kv = InMemoryConfigStore()
+    await kv.set(CONFIG_KEY, _config_payload())
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=1000)
+    request = await _enqueue_manual_remove_request(
+        kv,
+        endpoint_name="lium-b200-1",
+        keep_slot=False,
+        updated_by="test",
+        now=1000,
+    )
+
+    result = await autoscaler.tick(_config())
+
+    assert result.action == "manual-remove:completed"
+    assert _Client.events == [
+        ("drain", "lium-b200-1", "old-inst"),
+        ("delete", "old-inst"),
+        ("deactivate", "lium-b200-1", "old-inst"),
+    ]
+    config_payload = await kv.get(CONFIG_KEY)
+    assert [slot["name"] for slot in config_payload["endpoints"]] == [
+        "lium-b200-2"
+    ]
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+    payload = await kv.get(_manual_endpoint_result_key(request["token"]))
+    assert payload["status"] == "completed"
+    assert payload["result"] == {
+        "endpoint_name": "lium-b200-1",
+        "instance_id": "old-inst",
+        "deleted": True,
+        "slot_removed": True,
+        "dry_run": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_failed_remove_restores_slot_before_releasing_request():
+    _Client.delete_returns_false_for_ids = {"old-inst"}
+    kv = InMemoryConfigStore()
+    await kv.set(CONFIG_KEY, _config_payload())
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=1000)
+    request = await _enqueue_manual_remove_request(
+        kv,
+        endpoint_name="lium-b200-1",
+        keep_slot=False,
+        updated_by="test",
+        now=1000,
+    )
+
+    result = await autoscaler.tick(_config())
+
+    assert result.action == "manual-remove:failed"
+    config_payload = await kv.get(CONFIG_KEY)
+    assert [slot["name"] for slot in config_payload["endpoints"]] == [
+        "lium-b200-1",
+        "lium-b200-2",
+    ]
+    assert endpoints.endpoints["lium-b200-1"].active is True
+    assert endpoints.endpoints["lium-b200-1"].autoscale_instance_id == "old-inst"
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+    payload = await kv.get(_manual_endpoint_result_key(request["token"]))
+    assert payload["status"] == "failed"
+    assert "failed to delete endpoint" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_daemon_treats_legacy_keep_old_request_as_add():
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=1000)
+    await kv.set(
+        MANUAL_REPLACEMENT_LOCK_KEY,
+        {
+            "request_version": MANUAL_REPLACEMENT_REQUEST_VERSION,
+            "status": "requested",
+            "token": "legacy-keep-old",
+            "old_endpoint_name": "lium-b200-1",
+            "new_slot_name": "lium-b200-2",
+            "delete_old": False,
+            "requested_at": 1000,
+            "expires_at": 1100,
+            "updated_by": "test",
+        },
+    )
+
+    result = await autoscaler.tick(_config())
+
+    assert result.action == "manual-add:completed"
+    assert _Client.events == [
+        ("create", "lium-b200-2"),
+        ("activate", "lium-b200-2"),
+    ]
+    assert endpoints.endpoints["lium-b200-1"].active is True
+    assert endpoints.endpoints["lium-b200-2"].active is True
+
+
+@pytest.mark.asyncio
+async def test_daemon_executes_replacement_without_scaling_fallback_slot():
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        role="scoring",
+        ssh_url="ssh://root@old.example.com:22",
+        public_inference_url="http://validator.example.com:8102/v1",
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    tunnels = _Tunnels()
+    autoscaler = _autoscaler(
+        _Queue(pending=10),
+        endpoints,
+        kv,
+        now=1000,
+        tunnels=tunnels,
     )
     cfg = GPUAutoscalerConfig(
         enabled=True,
         pending_threshold_per_instance=1,
         max_gpu_down_wait_seconds=0,
         min_instances=0,
-        max_instances=1,
+        max_instances=2,
         providers={
             "lium": InstanceAPIConfig(
                 provider="lium",
@@ -711,29 +1007,282 @@ async def test_manual_replacement_lock_pauses_scale_up_for_locked_slot():
                 delete_path="/instances/{instance_id}",
             )
         },
-        slots=[ManagedEndpointSlot(name="lium-b200-1", provider="lium")],
+        slots=[
+            ManagedEndpointSlot(
+                name="lium-b200-1",
+                provider="lium",
+                endpoint={
+                    "public_inference_url": ("http://validator.example.com:8102/v1"),
+                },
+                tunnel={"enabled": True},
+            ),
+            ManagedEndpointSlot(name="lium-b300-fallback", provider="lium"),
+        ],
+    )
+    request = await _enqueue_manual_replacement_request(
+        kv,
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-1",
+        updated_by="test",
+        now=1000,
     )
 
     result = await autoscaler.tick(cfg)
 
-    assert result.action == "paused:manual-replacement"
-    assert result.desired_instances == 1
-    assert endpoints.endpoints == {}
-    assert _Client.create_calls == []
-    lock = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
-    assert lock["token"] == "replace-1"
+    assert result.action == "manual-replacement:completed"
+    assert _Client.events == [
+        ("drain", "lium-b200-1", "old-inst"),
+        ("delete", "old-inst"),
+        ("deactivate", "lium-b200-1", "old-inst"),
+        ("create", "lium-b200-1"),
+        ("activate", "lium-b200-1"),
+    ]
+    assert all(event != ("create", "lium-b300-fallback") for event in _Client.events)
+    assert tunnels.stopped == ["lium-b200-1"]
+    assert [spec.instance_id for spec in tunnels.ensured] == ["inst-lium-b200-1"]
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+    replacement = await kv.get(_manual_endpoint_result_key(request["token"]))
+    assert replacement["status"] == "completed"
+    state = await kv.get(STATE_KEY)
+    assert state["last_tick_at"] == 1000
+    assert state["last_action"] == "manual-replacement:completed"
+    assert state["last_manual_replacement"]["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_result_prevents_replaying_request_left_after_cleanup():
+    kv = InMemoryConfigStore()
+    original_delete_if_token = kv.delete_if_token
+    delete_attempts = 0
+
+    async def fail_first_request_delete(key, token, *, token_field="token"):
+        nonlocal delete_attempts
+        if key == MANUAL_REPLACEMENT_LOCK_KEY:
+            delete_attempts += 1
+            if delete_attempts == 1:
+                return False
+        return await original_delete_if_token(
+            key,
+            token,
+            token_field=token_field,
+        )
+
+    kv.delete_if_token = fail_first_request_delete
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        _Endpoints([old]),
+        kv,
+        now=1000,
+    )
+    await _enqueue_manual_replacement_request(
+        kv,
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-1",
+        updated_by="test",
+        now=1000,
+    )
+
+    config = _config(lease_renew_margin_seconds=0)
+    first = await autoscaler.tick(config)
+    events_after_replacement = list(_Client.events)
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is not None
+
+    second = await autoscaler.tick(config)
+
+    assert first.action == "manual-replacement:completed"
+    assert second.action == "none"
+    assert _Client.events == events_after_replacement
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+    assert delete_attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_request_arriving_during_tick_waits_for_daemon_boundary():
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        role="scoring",
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_snapshot = autoscaler._snapshot
+
+    async def blocked_snapshot():
+        entered.set()
+        await release.wait()
+        return await original_snapshot()
+
+    autoscaler._snapshot = blocked_snapshot
+    first_tick = asyncio.create_task(autoscaler.tick(_config(threshold=1)))
+    await entered.wait()
+    await _enqueue_manual_replacement_request(
+        kv,
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-1",
+        updated_by="test",
+        now=1000,
+    )
+
+    assert _Client.events == []
+    release.set()
+    first_result = await first_tick
+    events_after_first_tick = list(_Client.events)
+    second_result = await autoscaler.tick(_config(threshold=1))
+
+    assert first_result.action == "none"
+    assert events_after_first_tick == []
+    assert second_result.action == "manual-replacement:completed"
+    assert _Client.events[0] == ("drain", "lium-b200-1", "old-inst")
+
+
+@pytest.mark.asyncio
+async def test_manual_replacement_updates_heartbeat_while_running(monkeypatch):
+    monkeypatch.setattr(
+        "affine.src.scheduler.gpu_autoscaler.MANUAL_REPLACEMENT_HEARTBEAT_SECONDS",
+        0.01,
+    )
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        endpoints,
+        kv,
+        now=1000,
+    )
+    now = [1000]
+    autoscaler._now = lambda: now[0]
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_replace(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        return EndpointReplaceResult(
+            old_endpoint_name="lium-b200-1",
+            new_endpoint_name="lium-b200-1",
+            new_slot_name="lium-b200-1",
+            old_instance_id="old-inst",
+            new_instance_id="new-inst",
+            old_deleted=True,
+            new_created=True,
+            same_endpoint=True,
+        )
+
+    autoscaler.replace_endpoint = slow_replace
+    await _enqueue_manual_replacement_request(
+        kv,
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-1",
+        updated_by="test",
+        now=1000,
+    )
+
+    tick_task = asyncio.create_task(autoscaler.tick(_config()))
+    await entered.wait()
+    now[0] = 1010
+    await asyncio.sleep(0.03)
+
+    running_state = await kv.get(STATE_KEY)
+    assert running_state["last_tick_at"] == 1010
+    assert running_state["last_action"] == "manual-replacement:running"
+    release.set()
+    result = await tick_task
+    assert result.action == "manual-replacement:completed"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_replacement_records_failure_and_releases_request():
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    autoscaler = _autoscaler(
+        _Queue(pending=1),
+        _Endpoints([old]),
+        kv,
+        now=1000,
+    )
+    entered = asyncio.Event()
+
+    async def cancelled_replace(*args, **kwargs):
+        entered.set()
+        await asyncio.Event().wait()
+
+    autoscaler.replace_endpoint = cancelled_replace
+    request = await _enqueue_manual_replacement_request(
+        kv,
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-1",
+        updated_by="test",
+        now=1000,
+    )
+
+    tick_task = asyncio.create_task(autoscaler.tick(_config()))
+    await entered.wait()
+    tick_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await tick_task
+
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+    failure = await kv.get(_manual_endpoint_result_key(request["token"]))
+    assert failure["status"] == "failed"
+    assert failure["error_type"] == "CancelledError"
+    state = await kv.get(STATE_KEY)
+    assert state["last_action"] == "manual-replacement:failed"
 
 
 @pytest.mark.asyncio
 async def test_expired_manual_replacement_lock_allows_scale_up():
     kv = InMemoryConfigStore()
-    await kv.set(MANUAL_REPLACEMENT_LOCK_KEY, {
-        "old_endpoint_name": "lium-b200-1",
-        "new_slot_name": "lium-b200-1",
-        "started_at": 800,
-        "expires_at": 999,
-        "token": "replace-1",
-    })
+    await kv.set(
+        MANUAL_REPLACEMENT_LOCK_KEY,
+        {
+            "request_version": MANUAL_REPLACEMENT_REQUEST_VERSION,
+            "status": "requested",
+            "old_endpoint_name": "lium-b200-1",
+            "new_slot_name": "lium-b200-1",
+            "requested_at": 800,
+            "expires_at": 999,
+            "token": "replace-1",
+        },
+    )
     endpoints = _Endpoints()
     autoscaler = _autoscaler(
         _Queue(pending=1),
@@ -767,52 +1316,69 @@ async def test_expired_manual_replacement_lock_allows_scale_up():
 
 
 @pytest.mark.asyncio
-async def test_manual_replacement_lock_does_not_consume_restart_force_start():
+async def test_failed_replacement_releases_request_and_next_tick_recovers():
+    _Client.create_returns_none_for_names = {"lium-b200-1"}
     kv = InMemoryConfigStore()
-    await kv.set(STATE_KEY, {
-        MANUAL_REPLACEMENT_STATE_KEY: {
-            "old_endpoint_name": "lium-b200-1",
-            "new_slot_name": "lium-b200-1",
-            "started_at": 900,
-            "expires_at": 1100,
-            "token": "replace-1",
-        }
-    })
-    endpoints = _Endpoints()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+        autoscale_purpose="eval",
+    )
+    endpoints = _Endpoints([old])
     autoscaler = _autoscaler(
         _Queue(pending=1),
         endpoints,
         kv,
         now=1000,
     )
-
-    first = await autoscaler.tick(
-        _config(threshold=5, max_gpu_down_wait_seconds=3600)
+    request = await _enqueue_manual_replacement_request(
+        kv,
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-1",
+        updated_by="test",
+        now=1000,
     )
-    await kv.set(STATE_KEY, {})
-    second = await autoscaler.tick(
-        _config(threshold=5, max_gpu_down_wait_seconds=3600)
-    )
+    cfg = _config(threshold=5, max_gpu_down_wait_seconds=3600)
 
-    assert first.action == "none"
-    assert first.desired_instances == 0
+    first = await autoscaler.tick(cfg)
+
+    assert first.action == "manual-replacement:failed"
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+    failure = await kv.get(_manual_endpoint_result_key(request["token"]))
+    assert failure["status"] == "failed"
+    assert failure["error_type"] == "RuntimeError"
+    assert "was already deleted" in failure["error"]
+    state = await kv.get(STATE_KEY)
+    assert state["last_action"] == "manual-replacement:failed"
+    assert state["last_manual_replacement"]["status"] == "failed"
+
+    _Client.create_returns_none_for_names = set()
+    second = await autoscaler.tick(cfg)
+
     assert second.action == "scale-up:1"
     assert second.desired_instances == 1
     assert sorted(endpoints.endpoints) == ["lium-b200-1"]
 
 
 @pytest.mark.asyncio
-async def test_legacy_manual_replacement_lock_still_pauses_scale_up():
+async def test_legacy_manual_replacement_lock_is_discarded_without_pause():
     kv = InMemoryConfigStore()
-    await kv.set(STATE_KEY, {
-        MANUAL_REPLACEMENT_STATE_KEY: {
-            "old_endpoint_name": "lium-b200-1",
-            "new_slot_name": "lium-b200-1",
-            "started_at": 900,
-            "expires_at": 1100,
-            "token": "legacy-replace",
-        }
-    })
+    await kv.set(
+        STATE_KEY,
+        {
+            MANUAL_REPLACEMENT_STATE_KEY: {
+                "old_endpoint_name": "lium-b200-1",
+                "new_slot_name": "lium-b200-1",
+                "started_at": 900,
+                "expires_at": 1100,
+                "token": "legacy-replace",
+            }
+        },
+    )
     endpoints = _Endpoints()
     autoscaler = _autoscaler(
         _Queue(pending=1),
@@ -840,30 +1406,77 @@ async def test_legacy_manual_replacement_lock_still_pauses_scale_up():
 
     result = await autoscaler.tick(cfg)
 
-    assert result.action == "paused:manual-replacement"
-    assert endpoints.endpoints == {}
+    assert result.action == "scale-up:1"
+    assert sorted(endpoints.endpoints) == ["lium-b200-1"]
+    state = await kv.get(STATE_KEY)
+    assert MANUAL_REPLACEMENT_STATE_KEY not in state
+    assert state["last_tick_at"] == 1000
+    assert state["last_action"] == "scale-up:1"
+    assert state["last_manual_replacement"]["status"] == ("discarded-legacy-lock")
 
 
 @pytest.mark.asyncio
-async def test_manual_replacement_lock_survives_state_updates():
+async def test_duplicate_manual_replacement_request_is_rejected():
     kv = InMemoryConfigStore()
-    await kv.set(MANUAL_REPLACEMENT_LOCK_KEY, {
-        "old_endpoint_name": "lium-b200-1",
-        "new_slot_name": "lium-b200-1",
-        "started_at": 900,
-        "expires_at": 1100,
-        "token": "replace-1",
-    })
-    autoscaler = _autoscaler(
-        _Queue(pending=0),
-        _Endpoints(),
+    await _enqueue_manual_replacement_request(
         kv,
+        old_endpoint_name="lium-b200-1",
+        new_slot_name="lium-b200-1",
+        updated_by="test",
         now=1000,
     )
 
-    await autoscaler.tick(_config(threshold=1))
+    with pytest.raises(RuntimeError, match="already queued"):
+        await _enqueue_manual_replacement_request(
+            kv,
+            old_endpoint_name="lium-b200-2",
+            new_slot_name="lium-b200-2",
+            updated_by="test",
+            now=1001,
+        )
 
-    assert (await kv.get(MANUAL_REPLACEMENT_LOCK_KEY))["token"] == "replace-1"
+
+@pytest.mark.asyncio
+async def test_result_wait_tolerates_eventually_consistent_reads(monkeypatch):
+    monkeypatch.setattr(
+        "affine.src.scheduler.gpu_autoscaler."
+        "MANUAL_REPLACEMENT_RESULT_VISIBILITY_GRACE_SECONDS",
+        1.0,
+    )
+    kv = InMemoryConfigStore()
+    request = {
+        "token": "replace-eventual",
+    }
+    result_key = _manual_endpoint_result_key(request["token"])
+    await kv.set(
+        result_key,
+        {
+            "token": request["token"],
+            "status": "completed",
+            "result": {},
+        },
+    )
+    original_get = kv.get
+    result_reads = 0
+
+    async def eventually_consistent_get(key, default=None):
+        nonlocal result_reads
+        if key == result_key and result_reads < 2:
+            result_reads += 1
+            return None
+        return await original_get(key, default)
+
+    kv.get = eventually_consistent_get
+
+    result = await _wait_for_manual_endpoint_result(
+        kv,
+        request,
+        timeout_seconds=1,
+        poll_seconds=0.05,
+    )
+
+    assert result["status"] == "completed"
+    assert result_reads == 2
 
 
 @pytest.mark.asyncio
@@ -1561,6 +2174,30 @@ async def test_renews_legacy_endpoint_using_configured_lease_duration():
 
 
 @pytest.mark.asyncio
+async def test_add_endpoint_creates_configured_slot_without_old_endpoint():
+    kv = InMemoryConfigStore()
+    endpoints = _Endpoints()
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=2000)
+
+    result = await autoscaler.add_endpoint(
+        _config(),
+        slot_name="lium-b200-2",
+    )
+
+    assert result == EndpointAddResult(
+        endpoint_name="lium-b200-2",
+        slot_name="lium-b200-2",
+        instance_id="inst-lium-b200-2",
+        created=True,
+    )
+    assert _Client.events == [
+        ("create", "lium-b200-2"),
+        ("activate", "lium-b200-2"),
+    ]
+    assert endpoints.endpoints["lium-b200-2"].active is True
+
+
+@pytest.mark.asyncio
 async def test_replace_same_endpoint_drains_old_before_delete_then_creates_new():
     kv = InMemoryConfigStore()
     state = StateStore(kv)
@@ -1670,6 +2307,42 @@ async def test_replace_different_slot_creates_new_before_deleting_old():
 
 
 @pytest.mark.asyncio
+async def test_replace_different_slot_rejects_active_target():
+    kv = InMemoryConfigStore()
+    old = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="old-inst",
+    )
+    target = Endpoint(
+        name="lium-b200-2",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="target-inst",
+    )
+    autoscaler = _autoscaler(
+        _Queue(),
+        _Endpoints([old, target]),
+        kv,
+        now=2000,
+    )
+
+    with pytest.raises(ValueError, match="already active"):
+        await autoscaler.replace_endpoint(
+            _config(),
+            old_endpoint_name="lium-b200-1",
+            new_slot_name="lium-b200-2",
+        )
+
+    assert _Client.events == []
+
+
+@pytest.mark.asyncio
 async def test_replace_different_slot_leaves_old_when_create_fails():
     _Client.create_returns_none_for_names = {"lium-b200-2"}
     kv = InMemoryConfigStore()
@@ -1699,38 +2372,6 @@ async def test_replace_different_slot_leaves_old_when_create_fails():
 
 
 @pytest.mark.asyncio
-async def test_replace_refuses_when_manual_replacement_lock_active():
-    kv = InMemoryConfigStore()
-    await kv.set(MANUAL_REPLACEMENT_LOCK_KEY, {
-        "old_endpoint_name": "lium-b200-1",
-        "new_slot_name": "lium-b200-1",
-        "started_at": 1900,
-        "expires_at": 2300,
-        "token": "replace-1",
-    })
-    old = Endpoint(
-        name="lium-b200-1",
-        kind="ssh",
-        active=True,
-        autoscale_managed=True,
-        autoscale_provider="lium",
-        autoscale_instance_id="old-inst",
-        autoscale_purpose="eval",
-    )
-    endpoints = _Endpoints([old])
-    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=2000)
-
-    with pytest.raises(RuntimeError, match="already in progress"):
-        await autoscaler.replace_endpoint(
-            _config(),
-            old_endpoint_name="lium-b200-1",
-        )
-
-    assert _Client.events == []
-    assert endpoints.endpoints["lium-b200-1"].autoscale_instance_id == "old-inst"
-
-
-@pytest.mark.asyncio
 async def test_replace_same_endpoint_keeps_instance_id_when_delete_fails():
     _Client.delete_returns_false_for_ids = {"old-inst"}
     kv = InMemoryConfigStore()
@@ -1750,7 +2391,6 @@ async def test_replace_same_endpoint_keeps_instance_id_when_delete_fails():
         await autoscaler.replace_endpoint(
             _config(),
             old_endpoint_name="lium-b200-1",
-            lock_ttl_seconds=300,
         )
 
     assert _Client.events == [
@@ -1761,12 +2401,7 @@ async def test_replace_same_endpoint_keeps_instance_id_when_delete_fails():
     ep = endpoints.endpoints["lium-b200-1"]
     assert ep.active is True
     assert ep.autoscale_instance_id == "old-inst"
-    lock = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
-    assert lock["old_endpoint_name"] == (
-        "lium-b200-1"
-    )
-    assert lock["new_slot_name"] == "lium-b200-1"
-    assert lock["expires_at"] == 2300
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
 
 
 @pytest.mark.asyncio
@@ -1803,7 +2438,7 @@ async def test_replace_same_endpoint_raises_when_new_create_fails():
 
 
 @pytest.mark.asyncio
-async def test_replace_refuses_keep_old_with_same_slot():
+async def test_add_endpoint_rejects_active_slot():
     kv = InMemoryConfigStore()
     endpoint = Endpoint(
         name="lium-b200-1",
@@ -1815,9 +2450,8 @@ async def test_replace_refuses_keep_old_with_same_slot():
     )
     autoscaler = _autoscaler(_Queue(), _Endpoints([endpoint]), kv, now=2000)
 
-    with pytest.raises(ValueError, match="--keep-old"):
-        await autoscaler.replace_endpoint(
+    with pytest.raises(ValueError, match="already active"):
+        await autoscaler.add_endpoint(
             _config(),
-            old_endpoint_name="lium-b200-1",
-            delete_old=False,
+            slot_name="lium-b200-1",
         )

@@ -16,7 +16,7 @@ dataclass below for the typed view.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Dict, List, Optional, Sequence
 
 from botocore.exceptions import ClientError
@@ -145,6 +145,12 @@ _ASSIGNMENT_FIELDS = (
 )
 
 
+_STATIC_ENDPOINT_CONFIG_FIELDS = (
+    *_ENDPOINT_RUNTIME_IDENTITY_FIELDS,
+    "notes",
+)
+
+
 class InferenceEndpointsDAO(BaseDAO):
     """CRUD over the ``inference_endpoints`` table."""
 
@@ -174,6 +180,113 @@ class InferenceEndpointsDAO(BaseDAO):
         payload["updated_at"] = now
         payload["updated_by"] = updated_by
         return await self.put(payload)
+
+    async def stage_static_endpoint(
+        self,
+        endpoint: Endpoint,
+        *,
+        updated_by: str = "operator",
+    ) -> None:
+        """Store static endpoint config as inactive without touching assignment.
+
+        Autoscaler-managed rows have a separate owner and must only be changed
+        through the autoscaler lifecycle. The conditional update closes the
+        race between the preceding read and this write.
+        """
+        if endpoint.autoscale_managed:
+            raise ValueError("static endpoint config cannot be autoscaler-managed")
+
+        previous = await self.get(endpoint.name)
+        if previous is not None and previous.autoscale_managed:
+            raise ValueError(
+                f"endpoint {endpoint.name!r} is autoscaler-managed; use "
+                "`af gpu replace-endpoint`"
+            )
+
+        now = int(time.time())
+        config_values = {
+            field: getattr(endpoint, field)
+            for field in _STATIC_ENDPOINT_CONFIG_FIELDS
+        }
+        updated = await self._update_endpoint_fields(
+            endpoint.name,
+            set_values={
+                **config_values,
+                "active": False,
+                "autoscale_managed": False,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            condition_expression=(
+                "attribute_not_exists(#cond_managed) OR "
+                "#cond_managed = :cond_false"
+            ),
+            condition_names={"#cond_managed": "autoscale_managed"},
+            condition_values={":cond_false": False},
+            return_false_on_condition_failure=True,
+        )
+        if not updated:
+            raise ValueError(
+                f"endpoint {endpoint.name!r} became autoscaler-managed; "
+                "refusing static update"
+            )
+
+    async def activate_static_endpoint(
+        self,
+        name: str,
+        *,
+        expected_updated_by: str,
+        updated_by: str = "operator",
+    ) -> None:
+        """Activate the caller's staged config while preserving assignment."""
+        previous = await self.get(name)
+        if previous is None:
+            raise ValueError(f"endpoint {name!r} does not exist")
+        if previous.autoscale_managed:
+            raise ValueError(
+                f"endpoint {name!r} is autoscaler-managed; use "
+                "`af gpu replace-endpoint`"
+            )
+
+        now = int(time.time())
+        active_endpoint = replace(previous, active=True)
+        generation = int(previous.generation or 0)
+        activated_at = int(previous.activated_at or 0)
+        if self._activation_bump_required(previous, active_endpoint):
+            generation += 1
+            activated_at = now
+
+        updated = await self._update_endpoint_fields(
+            name,
+            set_values={
+                "active": True,
+                "generation": generation,
+                "activated_at": activated_at,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            condition_expression=(
+                "attribute_exists(#cond_pk) AND "
+                "(attribute_not_exists(#cond_managed) OR "
+                "#cond_managed = :cond_false) AND "
+                "#cond_updated_by = :cond_updated_by"
+            ),
+            condition_names={
+                "#cond_pk": "pk",
+                "#cond_managed": "autoscale_managed",
+                "#cond_updated_by": "updated_by",
+            },
+            condition_values={
+                ":cond_false": False,
+                ":cond_updated_by": expected_updated_by,
+            },
+            return_false_on_condition_failure=True,
+        )
+        if not updated:
+            raise ValueError(
+                f"endpoint {name!r} changed after its health check, became "
+                "autoscaler-managed, or was deleted; refusing static activation"
+            )
 
     @staticmethod
     def _activation_bump_required(
