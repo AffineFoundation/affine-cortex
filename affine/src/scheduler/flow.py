@@ -33,8 +33,11 @@ record shape itself tells us where we are.
 
 from __future__ import annotations
 
+import math
 import os
+import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
 
 from affine.core.setup import logger
@@ -51,7 +54,6 @@ from affine.src.behavior_guard.models import (
 
 from affine.src.scorer.challenger_queue import (
     ChallengerQueue,
-    OUTCOME_FAILED,
     OUTCOME_LOST,
     OUTCOME_WON,
 )
@@ -92,9 +94,14 @@ from . import targon as targon_lifecycle
 # ---- deploy_fn contract: signaling exception -------------------------------
 
 
-class NoSpareEndpoint(RuntimeError):
+class NoEndpointCapacity(RuntimeError):
     """``deploy_fn`` raises this when no host is free for the role.
     The pre-deploy fill loop treats it as 'stop filling, not a failure'."""
+
+
+# Compatibility for downstream imports while callers migrate away from the
+# old fixed-primary/fixed-spare terminology.
+NoSpareEndpoint = NoEndpointCapacity
 
 
 class TransientDeployError(RuntimeError):
@@ -122,6 +129,14 @@ class DeploymentStateInvalidatedError(RuntimeError):
         self.invalidated_deployment_ids = tuple(
             did for did in deployment_ids if did
         )
+
+
+class DeploymentRoleTransitionResult(str, Enum):
+    """Outcome of fencing a runtime role change in provider state."""
+
+    UPDATED = "updated"
+    RETRYABLE = "retryable"
+    STALE = "stale"
 
 
 SYSTEM_MINER_MIN_UID = 1000
@@ -162,9 +177,6 @@ def _format_cause_chain(exc: BaseException, *, max_depth: int = 8) -> str:
 # ---- constants (no longer in system_config) --------------------------------
 
 
-import math
-import time
-
 WINDOW_BLOCKS = 7200
 """Logical scheduler window size for window_id bucketing."""
 
@@ -199,7 +211,7 @@ WIN_MIN_DOMINANT_ENVS = 1
 
 _PREDEPLOY_PEEK_LIMIT = 32
 """Upper bound on candidates pulled per fill tick. Real terminator is
-:exc:`NoSpareEndpoint`."""
+:exc:`NoEndpointCapacity`."""
 
 ORPHAN_GRACE_SECONDS = 120
 """Minimum age of an ``in_progress`` row, missing from all in-flight
@@ -236,6 +248,12 @@ ListCurrentMinersFn = Callable[[], Awaitable[List[Dict[str, Any]]]]
 DeployFn = Callable[[targon_lifecycle.DeployTarget, str],
                     Awaitable[targon_lifecycle.DeployResult]]
 TeardownFn = Callable[[Optional[str]], Awaitable[None]]
+TransitionDeploymentRoleFn = Callable[
+    [BattleRecord, str], Awaitable[DeploymentRoleTransitionResult]
+]
+"""Move an already-running deployment to the requested runtime role.
+The result distinguishes a durable update, a transient control-plane failure,
+and a permanently stale provider assignment."""
 
 ListActiveEndpointNamesFn = Callable[[], Awaitable[set]]
 """Return the set of currently-active endpoint names. Used by the
@@ -261,17 +279,15 @@ class FlowConfig:
     task_pool_refresh_blocks: Optional[int] = None
     scorer_hotkey: str = "scheduler"
     single_instance_provider: bool = False
-    """True when the inference provider hosts only one model at a time
-    (e.g. SSH/sglang on a single GPU host that swaps models). In that
-    mode, the champion's deployment becomes stale whenever:
-      - a challenger is deployed (b300 now serves challenger's model)
-      - a challenger is torn down on loss (b300 ends up empty)
-      - a task-id refresh fires (b300 may be holding an old model from
-        a previous battle)
-    Flow clears ``champion.deployment_id`` at those points so step 5
-    re-deploys champion fresh. Targon-style multi-instance providers
-    leave this False — each deployment is independent and survives
-    its sibling's teardown."""
+    """True when each provider endpoint can host only one model at a time.
+
+    SSH/sglang endpoints use this mode. Endpoint positions have no fixed
+    role: a pre-deployed challenger is promoted in place, then the previous
+    champion's distinct runtime is released for the next queued model. A
+    one-endpoint setup still works by replacing the champion deployment.
+    Targon-style multi-instance providers leave this False because sibling
+    deployments can coexist independently.
+    """
 
     def __post_init__(self) -> None:
         if self.task_pool_refresh_blocks is None:
@@ -307,6 +323,9 @@ class FlowScheduler:
         deployment_health_fn: Optional[DeploymentHealthFn] = None,
         sample_metrics_reader: Optional[SampleMetricsReader] = None,
         behavior_gate_dao: Any = None,
+        transition_deployment_role_fn: Optional[
+            TransitionDeploymentRoleFn
+        ] = None,
     ):
         self.cfg = config
         self.state = state
@@ -327,6 +346,7 @@ class FlowScheduler:
         )
         self._deployment_health = deployment_health_fn
         self._behavior_gate_dao = behavior_gate_dao
+        self._transition_deployment_role = transition_deployment_role_fn
         self._last_behavior_gate_log: Dict[str, str] = {}
         self._last_no_endpoint_log_at = 0.0
 
@@ -337,8 +357,8 @@ class FlowScheduler:
         The latter two are guarded so a flaky teardown / DDB scan
         can't block the next tick."""
         # Run this before the main phase so a failed pre-deployed miner cannot
-        # be adopted and redeployed onto the primary before its gate verdict
-        # is consumed.
+        # be promoted into the active battle before its gate verdict is
+        # consumed.
         try:
             await self._predeploy_behavior_gate_sweep()
         except Exception as e:
@@ -402,6 +422,22 @@ class FlowScheduler:
             await self._cold_start(current_block)
             return
 
+        # SSH endpoints host one model each. Once a battle is durable, the
+        # old champion runtime is no longer needed: its baseline is already
+        # complete and releasing its endpoint lets the next queued model
+        # pre-sample. A crash after set_battle but before this cleanup retries
+        # here. Do not clear the newly-promoted champion in the separate
+        # set_champion(new) -> clear_battle recovery window.
+        if (
+            battle is not None
+            and self.cfg.single_instance_provider
+            and not _same_subject(champion, battle.challenger)
+        ):
+            if not await self._release_champion_runtime_for_battle(
+                champion, battle,
+            ):
+                return
+
         # Crash-recovery must run before deployment/sample gates. If a
         # previous tick promoted the challenger then crashed before
         # ``clear_battle()``, the persisted state has the same UID in
@@ -448,24 +484,23 @@ class FlowScheduler:
         # Runtime health reconciliation. The deployment_id/base_url pair
         # says what the scheduler last *successfully* started, but not
         # whether that process is still alive. Only check while no battle
-        # is in flight: on single-instance SSH hosts the primary machine
-        # intentionally serves the challenger during a battle and the
-        # champion deployment is cleared when the challenger is started.
+        # is in flight: on single-model SSH endpoints the champion runtime is
+        # intentionally released once the challenger becomes active.
         if battle is None:
             if not await self._recover_unhealthy_champion_deployment(champion):
                 return
 
-        # 5. Champion needs inference. During a single-instance battle the
+        # 5. Champion needs inference. During a single-model-endpoint battle the
         # champion may intentionally have no live deployment because its
-        # samples were completed before the challenger reused the machine.
+        # samples were completed before the challenger became active.
         #
         # Single-instance loss-path fast-path: when the just-ended battle
         # was a loss, the champion is unchanged so its samples are still
         # complete (loss doesn't touch sample_results). Skip the ~2-minute
-        # champion redeploy and dispatch the next challenger directly —
-        # ``_start_battle`` would overwrite this deployment within seconds
-        # anyway. When the queue is empty we fall through to the redeploy
-        # so b300 isn't sitting empty.
+        # champion redeploy and dispatch the next challenger directly; that
+        # runtime would otherwise be released again as soon as the battle is
+        # durable. When the queue is empty, fall through so an endpoint keeps
+        # serving the champion.
         if battle is None and (not champion.deployment_id or not champion.base_url):
             if self.cfg.single_instance_provider and await self._samples_complete(
                 MinerSnapshot(uid=champion.uid, hotkey=champion.hotkey,
@@ -626,11 +661,9 @@ class FlowScheduler:
         )
         await self.state.set_task_state(new_state)
 
-        # Single-instance provider: the inference host may be empty or
-        # holding a stale challenger's model from before the refresh.
-        # Clear champion.deployment_id so step 5 re-deploys champion onto
-        # the host before any new sampling against the (possibly wrong)
-        # base_url.
+        # A single-model endpoint may be empty or hold stale runtime state
+        # from before the refresh. Clear the persisted champion URL so step 5
+        # reconciles its assignment before any new sampling.
         if self.cfg.single_instance_provider:
             champ = await self.state.get_champion()
             if champ is not None and (
@@ -1027,11 +1060,8 @@ class FlowScheduler:
             scores_refresh_block=task_state.refreshed_at_block,
             terminated_at_block=current_block,
         )
-        # Single-instance provider: the teardown just emptied the
-        # inference host (challenger and champion share the same
-        # container under sglang). Champion's deployment_id is now
-        # stale — clear it so step 5 re-deploys champion next tick.
-        # Symmetric to the ``_decide`` LOST branch.
+        # The champion runtime is normally released at battle start. Keep the
+        # persisted state empty here as an idempotent recovery safeguard.
         if self.cfg.single_instance_provider:
             champion.deployment_id = None
             champion.base_url = None
@@ -1433,9 +1463,27 @@ class FlowScheduler:
         ):
             return
 
+        battle = await self.state.get_battle()
+        champion = await self.state.get_champion()
         kept: List[BattleRecord] = []
         changed = False
         for record in records:
+            # set_battle is intentionally committed before the pre-list is
+            # pruned during in-place promotion. A crash in that window leaves
+            # two references to one deployment. Let the active-battle path
+            # consume its gate verdict; tearing down via the pre-list would
+            # kill the live battle (or its newly-promoted champion).
+            if (
+                battle is not None
+                and _same_subject(record.challenger, battle.challenger)
+                and _records_share_deployment(record, battle)
+            ) or (
+                champion is not None
+                and _same_subject(record.challenger, champion)
+                and _records_share_deployment(record, champion)
+            ):
+                kept.append(record)
+                continue
             if self._behavior_gate_dao is None:
                 kept.append(record)
                 continue
@@ -1486,7 +1534,7 @@ class FlowScheduler:
             await self.state.set_predeployed_challengers(kept)
 
     async def _predeploy_phase(self, current_block: int) -> None:
-        """Invalidation sweep, early-loss sweep, fill spare. No-op until
+        """Invalidation sweep, early-loss sweep, fill free endpoints. No-op until
         champion + task_state exist."""
         champion = await self.state.get_champion()
         if champion is None:
@@ -1498,7 +1546,7 @@ class FlowScheduler:
         await self._predeploy_early_loss_sweep(
             champion, task_state, current_block,
         )
-        await self._predeploy_fill_spare(champion, current_block)
+        await self._predeploy_fill_available(champion, current_block)
 
     async def _predeploy_invalidation_sweep(self) -> None:
         records = await self.state.get_predeployed_challengers()
@@ -1507,10 +1555,10 @@ class FlowScheduler:
         valid_uids = {
             int(r.get("uid", -1)) for r in await self._list_valid_miners()
         }
-        # Champion is read for the post-adoption stale-record check below;
-        # ``None`` is fine for cold-start ticks.
+        # Current-role records are read for crash recovery below; ``None`` is
+        # fine for cold-start ticks.
         champion = await self.state.get_champion()
-        champion_uid = champion.uid if champion is not None else None
+        battle = await self.state.get_battle()
         # An endpoint marked inactive is no longer ours to teardown.
         # Drop the record so the executor stops dispatching to a
         # base_url the operator removed.
@@ -1527,6 +1575,42 @@ class FlowScheduler:
         kept: List[BattleRecord] = []
         changed = False
         for record in records:
+            # Promotion writes current_battle before pruning the pre-list so
+            # the running deployment is never absent from scheduler state.
+            # A crash between those writes leaves a duplicate reference. Drop
+            # it without teardown when both records point to the same runtime;
+            # otherwise remove the genuinely stale, distinct pre-deployment.
+            if (
+                battle is not None
+                and _same_subject(record.challenger, battle.challenger)
+            ):
+                if _records_share_deployment(record, battle):
+                    logger.warning(
+                        f"FlowScheduler: dropping duplicate pre-deployed "
+                        f"record for active battle uid="
+                        f"{record.challenger.uid} without teardown"
+                    )
+                    changed = True
+                    continue
+                logger.warning(
+                    f"FlowScheduler: pre-deployed uid="
+                    f"{record.challenger.uid} duplicates the active subject "
+                    f"on a different deployment; tearing down stale runtime"
+                )
+                try:
+                    await self._teardown_record(record)
+                except Exception as e:
+                    logger.error(
+                        f"FlowScheduler: teardown failed for stale active-"
+                        f"subject pre-deployment uid="
+                        f"{record.challenger.uid}: {type(e).__name__}: "
+                        f"{e} — keeping for retry"
+                    )
+                    kept.append(record)
+                    continue
+                changed = True
+                continue
+
             record_endpoints = {
                 d.endpoint_name for d in (record.deployments or [])
                 if getattr(d, "endpoint_name", None)
@@ -1545,29 +1629,34 @@ class FlowScheduler:
                 )
                 changed = True
                 continue
-            # A record whose uid is now champion can only be left over
-            # from a crash mid-``_adopt_predeployed_if_present``: the
-            # champion write committed but the ``set_predeployed_challengers``
-            # for the remaining list did not. The spare endpoint stays
-            # assigned to that uid, blocking future fills. Tear down +
-            # drop here so the fill loop can recover on the next tick.
-            if champion_uid is not None and record.challenger.uid == champion_uid:
+            # A matching champion record can remain after a crash during
+            # promotion cleanup. In-place promotion means it may be the same
+            # deployment now owned by the champion, in which case teardown
+            # would kill valid inference. Legacy/distinct leftovers are still
+            # safe to tear down.
+            if (
+                champion is not None
+                and _same_subject(record.challenger, champion)
+            ):
+                shared = _records_share_deployment(record, champion)
                 logger.warning(
                     f"FlowScheduler: pre-deployed uid="
                     f"{record.challenger.uid} matches current champion; "
                     f"dropping stale crash-recovery record"
+                    + (" without teardown" if shared else "")
                 )
-                try:
-                    await self._teardown_record(record)
-                except Exception as e:
-                    logger.error(
-                        f"FlowScheduler: teardown failed for stale "
-                        f"champion-matching pre-deployed uid="
-                        f"{record.challenger.uid}: {type(e).__name__}: "
-                        f"{e} — keeping for retry"
-                    )
-                    kept.append(record)
-                    continue
+                if not shared:
+                    try:
+                        await self._teardown_record(record)
+                    except Exception as e:
+                        logger.error(
+                            f"FlowScheduler: teardown failed for stale "
+                            f"champion-matching pre-deployed uid="
+                            f"{record.challenger.uid}: {type(e).__name__}: "
+                            f"{e} — keeping for retry"
+                        )
+                        kept.append(record)
+                        continue
                 changed = True
                 continue
             if record.challenger.uid in valid_uids:
@@ -1691,15 +1780,35 @@ class FlowScheduler:
             f"uid={champion.uid} — terminated without entering battle"
         )
 
-    async def _predeploy_fill_spare(
+    async def _predeploy_fill_available(
         self, champion: ChampionRecord, current_block: int,
     ) -> None:
-        """Deploy queued miners on free non-primary endpoints, FIFO.
+        """Deploy queued miners on any free endpoint, FIFO.
+
+        Before the first battle, a champion without a runtime must deploy
+        first. Otherwise a one-endpoint installation could let a pre-
+        challenger consume its only machine and deadlock champion sampling.
+        During a battle the champion runtime is intentionally absent and the
+        endpoint it released is available for the next pre-challenger.
+
         Deploy failures leave the miner in queue and advance to the next
-        candidate; ``NoSpareEndpoint`` ends the loop cleanly."""
+        candidate; ``NoEndpointCapacity`` ends the loop cleanly."""
         if not await self._deployment_capacity_available("predeploy"):
             return
         battle = await self.state.get_battle()
+        if self.cfg.single_instance_provider:
+            champion_has_runtime = bool(
+                champion.deployment_id
+                or champion.base_url
+                or champion.deployments
+            )
+            if battle is None and not champion_has_runtime:
+                return
+            if battle is not None and champion_has_runtime:
+                # Battle state is durable but old-runtime cleanup has not
+                # converged. Do not reuse an endpoint whose stable SSH
+                # deployment id may still be retried by that cleanup.
+                return
         records = await self.state.get_predeployed_challengers()
         exclude = {p.challenger.uid for p in records}
         if battle is not None:
@@ -1717,11 +1826,11 @@ class FlowScheduler:
             )
             try:
                 result = await self._deploy(target, "pre_challenger")
-            except NoSpareEndpoint:
+            except NoEndpointCapacity:
                 return
             except Exception as e:
                 await self._forget_invalidated_deployments_from_error(e)
-                # Any non-NoSpareEndpoint deploy failure (transient
+                # Any non-capacity deploy failure (transient
                 # transport, sglang container crash on startup, HF
                 # 5xx, ``_wait_ready`` timeout) leaves the miner in
                 # queue. Scheduler can't tell a true model fault apart
@@ -1768,7 +1877,7 @@ class FlowScheduler:
     async def _start_battle(
         self, champion: ChampionRecord, current_block: int,
     ) -> None:
-        """Pick the next pending miner and stand up its Targon workload."""
+        """Pick the next pending miner and make its deployment active."""
         if not await self._deployment_capacity_available("challenger"):
             return
         candidate = await self.queue.pick_next(
@@ -1777,77 +1886,202 @@ class FlowScheduler:
         )
         if candidate is None:
             return  # idle, no challengers
-        await self._adopt_predeployed_if_present(candidate.uid)
-        target = targon_lifecycle.DeployTarget(
-            uid=candidate.uid, hotkey=candidate.hotkey,
-            model=candidate.model, revision=candidate.revision,
-            model_type=candidate.model_type,
-        )
+        records = await self.state.get_predeployed_challengers()
+        adopted: Optional[BattleRecord] = None
+        remaining: List[BattleRecord] = []
+        for record in records:
+            if adopted is None and _record_matches_candidate(record, candidate):
+                adopted = record
+                continue
+            remaining.append(record)
+
+        if adopted is not None:
+            transition = await self._transition_runtime_role(
+                adopted, "challenger",
+            )
+            if transition is DeploymentRoleTransitionResult.RETRYABLE:
+                released = await self.queue.release_claim(
+                    candidate.uid,
+                    hotkey=candidate.hotkey,
+                    revision=candidate.revision,
+                )
+                logger.warning(
+                    f"FlowScheduler: pre-deployment promotion temporarily "
+                    f"failed for uid={candidate.uid}; retaining runtime and "
+                    f"releasing claim={released} for retry"
+                )
+                return
+            if transition is DeploymentRoleTransitionResult.STALE:
+                # The provider assignment has moved to another owner.
+                # Drop only the stale state reference; tearing it down by
+                # endpoint-stable deployment id could kill that new owner.
+                try:
+                    await self.state.set_predeployed_challengers(remaining)
+                except Exception as e:
+                    logger.error(
+                        f"FlowScheduler: failed to drop stale pre-"
+                        f"deployment uid={candidate.uid}: "
+                        f"{type(e).__name__}: {e}"
+                    )
+                released = await self.queue.release_claim(
+                    candidate.uid,
+                    hotkey=candidate.hotkey,
+                    revision=candidate.revision,
+                )
+                logger.warning(
+                    f"FlowScheduler: pre-deployed uid={candidate.uid} "
+                    f"no longer owns its provider assignment; dropped "
+                    f"stale record and released claim={released}"
+                )
+                return
+
+            battle = BattleRecord(
+                challenger=adopted.challenger,
+                deployment_id=adopted.deployment_id,
+                base_url=adopted.base_url,
+                started_at_block=current_block,
+                deployments=list(adopted.deployments),
+                previous_champion=_champion_snapshot(champion),
+            )
+        else:
+            target = targon_lifecycle.DeployTarget(
+                uid=candidate.uid, hotkey=candidate.hotkey,
+                model=candidate.model, revision=candidate.revision,
+                model_type=candidate.model_type,
+            )
+            try:
+                result = await self._deploy(target, "challenger")
+            except Exception as e:
+                await self._forget_invalidated_deployments_from_error(e)
+                # Any deploy failure leaves the miner eligible for a retry.
+                # The monitor's model checks, not a single provider failure,
+                # are authoritative for deciding whether the model is broken.
+                kind = (
+                    "transport" if isinstance(e, TransientDeployError)
+                    else "deploy"
+                )
+                logger.error(
+                    f"FlowScheduler: challenger {kind} error "
+                    f"uid={candidate.uid}; releasing claim so miner stays "
+                    f"re-pickable: {type(e).__name__}: "
+                    f"{e}{_format_cause_chain(e)}"
+                )
+                released = await self.queue.release_claim(
+                    candidate.uid,
+                    hotkey=candidate.hotkey, revision=candidate.revision,
+                )
+                if not released:
+                    logger.warning(
+                        f"FlowScheduler: release_claim race on "
+                        f"uid={candidate.uid} — row no longer in_progress; "
+                        f"leaving as-is"
+                    )
+                return
+            battle = BattleRecord(
+                challenger=MinerSnapshot(
+                    uid=candidate.uid, hotkey=candidate.hotkey,
+                    revision=candidate.revision, model=candidate.model,
+                    model_type=candidate.model_type,
+                ),
+                deployment_id=result.deployment_id,
+                base_url=result.base_url,
+                started_at_block=current_block,
+                deployments=_deployments_from_result(result),
+                previous_champion=_champion_snapshot(champion),
+            )
+
+        # Persist the active role first. If pruning the pre-list fails, both
+        # references temporarily point to one deployment; executor launch
+        # dedupe and the invalidation sweep make that crash window harmless.
         try:
-            result = await self._deploy(target, "challenger")
+            await self.state.set_battle(battle)
         except Exception as e:
-            await self._forget_invalidated_deployments_from_error(e)
-            # Any deploy failure (transient transport, sglang container
-            # crash on startup, HF 5xx, ``_wait_ready`` timeout) leaves
-            # the miner in queue. ``pick_next`` already flipped the row
-            # to ``in_progress``; release it back so the same uid stays
-            # re-pickable on the next tick (and may land on a healed
-            # host). Pre-sample work, if any, was already torn down by
-            # ``_adopt_predeployed_if_present`` — that work is lost,
-            # but we'd rather lose pre-samples than a miner's queue
-            # entry to an infra blip. The monitor's ``hf_model_fetch``
-            # check is the authoritative signal for "model is broken";
-            # scheduler doesn't have enough info to judge from a single
-            # deploy failure.
-            kind = (
-                "transport" if isinstance(e, TransientDeployError)
-                else "deploy"
-            )
-            logger.error(
-                f"FlowScheduler: challenger {kind} error "
-                f"uid={candidate.uid}; releasing claim so miner stays "
-                f"re-pickable: {type(e).__name__}: {e}{_format_cause_chain(e)}"
-            )
             released = await self.queue.release_claim(
                 candidate.uid,
-                hotkey=candidate.hotkey, revision=candidate.revision,
+                hotkey=candidate.hotkey,
+                revision=candidate.revision,
             )
-            if not released:
-                logger.warning(
-                    f"FlowScheduler: release_claim race on "
-                    f"uid={candidate.uid} — row no longer in_progress; "
-                    f"leaving as-is"
-                )
+            logger.error(
+                f"FlowScheduler: failed to persist battle uid="
+                f"{candidate.uid}; released claim={released} for retry: "
+                f"{type(e).__name__}: {e}"
+            )
             return
+        if adopted is not None:
+            try:
+                await self.state.set_predeployed_challengers(remaining)
+            except Exception as e:
+                logger.warning(
+                    f"FlowScheduler: battle uid={candidate.uid} is durable "
+                    f"but pre-list pruning failed; recovery sweep will retry: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+            task_state = await self.state.get_task_state()
+            if (
+                task_state is not None
+                and adopted.started_at_block < task_state.refreshed_at_block
+            ):
+                logger.warning(
+                    f"FlowScheduler: promoted pre-deployed uid="
+                    f"{candidate.uid} across task-id refresh boundary "
+                    f"(started_at_block={adopted.started_at_block} < "
+                    f"refreshed_at_block={task_state.refreshed_at_block}); "
+                    f"earlier-refresh samples do not count toward overlap"
+                )
+            logger.info(
+                f"FlowScheduler: promoted pre-deployed uid={candidate.uid} "
+                f"in place as active challenger"
+            )
+
         if self.cfg.single_instance_provider:
-            champion.deployment_id = None
-            champion.base_url = None
-            champion.deployments = []
-            await self.state.set_champion(champion)
-        battle = BattleRecord(
-            challenger=MinerSnapshot(
-                uid=candidate.uid, hotkey=candidate.hotkey,
-                revision=candidate.revision, model=candidate.model,
-                model_type=candidate.model_type,
-            ),
-            deployment_id=result.deployment_id,
-            base_url=result.base_url,
-            started_at_block=current_block,
-            deployments=_deployments_from_result(result),
-            # Captured BEFORE ``set_champion(new)`` ever runs so the
-            # _decide recovery branch can still terminate the old
-            # champion and re-emit weights after a mid-flow crash.
-            previous_champion=MinerSnapshot(
-                uid=champion.uid, hotkey=champion.hotkey,
-                revision=champion.revision, model=champion.model,
-                model_type=champion.model_type,
-            ),
-        )
-        await self.state.set_battle(battle)
+            await self._release_champion_runtime_for_battle(champion, battle)
         logger.info(
             f"FlowScheduler: battle started — challenger uid={candidate.uid} "
             f"vs champion uid={champion.uid}"
         )
+
+    async def _transition_runtime_role(
+        self, record: BattleRecord, role: str,
+    ) -> DeploymentRoleTransitionResult:
+        if self._transition_deployment_role is None:
+            return DeploymentRoleTransitionResult.UPDATED
+        try:
+            result = await self._transition_deployment_role(record, role)
+        except Exception as e:
+            logger.error(
+                f"FlowScheduler: provider role transition failed "
+                f"for uid={record.challenger.uid} role={role}; "
+                f"{type(e).__name__}: {e}"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        if not isinstance(result, DeploymentRoleTransitionResult):
+            logger.error(
+                f"FlowScheduler: provider role transition returned invalid "
+                f"result={result!r} for uid={record.challenger.uid} "
+                f"role={role}; retrying without changing scheduler state"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        return result
+
+    async def _promote_runtime_to_champion(
+        self, battle: BattleRecord,
+    ) -> DeploymentRoleTransitionResult:
+        """Fence runtime reuse behind the provider's persisted assignment."""
+        result = await self._transition_runtime_role(battle, "champion")
+        if result is DeploymentRoleTransitionResult.RETRYABLE:
+            logger.error(
+                "FlowScheduler: challenger-to-champion provider role "
+                f"transition temporarily failed for uid="
+                f"{battle.challenger.uid}; retaining battle for retry"
+            )
+        elif result is DeploymentRoleTransitionResult.STALE:
+            logger.warning(
+                "FlowScheduler: challenger-to-champion provider role "
+                f"transition rejected for uid={battle.challenger.uid}; "
+                "winner remains valid but its stale runtime will not be reused"
+            )
+        return result
 
     async def _deployment_capacity_available(self, role: str) -> bool:
         """Return whether an SSH/single-instance deployment can start now.
@@ -1945,6 +2179,15 @@ class FlowScheduler:
                         f"reason={reason}"
                     )
                 return
+            transition = await self._promote_runtime_to_champion(battle)
+            if transition is DeploymentRoleTransitionResult.RETRYABLE:
+                return
+            if transition is DeploymentRoleTransitionResult.STALE:
+                # The winner was already made canonical before the crash, but
+                # its provider assignment has since disappeared or changed
+                # owner. Preserve the evaluation result and force a clean
+                # champion deploy on a later tick.
+                await self._clear_champion_deployment_state(champion)
             logger.info(
                 f"FlowScheduler: detected post-promotion crash recovery "
                 f"for uid={champion.uid}; finalizing bookkeeping without "
@@ -2195,15 +2438,25 @@ class FlowScheduler:
                     f"reason={reason}"
                 )
                 return
+            transition = await self._promote_runtime_to_champion(battle)
+            if transition is DeploymentRoleTransitionResult.RETRYABLE:
+                return
+            reuse_runtime = (
+                transition is DeploymentRoleTransitionResult.UPDATED
+            )
             new_champion = ChampionRecord(
                 uid=battle.challenger.uid,
                 hotkey=battle.challenger.hotkey,
                 revision=battle.challenger.revision,
                 model=battle.challenger.model,
                 model_type=battle.challenger.model_type,
-                deployment_id=battle.deployment_id,
-                base_url=battle.base_url,
-                deployments=list(battle.deployments),
+                deployment_id=(
+                    battle.deployment_id if reuse_runtime else None
+                ),
+                base_url=battle.base_url if reuse_runtime else None,
+                deployments=(
+                    list(battle.deployments) if reuse_runtime else []
+                ),
                 since_block=current_block,
             )
             # Order: write the canonical champion record FIRST so any
@@ -2282,12 +2535,9 @@ class FlowScheduler:
                 scores_refresh_block=task_state.refreshed_at_block,
                 terminated_at_block=current_block,
             )
-            # Single-instance provider: the teardown just emptied the
-            # inference host (champion's container went away with the
-            # challenger's — they're the same container). Champion's
-            # deployment_id is now stale. Clear it so step 5 re-deploys
-            # champion onto the host before the next ``_samples_complete``
-            # would otherwise sample against a dead URL.
+            # The champion runtime is normally released at battle start. Keep
+            # the persisted state empty so the next tick either starts another
+            # battle from completed samples or redeploys the champion.
             if self.cfg.single_instance_provider:
                 champion.deployment_id = None
                 champion.base_url = None
@@ -2357,6 +2607,48 @@ class FlowScheduler:
                 await self._teardown(dep.deployment_id)
             return
         await self._teardown(getattr(record, "deployment_id", None))
+
+    async def _release_champion_runtime_for_battle(
+        self,
+        champion: ChampionRecord,
+        battle: BattleRecord,
+    ) -> bool:
+        """Release the old champion's distinct endpoint after battle start.
+
+        ``current_battle`` is persisted before this runs, so a teardown error
+        can safely retry next tick. Deployment ids shared with the battle are
+        skipped: that is the one-endpoint model-swap case where tearing down
+        the old champion id would actually kill the active challenger.
+        """
+        if not (
+            champion.deployment_id
+            or champion.base_url
+            or champion.deployments
+        ):
+            return True
+
+        battle_ids = set(_record_deployment_ids(battle))
+        champion_ids = _record_deployment_ids(champion)
+        try:
+            for deployment_id in champion_ids:
+                if deployment_id in battle_ids:
+                    continue
+                await self._teardown(deployment_id)
+            await self._clear_champion_deployment_state(champion)
+        except Exception as e:
+            logger.error(
+                f"FlowScheduler: failed to release champion uid="
+                f"{champion.uid} runtime after battle uid="
+                f"{battle.challenger.uid} became durable: "
+                f"{type(e).__name__}: {e}; will retry next tick"
+            )
+            return False
+
+        logger.info(
+            f"FlowScheduler: released champion uid={champion.uid} runtime "
+            f"for active battle uid={battle.challenger.uid}"
+        )
+        return True
 
     async def _forget_invalidated_deployments_from_error(
         self, error: Exception,
@@ -2428,47 +2720,6 @@ class FlowScheduler:
             if changed:
                 await self.state.set_predeployed_challengers(kept)
 
-    async def _adopt_predeployed_if_present(self, uid: int) -> None:
-        """Tear down the pre-sample slot for ``uid`` (if any) so the
-        caller can deploy it fresh on the primary."""
-        records = await self.state.get_predeployed_challengers()
-        if not records:
-            return
-        remaining: List[BattleRecord] = []
-        adopted: Optional[BattleRecord] = None
-        for record in records:
-            if adopted is None and record.challenger.uid == uid:
-                adopted = record
-                continue
-            remaining.append(record)
-        if adopted is None:
-            return
-        await self._teardown_record(adopted)
-        await self.state.set_predeployed_challengers(remaining)
-        # Pre-samples are keyed by ``refresh_block``; if the task-id pool
-        # refreshed after this miner was pre-deployed, old-refresh samples
-        # won't count toward current-refresh overlap and the battle
-        # effectively starts from zero pre-sample value. Flag the wasted
-        # work so operators can see it.
-        task_state = await self.state.get_task_state()
-        if (
-            task_state is not None
-            and adopted.started_at_block < task_state.refreshed_at_block
-        ):
-            logger.warning(
-                f"FlowScheduler: adopted pre-deployed uid={uid} crosses "
-                f"task-id refresh boundary (started_at_block="
-                f"{adopted.started_at_block} < refreshed_at_block="
-                f"{task_state.refreshed_at_block}); pre-samples from "
-                f"earlier refresh are not counted toward current-refresh "
-                f"overlap"
-            )
-        logger.info(
-            f"FlowScheduler: adopted pre-deployed uid={uid} as active "
-            f"challenger (pre-sample slot torn down; pre-samples retained "
-            f"via sample_results)"
-        )
-
     async def _write_weights(
         self, champion: ChampionRecord, block_number: int, result: Any,
         previous_champion: Optional[ChampionRecord] = None,
@@ -2523,6 +2774,55 @@ class FlowScheduler:
             outcome=_outcome_for_snapshot(result, champion),
             rules=_rules_for_snapshot(),
         )
+
+
+def _same_subject(left: Any, right: Any) -> bool:
+    return (
+        getattr(left, "hotkey", None) == getattr(right, "hotkey", None)
+        and getattr(left, "revision", None) == getattr(right, "revision", None)
+    )
+
+
+def _record_matches_candidate(record: BattleRecord, candidate: Any) -> bool:
+    challenger = record.challenger
+    return (
+        challenger.uid == candidate.uid
+        and challenger.hotkey == candidate.hotkey
+        and challenger.revision == candidate.revision
+        and challenger.model == candidate.model
+    )
+
+
+def _champion_snapshot(champion: ChampionRecord) -> MinerSnapshot:
+    return MinerSnapshot(
+        uid=champion.uid,
+        hotkey=champion.hotkey,
+        revision=champion.revision,
+        model=champion.model,
+        model_type=champion.model_type,
+    )
+
+
+def _record_deployment_ids(record: Any) -> List[str]:
+    ids = [
+        str(dep.deployment_id)
+        for dep in (getattr(record, "deployments", []) or [])
+        if getattr(dep, "deployment_id", None)
+    ]
+    fallback = getattr(record, "deployment_id", None)
+    if fallback:
+        ids.append(str(fallback))
+    return list(dict.fromkeys(ids))
+
+
+def _records_share_deployment(left: Any, right: Any) -> bool:
+    left_ids = set(_record_deployment_ids(left))
+    right_ids = set(_record_deployment_ids(right))
+    if left_ids and right_ids:
+        return bool(left_ids & right_ids)
+    left_url = getattr(left, "base_url", None)
+    right_url = getattr(right, "base_url", None)
+    return bool(left_url and right_url and left_url == right_url)
 
 
 def _deployments_from_result(result: targon_lifecycle.DeployResult) -> List[DeploymentRecord]:

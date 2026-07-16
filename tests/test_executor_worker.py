@@ -1928,10 +1928,6 @@ def test_predeployed_challenger_dispatches_to_its_own_url():
 
     fx.drive()
 
-    pre_dispatches = [
-        (tid, url) for uid, tid in fx.dispatched
-        for url in [None]  # placeholder; we'll re-fetch with base_url
-    ]
     # The fixture's _capture only stored (uid, tid). To check URL we
     # need a richer capture — replace and re-run.
     fx.dispatched = []
@@ -1995,6 +1991,45 @@ def test_predeployed_challenger_gated_on_champion_done():
     assert pre_tids == {0, 1, 2}, (
         f"pre-deployed must gate on champion-done set {{0,1,2}}, got {pre_tids}"
     )
+
+
+def test_in_place_promotion_overlap_dispatches_each_task_once():
+    """Crash recovery may expose one deployment as both current_battle and
+    predeployed for a poll; the launch fence must collapse duplicate work."""
+    from affine.src.scorer.window_state import (
+        BattleRecord, DeploymentRecord, MinerSnapshot,
+    )
+
+    fx = _make_overlap_worker()
+    fx.task_ids = list(range(5))
+    fx.sampling_count = 5
+    fx.champ_scores = {task_id: 0.5 for task_id in fx.task_ids}
+    fx.chal_scores = {}
+    fx.predeployed = [BattleRecord(
+        challenger=MinerSnapshot(
+            uid=2,
+            hotkey="chal_hk",
+            revision="chal_rev",
+            model="org/m2",
+        ),
+        deployment_id="wrk-chal",
+        base_url="https://t/wrk-chal",
+        started_at_block=0,
+        deployments=[DeploymentRecord(
+            endpoint_name="endpoint-2",
+            deployment_id="wrk-chal",
+            base_url="https://t/wrk-chal",
+        )],
+    )]
+
+    launched = fx.drive()
+
+    challenger_tasks = [
+        task_id for uid, task_id in fx.dispatched if uid == 2
+    ]
+    assert launched == 5
+    assert sorted(challenger_tasks) == fx.task_ids
+    assert len(challenger_tasks) == len(set(challenger_tasks))
 
 
 # ---- stale-dispatch cancellation -----------------------------------------
