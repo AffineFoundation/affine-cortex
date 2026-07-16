@@ -16,17 +16,24 @@ from botocore.exceptions import ClientError
 
 from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.flow import (
+    DeploymentRoleTransitionResult,
     DeploymentStateInvalidatedError,
-    NoSpareEndpoint,
+    NoEndpointCapacity,
 )
 from affine.src.scheduler.main import (
     EndpointReservationConflict,
     _deploy_ssh_target,
     _gpu_autoscaler_empty_provider_kind,
     _resolve_provider_kind,
+    _transition_ssh_deployment_role,
 )
 from affine.src.scheduler.ssh import SSHConfig
 from affine.src.scheduler.targon import DeployResult, DeployTarget
+from affine.src.scorer.window_state import (
+    BattleRecord,
+    DeploymentRecord,
+    MinerSnapshot,
+)
 
 
 class _UpdateRecordingClient:
@@ -243,6 +250,86 @@ async def test_live_endpoint_reservation_cannot_be_taken_over(monkeypatch):
     assert client.update_calls == []
 
 
+@pytest.mark.asyncio
+async def test_endpoint_assignment_promotes_role_with_identity_fence(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    promoted = await InferenceEndpointsDAO().promote_assignment(
+        "b200-2",
+        uid=42,
+        hotkey="hk42",
+        model="org/model-42",
+        revision="rev42",
+        deployment_id="ssh:b200-2:affine-sglang-current",
+    )
+
+    assert promoted is True
+    call = client.update_calls[0]
+    updated_fields = set(call["ExpressionAttributeNames"].values())
+    assert "assignment_role" in updated_fields
+    assert "assigned_uid" in updated_fields
+    assert "deployment_id" in updated_fields
+    assert "#cond_uid = :uid" in call["ConditionExpression"]
+    assert "#cond_deployment = :deployment" in call["ConditionExpression"]
+    assert "#cond_role = :accepted_role_0" in call["ConditionExpression"]
+    assert "#cond_role = :accepted_role_1" in call["ConditionExpression"]
+    assert {"S": "pre_challenger"} in call["ExpressionAttributeValues"].values()
+    assert {"S": "challenger"} in call["ExpressionAttributeValues"].values()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_assignment_promotes_challenger_to_champion(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    promoted = await InferenceEndpointsDAO().promote_assignment(
+        "b200-2",
+        uid=42,
+        hotkey="hk42",
+        model="org/model-42",
+        revision="rev42",
+        deployment_id="ssh:b200-2:affine-sglang-current",
+        role="champion",
+        expected_roles=("challenger", "active"),
+    )
+
+    assert promoted is True
+    call = client.update_calls[0]
+    values = call["ExpressionAttributeValues"].values()
+    assert {"S": "challenger"} in values
+    assert {"S": "active"} in values
+    assert {"S": "champion"} in values
+    assert "#cond_role = :accepted_role_0" in call["ConditionExpression"]
+    assert "#cond_role = :accepted_role_1" in call["ConditionExpression"]
+    assert "#cond_role = :accepted_role_2" in call["ConditionExpression"]
+
+
+@pytest.mark.asyncio
+async def test_endpoint_assignment_promotion_rejects_stale_owner(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: _ConditionalFailureClient(),
+    )
+
+    promoted = await InferenceEndpointsDAO().promote_assignment(
+        "b200-2",
+        uid=42,
+        hotkey="hk42",
+        model="org/model-42",
+        revision="rev42",
+        deployment_id="ssh:b200-2:affine-sglang-current",
+    )
+
+    assert promoted is False
+
+
 def test_all_ssh_resolves_to_ssh():
     eps = [_Ep("b300", "ssh"), _Ep("b300-2", "ssh")]
     kind, ssh, targon = _resolve_provider_kind(eps)
@@ -446,6 +533,7 @@ class _EndpointsDAOFake:
         self.assignments = []
         self.reservations = []
         self.releases = []
+        self.promotions = []
 
     async def list_active(self, kind=None):
         return [
@@ -485,6 +573,25 @@ class _EndpointsDAOFake:
         }))
         return True
 
+    async def promote_assignment(self, name, **kwargs):
+        endpoint = next(ep for ep in self.endpoints if ep.name == name)
+        self.promotions.append((name, kwargs))
+        if (
+            endpoint.assigned_uid != kwargs["uid"]
+            or endpoint.assigned_hotkey != kwargs["hotkey"]
+            or endpoint.assigned_model != kwargs["model"]
+            or endpoint.assigned_revision != kwargs["revision"]
+            or endpoint.deployment_id != kwargs["deployment_id"]
+            or endpoint.assignment_status != "ready"
+            or endpoint.assignment_role not in (
+                *kwargs.get("expected_roles", ("pre_challenger",)),
+                kwargs["role"],
+            )
+        ):
+            return False
+        endpoint.assignment_role = kwargs["role"]
+        return True
+
     async def release_assignment(self, name, *, token):
         endpoint = next(ep for ep in self.endpoints if ep.name == name)
         self.releases.append((name, token))
@@ -514,6 +621,9 @@ class _StaleReadEndpointsDAOFake(_EndpointsDAOFake):
                 assigned_hotkey=None,
                 assigned_model=None,
                 assigned_revision=None,
+                deployment_id=None,
+                base_url=None,
+                assignment_role=None,
                 assignment_token=None,
                 assignment_status=None,
             )
@@ -546,6 +656,127 @@ def _target():
     )
 
 
+def _role_transition_record(*, endpoint_name: str = "b300") -> BattleRecord:
+    target = _target()
+    deployment_id = "ssh:b300:affine-sglang-current"
+    deployments = []
+    if endpoint_name:
+        deployments.append(
+            DeploymentRecord(
+                endpoint_name=endpoint_name,
+                deployment_id=deployment_id,
+                base_url="http://b300:10001/v1",
+            )
+        )
+    return BattleRecord(
+        challenger=MinerSnapshot(
+            uid=target.uid,
+            hotkey=target.hotkey,
+            revision=target.revision,
+            model=target.model,
+        ),
+        deployment_id=deployment_id,
+        base_url="http://b300:10001/v1",
+        started_at_block=100,
+        deployments=deployments,
+    )
+
+
+def _assigned_endpoint(*, role: str = "challenger") -> Endpoint:
+    target = _target()
+    return Endpoint(
+        name="b300",
+        kind="ssh",
+        ssh_url="ssh://root@b300",
+        assigned_uid=target.uid,
+        assigned_hotkey=target.hotkey,
+        assigned_model=target.model,
+        assigned_revision=target.revision,
+        deployment_id="ssh:b300:affine-sglang-current",
+        base_url="http://b300:10001/v1",
+        assignment_role=role,
+        assignment_status="ready",
+    )
+
+
+@pytest.mark.asyncio
+async def test_ssh_role_transition_accepts_legacy_active_champion_assignment():
+    endpoint = _assigned_endpoint(role="active")
+    dao = _EndpointsDAOFake([endpoint])
+
+    result = await _transition_ssh_deployment_role(
+        dao,
+        {},
+        _role_transition_record(),
+        "champion",
+    )
+
+    assert result is DeploymentRoleTransitionResult.UPDATED
+    assert endpoint.assignment_role == "champion"
+    assert dao.promotions[0][1]["expected_roles"] == (
+        "challenger",
+        "active",
+    )
+
+
+@pytest.mark.asyncio
+async def test_ssh_role_transition_classifies_provider_error_as_retryable():
+    class _FailingPromotionDAO(_EndpointsDAOFake):
+        async def promote_assignment(self, name, **kwargs):
+            raise RuntimeError("ddb unavailable")
+
+    result = await _transition_ssh_deployment_role(
+        _FailingPromotionDAO([_assigned_endpoint()]),
+        {},
+        _role_transition_record(),
+        "champion",
+    )
+
+    assert result is DeploymentRoleTransitionResult.RETRYABLE
+
+
+@pytest.mark.asyncio
+async def test_ssh_role_transition_classifies_missing_endpoint_as_stale():
+    result = await _transition_ssh_deployment_role(
+        _EndpointsDAOFake([]),
+        {},
+        _role_transition_record(endpoint_name=""),
+        "champion",
+    )
+
+    assert result is DeploymentRoleTransitionResult.STALE
+
+
+@pytest.mark.asyncio
+async def test_ssh_role_transition_classifies_owner_mismatch_as_stale():
+    endpoint = _assigned_endpoint()
+    endpoint.assigned_uid = 99
+
+    result = await _transition_ssh_deployment_role(
+        _EndpointsDAOFake([endpoint]),
+        {},
+        _role_transition_record(),
+        "champion",
+    )
+
+    assert result is DeploymentRoleTransitionResult.STALE
+
+
+@pytest.mark.asyncio
+async def test_ssh_role_transition_classifies_missing_deployment_as_stale():
+    record = _role_transition_record(endpoint_name="")
+    record.deployment_id = ""
+
+    result = await _transition_ssh_deployment_role(
+        _EndpointsDAOFake([_assigned_endpoint()]),
+        {},
+        record,
+        "champion",
+    )
+
+    assert result is DeploymentRoleTransitionResult.STALE
+
+
 @pytest.mark.asyncio
 async def test_ssh_deploy_failure_clears_assignment_and_reports_deployment(
     monkeypatch,
@@ -558,6 +789,7 @@ async def test_ssh_deploy_failure_clears_assignment_and_reports_deployment(
         assigned_hotkey="old",
         assigned_model="old/model",
         assigned_revision="oldrev",
+        assignment_role="champion",
     )
     dao = _EndpointsDAOFake([endpoint])
 
@@ -664,7 +896,9 @@ async def test_stale_endpoint_read_cannot_overwrite_predeploy_reservation(
 ):
     endpoints = [
         Endpoint(name="a-primary", kind="ssh", ssh_url="ssh://root@primary"),
-        Endpoint(name="b-spare", kind="ssh", ssh_url="ssh://root@spare"),
+        Endpoint(
+            name="b-secondary", kind="ssh", ssh_url="ssh://root@secondary",
+        ),
     ]
     dao = _StaleReadEndpointsDAOFake(endpoints)
     deployed_uids = []
@@ -689,11 +923,11 @@ async def test_stale_endpoint_read_cannot_overwrite_predeploy_reservation(
         model="org/model-194",
         revision="rev194",
     )
-    with pytest.raises(NoSpareEndpoint):
+    with pytest.raises(NoEndpointCapacity):
         await _deploy_ssh_target(dao, {}, second, role="pre_challenger")
 
     assert deployed_uids == [42]
-    assert endpoints[1].assigned_uid == 42
+    assert endpoints[0].assigned_uid == 42
 
 
 @pytest.mark.asyncio
