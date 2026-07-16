@@ -267,8 +267,34 @@ async def test_endpoint_assignment_promotes_role_with_identity_fence(monkeypatch
     assert "deployment_id" in updated_fields
     assert "#cond_uid = :uid" in call["ConditionExpression"]
     assert "#cond_deployment = :deployment" in call["ConditionExpression"]
-    assert "#cond_role = :pre_role" in call["ConditionExpression"]
+    assert "#cond_role = :expected_role" in call["ConditionExpression"]
     assert {"S": "challenger"} in call["ExpressionAttributeValues"].values()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_assignment_promotes_challenger_to_champion(monkeypatch):
+    from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
+
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr("affine.database.client.get_client", lambda: client)
+
+    promoted = await InferenceEndpointsDAO().promote_assignment(
+        "b200-2",
+        uid=42,
+        hotkey="hk42",
+        model="org/model-42",
+        revision="rev42",
+        deployment_id="ssh:b200-2:affine-sglang-current",
+        role="champion",
+        expected_role="challenger",
+    )
+
+    assert promoted is True
+    call = client.update_calls[0]
+    values = call["ExpressionAttributeValues"].values()
+    assert {"S": "challenger"} in values
+    assert {"S": "champion"} in values
+    assert "#cond_role = :expected_role" in call["ConditionExpression"]
 
 
 @pytest.mark.asyncio
@@ -546,7 +572,8 @@ class _EndpointsDAOFake:
             or endpoint.deployment_id != kwargs["deployment_id"]
             or endpoint.assignment_status != "ready"
             or endpoint.assignment_role not in (
-                "pre_challenger", "challenger"
+                kwargs.get("expected_role", "pre_challenger"),
+                kwargs["role"],
             )
         ):
             return False

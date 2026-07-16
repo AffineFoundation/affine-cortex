@@ -128,7 +128,7 @@ class _DeployTracker:
     pre_challenger_slots: int = 0
     next_deployment_id: int = 0
     predeploys: List[DeployTarget] = field(default_factory=list)
-    promotions: List[str] = field(default_factory=list)
+    promotions: List[Tuple[str, str]] = field(default_factory=list)
     # uids that should raise a non-capacity error on pre-deploy
     # (simulates a real ssh / docker failure). The fill loop must
     # ``mark_terminated(FAILED)`` and advance to the next candidate.
@@ -178,8 +178,64 @@ class _DeployTracker:
                     f"simulated teardown failure for {deployment_id}"
                 )
 
-    async def promote(self, record: BattleRecord) -> bool:
-        self.promotions.append(record.deployment_id)
+    async def transition_role(self, record: BattleRecord, role: str) -> bool:
+        self.promotions.append((record.deployment_id, role))
+        return True
+
+
+@dataclass
+class _SingleEndpointDeployTracker:
+    """Model the stable deployment id and role ownership of one SSH host."""
+
+    deploys: List[DeployTarget] = field(default_factory=list)
+    teardowns: List[Optional[str]] = field(default_factory=list)
+    transitions: List[Tuple[str, str]] = field(default_factory=list)
+    endpoint_role: Optional[str] = None
+    deployment_id: str = "ssh:only-endpoint:affine-sglang-current"
+    champion_transition_failures: int = 0
+
+    async def deploy(
+        self, target: DeployTarget, role: str = "active",
+    ) -> DeployResult:
+        if role == "pre_challenger":
+            from affine.src.scheduler.flow import NoEndpointCapacity
+
+            raise NoEndpointCapacity("single endpoint is already occupied")
+        if (
+            role == "challenger"
+            and self.endpoint_role not in (None, "champion", "active")
+        ):
+            raise RuntimeError(
+                f"single endpoint cannot replace role={self.endpoint_role!r}"
+            )
+        self.deploys.append(target)
+        self.endpoint_role = role
+        return DeployResult(
+            deployment_id=self.deployment_id,
+            base_url="https://only-endpoint/v1",
+        )
+
+    async def teardown(self, deployment_id: Optional[str]) -> None:
+        self.teardowns.append(deployment_id)
+        if deployment_id == self.deployment_id:
+            self.endpoint_role = None
+
+    async def transition_role(
+        self, record: BattleRecord, role: str,
+    ) -> bool:
+        expected_role = {
+            "challenger": "pre_challenger",
+            "champion": "challenger",
+        }[role]
+        if role == "champion" and self.champion_transition_failures > 0:
+            self.champion_transition_failures -= 1
+            return False
+        if record.deployment_id != self.deployment_id:
+            return False
+        if self.endpoint_role not in (expected_role, role):
+            return False
+        self.endpoint_role = role
+        self.transitions.append((record.deployment_id, role))
         return True
 
 
@@ -275,7 +331,7 @@ def _build_scheduler(
     list_active_endpoint_names_fn=None,
     list_active_endpoint_activations_fn=None,
     task_pool_refresh_blocks=None, config=None, behavior_gate_dao=None,
-    promote_deployment_fn=None,
+    transition_deployment_role_fn=None,
 ):
     state = StateStore(kv)
     queue = ChallengerQueue(miner_store)
@@ -311,8 +367,8 @@ def _build_scheduler(
         ),
         deployment_health_fn=deployment_health_fn,
         behavior_gate_dao=behavior_gate_dao,
-        promote_deployment_fn=(
-            promote_deployment_fn or deployer.promote
+        transition_deployment_role_fn=(
+            transition_deployment_role_fn or deployer.transition_role
         ),
     )
     return scheduler, state, weight_writer
@@ -1554,6 +1610,7 @@ async def test_post_promotion_crash_recovery_does_not_self_demote():
     )
     # Battle cleared.
     assert await state.get_battle() is None
+    assert deployer.promotions == [("wrk-002", "champion")]
     # No teardown of the just-promoted champion's workload.
     assert "wrk-002" not in deployer.teardowns
 
@@ -2289,6 +2346,76 @@ async def test_decided_battle_snapshot_outcome_persists_battle_rules():
         assert abs(env_row["champion_avg"] - 0.5) < 1e-9
         assert abs(env_row["challenger_avg"] - 0.9) < 1e-9
         assert abs(env_row["delta"] - 0.4) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_single_endpoint_win_relabels_runtime_before_next_battle():
+    """A winner is canonical only after its endpoint role is durable."""
+    kv = _seed_state(sampling_count=4)
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+        _make_miner(3, "next_hk", 300, revision="next_rev"),
+    ])
+    samples = _SamplesFake()
+    deployer = _SingleEndpointDeployTracker(champion_transition_failures=1)
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=samples,
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    task_state = await state.get_task_state()
+    refresh_block = task_state.refreshed_at_block
+    for env in ("ENV_A", "ENV_B"):
+        task_ids = task_state.task_ids[env]
+        samples.set_samples(
+            "champ_hk", "champ_rev", env, task_ids,
+            score=0.5, refresh_block=refresh_block,
+        )
+
+    await scheduler.tick(current_block=52)
+    assert deployer.endpoint_role == "challenger"
+
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "chal_hk", "chal_rev", env, task_state.task_ids[env],
+            score=0.9, refresh_block=refresh_block,
+        )
+
+    await scheduler.tick(current_block=53)
+
+    champion = await state.get_champion()
+    battle = await state.get_battle()
+    assert champion.uid == 1
+    assert battle is not None and battle.challenger.uid == 2
+    assert deployer.endpoint_role == "challenger"
+
+    await scheduler.tick(current_block=54)
+
+    champion = await state.get_champion()
+    assert champion.uid == 2
+    assert await state.get_battle() is None
+    assert deployer.endpoint_role == "champion"
+    assert deployer.transitions == [
+        (deployer.deployment_id, "champion"),
+    ]
+
+    await scheduler.tick(current_block=55)
+
+    battle = await state.get_battle()
+    assert battle is not None and battle.challenger.uid == 3
+    assert deployer.endpoint_role == "challenger"
 
 
 @pytest.mark.asyncio
@@ -3585,7 +3712,7 @@ async def test_start_battle_adopts_predeployed_record():
     battle = await state.get_battle()
     assert battle is not None and battle.challenger.uid == 2
     assert battle.deployment_id == pre_dep_id
-    assert deployer.promotions == [pre_dep_id]
+    assert deployer.promotions == [(pre_dep_id, "challenger")]
     assert len(deployer.deploys) == active_deploys_before
     assert pre_dep_id not in deployer.teardowns
     assert champion_dep_id in deployer.teardowns
@@ -3612,7 +3739,7 @@ async def test_stale_predeployment_promotion_drops_state_without_teardown():
     deployer = _DeployTracker()
     samples = _SamplesFake()
 
-    async def reject_stale_assignment(_record):
+    async def reject_stale_assignment(_record, _role):
         return False
 
     scheduler, state, _ = _build_scheduler(
@@ -3620,7 +3747,7 @@ async def test_stale_predeployment_promotion_drops_state_without_teardown():
         miner_store=miner_store,
         deployer=deployer,
         samples=samples,
-        promote_deployment_fn=reject_stale_assignment,
+        transition_deployment_role_fn=reject_stale_assignment,
     )
     champion = ChampionRecord(
         uid=1,

@@ -239,8 +239,8 @@ ListCurrentMinersFn = Callable[[], Awaitable[List[Dict[str, Any]]]]
 DeployFn = Callable[[targon_lifecycle.DeployTarget, str],
                     Awaitable[targon_lifecycle.DeployResult]]
 TeardownFn = Callable[[Optional[str]], Awaitable[None]]
-PromoteDeploymentFn = Callable[[BattleRecord], Awaitable[bool]]
-"""Promote an already-running pre-challenger to the active challenger role.
+TransitionDeploymentRoleFn = Callable[[BattleRecord, str], Awaitable[bool]]
+"""Move an already-running deployment to the requested runtime role.
 Returns False when the persisted provider assignment no longer owns the
 deployment; raises for transient provider/control-plane failures."""
 
@@ -312,7 +312,9 @@ class FlowScheduler:
         deployment_health_fn: Optional[DeploymentHealthFn] = None,
         sample_metrics_reader: Optional[SampleMetricsReader] = None,
         behavior_gate_dao: Any = None,
-        promote_deployment_fn: Optional[PromoteDeploymentFn] = None,
+        transition_deployment_role_fn: Optional[
+            TransitionDeploymentRoleFn
+        ] = None,
     ):
         self.cfg = config
         self.state = state
@@ -333,7 +335,7 @@ class FlowScheduler:
         )
         self._deployment_health = deployment_health_fn
         self._behavior_gate_dao = behavior_gate_dao
-        self._promote_deployment = promote_deployment_fn
+        self._transition_deployment_role = transition_deployment_role_fn
         self._last_behavior_gate_log: Dict[str, str] = {}
         self._last_no_endpoint_log_at = 0.0
 
@@ -1883,9 +1885,11 @@ class FlowScheduler:
             remaining.append(record)
 
         if adopted is not None:
-            if self._promote_deployment is not None:
+            if self._transition_deployment_role is not None:
                 try:
-                    promoted = await self._promote_deployment(adopted)
+                    promoted = await self._transition_deployment_role(
+                        adopted, "challenger",
+                    )
                 except Exception as e:
                     logger.error(
                         f"FlowScheduler: pre-deployment promotion failed "
@@ -2028,6 +2032,34 @@ class FlowScheduler:
             f"vs champion uid={champion.uid}"
         )
 
+    async def _promote_runtime_to_champion(
+        self, battle: BattleRecord,
+    ) -> bool:
+        """Fence canonical champion state behind the provider role update."""
+        if self._transition_deployment_role is None:
+            return True
+        try:
+            promoted = await self._transition_deployment_role(
+                battle, "champion",
+            )
+        except Exception as e:
+            logger.error(
+                "FlowScheduler: challenger-to-champion provider role "
+                f"transition failed for uid={battle.challenger.uid}; "
+                "retaining battle for retry: "
+                f"{type(e).__name__}: {e}"
+            )
+            return False
+        if not promoted:
+            logger.error(
+                "FlowScheduler: challenger-to-champion provider role "
+                f"transition rejected for uid={battle.challenger.uid}; "
+                "persisted assignment no longer matches the battle, "
+                "retaining battle for retry"
+            )
+            return False
+        return True
+
     async def _deployment_capacity_available(self, role: str) -> bool:
         """Return whether an SSH/single-instance deployment can start now.
 
@@ -2123,6 +2155,8 @@ class FlowScheduler:
                         f"behavior gate uid={champion.uid} status={status} "
                         f"reason={reason}"
                     )
+                return
+            if not await self._promote_runtime_to_champion(battle):
                 return
             logger.info(
                 f"FlowScheduler: detected post-promotion crash recovery "
@@ -2373,6 +2407,8 @@ class FlowScheduler:
                     f"uid={battle.challenger.uid} status={status} "
                     f"reason={reason}"
                 )
+                return
+            if not await self._promote_runtime_to_champion(battle):
                 return
             new_champion = ChampionRecord(
                 uid=battle.challenger.uid,

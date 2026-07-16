@@ -354,14 +354,15 @@ class InferenceEndpointsDAO(BaseDAO):
         revision: str,
         deployment_id: str,
         role: str = "challenger",
+        expected_role: str = "pre_challenger",
         updated_by: str = "scheduler",
     ) -> bool:
         """Atomically change a ready deployment's runtime role.
 
         The full model identity and deployment id fence the update so an old
-        pre-deployed record cannot relabel a newer owner of the same endpoint.
-        Both the pre-challenger and already-promoted challenger roles are
-        accepted, making retries idempotent without relabeling a champion.
+        state record cannot relabel a newer owner of the same endpoint. Both
+        ``expected_role`` and the target ``role`` are accepted, making the
+        transition idempotent without accepting unrelated runtime roles.
         """
         now = int(time.time())
         return await self._update_endpoint_fields(
@@ -377,7 +378,7 @@ class InferenceEndpointsDAO(BaseDAO):
                 "#cond_uid = :uid AND #cond_hotkey = :hotkey AND "
                 "#cond_model = :model AND #cond_revision = :revision AND "
                 "#cond_deployment = :deployment AND #cond_status = :ready "
-                "AND (#cond_role = :pre_role OR #cond_role = :role)"
+                "AND (#cond_role = :expected_role OR #cond_role = :role)"
             ),
             condition_names={
                 "#cond_active": "active",
@@ -397,7 +398,7 @@ class InferenceEndpointsDAO(BaseDAO):
                 ":revision": revision,
                 ":deployment": deployment_id,
                 ":ready": "ready",
-                ":pre_role": "pre_challenger",
+                ":expected_role": expected_role,
                 ":role": role,
             },
             return_false_on_condition_failure=True,

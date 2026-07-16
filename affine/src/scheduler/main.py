@@ -451,7 +451,15 @@ async def _run() -> None:
             finally:
                 await endpoints_dao.clear_assignment(name)
 
-        async def promote_deployment_fn(record):
+        async def transition_deployment_role_fn(record, role):
+            expected_roles = {
+                "challenger": "pre_challenger",
+                "champion": "challenger",
+            }
+            if role not in expected_roles:
+                raise ValueError(
+                    f"unsupported deployment role transition target: {role!r}"
+                )
             deployment_ids = [
                 dep.deployment_id for dep in (record.deployments or [])
                 if dep.deployment_id
@@ -473,7 +481,8 @@ async def _run() -> None:
                     model=record.challenger.model,
                     revision=record.challenger.revision,
                     deployment_id=deployment_id,
-                    role="challenger",
+                    role=role,
+                    expected_role=expected_roles[role],
                 )
                 if not promoted:
                     return False
@@ -546,7 +555,7 @@ async def _run() -> None:
             await targon_lifecycle.teardown(targon_client, deployment_id)
 
         deployment_health_fn = None
-        promote_deployment_fn = None
+        transition_deployment_role_fn = None
         list_active_ssh_endpoint_names = None
         list_active_ssh_endpoint_activations = None
         flow_config = FlowConfig()
@@ -573,7 +582,7 @@ async def _run() -> None:
             list_active_ssh_endpoint_activations
         ),
         deployment_health_fn=deployment_health_fn,
-        promote_deployment_fn=promote_deployment_fn,
+        transition_deployment_role_fn=transition_deployment_role_fn,
         sample_metrics_reader=sample_metrics_reader,
         behavior_gate_dao=BehaviorGateDAO(),
     )
