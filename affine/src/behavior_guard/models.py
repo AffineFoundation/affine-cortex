@@ -23,7 +23,15 @@ class BehaviorGateMode(str, Enum):
     """Whether a configured gate observes or blocks sampling."""
 
     SHADOW = "shadow"
+    ADMISSION_SHADOW = "admission_shadow"
     ENFORCE = "enforce"
+
+
+POLICY_SCHEMA_EPOCH = "v3-load-attribution"
+"""Bump when persisted verdict semantics are not backward compatible."""
+
+TEMPLATE_POLICY_SCHEMA_EPOCH = "template-integrity-v1"
+"""Stable epoch for invalid-sample/template quarantine semantics."""
 
 
 class ProbeClassification(str, Enum):
@@ -47,7 +55,6 @@ STRIKE_CLASSIFICATIONS = frozenset(
     {
         ProbeClassification.MODEL_NO_PROGRESS,
         ProbeClassification.MODEL_PROTOCOL_FAILURE,
-        ProbeClassification.HARNESS_INVALID,
     }
 )
 ADMISSIBLE_COMPLETION_CLASSIFICATIONS = frozenset(
@@ -64,6 +71,31 @@ class VerdictStatus(str, Enum):
     SUSPECTED = "suspected"
     FAILED = "failed"
     DEFERRED = "deferred"
+    # Scheduler-owned control final.  This is deliberately distinct from a
+    # model failure: it only says the deployment exhausted its bounded
+    # admission window.  Once claimed atomically, a late probe must not turn
+    # the already-released deployment into PASSED or FAILED.
+    EXPIRED = "expired"
+
+
+class FailureOwner(str, Enum):
+    """Trusted component attribution supplied by an environment harness."""
+
+    MODEL = "model"
+    TEMPLATE = "template"
+    HARNESS = "harness"
+    INFRASTRUCTURE = "infrastructure"
+    UNKNOWN = "unknown"
+
+
+class InvalidSampleReason(str, Enum):
+    """Sample-integrity failures which must never become benchmark scores."""
+
+    POSITIVE_SCORE_ZERO_ACTIVITY = "positive_score_zero_activity"
+    HARNESS_DEADLINE_EXCEEDED = "harness_deadline_exceeded"
+    HARNESS_RESULT_ERROR = "harness_result_error"
+    HARNESS_EXCEPTION = "harness_exception"
+    TEMPLATE_FAMILY_QUARANTINED = "template_family_quarantined"
 
 
 @dataclass(frozen=True)
@@ -86,6 +118,7 @@ class BehaviorGateConfig:
     first_action_deadline_seconds: float = 90.0
     probe_timeout_seconds: float = 120.0
     admission_timeout_seconds: float = 390.0
+    admission_hold_seconds: int = 300
     max_tokens_without_progress: int = 4096
     max_completion_tokens: int = 8192
     lease_seconds: int = 420
@@ -94,6 +127,15 @@ class BehaviorGateConfig:
     @property
     def enforces(self) -> bool:
         return self.enabled and self.mode is BehaviorGateMode.ENFORCE
+
+    @property
+    def blocks_admission(self) -> bool:
+        """Whether workers must wait for a verdict or an admission deadline."""
+
+        return self.enabled and self.mode in {
+            BehaviorGateMode.ADMISSION_SHADOW,
+            BehaviorGateMode.ENFORCE,
+        }
 
     @property
     def attempt_budget(self) -> int:
@@ -119,6 +161,7 @@ class BehaviorGateConfig:
         Rollout-only fields (enabled/mode/environment allowlist) are omitted.
         """
         payload = {
+            "policy_schema_epoch": POLICY_SCHEMA_EPOCH,
             "policy_version": self.policy_version,
             "probe_count": self.probe_count,
             "clean_to_pass": self.clean_to_pass,
@@ -131,13 +174,29 @@ class BehaviorGateConfig:
             "first_action_deadline_seconds": self.first_action_deadline_seconds,
             "probe_timeout_seconds": self.probe_timeout_seconds,
             "admission_timeout_seconds": self.admission_timeout_seconds,
+            "admission_hold_seconds": self.admission_hold_seconds,
             "max_tokens_without_progress": self.max_tokens_without_progress,
             "max_completion_tokens": self.max_completion_tokens,
         }
         canonical = json.dumps(
             payload, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")
-        return f"{self.policy_version}:{hashlib.sha256(canonical).hexdigest()[:16]}"
+        return (
+            f"{POLICY_SCHEMA_EPOCH}:{self.policy_version}:"
+            f"{hashlib.sha256(canonical).hexdigest()[:16]}"
+        )
+
+    @property
+    def template_policy_identity(self) -> str:
+        """Identity for template health, independent of admission tuning.
+
+        Admission thresholds, rollout mode and preflight timeouts may change
+        frequently.  None of them changes whether a positive, zero-activity
+        row is an invalid sample, so they must not silently discard an active
+        template quarantine.
+        """
+
+        return TEMPLATE_POLICY_SCHEMA_EPOCH
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any] | None) -> "BehaviorGateConfig":
@@ -229,6 +288,21 @@ class BehaviorGateConfig:
             lease_seconds,
             math.ceil(max(timeout, admission_timeout)) + 30,
         )
+        admission_hold_seconds = _bounded_int(
+            raw.get("admission_hold_seconds"),
+            300,
+            minimum=30,
+            maximum=900,
+        )
+        if mode is BehaviorGateMode.ENFORCE:
+            # Enforce must not expire and recycle a healthy deployment before
+            # its configured worst-case baseline can finish.  Admission-shadow
+            # may intentionally use a shorter observation hold because expiry
+            # there releases sampling rather than failing the model.
+            admission_hold_seconds = max(
+                admission_hold_seconds,
+                math.ceil(admission_timeout),
+            )
 
         return cls(
             enabled=_coerce_bool(raw.get("enabled"), False),
@@ -264,6 +338,7 @@ class BehaviorGateConfig:
             first_action_deadline_seconds=first_action,
             probe_timeout_seconds=timeout,
             admission_timeout_seconds=admission_timeout,
+            admission_hold_seconds=admission_hold_seconds,
             max_tokens_without_progress=_bounded_int(
                 raw.get("max_tokens_without_progress"),
                 4096,
@@ -471,9 +546,131 @@ class SampleOutcomeEvidence:
     terminated_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class ModelBehaviorEvidence:
+    """Structured, model-attributable runtime evidence.
+
+    These fields are a producer contract, not hints to be reconstructed from
+    exception strings.  In particular, a timeout or protocol error can count
+    toward a model verdict only when a trusted harness confirms that the
+    request reached the model and both the endpoint and template were healthy.
+    A stable template family (or exact template id when no family exists) is
+    mandatory so the DAO cannot treat two instances of one broken template as
+    independent.
+    """
+
+    classification: ProbeClassification
+    failure_owner: FailureOwner = FailureOwner.UNKNOWN
+    request_dispatched: bool | None = None
+    request_reached_model: bool | None = None
+    endpoint_healthy: bool | None = None
+    template_healthy: bool | None = None
+    template_family_id: str | None = None
+    template_id: str | None = None
+    template_revision: str | None = None
+    catalog_revision: str | None = None
+
+    @classmethod
+    def from_mapping(
+        cls, raw: Mapping[str, Any] | None,
+    ) -> "ModelBehaviorEvidence | None":
+        if not isinstance(raw, Mapping):
+            return None
+        try:
+            classification = ProbeClassification(str(raw.get("classification")))
+        except ValueError:
+            return None
+        if classification not in {
+            ProbeClassification.MODEL_NO_PROGRESS,
+            ProbeClassification.MODEL_PROTOCOL_FAILURE,
+        }:
+            return None
+        try:
+            owner = FailureOwner(str(raw.get("failure_owner")))
+        except ValueError:
+            owner = FailureOwner.UNKNOWN
+        return cls(
+            classification=classification,
+            failure_owner=owner,
+            request_dispatched=_structured_request_dispatched(raw),
+            request_reached_model=_strict_optional_bool(
+                raw.get("request_reached_model")
+            ),
+            endpoint_healthy=_strict_optional_bool(raw.get("endpoint_healthy")),
+            template_healthy=_strict_optional_bool(raw.get("template_healthy")),
+            template_family_id=_optional_identifier(
+                raw.get("template_family_id")
+            ),
+            template_id=_optional_identifier(raw.get("template_id")),
+            template_revision=_optional_identifier(
+                raw.get("template_revision")
+            ),
+            catalog_revision=_optional_identifier(raw.get("catalog_revision")),
+        )
+
+    @property
+    def eligible_for_model_strike(self) -> bool:
+        return (
+            self.classification in {
+                ProbeClassification.MODEL_NO_PROGRESS,
+                ProbeClassification.MODEL_PROTOCOL_FAILURE,
+            }
+            and self.failure_owner is FailureOwner.MODEL
+            and self.request_dispatched is True
+            and self.request_reached_model is True
+            and self.endpoint_healthy is True
+            and self.template_healthy is True
+            and (self.template_family_id is not None or self.template_id is not None)
+        )
+
+    def template_key_hash(self, environment: str) -> str | None:
+        template_key = self.template_family_id or self.template_id
+        if template_key is None:
+            return None
+        return _stable_digest({
+            "kind": "behavior-template-family-v1",
+            "environment": str(environment),
+            "template_key": template_key,
+        })
+
+    def catalog_revision_hash(self, environment: str) -> str | None:
+        if self.catalog_revision is None:
+            return None
+        return _stable_digest({
+            "kind": "behavior-template-catalog-v1",
+            "environment": str(environment),
+            "catalog_revision": self.catalog_revision,
+        })
+
+    def attribution(self) -> dict[str, Any]:
+        """Compact allowlisted payload for ``BehaviorGateDAO``."""
+
+        return {
+            "failure_owner": self.failure_owner.value,
+            "request_dispatched": self.request_dispatched,
+            "request_reached_model": self.request_reached_model,
+            "endpoint_healthy": self.endpoint_healthy,
+            "template_healthy": self.template_healthy,
+        }
+
+    def audit_evidence(self) -> dict[str, Any]:
+        return {
+            "classification": self.classification.value,
+            "failure_owner": self.failure_owner.value,
+            "request_dispatched": self.request_dispatched,
+            "request_reached_model": self.request_reached_model,
+            "endpoint_healthy": self.endpoint_healthy,
+            "template_healthy": self.template_healthy,
+            "template_family_id": self.template_family_id,
+            "template_id": self.template_id,
+            "template_revision": self.template_revision,
+            "catalog_revision": self.catalog_revision,
+        }
+
+
 def classify_sample_invariant(
     evidence: SampleOutcomeEvidence,
-) -> ProbeClassification | None:
+) -> InvalidSampleReason | None:
     """Reject a UID208-style score that contains no model/action evidence.
 
     A positive benchmark score cannot prove model quality when the harness made
@@ -499,7 +696,7 @@ def classify_sample_invariant(
         )
     )
     if positive_score and exact_zero_activity:
-        return ProbeClassification.HARNESS_INVALID
+        return InvalidSampleReason.POSITIVE_SCORE_ZERO_ACTIVITY
     return None
 
 
@@ -550,7 +747,6 @@ def _dominant_strike(
     counts: Mapping[ProbeClassification, int],
 ) -> ProbeClassification:
     priority = (
-        ProbeClassification.HARNESS_INVALID,
         ProbeClassification.MODEL_PROTOCOL_FAILURE,
         ProbeClassification.MODEL_NO_PROGRESS,
     )
@@ -596,3 +792,41 @@ def _is_exact_zero(value: Any) -> bool:
         and math.isfinite(float(value))
         and float(value) == 0.0
     )
+
+
+def _strict_optional_bool(value: Any) -> bool | None:
+    """Accept only native booleans from the structured producer contract."""
+
+    return value if isinstance(value, bool) else None
+
+
+def _structured_request_dispatched(raw: Mapping[str, Any]) -> bool | None:
+    """Read the canonical wire field, with the deployed legacy alias.
+
+    A conflicting canonical value wins.  This keeps an explicit
+    ``request_dispatched=False`` from being upgraded by a stale
+    ``request_attempted=True`` field in the same payload.
+    """
+
+    canonical = _strict_optional_bool(raw.get("request_dispatched"))
+    if canonical is not None:
+        return canonical
+    return _strict_optional_bool(raw.get("request_attempted"))
+
+
+def _optional_identifier(value: Any) -> str | None:
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text[:256] if text else None
+
+
+def _stable_digest(payload: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()

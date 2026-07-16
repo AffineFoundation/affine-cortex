@@ -65,7 +65,8 @@ class _FakeSystemConfigDAO:
                 "tasks_in_flight": 7,
                 "tasks_succeeded": 10,
                 "tasks_failed": 1,
-                "total_execution_ms": 11000,
+                "tasks_invalid": 1,
+                "total_execution_ms": 12000,
                 "reported_at": 1000,
             },
         }
@@ -123,3 +124,6 @@ async def test_sample_progress_default_reports_only_active_subjects(monkeypatch,
     assert "=== challenger  uid=32" in out
     assert "LIVEWEB" in out
     assert "  400    72" in out
+    # Invalid attempts contribute latency and therefore also belong in the
+    # denominator; otherwise the status UI overstates average execution time.
+    assert "1.0s" in out

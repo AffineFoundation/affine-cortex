@@ -28,8 +28,10 @@ from affine.database import close_client, init_client
 from affine.database.dao.sample_results import SampleResultsDAO
 from affine.database.dao.system_config import SystemConfigDAO
 from affine.src.executor.config import (
+    BEHAVIOR_PREFLIGHT_RESERVED_SLOTS,
     GLOBAL_DISPATCH_BUDGET,
     PER_HOST_DISPATCH_BUDGET,
+    PER_HOST_TOTAL_CAPACITY,
     get_max_concurrent,
 )
 from affine.src.executor.worker_process import WorkerProcess
@@ -113,6 +115,7 @@ class ExecutorManager:
             f"ExecutorManager init: envs={envs}, "
             f"hosts={self.host_names!r} "
             f"per_host_budget={PER_HOST_DISPATCH_BUDGET} "
+            f"preflight_reserved={BEHAVIOR_PREFLIGHT_RESERVED_SLOTS} "
             f"total_budget={self.total_budget}"
         )
 
@@ -160,7 +163,8 @@ class ExecutorManager:
 
         This task intentionally lives in the manager rather than an env
         subprocess: benchmark workers may be restarted independently, while a
-        single coordinator and DynamoDB lease keep probe concurrency at one.
+        single coordinator, per-endpoint reserved slots, and DynamoDB leases
+        keep probe concurrency bounded.
         """
         from affine.database.dao.behavior_gate import BehaviorGateDAO
         from affine.src.executor.preflight import BehaviorPreflightCoordinator
@@ -176,8 +180,41 @@ class ExecutorManager:
                 )
             ),
             dao=BehaviorGateDAO(),
+            endpoint_load_reader=self._behavior_endpoint_load,
+            benchmark_load_limit=PER_HOST_DISPATCH_BUDGET,
+            endpoint_capacity=PER_HOST_TOTAL_CAPACITY,
+            probe_slot_limit=BEHAVIOR_PREFLIGHT_RESERVED_SLOTS,
         )
         await coordinator.run()
+
+    def _behavior_endpoint_load(self, endpoint_name: str) -> Optional[int]:
+        """Return benchmark in-flight load for one preflight endpoint.
+
+        A Targon-only manager has no per-host map, so even an empty endpoint
+        identity uses the global benchmark count.  Once named-host counters
+        exist, a missing or unknown identity remains unattributable rather
+        than borrowing another host's load.
+        """
+
+        value = self.per_host_in_flight.get(str(endpoint_name))
+        if value is None:
+            # Targon-only setups and a conservative registry-startup fallback
+            # have no per-host map.  Their global benchmark semaphore is only
+            # one host budget, so the sum across env counters is still a safe
+            # upper bound for any endpoint.  Once named host counters exist,
+            # an unknown name must remain unattributable rather than borrowing
+            # another host's load.
+            if not self.per_host_in_flight:
+                return sum(
+                    max(0, int(counter.value))
+                    for counter in self.in_flight_values.values()
+                )
+            return None
+        lock_getter = getattr(value, "get_lock", None)
+        if lock_getter is None:
+            return max(0, int(value.value))
+        with lock_getter():
+            return max(0, int(value.value))
 
     async def _supervise_behavior_preflight(self) -> None:
         """Keep the admission coordinator alive until manager shutdown.
@@ -484,17 +521,22 @@ async def _enabled_envs() -> List[str]:
 
 
 async def _active_ssh_endpoint_names() -> List[str]:
-    """SSH endpoint names from ``inference_endpoints``. Empty list for
-    targon-only setups."""
+    """Configured scoring SSH names, including currently inactive slots.
+
+    Autoscaling commonly activates a preconfigured slot after executor
+    startup.  Allocating its shared counter up front prevents that endpoint
+    from becoming permanently load-unattributable until the next restart.
+    Empty remains valid for targon-only setups.
+    """
     try:
         from affine.database.dao.inference_endpoints import InferenceEndpointsDAO
         return [
-            ep.name for ep in await InferenceEndpointsDAO().list_active(kind="ssh")
-            if (ep.role or "scoring") == "scoring"
+            ep.name for ep in await InferenceEndpointsDAO().list_all()
+            if ep.kind == "ssh" and (ep.role or "scoring") == "scoring"
         ]
     except Exception as e:
         logger.warning(
-            f"executor: list_active ssh endpoints failed "
+            f"executor: list configured ssh endpoints failed "
             f"({type(e).__name__}: {e}); falling back to single-host budget"
         )
         return []

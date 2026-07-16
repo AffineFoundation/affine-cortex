@@ -716,6 +716,166 @@ async def test_miner_stats_hotkey_fallback_blocks_later_revision_claim():
     assert claimed is False
 
 
+@pytest.mark.asyncio
+async def test_admission_only_state_is_not_inherited_across_revisions():
+    dao = _MemoryMinerStatsDAO(
+        direct={
+            ("hk", "new"): {
+                "hotkey": "hk",
+                "revision": "new",
+                "challenge_status": "sampling",
+            }
+        },
+        rows=[
+            {
+                "hotkey": "hk",
+                "revision": "old",
+                "challenge_status": "sampling",
+                "admission_policy_identity": "old-policy",
+                "admission_deferral_count": 3,
+                "admission_retry_after": 9_999_999_999,
+                "admission_deferral_exhausted": True,
+                "last_updated_at": 10,
+            }
+        ],
+    )
+
+    state = await dao.get_challenge_state("hk", "new")
+
+    assert state["challenge_status"] == "sampling"
+    assert state["admission_policy_identity"] == ""
+    assert state["admission_deferral_count"] == 0
+    assert state["admission_deferral_exhausted"] is False
+
+
+class _AdmissionDeferralClient:
+    def __init__(self, dao: MinerStatsDAO, row: dict):
+        self.dao = dao
+        self.item = dao._serialize(row)
+        self.update_calls = []
+
+    async def get_item(self, **_kwargs):
+        return {"Item": self.item}
+
+    async def update_item(self, **kwargs):
+        self.update_calls.append(kwargs)
+        values = kwargs["ExpressionAttributeValues"]
+        row = self.dao._deserialize(self.item)
+        row.update({
+            "challenge_status": values[":sampling"]["S"],
+            "admission_policy_identity": values[":policy"]["S"],
+            "admission_last_deployment_generation": values[":generation"]["S"],
+            "admission_deferral_count": int(values[":count"]["N"]),
+            "admission_retry_after": int(values[":retry"]["N"]),
+            "admission_deferral_exhausted": values[":exhausted"]["BOOL"],
+            "admission_deferral_max_attempts": int(values[":maximum"]["N"]),
+            "last_updated_at": int(values[":now"]["N"]),
+        })
+        self.item = self.dao._serialize(row)
+        return {}
+
+
+@pytest.mark.asyncio
+async def test_admission_deferral_is_generation_idempotent_and_policy_scoped(
+    monkeypatch,
+):
+    dao = MinerStatsDAO()
+    client = _AdmissionDeferralClient(dao, {
+        "pk": dao._make_pk("hk"),
+        "sk": dao._make_sk("rev"),
+        "hotkey": "hk",
+        "revision": "rev",
+        "challenge_status": "in_progress",
+    })
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+
+    first = await dao.defer_admission_for_challenge(
+        hotkey="hk",
+        revision="rev",
+        policy_identity="policy-v1",
+        deployment_generation="generation-a",
+        base_delay_seconds=30,
+        max_attempts=3,
+        now=100,
+    )
+    repeated = await dao.defer_admission_for_challenge(
+        hotkey="hk",
+        revision="rev",
+        policy_identity="policy-v1",
+        deployment_generation="generation-a",
+        base_delay_seconds=30,
+        max_attempts=3,
+        now=200,
+    )
+    changed_policy = await dao.defer_admission_for_challenge(
+        hotkey="hk",
+        revision="rev",
+        policy_identity="policy-v2",
+        deployment_generation="generation-a",
+        base_delay_seconds=30,
+        max_attempts=3,
+        now=300,
+    )
+
+    assert first == {
+        "released": True,
+        "idempotent": False,
+        "deferral_count": 1,
+        "next_retry_at": 130,
+        "exhausted": False,
+        "status": "sampling",
+    }
+    assert repeated["released"] is True
+    assert repeated["idempotent"] is True
+    assert repeated["deferral_count"] == 1
+    assert changed_policy["idempotent"] is False
+    assert changed_policy["deferral_count"] == 1
+    assert changed_policy["next_retry_at"] == 330
+    assert len(client.update_calls) == 2
+    first_condition = client.update_calls[0]["ConditionExpression"]
+    assert "challenge_status = :previous_status" in first_condition
+    assert "attribute_not_exists(admission_policy_identity)" in first_condition
+    changed_condition = client.update_calls[1]["ConditionExpression"]
+    assert "admission_policy_identity = :previous_policy" in changed_condition
+    assert (
+        "admission_last_deployment_generation = :previous_generation"
+        in changed_condition
+    )
+
+
+@pytest.mark.asyncio
+async def test_admission_deferral_reports_terminal_conflict_without_write(
+    monkeypatch,
+):
+    dao = MinerStatsDAO()
+    client = _AdmissionDeferralClient(dao, {
+        "pk": dao._make_pk("hk"),
+        "sk": dao._make_sk("rev"),
+        "hotkey": "hk",
+        "revision": "rev",
+        "challenge_status": "terminated",
+    })
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+
+    outcome = await dao.defer_admission_for_challenge(
+        hotkey="hk",
+        revision="rev",
+        policy_identity="policy-v1",
+        deployment_generation="generation-a",
+        now=100,
+    )
+
+    assert outcome["released"] is False
+    assert outcome["status"] == "terminated"
+    assert client.update_calls == []
+
+
 class _FakeMinersDAO:
     def __init__(self):
         self.saved = []

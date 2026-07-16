@@ -71,11 +71,24 @@ class MinersQueueAdapter:
                 "challenge_status", MinerStatsDAO.STATUS_SAMPLING,
             )
             row["termination_reason"] = state.get("termination_reason") or None
+            for field in (
+                "admission_policy_identity",
+                "admission_deferral_count",
+                "admission_retry_after",
+                "admission_deferral_exhausted",
+                "admission_last_deployment_generation",
+            ):
+                row[field] = state.get(field)
             out.append(row)
         return out
 
     async def claim_pending(
-        self, uid: int, window_id: int, *, expected_status: str = STATUS_SAMPLING,
+        self,
+        uid: int,
+        window_id: int,
+        *,
+        expected_status: str = STATUS_SAMPLING,
+        admission_policy_identity: Optional[str] = None,
     ) -> bool:
         miner = await self._dao.get_miner_by_uid(uid)
         if not miner or str(miner.get("is_valid") or "").lower() != "true":
@@ -86,12 +99,36 @@ class MinersQueueAdapter:
                 revision=str(miner["revision"]),
                 model=str(miner.get("model") or ""),
                 window_id=window_id,
+                admission_policy_identity=admission_policy_identity,
             )
         except Exception as e:
             logger.warning(
                 f"MinersQueueAdapter.claim_pending(uid={uid}) failed: {e}"
             )
             return False
+
+    async def defer_admission(
+        self,
+        uid: int,
+        *,
+        hotkey: str,
+        revision: str,
+        policy_identity: str,
+        deployment_generation: str,
+        base_delay_seconds: int,
+        max_attempts: int,
+    ) -> Dict[str, Any]:
+        """Strict, idempotent expiry requeue; transport errors propagate."""
+
+        del uid  # Identity is durable by hotkey/revision, not mutable UID.
+        return await self._stats.defer_admission_for_challenge(
+            hotkey=hotkey,
+            revision=revision,
+            policy_identity=policy_identity,
+            deployment_generation=deployment_generation,
+            base_delay_seconds=base_delay_seconds,
+            max_attempts=max_attempts,
+        )
 
     async def release_claim(
         self, uid: int, *,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
 
 import pytest
@@ -42,9 +43,18 @@ class _DAO:
     async def get_verdict(self, *_args):
         return self.row
 
-    async def ensure_pending(self, *_args):
+    async def ensure_pending(
+        self, *_args, admission_deadline_at=None,
+    ):
         if self.row is None:
-            self.row = {"status": "pending", "updated_at": 0}
+            self.row = {
+                "status": "pending",
+                "created_at": int(time.time()),
+                "updated_at": 0,
+                "admission_deadline_at": admission_deadline_at,
+            }
+        elif self.row.get("admission_deadline_at") is None:
+            self.row["admission_deadline_at"] = admission_deadline_at
         return self.row
 
     async def acquire_lease(self, *_args, owner_token, lease_seconds):
@@ -52,7 +62,11 @@ class _DAO:
         if self.owner is not None:
             return False
         self.owner = owner_token
-        self.row = {"status": "running", "updated_at": 0}
+        self.row = {
+            **(self.row or {}),
+            "status": "running",
+            "updated_at": 0,
+        }
         return True
 
     async def renew_lease(self, *_args, owner_token, lease_seconds):
@@ -87,6 +101,7 @@ class _DAO:
     ):
         assert self.owner == owner_token
         self.row = {
+            **(self.row or {}),
             "status": status,
             "reason_code": reason_code,
             "counts": counts,
@@ -144,10 +159,11 @@ class _ProbeClient:
 
 
 def _record(*, two_endpoints=False):
-    deployments = []
+    deployments = [
+        DeploymentRecord("gpu-a", "dep-a", "https://gpu-a.invalid/v1"),
+    ]
     if two_endpoints:
-        deployments = [
-            DeploymentRecord("gpu-a", "dep-a", "https://gpu-a.invalid/v1"),
+        deployments += [
             DeploymentRecord("gpu-b", "dep-b", "https://gpu-b.invalid/v1"),
         ]
     return BattleRecord(
@@ -181,7 +197,7 @@ def _config(**overrides):
     return value
 
 
-def _coordinator(record, outcomes):
+def _coordinator(record, outcomes, *, endpoint_load_reader=None):
     dao = _DAO()
     concurrency = {"active": 0, "max": 0}
     by_url = {
@@ -196,8 +212,44 @@ def _coordinator(record, outcomes):
         state=_State(record, _config()),
         dao=dao,
         probe_client_factory=factory,
+        endpoint_load_reader=(
+            endpoint_load_reader or (lambda _endpoint: 0)
+        ),
+        benchmark_load_limit=596,
+        endpoint_capacity=600,
+        probe_slot_limit=4,
     )
     return coordinator, dao, concurrency
+
+
+@pytest.mark.asyncio
+async def test_targon_endpoint_uses_global_load_fallback_for_attribution():
+    record = _record()
+    record.deployments = []
+    record.deployment_id = "targon:deployment-a"
+    observed_endpoint_names = []
+
+    def read_load(endpoint_name):
+        observed_endpoint_names.append(endpoint_name)
+        return 0
+
+    coordinator, dao, _concurrency = _coordinator(
+        record,
+        [
+            ProbeClassification.MODEL_NO_PROGRESS,
+            ProbeClassification.MODEL_NO_PROGRESS,
+        ],
+        endpoint_load_reader=read_load,
+    )
+
+    await coordinator.run_once()
+
+    assert dao.row["status"] == "failed"
+    assert observed_endpoint_names == ["", "", "", ""]
+    assert all(
+        attempt["evidence"]["endpoint_healthy"] is True
+        for attempt in dao.attempts
+    )
 
 
 @pytest.mark.asyncio
@@ -216,7 +268,7 @@ async def test_preflight_passes_only_after_every_serving_endpoint_passes():
     assert dao.row["status"] == "passed"
     assert dao.row["counts"]["admissible"] == 6
     assert len(dao.attempts) == 6
-    assert concurrency["max"] == 1
+    assert concurrency["max"] == 2
 
 
 @pytest.mark.asyncio
@@ -234,6 +286,10 @@ async def test_uid208_empty_protocol_pattern_fails_after_two_short_probes():
     assert dao.row["status"] == "failed"
     assert dao.row["counts"]["strikes"] == 2
     assert len(dao.attempts) == 2
+    assert all(
+        attempt["evidence"]["endpoint_healthy"] is True
+        for attempt in dao.attempts
+    )
 
 
 @pytest.mark.asyncio
@@ -317,6 +373,10 @@ async def test_suspected_rounds_survive_an_intervening_deferred_round():
         state=_State(record, _config()),
         dao=dao,
         probe_client_factory=factory,
+        endpoint_load_reader=lambda _endpoint: 0,
+        benchmark_load_limit=596,
+        endpoint_capacity=600,
+        probe_slot_limit=4,
     )
 
     await coordinator.run_once()
@@ -349,6 +409,10 @@ async def test_each_endpoint_gets_its_own_bounded_action_proof_budget():
         state=_State(record, _config()),
         dao=dao,
         probe_client_factory=factory,
+        endpoint_load_reader=lambda _endpoint: 0,
+        benchmark_load_limit=596,
+        endpoint_capacity=600,
+        probe_slot_limit=4,
     )
     config = replace(
         parse_behavior_gate_config(_config()),
@@ -362,7 +426,7 @@ async def test_each_endpoint_gets_its_own_bounded_action_proof_budget():
 
     assert dao.row["status"] == "passed"
     assert len(dao.attempts) == 6
-    assert concurrency["max"] == 1
+    assert concurrency["max"] == 2
 
 
 @pytest.mark.asyncio
@@ -379,6 +443,10 @@ async def test_all_slow_malicious_endpoints_converge_with_per_endpoint_budgets()
         state=_State(record, _config()),
         dao=dao,
         probe_client_factory=factory,
+        endpoint_load_reader=lambda _endpoint: 0,
+        benchmark_load_limit=596,
+        endpoint_capacity=600,
+        probe_slot_limit=4,
     )
     config = replace(
         parse_behavior_gate_config(_config()),
@@ -393,7 +461,74 @@ async def test_all_slow_malicious_endpoints_converge_with_per_endpoint_budgets()
     assert dao.row["status"] == "failed"
     assert dao.row["counts"]["strikes"] == 4
     assert len(dao.attempts) == 4
-    assert concurrency["max"] == 1
+    assert concurrency["max"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observed_load", [None, 597])
+async def test_unattributable_endpoint_load_suppresses_model_strikes(
+    observed_load,
+):
+    record = _record(two_endpoints=True)
+    dao = _DAO()
+    concurrency = {"active": 0, "max": 0}
+
+    def factory(**_kwargs):
+        return _ProbeClient(
+            [ProbeClassification.MODEL_PROTOCOL_FAILURE] * 5,
+            concurrency,
+        )
+
+    coordinator = BehaviorPreflightCoordinator(
+        state=_State(record, _config()),
+        dao=dao,
+        probe_client_factory=factory,
+        endpoint_load_reader=lambda _endpoint: observed_load,
+        benchmark_load_limit=596,
+        endpoint_capacity=600,
+        probe_slot_limit=4,
+    )
+
+    await coordinator.run_once()
+
+    assert dao.row["status"] == "deferred"
+    assert dao.row["counts"]["strikes"] == 0
+    assert dao.row["counts"]["infra_failure"] == 10
+    assert {attempt["classification"] for attempt in dao.attempts} == {
+        "infra_failure"
+    }
+    assert all(
+        attempt["evidence"]["reason_code"]
+        == "endpoint_load_unattributable"
+        for attempt in dao.attempts
+    )
+    assert all(
+        attempt["evidence"]["endpoint_healthy"] is False
+        for attempt in dao.attempts
+    )
+
+
+@pytest.mark.asyncio
+async def test_reserved_probe_slots_bound_same_endpoint_concurrency():
+    coordinator = BehaviorPreflightCoordinator(
+        state=_State(_record(), _config()),
+        dao=_DAO(),
+        probe_slot_limit=4,
+    )
+    active = 0
+    maximum = 0
+
+    async def use_slot():
+        nonlocal active, maximum
+        async with coordinator._endpoint_probe_slot("gpu-a", "hash"):
+            active += 1
+            maximum = max(maximum, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+
+    await asyncio.gather(*(use_slot() for _ in range(8)))
+
+    assert maximum == 4
 
 
 @pytest.mark.asyncio
@@ -420,6 +555,10 @@ async def test_multi_endpoint_disagreement_is_infra_deferred_not_model_loss():
         state=_State(record, _config()),
         dao=dao,
         probe_client_factory=factory,
+        endpoint_load_reader=lambda _endpoint: 0,
+        benchmark_load_limit=596,
+        endpoint_capacity=600,
+        probe_slot_limit=4,
     )
 
     await coordinator.run_once()
@@ -428,3 +567,121 @@ async def test_multi_endpoint_disagreement_is_infra_deferred_not_model_loss():
     assert dao.row["reason_code"] == "endpoint_verdict_disagreement"
     assert dao.row["counts"]["strikes"] == 2
     assert len(dao.attempts) == 5
+
+
+@pytest.mark.asyncio
+async def test_one_suspect_endpoint_cannot_fail_a_passing_peer_across_rounds():
+    record = _record(two_endpoints=True)
+    dao = _DAO()
+    concurrency = {"active": 0, "max": 0}
+    by_url = {
+        "https://gpu-a.invalid/v1": [
+            ProbeClassification.CLEAN,
+            ProbeClassification.MODEL_PROTOCOL_FAILURE,
+            ProbeClassification.CLEAN,
+        ],
+        "https://gpu-b.invalid/v1": [
+            ProbeClassification.CLEAN,
+            ProbeClassification.CLEAN,
+            ProbeClassification.CLEAN,
+        ],
+    }
+
+    def factory(**kwargs):
+        return _ProbeClient(by_url[kwargs["base_url"]], concurrency)
+
+    coordinator = BehaviorPreflightCoordinator(
+        state=_State(record, _config()),
+        dao=dao,
+        probe_client_factory=factory,
+        endpoint_load_reader=lambda _endpoint: 0,
+        benchmark_load_limit=596,
+        endpoint_capacity=600,
+        probe_slot_limit=4,
+    )
+
+    await coordinator.run_once()
+    await coordinator.run_once()
+
+    assert dao.row["status"] == "deferred"
+    assert dao.row["reason_code"] == "endpoint_verdict_disagreement"
+    assert dao.row["counts"].get("suspected_rounds", 0) == 0
+    assert dao.row["counts"]["deferred_rounds"] == 2
+
+
+@pytest.mark.asyncio
+async def test_admission_deadline_is_persisted_once_across_retry_rounds():
+    record = _record()
+    dao = _DAO()
+    original_deadline = int(time.time()) - 1
+    dao.row = {
+        "status": "deferred",
+        "created_at": original_deadline - 30,
+        "updated_at": 0,
+        "admission_deadline_at": original_deadline,
+    }
+    factory_calls = 0
+
+    def factory(**_kwargs):
+        nonlocal factory_calls
+        factory_calls += 1
+        raise AssertionError("expired deployment must not start another probe")
+
+    coordinator = BehaviorPreflightCoordinator(
+        state=_State(record, _config()),
+        dao=dao,
+        probe_client_factory=factory,
+    )
+
+    await coordinator.run_once()
+
+    assert dao.row["admission_deadline_at"] == original_deadline
+    assert factory_calls == 0
+    assert dao.attempts == []
+
+
+@pytest.mark.asyncio
+async def test_deployment_deadline_bounds_all_serving_endpoints():
+    record = _record(two_endpoints=True)
+    dao = _DAO()
+    dao.row = {
+        "status": "pending",
+        "created_at": int(time.time()),
+        "updated_at": 0,
+        "admission_deadline_at": time.time() + 0.08,
+    }
+    concurrency = {"active": 0, "max": 0}
+    requested_urls = []
+
+    def factory(**kwargs):
+        requested_urls.append(kwargs["base_url"])
+        return _ProbeClient(
+            [ProbeClassification.INFRA_FAILURE] * 5,
+            concurrency,
+            delay=0.25,
+        )
+
+    coordinator = BehaviorPreflightCoordinator(
+        state=_State(record, _config()),
+        dao=dao,
+        probe_client_factory=factory,
+    )
+    config = replace(
+        parse_behavior_gate_config(_config()),
+        admission_timeout_seconds=10.0,
+    )
+
+    started = time.monotonic()
+    await coordinator._ensure_verdict(
+        record, config, "deployment-wide-deadline",
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert dao.row["status"] == "deferred"
+    assert dao.row["reason_code"] == "deployment_admission_deadline_exceeded"
+    assert requested_urls == [
+        "https://gpu-a.invalid/v1",
+        "https://gpu-b.invalid/v1",
+    ]
+    assert concurrency["max"] == 2

@@ -963,7 +963,11 @@ async def _cmd_sample_progress(window_spec: str, miner_filter: str) -> None:
                 succ = ws.get("tasks_succeeded", "—")
                 fail = ws.get("tasks_failed", "—")
                 total_ms = ws.get("total_execution_ms", 0)
-                count = (ws.get("tasks_succeeded", 0) + ws.get("tasks_failed", 0)) if ws else 0
+                count = (
+                    ws.get("tasks_succeeded", 0)
+                    + ws.get("tasks_failed", 0)
+                    + ws.get("tasks_invalid", 0)
+                ) if ws else 0
                 avg_lat = f"{(total_ms / count) / 1000:.1f}s" if count else "—"
                 reported_at = ws.get("reported_at", 0) if ws else 0
                 age = int(now - reported_at) if reported_at else None

@@ -16,10 +16,20 @@ to gate anything, just so a runaway pending list can't schedule tens of
 thousands of coroutines into asyncio at once.
 """
 
-# Per-host in-flight cap. ``ExecutorManager`` sizes the global sem to
-# ``PER_HOST_DISPATCH_BUDGET × len(active_ssh_endpoints)`` and gates
-# every dispatch against the host its sglang lives on.
-PER_HOST_DISPATCH_BUDGET = 600
+# Serving capacity per inference host.  Behavior preflight talks directly to
+# the same endpoint as benchmark traffic, so benchmark dispatch must not be
+# allowed to consume every request slot before admission can be decided.
+PER_HOST_TOTAL_CAPACITY = 600
+BEHAVIOR_PREFLIGHT_RESERVED_SLOTS = 4
+
+# Per-host *benchmark* cap. ``ExecutorManager`` sizes the global sem to
+# ``PER_HOST_DISPATCH_BUDGET × len(active_ssh_endpoints)`` and gates every
+# benchmark dispatch against the host its sglang lives on.  The difference
+# from ``PER_HOST_TOTAL_CAPACITY`` remains available to the bounded, CPU-side
+# behavior probes; it does not require another GPU.
+PER_HOST_DISPATCH_BUDGET = (
+    PER_HOST_TOTAL_CAPACITY - BEHAVIOR_PREFLIGHT_RESERVED_SLOTS
+)
 
 GLOBAL_DISPATCH_BUDGET = PER_HOST_DISPATCH_BUDGET
 

@@ -130,3 +130,67 @@ class WindowSampler:
                     f"expected {SAMPLING_MODE_LATEST!r} or {SAMPLING_MODE_RANDOM!r}"
                 )
         return result
+
+    def extend(
+        self,
+        existing: List[int],
+        config: EnvSamplingConfig,
+        count: int,
+    ) -> List[int]:
+        """Pick new IDs without changing an active window's existing pool."""
+
+        wanted = max(0, int(count))
+        if wanted == 0:
+            return []
+        ranges = RangeSet(config.dataset_range).ranges
+        excluded = {
+            int(task_id)
+            for task_id in existing
+            if any(start <= int(task_id) < end for start, end in ranges)
+        }
+        total = sum(end - start for start, end in ranges)
+        available = total - len(excluded)
+        if wanted > available:
+            raise ValueError(
+                f"replacement_count={wanted} exceeds available IDs={available} "
+                "after existing task_ids"
+            )
+
+        if config.mode == SAMPLING_MODE_LATEST:
+            picked: List[int] = []
+            for start, end in reversed(ranges):
+                for task_id in range(end - 1, start - 1, -1):
+                    if task_id in excluded:
+                        continue
+                    picked.append(task_id)
+                    if len(picked) >= wanted:
+                        return sorted(picked)
+            return sorted(picked)
+
+        if config.mode != SAMPLING_MODE_RANDOM:
+            raise ValueError(
+                f"unknown sampling mode {config.mode!r} for env={config.env!r}"
+            )
+
+        rng = self._rng()
+        weights = [end - start for start, end in ranges]
+        picked_set: set[int] = set()
+        attempts = 0
+        max_attempts = max(100, wanted * 20)
+        while len(picked_set) < wanted and attempts < max_attempts:
+            index = rng.choices(range(len(ranges)), weights=weights, k=1)[0]
+            start, end = ranges[index]
+            task_id = rng.randrange(start, end)
+            if task_id not in excluded:
+                picked_set.add(task_id)
+            attempts += 1
+
+        if len(picked_set) < wanted:
+            for start, end in ranges:
+                for task_id in range(start, end):
+                    if task_id in excluded or task_id in picked_set:
+                        continue
+                    picked_set.add(task_id)
+                    if len(picked_set) >= wanted:
+                        return sorted(picked_set)
+        return sorted(picked_set)

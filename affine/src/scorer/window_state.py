@@ -93,6 +93,16 @@ class BattleRecord:
     deployment_id: str
     base_url: str
     started_at_block: int
+    # Opaque per-deploy activation identity.  SSH deployment ids and URLs are
+    # intentionally stable across container rotations, while a block number is
+    # not guaranteed to advance between two scheduler ticks.  This token keeps
+    # behavior verdicts and admission deadlines bound to exactly one serving
+    # generation.
+    deployment_generation: str = ""
+    # Absolute UTC epoch anchored when the serving endpoint reports ready.
+    # Keeping it with deployment state lets scheduler restarts and temporary
+    # behavior-DAO outages preserve one bounded admission window.
+    behavior_admission_deadline_at: Optional[int] = None
     deployments: List[DeploymentRecord] = field(default_factory=list)
     previous_champion: Optional[MinerSnapshot] = None
 
@@ -116,6 +126,9 @@ class WindowRotationRequest:
     """
     requested_at_block: int
     stale_refreshed_at_block: int
+    reason: str = ""
+    environment: str = ""
+    replacement_count: int = 0
 
 
 @dataclass
@@ -553,6 +566,8 @@ def _battle_to_dict(b: BattleRecord) -> Dict[str, Any]:
         "deployment_id": b.deployment_id,
         "base_url": b.base_url,
         "started_at_block": b.started_at_block,
+        "deployment_generation": b.deployment_generation,
+        "behavior_admission_deadline_at": b.behavior_admission_deadline_at,
         "deployments": [asdict(d) for d in b.deployments],
     }
     if b.previous_champion is not None:
@@ -577,6 +592,7 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
             for k in ("uid", "hotkey", "revision", "model", "model_type")
             if k in prev_raw
         })
+    started_at_block = int(raw.get("started_at_block", 0))
     return BattleRecord(
         challenger=MinerSnapshot(**{
             k: chal_raw[k]
@@ -585,7 +601,19 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
         }),
         deployment_id=deployment_id,
         base_url=base_url,
-        started_at_block=int(raw.get("started_at_block", 0)),
+        started_at_block=started_at_block,
+        # Keep legacy records stable across reads; never mint a random token in
+        # the decoder because that would rotate the fingerprint every poll.
+        deployment_generation=(
+            str(raw.get("deployment_generation") or "")
+            if "deployment_generation" in raw
+            else f"legacy-block:{started_at_block}"
+        ),
+        behavior_admission_deadline_at=(
+            int(raw["behavior_admission_deadline_at"])
+            if raw.get("behavior_admission_deadline_at") is not None
+            else None
+        ),
         deployments=deployments,
         previous_champion=previous_champion,
     )
@@ -595,6 +623,9 @@ def _rotation_request_from_dict(raw: Dict[str, Any]) -> WindowRotationRequest:
     return WindowRotationRequest(
         requested_at_block=int(raw.get("requested_at_block", 0)),
         stale_refreshed_at_block=int(raw.get("stale_refreshed_at_block", 0)),
+        reason=str(raw.get("reason") or ""),
+        environment=str(raw.get("environment") or ""),
+        replacement_count=max(0, int(raw.get("replacement_count") or 0)),
     )
 
 
