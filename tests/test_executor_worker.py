@@ -6,7 +6,6 @@ import pytest
 import affine.src.executor.main as executor_main
 from affine.src.executor.worker import (
     _base_urls,
-    _is_zero_score_error,
     _pick_url,
     _resolve_deployment_id,
 )
@@ -161,45 +160,6 @@ def test_pick_url_stably_shards_tasks_across_urls():
     ]
 
 
-def test_is_zero_score_error_matches_context_overflow_patterns():
-    cases = [
-        "BadRequest: This model's maximum context length is 65536 tokens, but the input is longer than the model can handle",
-        "This model supports context lengths of up to 65536 tokens",
-        "HTTP 400: prompt exceeds the maximum allowed length",
-        "Error: exceeds the maximum context length of 32000 tokens",
-    ]
-    for msg in cases:
-        assert _is_zero_score_error(Exception(msg)), msg
-
-
-def test_is_zero_score_error_rejects_transport_and_env_failures():
-    cases = [
-        "ReadError: connection reset by peer",
-        "Remote execution failed: {'status': 'failed', 'error': 'worker crashed'}",
-        "BackendError: Method call failed: Failed to call method 'evaluate'",
-        "EnvironmentError: Method 'evaluate' failed on environment 'liveweb-pool-2'",
-        "HTTP 503: service unavailable",
-    ]
-    for msg in cases:
-        assert not _is_zero_score_error(Exception(msg)), msg
-
-
-def test_is_zero_score_error_walks_exception_chain():
-    # Affinetes wraps the original error several layers deep — the pattern
-    # can live on any cause/context node.
-    leaf = ValueError("prompt is longer than the model context window")
-    middle = RuntimeError("Method call failed")
-    middle.__cause__ = leaf
-    top = RuntimeError("Method 'evaluate' failed on environment")
-    top.__cause__ = middle
-
-    assert _is_zero_score_error(top)
-
-
-def test_is_zero_score_error_is_case_insensitive():
-    assert _is_zero_score_error(Exception("EXCEEDS THE MAXIMUM CONTEXT LENGTH"))
-
-
 def test_executor_does_not_persist_structured_error_results():
     import asyncio as _asyncio
     from affine.core.models import Result
@@ -250,7 +210,7 @@ def test_executor_does_not_persist_structured_error_results():
     assert samples.persist_calls == []
 
 
-def test_executor_persists_structured_context_overflow_as_zero():
+def test_executor_persists_explicitly_valid_model_failure_as_zero():
     import asyncio as _asyncio
     from affine.core.models import Result
     from affine.src.executor.worker import ExecutorWorker
@@ -267,7 +227,10 @@ def test_executor_persists_structured_context_overflow_as_zero():
                 success=False,
                 error="prompt exceeds the maximum context length",
                 task_id=task_id,
-                extra={"error": "prompt exceeds the maximum context length"},
+                extra={
+                    "valid_for_scoring": True,
+                    "failure_detail": "prompt exceeds the maximum context length",
+                },
             )
 
     class _SamplesStub:
@@ -300,7 +263,258 @@ def test_executor_persists_structured_context_overflow_as_zero():
     assert len(samples.persist_calls) == 1
     persisted = samples.persist_calls[0]
     assert persisted["score"] == 0.0
-    assert persisted["extra"]["zero_score_reason"] == "context_overflow"
+    assert persisted["extra"]["valid_for_scoring"] is True
+
+
+def _persist_calls_for_result(
+    result, *, env="SWE-INFINITE", configure_worker=None,
+):
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import MinerSnapshot
+
+    worker = ExecutorWorker(worker_id=0, env=env)
+
+    class _EnvStub:
+        async def evaluate(self, *, miner, task_id):
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    class _SamplesStub:
+        def __init__(self):
+            self.persist_calls = []
+
+        async def persist(self, **kwargs):
+            self.persist_calls.append(kwargs)
+
+    samples = _SamplesStub()
+    worker._env_executor = _EnvStub()
+    worker._samples = samples
+    if configure_worker is not None:
+        configure_worker(worker)
+
+    async def _drive():
+        await worker._evaluate_and_persist_gated(
+            miner=MinerSnapshot(
+                uid=215,
+                hotkey="hk",
+                revision="rev",
+                model="org/model",
+            ),
+            task_id=123,
+            base_url="https://example/v1",
+            refresh_block=10,
+            miner_obj=object(),
+        )
+
+    asyncio.run(_drive())
+    return samples.persist_calls
+
+
+def test_executor_does_not_infer_disposition_from_exception_text():
+    error = RuntimeError("prompt exceeds the maximum context length")
+
+    assert _persist_calls_for_result(error) == []
+
+
+def test_executor_does_not_persist_explicitly_invalid_attempt():
+    from affine.core.models import Result
+
+    result = Result(
+        env="SWE-INFINITE",
+        score=0.0,
+        latency_seconds=1.0,
+        success=False,
+        error=None,
+        task_id=123,
+        extra={
+            "valid_for_scoring": False,
+            "failure_detail": "agent process exited before completion",
+            "conversation": [
+                {"role": "user", "content": "task"},
+                {"role": "assistant", "content": "working"},
+                {"role": "tool", "content": "output"},
+            ],
+            "model_calls": 0,
+            "test_stats": {
+                "error": (
+                    "codex_error: exit 1: stream disconnected before "
+                    "completion"
+                ),
+                "error_type": "agent_error",
+            },
+        },
+    )
+
+    assert _persist_calls_for_result(result) == []
+
+
+def test_executor_checks_runtime_invariants_before_invalid_disposition_drop():
+    from affine.core.models import Result
+
+    result = Result(
+        env="SWE-INFINITE",
+        score=0.0,
+        latency_seconds=1.0,
+        success=False,
+        task_id=123,
+        extra={"valid_for_scoring": False},
+    )
+
+    invariant_calls = []
+
+    async def observe_invariant(**kwargs):
+        invariant_calls.append(kwargs)
+        return False
+
+    def configure(worker):
+        worker._runtime_invariant_blocks_persist = observe_invariant
+
+    assert _persist_calls_for_result(result, configure_worker=configure) == []
+    assert len(invariant_calls) == 1
+
+
+def test_executor_checks_runtime_invariants_before_unclassified_error_drop():
+    from affine.core.models import Result
+
+    result = Result(
+        env="DISTILL-V2",
+        score=0.0,
+        latency_seconds=1.0,
+        success=False,
+        error="worker process failed",
+        task_id=123,
+    )
+
+    invariant_calls = []
+
+    async def observe_invariant(**kwargs):
+        invariant_calls.append(kwargs)
+        return False
+
+    def configure(worker):
+        worker._runtime_invariant_blocks_persist = observe_invariant
+
+    assert _persist_calls_for_result(
+        result,
+        env="DISTILL-V2",
+        configure_worker=configure,
+    ) == []
+    assert len(invariant_calls) == 1
+
+
+def test_executor_rejects_malformed_scoring_disposition():
+    from affine.core.models import Result
+
+    result = Result(
+        env="SWE-INFINITE",
+        score=1.0,
+        latency_seconds=1.0,
+        success=True,
+        task_id=123,
+        extra={"valid_for_scoring": "false"},
+    )
+
+    assert _persist_calls_for_result(result) == []
+
+
+def test_executor_does_not_reclassify_explicit_disposition_from_message_text():
+    from affine.core.models import Result
+
+    result = Result(
+        env="SWE-INFINITE",
+        score=0.0,
+        latency_seconds=1.0,
+        success=False,
+        error=None,
+        task_id=123,
+        extra={
+            "valid_for_scoring": False,
+            "test_stats": {
+                # This text matches the legacy zero-score heuristic. The
+                # explicit boolean remains authoritative and forces a retry.
+                "error": "input is longer than the model context",
+                "error_type": "agent_error",
+            },
+        },
+    )
+
+    assert _persist_calls_for_result(result) == []
+
+
+def test_executor_applies_explicit_disposition_to_every_environment():
+    from affine.core.models import Result
+
+    result = Result(
+        env="OTHER",
+        score=0.0,
+        latency_seconds=1.0,
+        success=False,
+        error=None,
+        task_id=123,
+        extra={
+            "valid_for_scoring": False,
+            "test_stats": {
+                "error": "environment-specific model failure",
+                "error_type": "agent_error",
+            },
+        },
+    )
+
+    assert _persist_calls_for_result(result, env="OTHER") == []
+
+
+@pytest.mark.parametrize(
+    "test_stats",
+    [
+        {
+            "error": "ContextWindowExceededError: input is too long",
+            "error_type": "context_exceeded",
+        },
+        {"error": "patch apply failed"},
+        {"failure_reason": "no_patch_generated"},
+    ],
+)
+def test_executor_keeps_swe_model_zero_results(test_stats):
+    from affine.core.models import Result
+
+    result = Result(
+        env="SWE-INFINITE",
+        score=0.0,
+        latency_seconds=1.0,
+        success=False,
+        error=None,
+        task_id=123,
+        extra={"valid_for_scoring": True, "test_stats": test_stats},
+    )
+
+    calls = _persist_calls_for_result(result)
+    assert len(calls) == 1
+    assert calls[0]["score"] == 0.0
+    assert calls[0]["extra"]["test_stats"] == test_stats
+
+
+def test_executor_does_not_infer_disposition_from_structured_error_code():
+    """Legacy error labels alone cannot decide whether a sample is valid."""
+    from affine.core.models import Result
+
+    result = Result(
+        env="SWE-INFINITE",
+        score=0.0,
+        latency_seconds=1.0,
+        success=False,
+        error=None,
+        task_id=123,
+        extra={
+            "test_stats": {
+                "error": "stream disconnected before completion",
+                "error_type": "agent_error",
+            },
+        },
+    )
+
+    calls = _persist_calls_for_result(result)
+    assert len(calls) == 1
 
 
 def test_global_slot_acquire_release_round_trip():
