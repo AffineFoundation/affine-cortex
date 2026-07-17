@@ -716,24 +716,19 @@ class ExecutorWorker:
         tagged with the task-id pool's ``refresh_block`` so the scheduler
         only counts current-refresh samples.
 
-        Failure handling distinguishes three cases (pre-refactor parity,
-        see PR #439):
+        Failure handling distinguishes two cases:
 
-          - **Miner-capability error** — the exception chain matches
-            ``_ZERO_SCORE_ERROR_PATTERNS`` (context-length overflow).
-            That's a property of the model and won't change on retry,
-            so persist score=0.
-          - **All other exceptions** (transport, parse, HTTP status,
-            env crash mid-flight, env returning ``status=failed`` for
-            non-capability reasons): never the miner's fault to know.
+          - **Exceptions** (transport, parse, HTTP status, env crash
+            mid-flight): they have no structured scoring disposition.
             **Don't persist** — let the next ``_tick`` re-attempt this
             task_id. The shuffle keeps us from always blocking on the
             same flaky task. The 10% buffer absorbs permanent infra-only
             failures; beyond that operators step in.
-          - ``Result.success=False`` / ``error`` from a non-raising
-            evaluate: the env returned a structured invalid attempt.
-            **Don't persist** — rows with ``extra.error`` are not valid
-            samples and must not count toward completion or comparison.
+          - A non-raising evaluate with ``extra.valid_for_scoring=False``:
+            the environment returned an invalid attempt. **Don't persist** —
+            it must not count toward completion or comparison.
+            ``success=False`` alone is not enough; environments also use it
+            for legitimate zero-score model results.
         """
         miner_obj = _Miner(
             hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
@@ -1151,36 +1146,10 @@ class ExecutorWorker:
                 latency_s = time.monotonic() - started
                 latency_ms = int(latency_s * 1000)
                 error_brief = str(e).replace("\n", " ").replace("\r", " ")[:200]
-                zero_score = _is_zero_score_error(e)
-                tag = "ZERO" if zero_score else "FAILED"
                 logger.info(
-                    f"[{tag}] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
+                    f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
                     f"task_id={task_id:<8} │ {latency_s:6.3f}s │ {type(e).__name__}: {error_brief}"
                 )
-                if zero_score:
-                    # Miner-capability limit (context overflow). Persist as
-                    # score=0 — retrying would yield the same error.
-                    if not await self._validate_or_drop(
-                        miner=miner, task_id=task_id,
-                        expected_deployment_id=expected_deployment_id,
-                        latency_ms=latency_ms,
-                    ):
-                        return
-                    await self._samples.persist(
-                        miner_hotkey=miner.hotkey,
-                        model_revision=miner.revision,
-                        model=miner.model,
-                        env=self.env,
-                        task_id=task_id,
-                        score=0.0,
-                        latency_ms=latency_ms,
-                        extra={
-                            "error": error_brief,
-                            "zero_score_reason": "context_overflow",
-                        },
-                        block_number=0,
-                        refresh_block=refresh_block,
-                    )
                 self.metrics.record_completion(success=False, latency_ms=latency_ms)
                 return
         finally:
@@ -1192,6 +1161,11 @@ class ExecutorWorker:
         success = bool(getattr(result, "success", True))
         error = getattr(result, "error", None)
         extra = dict(getattr(result, "extra", {}) or {})
+        valid_for_scoring = extra.get("valid_for_scoring")
+        malformed_disposition = (
+            "valid_for_scoring" in extra
+            and not isinstance(valid_for_scoring, bool)
+        )
         latency_ms = int((time.monotonic() - started) * 1000)
         if not await self._validate_or_drop(
             miner=miner,
@@ -1200,6 +1174,33 @@ class ExecutorWorker:
             latency_ms=latency_ms,
         ):
             return
+        if valid_for_scoring is False or malformed_disposition:
+            detail = extra.get("failure_detail") or error or extra.get("error")
+            error_brief = str(detail or "environment marked attempt invalid").replace(
+                "\n", " "
+            ).replace("\r", " ")[:200]
+            disposition = (
+                "malformed valid_for_scoring"
+                if malformed_disposition
+                else "valid_for_scoring=false"
+            )
+            logger.info(
+                f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
+                f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ "
+                f"{disposition}: {error_brief}"
+            )
+            self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            return
+        if (error or extra.get("error")) and valid_for_scoring is not True:
+            error_brief = str(error or extra.get("error")).replace(
+                "\n", " "
+            ).replace("\r", " ")[:200]
+            logger.info(
+                f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
+                f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {error_brief}"
+            )
+            self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            return
         if await self._runtime_invariant_blocks_persist(
             miner=miner,
             task_id=task_id,
@@ -1207,32 +1208,6 @@ class ExecutorWorker:
             score=score,
             extra=extra,
         ):
-            self.metrics.record_completion(success=False, latency_ms=latency_ms)
-            return
-        if error or extra.get("error"):
-            error_brief = str(error or extra.get("error")).replace("\n", " ").replace("\r", " ")[:200]
-            if _is_zero_score_error(Exception(error_brief)):
-                await self._samples.persist(
-                    miner_hotkey=miner.hotkey,
-                    model_revision=miner.revision,
-                    model=miner.model,
-                    env=self.env,
-                    task_id=task_id,
-                    score=0.0,
-                    latency_ms=latency_ms,
-                    extra={
-                        "error": error_brief,
-                        "zero_score_reason": "context_overflow",
-                    },
-                    block_number=0,
-                    refresh_block=refresh_block,
-                )
-                self.metrics.record_completion(success=False, latency_ms=latency_ms)
-                return
-            logger.info(
-                f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
-                f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {error_brief}"
-            )
             self.metrics.record_completion(success=False, latency_ms=latency_ms)
             return
         await self._samples.persist(
@@ -1407,38 +1382,3 @@ def _resolve_deployment_id(
         if d.base_url == base_url:
             return d.deployment_id
     return legacy_id
-
-
-# Pre-refactor parity (see PR #439): only errors that point at a miner
-# capability limit get persisted as a real zero-score sample. Everything
-# else is transport / env-side flake and gets retried on the next tick.
-#
-# This is conservative on purpose. Random ``status=failed`` from the env,
-# Targon 5xx, dropped connections — none of those are the miner's fault,
-# and persisting them as 0 would let one flaky env round permanently
-# disqualify a miner. The only sanctioned zero-score-on-error class is
-# "the miner's response/prompt blew past the model context window",
-# which is a model property and won't change on retry.
-_ZERO_SCORE_ERROR_PATTERNS = (
-    "context lengths of up to",
-    "is longer than the model",
-    "exceeds the maximum allowed length",
-    "exceeds the maximum context length",
-)
-
-
-def _is_zero_score_error(exc: BaseException) -> bool:
-    """Walk the cause chain and check each layer's message for a known
-    miner-capability-limit pattern. We walk the chain because affinetes
-    wraps the original error several times (ExecutionError → BackendError
-    → EnvironmentError) and the substring of interest can live on any
-    layer."""
-    seen: List[BaseException] = []
-    cur: Optional[BaseException] = exc
-    while cur is not None and cur not in seen:
-        msg = str(cur).lower()
-        if any(p in msg for p in _ZERO_SCORE_ERROR_PATTERNS):
-            return True
-        seen.append(cur)
-        cur = cur.__cause__ or cur.__context__
-    return False
