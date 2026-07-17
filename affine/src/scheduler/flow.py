@@ -89,6 +89,7 @@ from affine.src.scorer.window_state import (
 )
 
 from . import targon as targon_lifecycle
+from .health import DeploymentHealthResult, DeploymentHealthState
 
 
 # ---- deploy_fn contract: signaling exception -------------------------------
@@ -267,10 +268,18 @@ seconds. Used by the orphan reaper to tell whether an ``in_progress`` claim
 belongs to an older endpoint generation. Optional for providers without
 endpoint lifecycle metadata."""
 
-DeploymentHealthFn = Callable[[ChampionRecord], Awaitable[bool]]
-"""Return whether a persisted champion deployment is still serving the
-saved champion identity. Optional; providers that cannot cheaply check
-runtime health can leave it unset."""
+DeploymentHealthFn = Callable[
+    [ChampionRecord], Awaitable[bool | DeploymentHealthResult]
+]
+"""Classify whether a persisted champion deployment is still serving the
+saved champion identity. Boolean callbacks remain supported for providers
+using the legacy contract."""
+
+DeploymentTransportRepairFn = Callable[
+    [ChampionRecord, DeploymentHealthResult], Awaitable[bool]
+]
+"""Request repair of the transport in front of a healthy model runtime.
+Return whether the transport is managed and a repair is pending."""
 
 
 @dataclass
@@ -288,6 +297,8 @@ class FlowConfig:
     Targon-style multi-instance providers leave this False because sibling
     deployments can coexist independently.
     """
+    deployment_health_failure_threshold: int = 3
+    """Consecutive inconclusive readiness failures required before repair."""
 
     def __post_init__(self) -> None:
         if self.task_pool_refresh_blocks is None:
@@ -297,6 +308,10 @@ class FlowConfig:
         self.task_pool_refresh_blocks = _positive_int_config(
             self.task_pool_refresh_blocks,
             source="FlowConfig.task_pool_refresh_blocks",
+        )
+        self.deployment_health_failure_threshold = _positive_int_config(
+            self.deployment_health_failure_threshold,
+            source="FlowConfig.deployment_health_failure_threshold",
         )
 
 
@@ -321,6 +336,9 @@ class FlowScheduler:
             ListActiveEndpointActivationsFn
         ] = None,
         deployment_health_fn: Optional[DeploymentHealthFn] = None,
+        deployment_transport_repair_fn: Optional[
+            DeploymentTransportRepairFn
+        ] = None,
         sample_metrics_reader: Optional[SampleMetricsReader] = None,
         behavior_gate_dao: Any = None,
         transition_deployment_role_fn: Optional[
@@ -345,6 +363,10 @@ class FlowScheduler:
             list_active_endpoint_activations_fn
         )
         self._deployment_health = deployment_health_fn
+        self._deployment_transport_repair = deployment_transport_repair_fn
+        self._deployment_health_failure: Optional[
+            Tuple[str, str, DeploymentHealthState, int]
+        ] = None
         self._behavior_gate_dao = behavior_gate_dao
         self._transition_deployment_role = transition_deployment_role_fn
         self._last_behavior_gate_log: Dict[str, str] = {}
@@ -752,7 +774,7 @@ class FlowScheduler:
     async def _recover_unhealthy_champion_deployment(
         self, champion: ChampionRecord,
     ) -> bool:
-        """Redeploy champion if its persisted runtime has gone stale.
+        """Reconcile a persisted champion runtime without overreacting.
 
         Returns ``True`` when the caller can continue the normal flow, or
         ``False`` when this tick performed/attempted a recovery deployment
@@ -764,7 +786,21 @@ class FlowScheduler:
             return True
 
         try:
-            healthy = await self._deployment_health(champion)
+            raw_health = await self._deployment_health(champion)
+            if isinstance(raw_health, bool):
+                health = DeploymentHealthResult(
+                    DeploymentHealthState.HEALTHY
+                    if raw_health
+                    else DeploymentHealthState.UNHEALTHY,
+                    reason="legacy_boolean_health_check",
+                )
+            elif isinstance(raw_health, DeploymentHealthResult):
+                health = raw_health
+            else:
+                raise TypeError(
+                    "deployment health callback returned unsupported value "
+                    f"{raw_health!r}"
+                )
         except Exception as e:
             logger.warning(
                 f"FlowScheduler: champion deployment health check raised "
@@ -773,8 +809,100 @@ class FlowScheduler:
                 f"this tick: {type(e).__name__}: {e}"
             )
             return True
-        if healthy:
+
+        deployment_id = champion.deployment_id
+        if health.state is DeploymentHealthState.HEALTHY:
+            self._deployment_health_failure = None
             return True
+
+        if health.state is DeploymentHealthState.UNKNOWN:
+            self._deployment_health_failure = None
+            logger.warning(
+                f"FlowScheduler: champion uid={champion.uid} deployment "
+                f"{deployment_id!r} health is unknown "
+                f"(reason={health.reason or '-'}); preserving runtime state"
+            )
+            return True
+
+        if health.state is DeploymentHealthState.UNHEALTHY:
+            self._deployment_health_failure = None
+            return await self._redeploy_unhealthy_champion(
+                champion, reason=health.reason,
+            )
+
+        previous = self._deployment_health_failure
+        marker = (deployment_id, health.identity, health.state)
+        failure_count = (
+            previous[3] + 1
+            if previous is not None and previous[:3] == marker
+            else 1
+        )
+        self._deployment_health_failure = (
+            deployment_id,
+            health.identity,
+            health.state,
+            failure_count,
+        )
+        threshold = self.cfg.deployment_health_failure_threshold
+        if failure_count < threshold:
+            logger.warning(
+                f"FlowScheduler: champion uid={champion.uid} deployment "
+                f"{deployment_id!r} health suspected "
+                f"({failure_count}/{threshold}, state={health.state.value}, "
+                f"reason={health.reason or '-'}); preserving runtime state"
+            )
+            return True
+
+        self._deployment_health_failure = None
+        if health.state is DeploymentHealthState.TRANSPORT_UNHEALTHY:
+            if self._deployment_transport_repair is None:
+                logger.error(
+                    f"FlowScheduler: champion uid={champion.uid} deployment "
+                    f"{deployment_id!r} transport is unhealthy but no repair "
+                    "callback is configured; preserving the SGLang runtime"
+                )
+                return True
+            try:
+                repair_pending = await self._deployment_transport_repair(
+                    champion,
+                    health,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"FlowScheduler: transport repair request failed for "
+                    f"uid={champion.uid} deployment_id={deployment_id!r}; "
+                    f"preserving runtime state: {type(e).__name__}: {e}"
+                )
+                return True
+            if not repair_pending:
+                logger.error(
+                    f"FlowScheduler: champion uid={champion.uid} deployment "
+                    f"{deployment_id!r} transport repair was not queued; "
+                    "preserving the SGLang runtime and rechecking next tick"
+                )
+                return True
+            logger.warning(
+                f"FlowScheduler: requested transport repair for champion "
+                f"uid={champion.uid} deployment_id={deployment_id!r} after "
+                f"{threshold} consecutive failures; preserving SGLang state"
+            )
+            return True
+
+        return await self._redeploy_unhealthy_champion(
+            champion,
+            reason=(
+                f"{health.reason or health.state.value}; "
+                f"confirmed_after={threshold}"
+            ),
+        )
+
+    async def _redeploy_unhealthy_champion(
+        self,
+        champion: ChampionRecord,
+        *,
+        reason: str,
+    ) -> bool:
+        """Clear a confirmed stale runtime and run the normal deploy path."""
 
         stale_deployment_id = champion.deployment_id
         stale_base_url = champion.base_url
@@ -785,7 +913,7 @@ class FlowScheduler:
         logger.warning(
             f"FlowScheduler: champion uid={champion.uid} deployment "
             f"{stale_deployment_id!r} at {stale_base_url!r} is unhealthy; "
-            f"cleared stale state and redeploying"
+            f"cleared stale state and redeploying (reason={reason or '-'})"
         )
         await self._deploy_champion(champion)
         return False

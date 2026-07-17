@@ -18,6 +18,10 @@ from affine.src.scheduler.flow import (
     FlowConfig,
     FlowScheduler,
 )
+from affine.src.scheduler.health import (
+    DeploymentHealthResult,
+    DeploymentHealthState,
+)
 from affine.src.scheduler.targon import (
     DeployResult,
     DeployTarget,
@@ -340,6 +344,7 @@ def _seed_state(*, sampling_count=4, with_champion=True) -> InMemoryConfigStore:
 def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
     window_blocks=WINDOW_BLOCKS, deployment_health_fn=None,
+    deployment_transport_repair_fn=None,
     list_active_endpoint_names_fn=None,
     list_active_endpoint_activations_fn=None,
     task_pool_refresh_blocks=None, config=None, behavior_gate_dao=None,
@@ -378,6 +383,7 @@ def _build_scheduler(
             list_active_endpoint_activations_fn
         ),
         deployment_health_fn=deployment_health_fn,
+        deployment_transport_repair_fn=deployment_transport_repair_fn,
         behavior_gate_dao=behavior_gate_dao,
         transition_deployment_role_fn=(
             transition_deployment_role_fn or deployer.transition_role
@@ -1098,6 +1104,145 @@ async def test_healthy_champion_deployment_is_not_redeployed():
     assert champ.deployment_id == "wrk-live"
     assert champ.base_url == "https://t/live"
     assert deployer.deploys == []
+
+
+@pytest.mark.asyncio
+async def test_suspected_champion_requires_three_consecutive_failures():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-suspected"
+    kv.data["champion"]["base_url"] = "https://t/suspected"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+
+    async def deployment_health_fn(champion):
+        return DeploymentHealthResult(
+            DeploymentHealthState.SUSPECTED,
+            reason="both_probes_failed",
+        )
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+    await scheduler.tick(current_block=52)
+    assert deployer.deploys == []
+    assert (await state.get_champion()).deployment_id == "wrk-suspected"
+
+    await scheduler.tick(current_block=53)
+    assert [target.uid for target in deployer.deploys] == [1]
+    assert (await state.get_champion()).deployment_id == "wrk-001"
+
+
+@pytest.mark.asyncio
+async def test_health_failure_count_resets_for_new_endpoint_generation():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-stable-name"
+    kv.data["champion"]["base_url"] = "https://t/live"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    identities = iter(["generation-1", "generation-1", "generation-2"])
+
+    async def deployment_health_fn(champion):
+        return DeploymentHealthResult(
+            DeploymentHealthState.SUSPECTED,
+            reason="both_probes_failed",
+            identity=next(identities),
+        )
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+    await scheduler.tick(current_block=52)
+    await scheduler.tick(current_block=53)
+
+    assert deployer.deploys == []
+    assert (await state.get_champion()).deployment_id == "wrk-stable-name"
+
+
+@pytest.mark.asyncio
+async def test_transport_failure_repairs_tunnel_without_clearing_deployment():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-live"
+    kv.data["champion"]["base_url"] = "https://t/live"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    repairs = []
+
+    async def deployment_health_fn(champion):
+        return DeploymentHealthResult(
+            DeploymentHealthState.TRANSPORT_UNHEALTHY,
+            reason="public_failed_local_ready",
+        )
+
+    async def repair_fn(champion, health):
+        repairs.append((champion.deployment_id, health.reason))
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        deployment_health_fn=deployment_health_fn,
+        deployment_transport_repair_fn=repair_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+    await scheduler.tick(current_block=52)
+    await scheduler.tick(current_block=53)
+
+    assert repairs == [("wrk-live", "public_failed_local_ready")]
+    assert deployer.deploys == []
+    champion = await state.get_champion()
+    assert champion.deployment_id == "wrk-live"
+    assert champion.base_url == "https://t/live"
 
 
 @pytest.mark.asyncio
