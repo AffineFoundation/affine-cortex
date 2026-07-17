@@ -156,7 +156,7 @@
       "enabled_for_sampling": true,
       "enabled_for_scoring": true,
       "sampling": {
-        "sampling_count": 300,
+        "sampling_count": 450,
         "dataset_range": [
           [
             0,
