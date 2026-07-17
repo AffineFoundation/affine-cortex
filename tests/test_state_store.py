@@ -43,10 +43,44 @@ async def test_battle_roundtrip():
         challenger=MinerSnapshot(uid=2, hotkey="bb", revision="rb", model="org/b"),
         deployment_id="wrk-chal", base_url="https://t/c",
         started_at_block=2000,
+        deployment_generation="7dcab393ba2e4469b38744fc4a87ed73",
+        behavior_admission_deadline_at=1_900_000_000,
     )
     await store.set_battle(battle)
     got = await store.get_battle()
     assert got == battle
+
+
+@pytest.mark.asyncio
+async def test_battle_decoder_distinguishes_legacy_missing_generation_from_empty():
+    kv = InMemoryConfigStore()
+    common = {
+        "challenger": {
+            "uid": 2,
+            "hotkey": "bb",
+            "revision": "rb",
+            "model": "org/b",
+        },
+        "deployment_id": "wrk-chal",
+        "base_url": "https://t/c",
+        "started_at_block": 2000,
+    }
+    kv.data[StateStore.KEY_BATTLE] = dict(common)
+    store = StateStore(kv)
+
+    legacy = await store.get_battle()
+    assert legacy is not None
+    assert legacy.deployment_generation == "legacy-block:2000"
+
+    # An explicitly persisted empty value is a valid old/default value.  Do
+    # not reinterpret it as a missing-key legacy record during a round-trip.
+    kv.data[StateStore.KEY_BATTLE] = {
+        **common,
+        "deployment_generation": "",
+    }
+    explicit_empty = await store.get_battle()
+    assert explicit_empty is not None
+    assert explicit_empty.deployment_generation == ""
 
 
 @pytest.mark.asyncio

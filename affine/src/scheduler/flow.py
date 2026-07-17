@@ -36,6 +36,7 @@ from __future__ import annotations
 import math
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Tuple
@@ -48,6 +49,7 @@ from affine.src.behavior_guard.gate import (
     record_deployment_fingerprint,
 )
 from affine.src.behavior_guard.models import (
+    BehaviorGateConfig,
     VerdictStatus,
     parse_behavior_gate_config,
 )
@@ -216,6 +218,10 @@ _PREDEPLOY_PEEK_LIMIT = 32
 ORPHAN_GRACE_SECONDS = 120
 """Minimum age of an ``in_progress`` row, missing from all in-flight
 roles, before the reaper releases it back to the queue."""
+
+BEHAVIOR_ADMISSION_MAX_DEFERRALS = 3
+"""After this many infrastructure-inconclusive deployments, abstain until
+the behavior policy changes instead of rotating GPUs forever."""
 
 # ``SAMPLE_BUFFER_RATIO`` lives in ``sampling_thresholds`` and is
 # re-exported above so downstream importers (and tests) keep working.
@@ -395,6 +401,7 @@ class FlowScheduler:
                 rotation_request,
                 battle=battle,
                 task_state=task_state,
+                envs=envs,
             )
             if not applied:
                 return
@@ -475,6 +482,17 @@ class FlowScheduler:
                     await self._decide_behavior_gate_lost(
                         champion, battle, gate_snapshot.reason,
                     )
+                    return
+                if (
+                    not gate_snapshot.passed
+                    and getattr(gate_snapshot, "admission_expired", False)
+                ):
+                    if await self._claim_expired_behavior_admission(
+                        battle, gate_snapshot,
+                    ):
+                        await self._defer_behavior_gate_admission(
+                            champion, battle, gate_snapshot,
+                        )
                     return
                 if not gate_snapshot.passed:
                     # pending/running/suspected/deferred all keep the model's
@@ -1126,11 +1144,17 @@ class FlowScheduler:
                 deployment_fingerprint=record_deployment_fingerprint(
                     battle, config,
                 ),
+                admission_deadline_at=(
+                    battle.behavior_admission_deadline_at
+                ),
+                policy_identity=config.policy_identity,
+                policy_version=config.policy_version,
+                admission_hold_seconds=config.admission_hold_seconds,
             )
         else:
             try:
-                snapshot = await read_gate_snapshot(
-                    self._behavior_gate_dao, battle, config,
+                snapshot = await self._read_or_create_behavior_gate_snapshot(
+                    battle, config,
                 )
             except Exception as exc:
                 # A control-plane read error blocks progress but can never
@@ -1141,9 +1165,99 @@ class FlowScheduler:
                     deployment_fingerprint=record_deployment_fingerprint(
                         battle, config,
                     ),
+                    admission_deadline_at=(
+                        battle.behavior_admission_deadline_at
+                    ),
+                    policy_identity=config.policy_identity,
+                    policy_version=config.policy_version,
+                    admission_hold_seconds=config.admission_hold_seconds,
                 )
         self._log_behavior_gate_snapshot(battle, snapshot)
         return snapshot
+
+    async def _read_or_create_behavior_gate_snapshot(
+        self,
+        record: BattleRecord,
+        config: BehaviorGateConfig,
+    ) -> GateSnapshot:
+        """Return a strong snapshot, anchoring a missing admission row first.
+
+        Deploy state is persisted before the independent preflight coordinator
+        necessarily observes it. If the scheduler reaches the record's
+        absolute deadline first, a missing row or a legacy row without a
+        deadline would make the expiry CAS impossible because DynamoDB has no
+        deadline to compare. Create or backfill it with the record's original
+        deadline, then strongly re-read before making any expiry decision.
+        """
+        assert self._behavior_gate_dao is not None
+        snapshot = await read_gate_snapshot(
+            self._behavior_gate_dao, record, config,
+        )
+        if snapshot.row is not None and (
+            snapshot.row.get("admission_deadline_at") is not None
+            or record.behavior_admission_deadline_at is None
+        ):
+            return snapshot
+        await self._behavior_gate_dao.ensure_pending(
+            record.challenger.hotkey,
+            record.challenger.revision,
+            config.policy_version,
+            snapshot.deployment_fingerprint,
+            admission_deadline_at=record.behavior_admission_deadline_at,
+        )
+        return await read_gate_snapshot(
+            self._behavior_gate_dao, record, config,
+        )
+
+    async def _claim_expired_behavior_admission(
+        self,
+        record: BattleRecord,
+        snapshot: GateSnapshot,
+    ) -> bool:
+        """Atomically fence a non-final verdict before releasing its endpoint.
+
+        A client-side deadline check alone races a probe's final PASSED/FAILED
+        write.  The DAO CAS makes exactly one of those transitions win.  An
+        already-EXPIRED row is an idempotent scheduler retry after a crash.
+        """
+
+        if snapshot.status is VerdictStatus.EXPIRED:
+            return True
+        if self._behavior_gate_dao is None:
+            return False
+        try:
+            claimed = await self._behavior_gate_dao.claim_expired_admission(
+                record.challenger.hotkey,
+                record.challenger.revision,
+                snapshot.policy_version,
+                snapshot.deployment_fingerprint,
+            )
+        except Exception as exc:
+            logger.warning(
+                "FlowScheduler: behavior admission expiry CAS failed "
+                f"uid={record.challenger.uid}: {type(exc).__name__}"
+            )
+            return False
+        if claimed:
+            return True
+
+        # False may mean a final probe won the race, or another scheduler
+        # already claimed EXPIRED before crashing.  Strongly re-read rather
+        # than guessing; only the latter is safe to consume as a requeue.
+        try:
+            row = await self._behavior_gate_dao.get_verdict(
+                record.challenger.hotkey,
+                record.challenger.revision,
+                snapshot.policy_version,
+                snapshot.deployment_fingerprint,
+            )
+        except Exception as exc:
+            logger.warning(
+                "FlowScheduler: behavior admission CAS reconciliation failed "
+                f"uid={record.challenger.uid}: {type(exc).__name__}"
+            )
+            return False
+        return str((row or {}).get("status") or "") == VerdictStatus.EXPIRED.value
 
     async def _seal_behavior_gate_for_promotion(
         self,
@@ -1343,6 +1457,63 @@ class FlowScheduler:
             await self.state.set_champion(champion)
         await self.state.clear_battle()
 
+    async def _defer_behavior_gate_admission(
+        self,
+        champion: ChampionRecord,
+        battle: BattleRecord,
+        snapshot: GateSnapshot,
+    ) -> None:
+        """Release an inconclusive, expired admission without model loss.
+
+        A deployment-wide deadline can expire because the endpoint, proxy, or
+        control plane never produced enough attributable evidence.  That is
+        not a model verdict.  Tear down first (so failure remains retryable),
+        then return the claimed challenger to ``sampling`` and clear the
+        active battle.  The normal queue can deploy it again later on a fresh
+        endpoint generation.
+        """
+        logger.warning(
+            f"FlowScheduler: challenger uid={battle.challenger.uid} "
+            f"behavior admission expired ({snapshot.reason}); tearing down and "
+            "returning to sampling"
+        )
+        await self._teardown_record(battle)
+        outcome = await self.queue.defer_admission(
+            battle.challenger.uid,
+            hotkey=battle.challenger.hotkey,
+            revision=battle.challenger.revision,
+            policy_identity=snapshot.policy_identity,
+            deployment_generation=(
+                battle.deployment_generation
+                or f"legacy-block:{battle.started_at_block}"
+            ),
+            base_delay_seconds=snapshot.admission_hold_seconds,
+            max_attempts=BEHAVIOR_ADMISSION_MAX_DEFERRALS,
+        )
+        released = outcome.get("released") is True
+        terminal = str(outcome.get("status") or "") == "terminated"
+        if not released and not terminal:
+            # Keep the battle as the durable recovery marker.  The next tick
+            # repeats the idempotent generation-scoped write; clearing it here
+            # would orphan a possibly-still-in_progress queue row.
+            logger.error(
+                "FlowScheduler: behavior admission requeue conflicted for "
+                f"uid={battle.challenger.uid} status={outcome.get('status')}; "
+                "keeping battle for recovery"
+            )
+            return
+        if outcome.get("exhausted") is True:
+            logger.warning(
+                f"FlowScheduler: behavior admission uid={battle.challenger.uid} "
+                "exhausted retry budget; abstaining until policy changes"
+            )
+        if self.cfg.single_instance_provider:
+            champion.deployment_id = None
+            champion.base_url = None
+            champion.deployments = []
+            await self.state.set_champion(champion)
+        await self.state.clear_battle()
+
     # ---- invariant reaper -------------------------------------------------
 
     async def _reap_in_progress_orphans(self) -> None:
@@ -1447,9 +1618,10 @@ class FlowScheduler:
     async def _predeploy_behavior_gate_sweep(self) -> None:
         """Terminate pre-deployed records with a confirmed failed gate.
 
-        Pending, suspected, and infrastructure-deferred rows stay deployed so
-        the independent coordinator can retry.  They still dispatch no gated
-        benchmark work in executor enforce mode.
+        Pending and suspected rows stay deployed so the independent
+        coordinator can retry.  Infrastructure-deferred rows do too until
+        their durable admission deadline expires; expiry tears the endpoint
+        down and returns the unclaimed miner to sampling without model loss.
         """
         records = await self.state.get_predeployed_challengers()
         if not records:
@@ -1488,8 +1660,8 @@ class FlowScheduler:
                 kept.append(record)
                 continue
             try:
-                snapshot = await read_gate_snapshot(
-                    self._behavior_gate_dao, record, config,
+                snapshot = await self._read_or_create_behavior_gate_snapshot(
+                    record, config,
                 )
             except Exception as exc:
                 logger.warning(
@@ -1500,8 +1672,73 @@ class FlowScheduler:
                 kept.append(record)
                 continue
             self._log_behavior_gate_snapshot(record, snapshot)
-            if not snapshot.failed:
+            admission_expired = getattr(
+                snapshot, "admission_expired", False,
+            )
+            if (
+                snapshot.passed
+                or (not snapshot.failed and not admission_expired)
+            ):
                 kept.append(record)
+                continue
+
+            if admission_expired and not snapshot.failed:
+                if not await self._claim_expired_behavior_admission(
+                    record, snapshot,
+                ):
+                    # A PASSED/FAILED probe may have won after our snapshot.
+                    # Keep the live record and let the next strong read consume
+                    # the definitive state.
+                    kept.append(record)
+                    continue
+                try:
+                    # Pre-deployed candidates are only peeked, not claimed;
+                    # removing the record therefore returns the still-
+                    # ``sampling`` miner to the queue without a lifecycle
+                    # write.  Teardown first so a provider error keeps the
+                    # record protected and retryable on the next tick.
+                    await self._teardown_record(record)
+                    outcome = await self.queue.defer_admission(
+                        record.challenger.uid,
+                        hotkey=record.challenger.hotkey,
+                        revision=record.challenger.revision,
+                        policy_identity=snapshot.policy_identity,
+                        deployment_generation=(
+                            record.deployment_generation
+                            or f"legacy-block:{record.started_at_block}"
+                        ),
+                        base_delay_seconds=snapshot.admission_hold_seconds,
+                        max_attempts=BEHAVIOR_ADMISSION_MAX_DEFERRALS,
+                    )
+                    if (
+                        outcome.get("released") is not True
+                        and str(outcome.get("status") or "") != "terminated"
+                    ):
+                        raise RuntimeError(
+                            "admission deferral did not confirm sampling state"
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "FlowScheduler: failed to release expired behavior "
+                        f"admission for pre-deployed uid="
+                        f"{record.challenger.uid}: {type(exc).__name__}: "
+                        f"{exc} — keeping for retry"
+                    )
+                    kept.append(record)
+                    continue
+                changed = True
+                logger.warning(
+                    f"FlowScheduler: pre-deployed uid="
+                    f"{record.challenger.uid} behavior admission expired "
+                    f"({snapshot.reason}); returned to sampling without "
+                    "model loss"
+                )
+                if outcome.get("exhausted") is True:
+                    logger.warning(
+                        f"FlowScheduler: pre-deployed uid="
+                        f"{record.challenger.uid} exhausted behavior admission "
+                        "retry budget; abstaining until policy changes"
+                    )
                 continue
 
             try:
@@ -1733,6 +1970,26 @@ class FlowScheduler:
         if changed:
             await self.state.set_predeployed_challengers(kept)
 
+    async def _behavior_admission_config(
+        self,
+    ) -> Optional[BehaviorGateConfig]:
+        """Return the active admission policy, including admission-shadow.
+
+        Scheduler consumes losses/expiry only in enforce mode, but it still
+        anchors the deployment deadline for admission-shadow workers so every
+        environment observes the same wall-clock boundary.
+        """
+
+        config = parse_behavior_gate_config(
+            await self.state.get_behavior_gate_config()
+        )
+        if not config.blocks_admission:
+            return None
+        envs = await self.state.get_environments()
+        if not any(config.gates_environment(env) for env in envs):
+            return None
+        return config
+
     async def _decide_predeployed_early_lost(
         self,
         champion: ChampionRecord,
@@ -1810,6 +2067,10 @@ class FlowScheduler:
                 # deployment id may still be retried by that cleanup.
                 return
         records = await self.state.get_predeployed_challengers()
+        admission_config = await self._behavior_admission_config()
+        admission_policy = (
+            admission_config.policy_identity if admission_config else None
+        )
         exclude = {p.challenger.uid for p in records}
         if battle is not None:
             exclude.add(battle.challenger.uid)
@@ -1817,6 +2078,7 @@ class FlowScheduler:
             n=_PREDEPLOY_PEEK_LIMIT,
             champion_uid=champion.uid,
             exclude_uids=exclude,
+            admission_policy_identity=admission_policy,
         )
         for cand in candidates:
             target = targon_lifecycle.DeployTarget(
@@ -1865,6 +2127,14 @@ class FlowScheduler:
                 deployment_id=result.deployment_id,
                 base_url=result.base_url,
                 started_at_block=current_block,
+                deployment_generation=uuid.uuid4().hex,
+                behavior_admission_deadline_at=(
+                    math.ceil(
+                        time.time() + admission_config.admission_hold_seconds
+                    )
+                    if admission_config is not None
+                    else None
+                ),
                 deployments=deployments,
             ))
             await self.state.set_predeployed_challengers(records)
@@ -1880,9 +2150,14 @@ class FlowScheduler:
         """Pick the next pending miner and make its deployment active."""
         if not await self._deployment_capacity_available("challenger"):
             return
+        admission_config = await self._behavior_admission_config()
+        admission_policy = (
+            admission_config.policy_identity if admission_config else None
+        )
         candidate = await self.queue.pick_next(
             window_id=current_block // self.cfg.window_blocks,
             champion_uid=champion.uid,
+            admission_policy_identity=admission_policy,
         )
         if candidate is None:
             return  # idle, no challengers
@@ -1940,6 +2215,24 @@ class FlowScheduler:
                 deployment_id=adopted.deployment_id,
                 base_url=adopted.base_url,
                 started_at_block=current_block,
+                # Promoting an already-serving predeployment must preserve
+                # its behavior identity and absolute admission window.  The
+                # provider role changes in place; this is not a new rollout.
+                deployment_generation=(
+                    adopted.deployment_generation
+                    or str(adopted.started_at_block)
+                ),
+                behavior_admission_deadline_at=(
+                    adopted.behavior_admission_deadline_at
+                    or (
+                        math.ceil(
+                            time.time()
+                            + admission_config.admission_hold_seconds
+                        )
+                        if admission_config is not None
+                        else None
+                    )
+                ),
                 deployments=list(adopted.deployments),
                 previous_champion=_champion_snapshot(champion),
             )
@@ -1986,6 +2279,14 @@ class FlowScheduler:
                 deployment_id=result.deployment_id,
                 base_url=result.base_url,
                 started_at_block=current_block,
+                deployment_generation=uuid.uuid4().hex,
+                behavior_admission_deadline_at=(
+                    math.ceil(
+                        time.time() + admission_config.admission_hold_seconds
+                    )
+                    if admission_config is not None
+                    else None
+                ),
                 deployments=_deployments_from_result(result),
                 previous_champion=_champion_snapshot(champion),
             )
@@ -2382,29 +2683,7 @@ class FlowScheduler:
             setattr(result, "token_efficiency", token_sidecar)
 
         if result.winner == "challenger":
-            # Fence the promotion with a fresh strongly-consistent read.  A
-            # real sample can invalidate a previously-passed preflight while
-            # this tick is awaiting score reads/comparison; promoting from the
-            # earlier snapshot would make that final failure unreachable once
-            # the subject becomes champion.
             gate_envs = await self.state.get_runtime_environments()
-            gate_snapshot = await self._active_behavior_gate_snapshot(
-                battle, gate_envs,
-            )
-            if gate_snapshot is not None:
-                if gate_snapshot.failed:
-                    await self._decide_behavior_gate_lost(
-                        champion, battle, gate_snapshot.reason,
-                    )
-                    return
-                if not gate_snapshot.passed:
-                    logger.warning(
-                        "FlowScheduler: challenger promotion paused by "
-                        f"behavior gate uid={battle.challenger.uid} "
-                        f"status={gate_snapshot.status.value} "
-                        f"reason={gate_snapshot.reason}"
-                    )
-                    return
             await self._teardown_record(champion)
             # The old workload is now gone.  Persist that fact before the
             # atomic seal so a failed/uncertain seal can never leave a stale
@@ -2556,6 +2835,7 @@ class FlowScheduler:
         *,
         battle: Optional[BattleRecord],
         task_state: Optional[TaskIdState],
+        envs: Mapping[str, EnvConfig],
     ) -> bool:
         """Apply an operator-requested window rotation.
 
@@ -2563,6 +2843,13 @@ class FlowScheduler:
         active battle deployments are torn down through the provider-aware
         ``teardown_fn`` before ``current_battle`` is cleared.
         """
+        if request.reason.endswith("invalid_capacity_exhausted"):
+            return await self._extend_invalid_capacity_pool(
+                request,
+                task_state=task_state,
+                envs=envs,
+            )
+
         if battle is not None:
             try:
                 await self._teardown_record(battle)
@@ -2597,6 +2884,75 @@ class FlowScheduler:
         logger.warning(
             f"FlowScheduler: consumed window rotation request from block "
             f"{request.requested_at_block}"
+        )
+        return True
+
+    async def _extend_invalid_capacity_pool(
+        self,
+        request: WindowRotationRequest,
+        *,
+        task_state: Optional[TaskIdState],
+        envs: Mapping[str, EnvConfig],
+    ) -> bool:
+        """Append replacements without tearing down an otherwise valid battle."""
+
+        if task_state is None:
+            await self.state.clear_window_rotation_request()
+            return True
+        if task_state.refreshed_at_block != request.stale_refreshed_at_block:
+            # Another scheduler already refreshed or extended this request's
+            # window.  Drop the stale signal; the worker will re-evaluate the
+            # new capacity from durable invalid markers.
+            await self.state.clear_window_rotation_request()
+            return True
+        env = request.environment
+        cfg = envs.get(env)
+        if cfg is None or request.replacement_count <= 0:
+            logger.error(
+                "FlowScheduler: invalid-capacity extension has no usable "
+                f"config env={env!r} count={request.replacement_count}"
+            )
+            return False
+
+        resolved_range = cfg.dataset_range
+        if cfg.dataset_range_source:
+            from affine.src.scorer.dataset_range_resolver import (
+                resolve_dataset_range,
+            )
+
+            fresh = await resolve_dataset_range(cfg.dataset_range_source)
+            if fresh is not None:
+                resolved_range = fresh
+        existing = list(task_state.task_ids.get(env, []))
+        try:
+            replacements = self.sampler.extend(
+                existing,
+                EnvSamplingConfig(
+                    env=env,
+                    sampling_count=0,
+                    dataset_range=resolved_range,
+                    mode=cfg.sampling_mode,
+                ),
+                request.replacement_count,
+            )
+        except ValueError as exc:
+            # Keep the request durable and pause this transition.  Repeatedly
+            # rotating a fixed latest-mode dataset would only burn the same
+            # invalid tasks again; a growing dataset can satisfy it later.
+            logger.error(
+                "FlowScheduler: invalid-capacity replacement unavailable "
+                f"env={env} requested={request.replacement_count}: {exc}"
+            )
+            return False
+
+        task_state.task_ids[env] = sorted(set(existing) | set(replacements))
+        await self.state.set_task_state(task_state)
+        await self.state.clear_window_rotation_request()
+        logger.warning(
+            "FlowScheduler: extended task pool after invalid samples "
+            f"env={env} added={len(replacements)} "
+            f"refresh_block={task_state.refreshed_at_block}; "
+            "battle_teardown=false model_loss=false"
         )
         return True
 

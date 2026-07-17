@@ -7,6 +7,7 @@ production wiring uses.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -53,10 +54,25 @@ class _InMemoryMinerStore:
     async def list_valid_pending(self) -> List[dict]:
         return [r for r in self.rows.values() if str(r.get("is_valid", "")).lower() == "true"]
 
-    async def claim_pending(self, uid: int, window_id: int, *, expected_status=STATUS_SAMPLING) -> bool:
+    async def claim_pending(
+        self,
+        uid: int,
+        window_id: int,
+        *,
+        expected_status=STATUS_SAMPLING,
+        admission_policy_identity: str | None = None,
+    ) -> bool:
         row = self.rows.get(uid)
         if row is None:
             return False
+        if admission_policy_identity is not None and (
+            row.get("admission_policy_identity")
+            == admission_policy_identity
+        ):
+            if row.get("admission_deferral_exhausted"):
+                return False
+            if int(row.get("admission_retry_after") or 0) > int(time.time()):
+                return False
         cur = row.get("challenge_status")
         if cur is not None and cur != expected_status:
             return False
@@ -108,6 +124,62 @@ class _InMemoryMinerStore:
             return False
         row["challenge_status"] = STATUS_SAMPLING
         return True
+
+    async def defer_admission(
+        self,
+        uid: int,
+        *,
+        hotkey: str,
+        revision: str,
+        policy_identity: str,
+        deployment_generation: str,
+        base_delay_seconds: int,
+        max_attempts: int,
+    ) -> dict:
+        del hotkey, revision
+        row = self.rows.get(uid)
+        if row is None:
+            return {"released": False, "status": "missing"}
+        if (
+            row.get("admission_policy_identity") == policy_identity
+            and row.get("admission_last_deployment_generation")
+            == deployment_generation
+        ):
+            return {
+                "released": row.get("challenge_status") == STATUS_SAMPLING,
+                "idempotent": True,
+                "status": row.get("challenge_status"),
+                "exhausted": bool(row.get("admission_deferral_exhausted")),
+            }
+        if row.get("challenge_status") not in {
+            STATUS_SAMPLING,
+            STATUS_IN_PROGRESS,
+        }:
+            return {"released": False, "status": row.get("challenge_status")}
+        count = (
+            int(row.get("admission_deferral_count") or 0) + 1
+            if row.get("admission_policy_identity") == policy_identity
+            else 1
+        )
+        exhausted = count >= max_attempts
+        row.update({
+            "challenge_status": STATUS_SAMPLING,
+            "admission_policy_identity": policy_identity,
+            "admission_deferral_count": count,
+            "admission_retry_after": (
+                int(time.time())
+                + base_delay_seconds * (2 ** max(0, count - 1))
+            ),
+            "admission_deferral_exhausted": exhausted,
+            "admission_last_deployment_generation": deployment_generation,
+        })
+        return {
+            "released": True,
+            "idempotent": False,
+            "deferral_count": count,
+            "exhausted": exhausted,
+            "status": STATUS_SAMPLING,
+        }
 
     async def list_in_progress(self) -> List[dict]:
         return [
@@ -434,19 +506,52 @@ class _BehaviorGateFake:
         reason: str = "test_reason",
         *,
         seal_results: Optional[List[bool | BaseException]] = None,
+        admission_deadline_at: Optional[int] = None,
     ):
         self.statuses = [status] if isinstance(status, str) else list(status)
         if not self.statuses:
             raise ValueError("at least one behavior-gate status is required")
         self.reason = reason
         self.calls = []
+        self.ensure_calls = []
+        self.expiry_claim_calls = []
         self.seal_calls = []
         self.seal_results = list(seal_results or [])
+        self.admission_deadline_at = admission_deadline_at
+        self._status_override: str | None = None
 
     async def get_verdict(self, *identity):
         self.calls.append(identity)
         index = min(len(self.calls) - 1, len(self.statuses) - 1)
-        return {"status": self.statuses[index], "reason_code": self.reason}
+        row = {
+            "status": self._status_override or self.statuses[index],
+            "reason_code": self.reason,
+        }
+        if self.admission_deadline_at is not None:
+            row["admission_deadline_at"] = self.admission_deadline_at
+        return row
+
+    async def ensure_pending(
+        self, *identity, admission_deadline_at=None,
+    ):
+        self.ensure_calls.append((*identity, admission_deadline_at))
+        if self.admission_deadline_at is None:
+            self.admission_deadline_at = admission_deadline_at
+        return await self.get_verdict(*identity)
+
+    async def claim_expired_admission(self, *identity):
+        self.expiry_claim_calls.append(identity)
+        index = max(0, min(len(self.calls) - 1, len(self.statuses) - 1))
+        status = self._status_override or self.statuses[index]
+        if status in {"passed", "failed", "expired"}:
+            return False
+        if (
+            self.admission_deadline_at is None
+            or self.admission_deadline_at > int(time.time())
+        ):
+            return False
+        self._status_override = "expired"
+        return True
 
     async def seal_for_promotion(self, *identity):
         self.seal_calls.append(identity)
@@ -466,6 +571,7 @@ async def _build_active_behavior_gate_case(
     status: str | List[str],
     mode: str = "enforce",
     seal_results: Optional[List[bool | BaseException]] = None,
+    admission_deadline_at: Optional[int] = None,
 ):
     kv = _seed_state(sampling_count=1)
     kv.data["behavior_gate"] = {
@@ -498,6 +604,7 @@ async def _build_active_behavior_gate_case(
         status,
         reason="strike_threshold:model_protocol_failure",
         seal_results=seal_results,
+        admission_deadline_at=admission_deadline_at,
     )
     scheduler, state, _ = _build_scheduler(
         kv=kv,
@@ -517,6 +624,8 @@ async def _build_active_behavior_gate_case(
         deployment_id="dep-challenger",
         base_url="https://challenger.invalid/v1",
         started_at_block=12,
+        deployment_generation="test-generation",
+        behavior_admission_deadline_at=admission_deadline_at,
     ))
     return scheduler, state, miner_store, deployer, gate, samples
 
@@ -565,9 +674,10 @@ async def test_nonfinal_behavior_gate_blocks_decision_without_model_loss(status)
 
 
 @pytest.mark.asyncio
-async def test_shadow_behavior_gate_never_blocks_or_auto_loses():
+@pytest.mark.parametrize("mode", ["shadow", "admission_shadow"])
+async def test_shadow_behavior_gate_never_blocks_or_auto_loses(mode):
     scheduler, state, miners, deployer, gate, _samples = (
-        await _build_active_behavior_gate_case(status="failed", mode="shadow")
+        await _build_active_behavior_gate_case(status="failed", mode=mode)
     )
 
     await scheduler.tick(current_block=20)
@@ -579,17 +689,228 @@ async def test_shadow_behavior_gate_never_blocks_or_auto_loses():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("second_status", "expected_terminal"),
-    [("failed", True), ("pending", False)],
-)
-async def test_challenger_promotion_is_fenced_by_fresh_gate_snapshot(
-    second_status,
-    expected_terminal,
+async def test_expired_active_admission_requeues_without_model_loss():
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="deferred",
+            admission_deadline_at=int(time.time()) - 1,
+        )
+    )
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert not miners.rows[2].get("termination_reason")
+    assert deployer.teardowns == ["dep-challenger"]
+    assert len(gate.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("winning_status", ["passed", "failed"])
+async def test_expiry_cas_loser_never_tears_down_or_requeues_final_probe(
+    monkeypatch,
+    winning_status,
 ):
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status=["deferred", winning_status],
+            admission_deadline_at=int(time.time()) - 1,
+        )
+    )
+
+    async def probe_won_expiry_race(*_identity):
+        return False
+
+    monkeypatch.setattr(
+        gate, "claim_expired_admission", probe_won_expiry_race,
+    )
+
+    await scheduler.tick(current_block=20)
+
+    # The CAS loser reconciles the strong final row and leaves lifecycle state
+    # untouched.  A later tick consumes PASSED/FAILED through its normal path.
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert deployer.teardowns == []
+    assert len(gate.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_missing_gate_row_is_anchored_before_expiry_cas(monkeypatch):
+    deadline = int(time.time()) - 1
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="deferred",
+            admission_deadline_at=deadline,
+        )
+    )
+    gate.admission_deadline_at = None
+    original_get = gate.get_verdict
+    first_read = True
+
+    async def missing_once(*identity):
+        nonlocal first_read
+        if first_read:
+            first_read = False
+            gate.calls.append(identity)
+            return None
+        return await original_get(*identity)
+
+    monkeypatch.setattr(gate, "get_verdict", missing_once)
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert deployer.teardowns == ["dep-challenger"]
+    assert gate.ensure_calls and gate.ensure_calls[0][-1] == deadline
+    assert len(gate.expiry_claim_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_legacy_gate_row_backfills_deadline_before_expiry_cas():
+    deadline = int(time.time()) - 1
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="deferred",
+            admission_deadline_at=deadline,
+        )
+    )
+    # Simulate a verdict created before durable admission deadlines existed.
+    # The battle record still supplies the immutable deployment deadline.
+    gate.admission_deadline_at = None
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert deployer.teardowns == ["dep-challenger"]
+    assert gate.ensure_calls and gate.ensure_calls[0][-1] == deadline
+    assert len(gate.expiry_claim_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_admission_cooldown_prevents_same_tick_redeployment():
+    scheduler, state, miners, deployer, _gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="deferred",
+            admission_deadline_at=int(time.time()) - 1,
+        )
+    )
+    deployer.pre_challenger_slots = 1
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is None
+    assert await state.get_predeployed_challengers() == []
+    assert miners.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert miners.rows[2]["admission_retry_after"] > int(time.time())
+    assert deployer.predeploys == []
+
+
+@pytest.mark.asyncio
+async def test_expired_admission_transport_error_keeps_recovery_marker(
+    monkeypatch,
+):
+    scheduler, state, miners, deployer, _gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="deferred",
+            admission_deadline_at=int(time.time()) - 1,
+        )
+    )
+
+    async def transport_error(*_args, **_kwargs):
+        raise ConnectionError("ddb unavailable")
+
+    monkeypatch.setattr(
+        scheduler.queue, "defer_admission", transport_error,
+    )
+
+    with pytest.raises(ConnectionError, match="ddb unavailable"):
+        await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert deployer.teardowns == ["dep-challenger"]
+
+
+@pytest.mark.asyncio
+async def test_expired_admission_conflict_keeps_recovery_marker(monkeypatch):
+    scheduler, state, miners, deployer, _gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="deferred",
+            admission_deadline_at=int(time.time()) - 1,
+        )
+    )
+
+    async def conflict(*_args, **_kwargs):
+        return {"released": False, "status": STATUS_IN_PROGRESS}
+
+    monkeypatch.setattr(scheduler.queue, "defer_admission", conflict)
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert deployer.teardowns == ["dep-challenger"]
+
+
+@pytest.mark.asyncio
+async def test_expired_admission_retry_is_generation_idempotent(monkeypatch):
+    scheduler, state, miners, deployer, _gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="deferred",
+            admission_deadline_at=int(time.time()) - 1,
+        )
+    )
+    original_clear = state.clear_battle
+    clear_attempts = 0
+
+    async def fail_once_after_queue_write():
+        nonlocal clear_attempts
+        clear_attempts += 1
+        if clear_attempts == 1:
+            raise RuntimeError("crash after durable requeue")
+        await original_clear()
+
+    monkeypatch.setattr(state, "clear_battle", fail_once_after_queue_write)
+
+    with pytest.raises(RuntimeError, match="crash after durable requeue"):
+        await scheduler.tick(current_block=20)
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["admission_deferral_count"] == 1
+
+    await scheduler.tick(current_block=21)
+
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert miners.rows[2]["admission_deferral_count"] == 1
+    assert deployer.teardowns == ["dep-challenger", "dep-challenger"]
+
+
+@pytest.mark.asyncio
+async def test_passed_gate_never_expires_during_long_battle():
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="passed",
+            admission_deadline_at=int(time.time()) - 60,
+        )
+    )
+
+    await scheduler.tick(current_block=20)
+
+    assert await state.get_battle() is not None
+    assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert deployer.teardowns == []
+    assert len(gate.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_score_winner_is_not_subject_to_a_second_gate_read():
     scheduler, state, miners, deployer, gate, samples = (
         await _build_active_behavior_gate_case(
-            status=["passed", second_status],
+            status=["passed", "failed"],
         )
     )
     _fill_behavior_gate_winning_samples(samples)
@@ -609,17 +930,11 @@ async def test_challenger_promotion_is_fenced_by_fresh_gate_snapshot(
     )
 
     champion = await state.get_champion()
-    assert champion is not None and champion.uid == 1
-    assert len(gate.calls) == 2
-    if expected_terminal:
-        assert await state.get_battle() is None
-        assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
-        assert miners.rows[2]["termination_reason"].startswith("model_behavior:")
-        assert deployer.teardowns == ["dep-challenger"]
-    else:
-        assert await state.get_battle() is not None
-        assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
-        assert deployer.teardowns == []
+    assert champion is not None and champion.uid == 2
+    assert len(gate.calls) == 1
+    assert await state.get_battle() is None
+    assert miners.rows[2]["challenge_status"] == STATUS_CHAMPION
+    assert deployer.teardowns == ["dep-champion"]
 
 
 @pytest.mark.asyncio
@@ -665,7 +980,7 @@ async def test_promotion_seals_after_old_champion_teardown(monkeypatch):
 async def test_gate_failure_during_teardown_window_rolls_back_promotion():
     scheduler, state, miners, deployer, gate, samples = (
         await _build_active_behavior_gate_case(
-            status=["passed", "failed"],
+            status="failed",
             seal_results=[False],
         )
     )
@@ -689,14 +1004,14 @@ async def test_gate_failure_during_teardown_window_rolls_back_promotion():
     assert miners.rows[2]["termination_reason"].startswith("model_behavior:")
     assert deployer.teardowns == ["dep-champion", "dep-challenger"]
     assert len(gate.seal_calls) == 1
-    assert len(gate.calls) == 2
+    assert len(gate.calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_pending_promotion_seal_pauses_with_old_deployment_cleared():
     scheduler, state, miners, deployer, gate, samples = (
         await _build_active_behavior_gate_case(
-            status=["passed", "pending"],
+            status="pending",
             seal_results=[False],
         )
     )
@@ -719,7 +1034,7 @@ async def test_pending_promotion_seal_pauses_with_old_deployment_cleared():
     assert miners.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
     assert deployer.teardowns == ["dep-champion"]
     assert len(gate.seal_calls) == 1
-    assert len(gate.calls) == 2
+    assert len(gate.calls) == 1
 
 
 @pytest.mark.asyncio
@@ -768,6 +1083,29 @@ async def test_failed_predeployed_gate_tears_down_and_marks_lost():
     assert await state.get_predeployed_challengers() == []
     assert miners.rows[2]["challenge_status"] == STATUS_TERMINATED
     assert miners.rows[2]["termination_reason"].endswith(":predeploy")
+    assert deployer.teardowns == ["dep-challenger"]
+    assert len(gate.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_predeployed_admission_returns_to_sampling():
+    scheduler, state, miners, deployer, gate, _samples = (
+        await _build_active_behavior_gate_case(
+            status="deferred",
+            admission_deadline_at=int(time.time()) - 1,
+        )
+    )
+    record = await state.get_battle()
+    assert record is not None
+    await state.clear_battle()
+    miners.rows[2]["challenge_status"] = STATUS_SAMPLING
+    await state.set_predeployed_challengers([record])
+
+    await scheduler._predeploy_behavior_gate_sweep()
+
+    assert await state.get_predeployed_challengers() == []
+    assert miners.rows[2]["challenge_status"] == STATUS_SAMPLING
+    assert not miners.rows[2].get("termination_reason")
     assert deployer.teardowns == ["dep-challenger"]
     assert len(gate.calls) == 1
 
@@ -901,6 +1239,66 @@ async def test_window_rotation_request_tears_down_battle_then_refreshes():
     assert await state.get_window_rotation_request() is None
     task_state = await state.get_task_state()
     assert task_state.refreshed_at_block == 1000
+
+
+@pytest.mark.asyncio
+async def test_invalid_capacity_request_extends_pool_without_teardown():
+    kv = _seed_state()
+    kv.data["champion"].update({
+        "deployment_id": "dep-champion",
+        "base_url": "https://t/dep-champion",
+    })
+    kv.data["current_battle"] = {
+        "challenger": {
+            "uid": 2,
+            "hotkey": "chal_hk",
+            "revision": "chal_rev",
+            "model": "org/chal",
+        },
+        "deployment_id": "dep-challenger",
+        "base_url": "https://t/dep-challenger",
+        "started_at_block": 90,
+    }
+    original_env_a = [1, 2, 3, 4, 5]
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": original_env_a, "ENV_B": [6, 7, 8, 9, 10]},
+        "refreshed_at_block": 95,
+    }
+    kv.data["window_rotation_request"] = {
+        "requested_at_block": 95,
+        "stale_refreshed_at_block": 95,
+        "reason": "battle_invalid_capacity_exhausted",
+        "environment": "ENV_A",
+        "replacement_count": 3,
+    }
+    miners = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(
+            2, "chal_hk", 200,
+            status=STATUS_IN_PROGRESS, revision="chal_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miners,
+        deployer=deployer,
+        samples=_SamplesFake(),
+    )
+
+    await scheduler.tick(current_block=100)
+
+    task_state = await state.get_task_state()
+    assert task_state is not None
+    assert task_state.refreshed_at_block == 95
+    assert len(task_state.task_ids["ENV_A"]) == 8
+    assert set(original_env_a).issubset(task_state.task_ids["ENV_A"])
+    assert await state.get_battle() is not None
+    assert await state.get_window_rotation_request() is None
+    assert deployer.teardowns == []
 
 
 @pytest.mark.asyncio
@@ -1923,6 +2321,13 @@ async def test_start_battle_captures_previous_champion():
     a later crash + recovery can still terminate the loser. This pins
     the seed write down so the field isn't accidentally dropped."""
     kv = _seed_state()
+    kv.data["behavior_gate"] = {
+        "enabled": True,
+        "mode": "enforce",
+        "policy_version": "test-v1",
+        "gated_environments": ["*"],
+        "admission_hold_seconds": 45,
+    }
     miner_store = _InMemoryMinerStore([
         _make_miner(
             1, "champ_hk", 100,
@@ -1959,6 +2364,9 @@ async def test_start_battle_captures_previous_champion():
     )
     assert battle.previous_champion.uid == 1
     assert battle.previous_champion.hotkey == "champ_hk"
+    assert len(battle.deployment_generation) == 32
+    assert battle.behavior_admission_deadline_at is not None
+    assert battle.behavior_admission_deadline_at > int(time.time())
 
 
 @pytest.mark.asyncio
@@ -3738,7 +4146,8 @@ async def test_predeploy_early_loss_terminates_sure_loser():
 
 
 @pytest.mark.asyncio
-async def test_start_battle_adopts_predeployed_record():
+@pytest.mark.parametrize("clear_generation", [False, True])
+async def test_start_battle_adopts_predeployed_record(clear_generation):
     """When ``pick_next`` selects a miner that was pre-deployed, the
     running deployment is promoted in place. The old champion's distinct
     endpoint is released only after current_battle is durable."""
@@ -3763,6 +4172,18 @@ async def test_start_battle_adopts_predeployed_record():
     pre = await state.get_predeployed_challengers()
     assert [p.challenger.uid for p in pre] == [2]
     pre_dep_id = pre[0].deployment_id
+    pre_started_at_block = pre[0].started_at_block
+    if clear_generation:
+        # Older records may explicitly contain an empty generation. Their
+        # effective fingerprint is the original started_at_block, which must
+        # remain stable when adoption resets started_at_block for the battle.
+        pre[0].deployment_generation = ""
+    pre_generation = (
+        pre[0].deployment_generation or str(pre_started_at_block)
+    )
+    pre_deadline = int(time.time()) + 600
+    pre[0].behavior_admission_deadline_at = pre_deadline
+    await state.set_predeployed_challengers(pre)
     champion_dep_id = (await state.get_champion()).deployment_id
     active_deploys_before = len(deployer.deploys)
     teardowns_before = len(deployer.teardowns)
@@ -3780,6 +4201,8 @@ async def test_start_battle_adopts_predeployed_record():
     battle = await state.get_battle()
     assert battle is not None and battle.challenger.uid == 2
     assert battle.deployment_id == pre_dep_id
+    assert battle.deployment_generation == pre_generation
+    assert battle.behavior_admission_deadline_at == pre_deadline
     assert deployer.promotions == [(pre_dep_id, "challenger")]
     assert len(deployer.deploys) == active_deploys_before
     assert pre_dep_id not in deployer.teardowns
@@ -3790,6 +4213,77 @@ async def test_start_battle_adopts_predeployed_record():
     assert champion.deployment_id is None
     assert champion.base_url is None
     assert champion.deployments == []
+
+
+@pytest.mark.asyncio
+async def test_adopted_legacy_predeployment_backfills_admission_deadline():
+    """A pre-policy deployment has no deadline to persist in the verdict.
+
+    Once admission is enabled, adoption must anchor a bounded window instead
+    of creating a PENDING verdict that can never expire.
+    """
+    kv = _seed_state()
+    kv.data["behavior_gate"] = {
+        "enabled": True,
+        "mode": "enforce",
+        "policy_version": "test-v1",
+        "gated_environments": ["*"],
+        "admission_hold_seconds": 45,
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1, "champ_hk", 100,
+            status=STATUS_CHAMPION, revision="champ_rev",
+        ),
+        _make_miner(2, "chal_hk", 200, revision="chal_rev"),
+    ])
+    deployer = _DeployTracker(pre_challenger_slots=4)
+    samples = _SamplesFake()
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=samples,
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            single_instance_provider=True,
+        ),
+    )
+
+    await scheduler.tick(current_block=50)
+    await scheduler.tick(current_block=51)
+    pre = await state.get_predeployed_challengers()
+    assert [p.challenger.uid for p in pre] == [2]
+    pre_generation = pre[0].deployment_generation
+    pre[0].behavior_admission_deadline_at = None
+    await state.set_predeployed_challengers(pre)
+    admission_config = await scheduler._behavior_admission_config()
+    assert admission_config is not None
+    admission_hold_seconds = admission_config.admission_hold_seconds
+
+    task_state = await state.get_task_state()
+    for env in ("ENV_A", "ENV_B"):
+        samples.set_samples(
+            "champ_hk",
+            "champ_rev",
+            env,
+            task_state.task_ids[env],
+            refresh_block=task_state.refreshed_at_block,
+        )
+
+    before_adoption = int(time.time())
+    await scheduler.tick(current_block=52)
+    after_adoption = int(time.time())
+
+    battle = await state.get_battle()
+    assert battle is not None and battle.challenger.uid == 2
+    assert battle.deployment_generation == pre_generation
+    assert battle.behavior_admission_deadline_at is not None
+    assert (
+        before_adoption + admission_hold_seconds
+        <= battle.behavior_admission_deadline_at
+        <= after_adoption + admission_hold_seconds + 1
+    )
 
 
 @pytest.mark.asyncio

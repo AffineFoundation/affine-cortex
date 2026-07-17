@@ -34,9 +34,15 @@ class InMemoryStore:
         return [r for r in self.rows.values() if _truthy(r.get("is_valid"))]
 
     async def claim_pending(
-        self, uid: int, window_id: int, *, expected_status: str = STATUS_SAMPLING
+        self,
+        uid: int,
+        window_id: int,
+        *,
+        expected_status: str = STATUS_SAMPLING,
+        admission_policy_identity: Optional[str] = None,
     ) -> bool:
         """Mirrors production: accept either attribute_not_exists OR matching expected_status."""
+        del admission_policy_identity
         self.claim_calls.append((uid, window_id))
         row = self.rows.get(uid)
         if row is None:
@@ -279,3 +285,39 @@ async def test_picks_miner_missing_challenge_status():
     assert cand is not None and cand.uid == 5
     # Claim flipped status to in_progress.
     assert store.rows[5]["challenge_status"] == STATUS_IN_PROGRESS
+
+
+@pytest.mark.asyncio
+async def test_admission_cooldown_applies_only_to_the_policy_that_created_it():
+    row = _miner(5, "F", first_block=50)
+    row.update({
+        "admission_policy_identity": "policy-v1",
+        "admission_deferral_count": 1,
+        "admission_retry_after": 500,
+        "admission_deferral_exhausted": False,
+    })
+    store = InMemoryStore([row])
+    queue = ChallengerQueue(store)
+
+    assert await queue.peek_next(
+        1,
+        champion_uid=None,
+        admission_policy_identity="policy-v1",
+        now=100,
+    ) == []
+    assert await queue.pick_next(
+        window_id=1,
+        champion_uid=None,
+        admission_policy_identity="policy-v1",
+        now=100,
+    ) is None
+
+    # A policy rollout deliberately resets the abstention: the new detector
+    # must be allowed to establish its own independent admission evidence.
+    candidate = await queue.pick_next(
+        window_id=2,
+        champion_uid=None,
+        admission_policy_identity="policy-v2",
+        now=100,
+    )
+    assert candidate is not None and candidate.uid == 5

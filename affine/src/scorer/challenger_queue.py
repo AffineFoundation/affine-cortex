@@ -12,6 +12,7 @@ Selection rules:
   - order by (first_block ASC, uid ASC)
 """
 
+import time
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -61,12 +62,31 @@ class MinerQueueStore(Protocol):
     async def list_valid_pending(self) -> list[dict]: ...
 
     async def claim_pending(
-        self, uid: int, window_id: int, *, expected_status: str = STATUS_SAMPLING
+        self,
+        uid: int,
+        window_id: int,
+        *,
+        expected_status: str = STATUS_SAMPLING,
+        admission_policy_identity: Optional[str] = None,
     ) -> bool:
         """Atomically transition ``uid`` from ``expected_status`` to ``in_progress``.
 
         Returns True iff the transition was applied (i.e. no race lost).
         """
+        ...
+
+    async def defer_admission(
+        self,
+        uid: int,
+        *,
+        hotkey: str,
+        revision: str,
+        policy_identity: str,
+        deployment_generation: str,
+        base_delay_seconds: int,
+        max_attempts: int,
+    ) -> dict:
+        """Idempotently requeue an expired deployment with durable backoff."""
         ...
 
     async def release_claim(
@@ -109,7 +129,12 @@ class ChallengerQueue:
         self._store = store
 
     async def pick_next(
-        self, window_id: int, champion_uid: Optional[int]
+        self,
+        window_id: int,
+        champion_uid: Optional[int],
+        *,
+        admission_policy_identity: Optional[str] = None,
+        now: Optional[int] = None,
     ) -> Optional[MinerCandidate]:
         """Return the earliest eligible challenger and mark it in_progress.
 
@@ -120,6 +145,7 @@ class ChallengerQueue:
         the same candidate, the conditional write returns False and we
         walk on to the next row.
         """
+        timestamp = int(time.time()) if now is None else int(now)
         candidates = await self._store.list_valid_pending()
         ordered = sorted(
             candidates,
@@ -134,7 +160,24 @@ class ChallengerQueue:
                 continue
             if not _is_truthy(row.get("is_valid")):
                 continue
-            claimed = await self._store.claim_pending(uid, window_id)
+            if _admission_deferred(
+                row,
+                policy_identity=admission_policy_identity,
+                now=timestamp,
+            ):
+                continue
+            # Keep the queue protocol backwards-compatible for callers that do
+            # not enable admission gating.  More importantly, this avoids
+            # requiring unrelated stores to understand admission policy
+            # metadata when there is no policy to enforce.
+            if admission_policy_identity is None:
+                claimed = await self._store.claim_pending(uid, window_id)
+            else:
+                claimed = await self._store.claim_pending(
+                    uid,
+                    window_id,
+                    admission_policy_identity=admission_policy_identity,
+                )
             if claimed:
                 return MinerCandidate(
                     uid=uid,
@@ -149,6 +192,8 @@ class ChallengerQueue:
     async def peek_next(
         self, n: int, *, champion_uid: Optional[int],
         exclude_uids: Optional[set] = None,
+        admission_policy_identity: Optional[str] = None,
+        now: Optional[int] = None,
     ) -> list["MinerCandidate"]:
         """Return up to ``n`` next-up eligible candidates in pick order
         WITHOUT claiming any of them.
@@ -166,6 +211,7 @@ class ChallengerQueue:
         from the pre-deploy decision path."""
         if n <= 0:
             return []
+        timestamp = int(time.time()) if now is None else int(now)
         skip = exclude_uids or set()
         candidates = await self._store.list_valid_pending()
         ordered = sorted(
@@ -182,6 +228,12 @@ class ChallengerQueue:
                 continue
             if not _is_truthy(row.get("is_valid")):
                 continue
+            if _admission_deferred(
+                row,
+                policy_identity=admission_policy_identity,
+                now=timestamp,
+            ):
+                continue
             out.append(MinerCandidate(
                 uid=uid,
                 hotkey=row["hotkey"],
@@ -193,6 +245,27 @@ class ChallengerQueue:
             if len(out) >= n:
                 break
         return out
+
+    async def defer_admission(
+        self,
+        uid: int,
+        *,
+        hotkey: str,
+        revision: str,
+        policy_identity: str,
+        deployment_generation: str,
+        base_delay_seconds: int,
+        max_attempts: int,
+    ) -> dict:
+        return await self._store.defer_admission(
+            uid,
+            hotkey=hotkey,
+            revision=revision,
+            policy_identity=policy_identity,
+            deployment_generation=deployment_generation,
+            base_delay_seconds=base_delay_seconds,
+            max_attempts=max_attempts,
+        )
 
     async def release_claim(
         self, uid: int, *,
@@ -256,3 +329,23 @@ def _is_truthy(value) -> bool:
     if isinstance(value, str):
         return value.lower() == "true"
     return False
+
+
+def _admission_deferred(
+    row: dict,
+    *,
+    policy_identity: Optional[str],
+    now: int,
+) -> bool:
+    """Filter only the current policy's cooldown; a policy rollout resets it."""
+
+    policy = str(policy_identity or "")
+    if not policy or str(row.get("admission_policy_identity") or "") != policy:
+        return False
+    if row.get("admission_deferral_exhausted") is True:
+        return True
+    try:
+        return int(row.get("admission_retry_after") or 0) > int(now)
+    except (TypeError, ValueError, OverflowError):
+        # Malformed control data must not silently create a permanent hold.
+        return False

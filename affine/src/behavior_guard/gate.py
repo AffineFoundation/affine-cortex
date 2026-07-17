@@ -7,6 +7,7 @@ pending.  Keep that small piece of policy in one module.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
@@ -25,6 +26,10 @@ class GateSnapshot:
     reason: str
     deployment_fingerprint: str
     row: Optional[Mapping[str, Any]] = None
+    admission_deadline_at: Optional[float] = None
+    policy_identity: str = ""
+    policy_version: str = ""
+    admission_hold_seconds: int = 300
 
     @property
     def passed(self) -> bool:
@@ -33,6 +38,21 @@ class GateSnapshot:
     @property
     def failed(self) -> bool:
         return self.status is VerdictStatus.FAILED
+
+    @property
+    def admission_expired(self) -> bool:
+        """Whether the deployment-level admission hold reached its hard stop."""
+
+        if self.status is VerdictStatus.EXPIRED:
+            return True
+        if self.status in {VerdictStatus.PASSED, VerdictStatus.FAILED}:
+            return False
+        deadline = self.admission_deadline_at
+        if deadline is None:
+            deadline = (self.row or {}).get("admission_deadline_at")
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return False
+        return float(deadline) <= time.time()
 
 
 def record_deployment_fingerprint(
@@ -54,7 +74,10 @@ def record_deployment_fingerprint(
         revision=challenger.revision,
         policy_version=config.policy_identity,
         deployments=deployments,
-        deployment_generation=getattr(record, "started_at_block", None),
+        deployment_generation=(
+            getattr(record, "deployment_generation", None)
+            or getattr(record, "started_at_block", None)
+        ),
         **fallback,
     )
 
@@ -83,6 +106,13 @@ async def read_gate_snapshot(
         reason=str((row or {}).get("reason_code") or "awaiting_preflight"),
         deployment_fingerprint=fingerprint,
         row=row,
+        admission_deadline_at=(
+            (row or {}).get("admission_deadline_at")
+            or getattr(record, "behavior_admission_deadline_at", None)
+        ),
+        policy_identity=config.policy_identity,
+        policy_version=config.policy_version,
+        admission_hold_seconds=config.admission_hold_seconds,
     )
 
 

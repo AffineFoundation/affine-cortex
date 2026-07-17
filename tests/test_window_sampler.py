@@ -98,6 +98,17 @@ def test_overlapping_input_ranges_merged():
     assert sorted(out) == list(range(100))
 
 
+def test_random_extension_never_reuses_existing_ids():
+    config = _cfg("x", [[0, 100]], 0, mode=SAMPLING_MODE_RANDOM)
+    existing = list(range(40))
+
+    added = WindowSampler().extend(existing, config, 20)
+
+    assert len(added) == 20
+    assert not (set(added) & set(existing))
+    assert all(0 <= task_id < 100 for task_id in added)
+
+
 # ---- latest mode ------------------------------------------------------------
 
 
@@ -107,6 +118,14 @@ def test_latest_takes_tail_of_single_range():
         1, 0, {"x": _cfg("x", [[0, 10000]], 5, mode=SAMPLING_MODE_LATEST)}
     )["x"]
     assert out == [9995, 9996, 9997, 9998, 9999]
+
+
+def test_latest_extension_walks_below_existing_tail():
+    config = _cfg("x", [[0, 100]], 0, mode=SAMPLING_MODE_LATEST)
+
+    added = WindowSampler().extend([95, 96, 97, 98, 99], config, 3)
+
+    assert added == [92, 93, 94]
 
 
 def test_latest_walks_multiple_ranges_from_the_back():

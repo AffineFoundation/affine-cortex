@@ -4,9 +4,13 @@ import logging
 import pytest
 
 import affine.src.executor.main as executor_main
+from affine.src.executor.config import (
+    BEHAVIOR_PREFLIGHT_RESERVED_SLOTS,
+    PER_HOST_DISPATCH_BUDGET,
+    PER_HOST_TOTAL_CAPACITY,
+)
 from affine.src.executor.worker import (
     _base_urls,
-    _is_zero_score_error,
     _pick_url,
     _resolve_deployment_id,
 )
@@ -38,6 +42,24 @@ def test_executor_manager_ipc_handles_survive_spawn():
     # accounting is what gates production dispatch.
     assert manager.global_sem.acquire(block=False)
     manager.global_sem.release()
+
+
+def test_executor_reserves_per_host_capacity_for_behavior_preflight():
+    manager = ExecutorManager(["ENV_A"], host_names=["gpu-a", "gpu-b"])
+
+    assert PER_HOST_TOTAL_CAPACITY == 600
+    assert BEHAVIOR_PREFLIGHT_RESERVED_SLOTS == 4
+    assert PER_HOST_DISPATCH_BUDGET == 596
+    assert manager.total_budget == 2 * PER_HOST_DISPATCH_BUDGET
+    manager.per_host_in_flight["gpu-a"].value = 17
+    assert manager._behavior_endpoint_load("gpu-a") == 17
+    assert manager._behavior_endpoint_load("missing") is None
+
+    fallback = ExecutorManager(["ENV_A", "ENV_B"])
+    fallback.in_flight_values["ENV_A"].value = 10
+    fallback.in_flight_values["ENV_B"].value = 12
+    assert fallback._behavior_endpoint_load("targon-any-name") == 22
+    assert fallback._behavior_endpoint_load("") == 22
 
 
 def test_executor_manager_recovers_stale_slots_after_worker_death():
@@ -161,45 +183,6 @@ def test_pick_url_stably_shards_tasks_across_urls():
     ]
 
 
-def test_is_zero_score_error_matches_context_overflow_patterns():
-    cases = [
-        "BadRequest: This model's maximum context length is 65536 tokens, but the input is longer than the model can handle",
-        "This model supports context lengths of up to 65536 tokens",
-        "HTTP 400: prompt exceeds the maximum allowed length",
-        "Error: exceeds the maximum context length of 32000 tokens",
-    ]
-    for msg in cases:
-        assert _is_zero_score_error(Exception(msg)), msg
-
-
-def test_is_zero_score_error_rejects_transport_and_env_failures():
-    cases = [
-        "ReadError: connection reset by peer",
-        "Remote execution failed: {'status': 'failed', 'error': 'worker crashed'}",
-        "BackendError: Method call failed: Failed to call method 'evaluate'",
-        "EnvironmentError: Method 'evaluate' failed on environment 'liveweb-pool-2'",
-        "HTTP 503: service unavailable",
-    ]
-    for msg in cases:
-        assert not _is_zero_score_error(Exception(msg)), msg
-
-
-def test_is_zero_score_error_walks_exception_chain():
-    # Affinetes wraps the original error several layers deep — the pattern
-    # can live on any cause/context node.
-    leaf = ValueError("prompt is longer than the model context window")
-    middle = RuntimeError("Method call failed")
-    middle.__cause__ = leaf
-    top = RuntimeError("Method 'evaluate' failed on environment")
-    top.__cause__ = middle
-
-    assert _is_zero_score_error(top)
-
-
-def test_is_zero_score_error_is_case_insensitive():
-    assert _is_zero_score_error(Exception("EXCEEDS THE MAXIMUM CONTEXT LENGTH"))
-
-
 def test_executor_does_not_persist_structured_error_results():
     import asyncio as _asyncio
     from affine.core.models import Result
@@ -250,7 +233,7 @@ def test_executor_does_not_persist_structured_error_results():
     assert samples.persist_calls == []
 
 
-def test_executor_persists_structured_context_overflow_as_zero():
+def test_context_overflow_text_is_not_treated_as_model_attribution():
     import asyncio as _asyncio
     from affine.core.models import Result
     from affine.src.executor.worker import ExecutorWorker
@@ -297,10 +280,8 @@ def test_executor_persists_structured_context_overflow_as_zero():
 
     _asyncio.run(_drive())
 
-    assert len(samples.persist_calls) == 1
-    persisted = samples.persist_calls[0]
-    assert persisted["score"] == 0.0
-    assert persisted["extra"]["zero_score_reason"] == "context_overflow"
+    assert samples.persist_calls == []
+    assert len(worker._pending_invalid_samples) == 1
 
 
 def test_global_slot_acquire_release_round_trip():
@@ -995,7 +976,7 @@ def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
     assert manager._last_done[(228, "ENV_A")] == 400
     # No work remaining → planner falls back to initial fair share (the
     # whole budget when there's exactly one env).
-    assert manager.env_cap_values["ENV_A"].value == 600
+    assert manager.env_cap_values["ENV_A"].value == PER_HOST_DISPATCH_BUDGET
 
 
 def test_status_label_includes_uid_for_each_subject(caplog):

@@ -32,6 +32,11 @@ class MinerStatsDAO(BaseDAO):
         "challenge_checkpoints_passed",
         "challenge_status",
         "termination_reason",
+        "admission_policy_identity",
+        "admission_deferral_count",
+        "admission_retry_after",
+        "admission_deferral_exhausted",
+        "admission_last_deployment_generation",
     )
 
     def __init__(self):
@@ -190,6 +195,11 @@ class MinerStatsDAO(BaseDAO):
             "challenge_checkpoints_passed": 0,
             "challenge_status": cls.STATUS_SAMPLING,
             "termination_reason": "",
+            "admission_policy_identity": "",
+            "admission_deferral_count": 0,
+            "admission_retry_after": 0,
+            "admission_deferral_exhausted": False,
+            "admission_last_deployment_generation": "",
         }
         if not row:
             return defaults
@@ -282,16 +292,54 @@ class MinerStatsDAO(BaseDAO):
         revision: str,
         model: str = "",
         window_id: int,
+        admission_policy_identity: Optional[str] = None,
     ) -> bool:
         """Mark the historical row in-progress if it is still sampleable."""
         state = await self.get_challenge_state(hotkey, revision)
         if state.get("challenge_status") not in (None, "", self.STATUS_SAMPLING):
             return False
+        policy_identity = str(admission_policy_identity or "").strip()
+        now = int(time.time())
+        if (
+            policy_identity
+            and state.get("admission_policy_identity") == policy_identity
+            and (
+                state.get("admission_deferral_exhausted") is True
+                or int(state.get("admission_retry_after") or 0) > now
+            )
+        ):
+            return False
 
         from affine.database.client import get_client
 
-        now = int(time.time())
         client = get_client()
+        condition = (
+            "(attribute_not_exists(challenge_status) "
+            "OR challenge_status = :sampling)"
+        )
+        values = {
+            ":status": {"S": self.STATUS_IN_PROGRESS},
+            ":wid": {"N": str(window_id)},
+            ":now": {"N": str(now)},
+            ":hotkey": {"S": hotkey},
+            ":revision": {"S": revision},
+            ":model": {"S": model},
+            ":online": {"BOOL": True},
+            ":sampling": {"S": self.STATUS_SAMPLING},
+        }
+        if policy_identity:
+            condition += (
+                " AND (attribute_not_exists(admission_policy_identity) "
+                "OR admission_policy_identity <> :admission_policy "
+                "OR ((attribute_not_exists(admission_deferral_exhausted) "
+                "OR admission_deferral_exhausted = :false) "
+                "AND (attribute_not_exists(admission_retry_after) "
+                "OR admission_retry_after <= :now)))"
+            )
+            values.update({
+                ":admission_policy": {"S": policy_identity},
+                ":false": {"BOOL": False},
+            })
         try:
             await client.update_item(
                 TableName=self.table_name,
@@ -308,26 +356,181 @@ class MinerStatsDAO(BaseDAO):
                     "first_seen_at = if_not_exists(first_seen_at, :now), "
                     "is_currently_online = :online"
                 ),
-                ConditionExpression=(
-                    "attribute_not_exists(challenge_status) "
-                    "OR challenge_status = :sampling"
-                ),
-                ExpressionAttributeValues={
-                    ":status": {"S": self.STATUS_IN_PROGRESS},
-                    ":wid": {"N": str(window_id)},
-                    ":now": {"N": str(now)},
-                    ":hotkey": {"S": hotkey},
-                    ":revision": {"S": revision},
-                    ":model": {"S": model},
-                    ":online": {"BOOL": True},
-                    ":sampling": {"S": self.STATUS_SAMPLING},
-                },
+                ConditionExpression=condition,
+                ExpressionAttributeValues=values,
             )
             return True
         except ClientError as e:
             if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
                 return False
             raise
+
+    async def defer_admission_for_challenge(
+        self,
+        *,
+        hotkey: str,
+        revision: str,
+        policy_identity: str,
+        deployment_generation: str,
+        base_delay_seconds: int = 300,
+        max_attempts: int = 3,
+        now: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Atomically requeue one expired admission with bounded backoff.
+
+        The deployment generation is an idempotency token.  If the scheduler
+        crashes after this write but before clearing ``current_battle``, the
+        next tick observes the same token and treats the already-sampling row
+        as success without incrementing the deferral counter again.  Transport
+        errors propagate so callers never confuse an unconfirmed write with an
+        idempotent retry.
+        """
+
+        policy = str(policy_identity).strip()
+        generation = str(deployment_generation).strip()
+        if not policy or not generation:
+            raise ValueError(
+                "policy_identity and deployment_generation are required"
+            )
+        base_delay = int(base_delay_seconds)
+        maximum = int(max_attempts)
+        if base_delay <= 0:
+            raise ValueError("base_delay_seconds must be positive")
+        if maximum < 1 or maximum > 10:
+            raise ValueError("max_attempts must be between 1 and 10")
+
+        from affine.database.client import get_client
+
+        timestamp = int(time.time()) if now is None else int(now)
+        client = get_client()
+        key = {
+            "pk": {"S": self._make_pk(hotkey)},
+            "sk": {"S": self._make_sk(revision)},
+        }
+        for _ in range(5):
+            response = await client.get_item(
+                TableName=self.table_name,
+                Key=key,
+                ConsistentRead=True,
+            )
+            raw_item = response.get("Item")
+            row = self._deserialize(raw_item) if raw_item else {}
+            raw_status = row.get("challenge_status")
+            status = str(raw_status or self.STATUS_SAMPLING)
+            previous_generation = str(
+                row.get("admission_last_deployment_generation") or ""
+            )
+            previous_policy = str(row.get("admission_policy_identity") or "")
+            if (
+                previous_policy == policy
+                and previous_generation == generation
+            ):
+                return {
+                    "released": status == self.STATUS_SAMPLING,
+                    "idempotent": True,
+                    "deferral_count": int(
+                        row.get("admission_deferral_count") or 0
+                    ),
+                    "next_retry_at": int(row.get("admission_retry_after") or 0),
+                    "exhausted": row.get("admission_deferral_exhausted") is True,
+                    "status": status,
+                }
+            if status not in {self.STATUS_SAMPLING, self.STATUS_IN_PROGRESS}:
+                return {
+                    "released": False,
+                    "idempotent": False,
+                    "deferral_count": int(
+                        row.get("admission_deferral_count") or 0
+                    ),
+                    "next_retry_at": int(row.get("admission_retry_after") or 0),
+                    "exhausted": row.get("admission_deferral_exhausted") is True,
+                    "status": status,
+                }
+
+            old_count = (
+                int(row.get("admission_deferral_count") or 0)
+                if previous_policy == policy
+                else 0
+            )
+            count = min(maximum, old_count + 1)
+            exhausted = count >= maximum
+            delay = base_delay * (2 ** (count - 1))
+            next_retry_at = timestamp + delay
+            values = {
+                ":sampling": {"S": self.STATUS_SAMPLING},
+                ":policy": {"S": policy},
+                ":generation": {"S": generation},
+                ":count": {"N": str(count)},
+                ":retry": {"N": str(next_retry_at)},
+                ":exhausted": {"BOOL": exhausted},
+                ":maximum": {"N": str(maximum)},
+                ":now": {"N": str(timestamp)},
+                ":hotkey": {"S": hotkey},
+                ":revision": {"S": revision},
+            }
+            if "challenge_status" in row:
+                status_condition = "challenge_status = :previous_status"
+                values[":previous_status"] = {"S": str(raw_status or "")}
+            else:
+                status_condition = "attribute_not_exists(challenge_status)"
+            if "admission_last_deployment_generation" in row:
+                generation_condition = (
+                    "admission_last_deployment_generation = "
+                    ":previous_generation"
+                )
+                values[":previous_generation"] = {"S": previous_generation}
+            else:
+                generation_condition = (
+                    "attribute_not_exists("
+                    "admission_last_deployment_generation)"
+                )
+            if "admission_policy_identity" in row:
+                policy_condition = (
+                    "admission_policy_identity = :previous_policy"
+                )
+                values[":previous_policy"] = {"S": previous_policy}
+            else:
+                policy_condition = (
+                    "attribute_not_exists(admission_policy_identity)"
+                )
+            try:
+                await client.update_item(
+                    TableName=self.table_name,
+                    Key=key,
+                    UpdateExpression=(
+                        "SET challenge_status = :sampling, "
+                        "admission_policy_identity = :policy, "
+                        "admission_last_deployment_generation = :generation, "
+                        "admission_deferral_count = :count, "
+                        "admission_retry_after = :retry, "
+                        "admission_deferral_exhausted = :exhausted, "
+                        "admission_deferral_max_attempts = :maximum, "
+                        "last_updated_at = :now, "
+                        "hotkey = if_not_exists(hotkey, :hotkey), "
+                        "revision = if_not_exists(revision, :revision)"
+                    ),
+                    ConditionExpression=(
+                        f"({status_condition}) AND "
+                        f"({generation_condition}) AND "
+                        f"({policy_condition})"
+                    ),
+                    ExpressionAttributeValues=values,
+                )
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == (
+                    "ConditionalCheckFailedException"
+                ):
+                    continue
+                raise
+            return {
+                "released": True,
+                "idempotent": False,
+                "deferral_count": count,
+                "next_retry_at": next_retry_at,
+                "exhausted": exhausted,
+                "status": self.STATUS_SAMPLING,
+            }
+        raise RuntimeError("admission deferral update lost repeated write races")
 
     async def release_claim_for_challenge(
         self,

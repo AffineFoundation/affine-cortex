@@ -21,6 +21,15 @@ _ENV_CACHE: Dict[str, Any] = {}
 _ENV_LOCK = Lock()
 
 
+class EvaluationDeadlineExceeded(TimeoutError):
+    """Typed outer harness deadline; never inferred from exception text."""
+
+    def __init__(self, environment: str, timeout_seconds: float):
+        self.environment = str(environment)
+        self.timeout_seconds = float(timeout_seconds)
+        super().__init__("evaluation harness deadline exceeded")
+
+
 def _is_base_url_key(key: Any) -> bool:
     return "".join(ch for ch in str(key).lower() if ch.isalnum()) == "baseurl"
 
@@ -838,7 +847,16 @@ class SDKEnvironment:
                 payload.setdefault("hf_repo", miner.model)
                 payload.setdefault("arch", "qwen")
 
-        result = await self._env.evaluate(_timeout=self.config.proxy_timeout, **payload)
+        # Own the outer deadline here instead of accepting affinetes' textual
+        # ``EnvironmentError`` wrapper.  Callers can now handle a stable typed
+        # timeout without parsing a message that may change between versions.
+        try:
+            async with asyncio.timeout(float(self.config.proxy_timeout)):
+                result = await self._env.evaluate(**payload)
+        except TimeoutError as exc:
+            raise EvaluationDeadlineExceeded(
+                self.env_name, self.config.proxy_timeout,
+            ) from exc
         
         return self._build_result(result, miner, payload, start)
     

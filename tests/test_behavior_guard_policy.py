@@ -4,6 +4,10 @@ from affine.src.behavior_guard import (
     BehaviorGateConfig,
     BehaviorGateMode,
     DeploymentIdentity,
+    FailureOwner,
+    InvalidSampleReason,
+    ModelBehaviorEvidence,
+    POLICY_SCHEMA_EPOCH,
     ProbeClassification,
     ProbeResult,
     SampleOutcomeEvidence,
@@ -71,6 +75,46 @@ def test_unknown_mode_falls_back_to_non_enforcing_shadow() -> None:
     assert config.enforces is False
 
 
+def test_admission_shadow_blocks_only_during_bounded_hold() -> None:
+    config = BehaviorGateConfig.from_mapping({
+        "enabled": True,
+        "mode": "admission_shadow",
+        "admission_hold_seconds": 1,
+    })
+
+    assert config.mode is BehaviorGateMode.ADMISSION_SHADOW
+    assert config.blocks_admission is True
+    assert config.enforces is False
+    assert config.admission_hold_seconds == 30
+    assert BehaviorGateConfig.from_mapping({
+        "admission_hold_seconds": 9999,
+    }).admission_hold_seconds == 900
+
+
+def test_policy_identity_v2_includes_admission_hold_semantics() -> None:
+    first = BehaviorGateConfig(admission_hold_seconds=300).policy_identity
+    second = BehaviorGateConfig(admission_hold_seconds=301).policy_identity
+
+    assert first.startswith(f"{POLICY_SCHEMA_EPOCH}:v1:")
+    assert first != second
+
+
+def test_template_policy_identity_ignores_admission_and_model_thresholds() -> None:
+    first = BehaviorGateConfig(
+        policy_version="one",
+        admission_hold_seconds=30,
+        runtime_violations_to_fail=2,
+    )
+    second = BehaviorGateConfig(
+        policy_version="two",
+        admission_hold_seconds=900,
+        runtime_violations_to_fail=5,
+    )
+
+    assert first.policy_identity != second.policy_identity
+    assert first.template_policy_identity == second.template_policy_identity
+
+
 def test_lease_covers_full_endpoint_admission_budget() -> None:
     config = parse_behavior_gate_config(
         {
@@ -94,7 +138,24 @@ def test_admission_budget_covers_all_baseline_probes() -> None:
     )
 
     assert config.admission_timeout_seconds == 390
+    assert config.admission_hold_seconds == 300
     assert config.lease_seconds >= 420
+
+
+def test_enforce_hold_covers_the_full_baseline_budget() -> None:
+    config = parse_behavior_gate_config(
+        {
+            "enabled": True,
+            "mode": "enforce",
+            "probe_count": 3,
+            "probe_timeout_seconds": 120,
+            "admission_timeout_seconds": 300,
+            "admission_hold_seconds": 30,
+        }
+    )
+
+    assert config.admission_timeout_seconds == 390
+    assert config.admission_hold_seconds == 390
 
 
 def test_runtime_invariant_requires_repeated_distinct_tasks() -> None:
@@ -121,15 +182,15 @@ def test_bounded_quality_failures_are_admissible_but_not_clean() -> None:
     assert verdict.strike_count == 0
 
 
-def test_only_model_protocol_liveness_and_harness_failures_are_strikes() -> None:
+def test_only_model_owned_protocol_and_liveness_failures_are_strikes() -> None:
     strong = (
         ProbeClassification.MODEL_NO_PROGRESS,
         ProbeClassification.MODEL_PROTOCOL_FAILURE,
-        ProbeClassification.HARNESS_INVALID,
     )
 
     assert all(_result(str(index), item).is_strike for index, item in enumerate(strong))
     assert not _result("infra", ProbeClassification.INFRA_FAILURE).is_strike
+    assert not _result("harness", ProbeClassification.HARNESS_INVALID).is_strike
     assert not _result("quality", ProbeClassification.QUALITY_FAILURE).is_strike
     assert ProbeClassification.NO_PROGRESS is ProbeClassification.MODEL_NO_PROGRESS
     assert (
@@ -267,7 +328,10 @@ def test_uid208_zero_action_positive_score_is_invalid_harness_evidence() -> None
         terminated_reason="error_exit_3",
     )
 
-    assert classify_sample_invariant(uid208) is ProbeClassification.HARNESS_INVALID
+    assert (
+        classify_sample_invariant(uid208)
+        is InvalidSampleReason.POSITIVE_SCORE_ZERO_ACTIVITY
+    )
     assert classify_sample_invariant(
         SampleOutcomeEvidence(0, 0, 0, 0, 0, "error_exit_3")
     ) is None
@@ -278,3 +342,139 @@ def test_uid208_zero_action_positive_score_is_invalid_harness_evidence() -> None
     assert classify_sample_invariant(
         SampleOutcomeEvidence(1, None, 0, 0, 0, "error_exit_3")
     ) is None
+
+
+def test_model_behavior_evidence_requires_complete_structured_attribution() -> None:
+    raw = {
+        "classification": "model_no_progress",
+        "failure_owner": "model",
+        "request_attempted": True,
+        "request_reached_model": True,
+        "endpoint_healthy": True,
+        "template_healthy": True,
+        "template_family_id": "terminal:CythonBuild",
+        "template_id": 17,
+        "template_revision": "r3",
+        "catalog_revision": "catalog-9",
+    }
+    evidence = ModelBehaviorEvidence.from_mapping(raw)
+
+    assert evidence is not None
+    assert evidence.failure_owner is FailureOwner.MODEL
+    assert evidence.eligible_for_model_strike is True
+    assert len(evidence.template_key_hash("TERMINAL") or "") == 64
+    assert len(evidence.catalog_revision_hash("TERMINAL") or "") == 64
+    assert evidence.attribution() == {
+        "failure_owner": "model",
+        "request_dispatched": True,
+        "request_reached_model": True,
+        "endpoint_healthy": True,
+        "template_healthy": True,
+    }
+
+
+def test_model_behavior_accepts_canonical_request_dispatched_field() -> None:
+    raw = {
+        "classification": "model_no_progress",
+        "failure_owner": "model",
+        "request_dispatched": True,
+        "request_reached_model": True,
+        "endpoint_healthy": True,
+        "template_healthy": True,
+        "template_family_id": "family-a",
+    }
+
+    evidence = ModelBehaviorEvidence.from_mapping(raw)
+
+    assert evidence is not None
+    assert evidence.request_dispatched is True
+    assert evidence.eligible_for_model_strike is True
+
+
+def test_canonical_request_dispatched_wins_over_legacy_alias() -> None:
+    raw = {
+        "classification": "model_no_progress",
+        "failure_owner": "model",
+        "request_dispatched": False,
+        "request_attempted": True,
+        "request_reached_model": True,
+        "endpoint_healthy": True,
+        "template_healthy": True,
+        "template_family_id": "family-a",
+    }
+
+    evidence = ModelBehaviorEvidence.from_mapping(raw)
+
+    assert evidence is not None
+    assert evidence.request_dispatched is False
+    assert evidence.eligible_for_model_strike is False
+
+
+def test_template_family_independence_does_not_change_with_revision() -> None:
+    base = {
+        "classification": "model_no_progress",
+        "failure_owner": "model",
+        "request_dispatched": True,
+        "request_reached_model": True,
+        "endpoint_healthy": True,
+        "template_healthy": True,
+        "template_family_id": "family-a",
+    }
+    first = ModelBehaviorEvidence.from_mapping({
+        **base, "template_revision": "r1",
+    })
+    second = ModelBehaviorEvidence.from_mapping({
+        **base, "template_revision": "r2",
+    })
+
+    assert first is not None and second is not None
+    assert first.template_key_hash("TERMINAL") == second.template_key_hash(
+        "TERMINAL"
+    )
+
+
+def test_model_behavior_attribution_never_infers_missing_or_unhealthy_fields() -> None:
+    baseline = {
+        "classification": "model_protocol_failure",
+        "failure_owner": "model",
+        "request_attempted": True,
+        "request_reached_model": True,
+        "endpoint_healthy": True,
+        "template_healthy": True,
+        "template_family_id": "family-a",
+    }
+    for field, value in (
+        ("failure_owner", "harness"),
+        ("request_attempted", False),
+        ("request_reached_model", False),
+        ("endpoint_healthy", False),
+        ("template_healthy", False),
+    ):
+        raw = dict(baseline)
+        raw[field] = value
+        evidence = ModelBehaviorEvidence.from_mapping(raw)
+        assert evidence is not None
+        assert evidence.eligible_for_model_strike is False
+
+    # String booleans and arbitrary exception text are not a producer contract.
+    raw = dict(baseline, request_reached_model="true", error="model timeout")
+    evidence = ModelBehaviorEvidence.from_mapping(raw)
+    assert evidence is not None
+    assert evidence.request_reached_model is None
+    assert evidence.eligible_for_model_strike is False
+
+
+def test_model_behavior_can_use_exact_template_id_when_family_is_unavailable() -> None:
+    evidence = ModelBehaviorEvidence.from_mapping({
+        "classification": "model_no_progress",
+        "failure_owner": "model",
+        "request_attempted": True,
+        "request_reached_model": True,
+        "endpoint_healthy": True,
+        "template_healthy": True,
+        "template_id": 80,
+    })
+
+    assert evidence is not None
+    assert evidence.eligible_for_model_strike is True
+    assert len(evidence.template_key_hash("TERMINAL") or "") == 64

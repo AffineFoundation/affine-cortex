@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import random
 import time
 from typing import Any, Dict, List, Optional
@@ -28,6 +29,10 @@ from affine.src.behavior_guard.gate import (
     record_deployment_fingerprint,
 )
 from affine.src.behavior_guard.models import (
+    BehaviorGateMode,
+    FailureOwner,
+    InvalidSampleReason,
+    ModelBehaviorEvidence,
     SampleOutcomeEvidence,
     classify_sample_invariant,
     parse_behavior_gate_config,
@@ -36,6 +41,7 @@ from affine.src.executor.logging_utils import safe_log
 from affine.src.executor.metrics import WorkerMetrics
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
 from affine.src.scorer.sampling_thresholds import (
+    SAMPLE_BUFFER_RATIO,
     champion_completion_threshold,
 )
 from affine.src.scorer.window_state import (
@@ -43,6 +49,7 @@ from affine.src.scorer.window_state import (
     MinerSnapshot,
     StateStore,
     SystemConfigKVAdapter,
+    WindowRotationRequest,
 )
 
 
@@ -118,11 +125,24 @@ class ExecutorWorker:
 
         self._tasks_by_deployment: Dict[str, set] = {}
         self._last_behavior_gate_log: Dict[str, str] = {}
-        # Repeated distinct-task runtime invariants can revoke a passed
-        # preflight.  If that final control-plane write is temporarily
-        # unavailable, keep the exact deployment fingerprint fail-closed and
-        # retry before any later gate read can release traffic.
-        self._runtime_gate_quarantine: Dict[str, Dict[str, Any]] = {}
+        # Only structured, model-owned runtime evidence may revoke a passed
+        # preflight. If the final write is temporarily unavailable, enforce
+        # mode keeps that exact deployment fail-closed until it is durable.
+        self._model_behavior_quarantine: Dict[str, Dict[str, Any]] = {}
+        # A non-scoring completion must be durable before the dispatcher may
+        # forget it.  DynamoDB outages therefore leave a process-local
+        # tombstone which is retried on later polls and is also consulted by
+        # candidate selection.  Without this, dropping the score and losing
+        # the marker redispatches the same expensive task forever.
+        self._pending_invalid_samples: Dict[tuple, Dict[str, Any]] = {}
+        self._pending_template_incidents: Dict[tuple, Dict[str, Any]] = {}
+        self._template_health_cache: Dict[tuple[str, str], tuple[float, str]] = {}
+        self._template_health_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+        # Admission-shadow must eventually fail open even when DynamoDB is
+        # unavailable. This process-local clock is only a fallback; normally
+        # every worker observes the shared admission_deadline_at stored by the
+        # DAO's conditional ensure_pending write.
+        self._admission_first_seen: Dict[str, float] = {}
 
     # ---- lifecycle ---------------------------------------------------------
 
@@ -393,6 +413,12 @@ class ExecutorWorker:
         # is deliberately unaffected: the gate is an admission check for a
         # newly deployed challenger, not a global inference kill switch.
         gate_config = await self._behavior_gate_config()
+        await self._retry_pending_non_score_writes()
+        global_invalid = await self._global_invalid_task_ids(
+            config=gate_config,
+            refresh_block=refresh_block,
+            task_ids=task_ids,
+        )
         battle_allowed = True
         blocked_deployment_ids: set[str] = set()
         if battle is not None:
@@ -431,6 +457,12 @@ class ExecutorWorker:
             champion.hotkey, champion.revision, self.env,
             task_ids, refresh_block=refresh_block,
         )
+        champ_invalid = global_invalid | await self._subject_invalid_task_ids(
+            hotkey=champion.hotkey,
+            revision=champion.revision,
+            refresh_block=refresh_block,
+            task_ids=task_ids,
+        )
         champion_threshold = champion_completion_threshold(sampling_count)
 
         # Each candidate carries the deployment_id we resolved from the
@@ -438,7 +470,23 @@ class ExecutorWorker:
         # state at persist time and drops the result if this token is
         # no longer current — see ``_is_current_deployment``.
         candidates: List[tuple] = []
-        if champion_urls and len(champ_done) < champion_threshold:
+        valid_champ_done = set(champ_done) - champ_invalid
+        rotation_reason: Optional[str] = None
+        rotation_replacements = 0
+        champion_valid_capacity = len(set(map(int, task_ids)) - champ_invalid)
+        if (
+            env_cfg.enabled_for_scoring
+            and bool(champ_invalid)
+            and champion_valid_capacity < champion_threshold
+        ):
+            rotation_reason = "champion_invalid_capacity_exhausted"
+            rotation_replacements = (
+                champion_threshold - champion_valid_capacity
+                + max(1, math.ceil(
+                    champion_threshold * SAMPLE_BUFFER_RATIO
+                ))
+            )
+        if champion_urls and len(valid_champ_done) < champion_threshold:
             champ_snap = MinerSnapshot(
                 uid=champion.uid, hotkey=champion.hotkey,
                 revision=champion.revision, model=champion.model,
@@ -446,7 +494,7 @@ class ExecutorWorker:
             )
             for idx, tid in enumerate(task_ids):
                 tid_int = int(tid)
-                if tid_int in champ_done:
+                if tid_int in champ_done or tid_int in champ_invalid:
                     continue
                 key = (champion.hotkey, champion.revision, tid_int)
                 if key in in_flight_keys:
@@ -470,16 +518,39 @@ class ExecutorWorker:
                 battle.challenger.hotkey, battle.challenger.revision,
                 self.env, task_ids, refresh_block=refresh_block,
             )
+            chal_invalid = global_invalid | await self._subject_invalid_task_ids(
+                hotkey=battle.challenger.hotkey,
+                revision=battle.challenger.revision,
+                refresh_block=refresh_block,
+                task_ids=task_ids,
+            )
             chal_progress = (
                 len(chal_done) if is_shadow
-                else len(champ_done.keys() & chal_done.keys())
+                else len(
+                    (set(champ_done) & set(chal_done))
+                    - champ_invalid
+                    - chal_invalid
+                )
             )
+            battle_valid_capacity = len(
+                set(map(int, task_ids)) - champ_invalid - chal_invalid
+            )
+            if (
+                not is_shadow
+                and bool(champ_invalid or chal_invalid)
+                and battle_valid_capacity < sampling_count
+            ):
+                rotation_reason = "battle_invalid_capacity_exhausted"
+                rotation_replacements = (
+                    sampling_count - battle_valid_capacity
+                    + max(1, math.ceil(sampling_count * SAMPLE_BUFFER_RATIO))
+                )
             if chal_progress < sampling_count:
                 for idx, tid in enumerate(task_ids):
                     tid_int = int(tid)
                     if not is_shadow and tid_int not in champ_done:
                         continue              # champion hasn't sampled yet
-                    if tid_int in chal_done:
+                    if tid_int in chal_done or tid_int in chal_invalid:
                         continue              # challenger already done
                     key = (battle.challenger.hotkey, battle.challenger.revision, tid_int)
                     if key in in_flight_keys:
@@ -504,17 +575,41 @@ class ExecutorWorker:
                 record.challenger.hotkey, record.challenger.revision,
                 self.env, task_ids, refresh_block=refresh_block,
             )
+            pre_invalid = global_invalid | await self._subject_invalid_task_ids(
+                hotkey=record.challenger.hotkey,
+                revision=record.challenger.revision,
+                refresh_block=refresh_block,
+                task_ids=task_ids,
+            )
             pre_progress = (
                 len(pre_done) if is_shadow
-                else len(champ_done.keys() & pre_done.keys())
+                else len(
+                    (set(champ_done) & set(pre_done))
+                    - champ_invalid
+                    - pre_invalid
+                )
             )
+            pre_valid_capacity = len(
+                set(map(int, task_ids)) - champ_invalid - pre_invalid
+            )
+            if (
+                not is_shadow
+                and battle is None
+                and bool(champ_invalid or pre_invalid)
+                and pre_valid_capacity < sampling_count
+            ):
+                rotation_reason = "predeploy_invalid_capacity_exhausted"
+                rotation_replacements = (
+                    sampling_count - pre_valid_capacity
+                    + max(1, math.ceil(sampling_count * SAMPLE_BUFFER_RATIO))
+                )
             if pre_progress >= sampling_count:
                 continue                  # enough samples; let scheduler decide
             for idx, tid in enumerate(task_ids):
                 tid_int = int(tid)
                 if not is_shadow and tid_int not in champ_done:
                     continue              # champion hasn't sampled yet
-                if tid_int in pre_done:
+                if tid_int in pre_done or tid_int in pre_invalid:
                     continue              # this pre-challenger already done
                 key = (
                     record.challenger.hotkey,
@@ -530,6 +625,14 @@ class ExecutorWorker:
                 candidates.append(
                     (key, record.challenger, tid, url, dep_id)
                 )
+
+        if rotation_reason is not None:
+            await self._request_invalid_capacity_rotation(
+                refresh_block=refresh_block,
+                reason=rotation_reason,
+                replacement_count=rotation_replacements,
+            )
+            return 0
 
         if not candidates:
             return 0
@@ -563,6 +666,30 @@ class ExecutorWorker:
             launched += 1
         return launched
 
+    async def _request_invalid_capacity_rotation(
+        self,
+        *,
+        refresh_block: int,
+        reason: str,
+        replacement_count: int,
+    ) -> None:
+        """Ask scheduler to replace a pool that cannot meet valid overlap."""
+
+        existing = await self._state.get_window_rotation_request()
+        if existing is not None:
+            return
+        await self._state.set_window_rotation_request(WindowRotationRequest(
+            requested_at_block=int(refresh_block),
+            stale_refreshed_at_block=int(refresh_block),
+            reason=str(reason),
+            environment=self.env,
+            replacement_count=max(1, int(replacement_count)),
+        ))
+        logger.warning(
+            f"[{self.env}] requested automatic task-pool rotation "
+            f"refresh_block={refresh_block} reason={reason}; model_loss=false"
+        )
+
     async def _dispatch_one(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, key: tuple, in_flight_keys: set,
@@ -582,20 +709,178 @@ class ExecutorWorker:
         raw = await getter() if getter is not None else {}
         return parse_behavior_gate_config(raw)
 
+    async def _subject_invalid_task_ids(
+        self,
+        *,
+        hotkey: str,
+        revision: str,
+        refresh_block: int,
+        task_ids: List[int],
+    ) -> set[int]:
+        """Completed integrity-invalid tasks, excluded from redispatch only."""
+
+        local = {
+            int(key[4])
+            for key in self._pending_invalid_samples
+            if key[:4] == (
+                str(hotkey), str(revision), self.env, int(refresh_block),
+            )
+        }
+        if self._behavior_gate_dao is None:
+            return local
+        try:
+            durable = set(await self._behavior_gate_dao.list_invalid_sample_task_ids(
+                hotkey,
+                revision,
+                self.env,
+                int(refresh_block),
+                task_ids=task_ids,
+            ))
+            return durable | local
+        except Exception as exc:
+            logger.error(
+                f"[{self.env}] invalid sample read failed: {type(exc).__name__}"
+            )
+            return local
+
+    async def _global_invalid_task_ids(
+        self,
+        *,
+        config,
+        refresh_block: int,
+        task_ids: List[int],
+    ) -> set[int]:
+        """Tasks quarantined by exact-task or cross-subject template evidence."""
+
+        if self._behavior_gate_dao is None:
+            return set()
+        try:
+            return set(await self._behavior_gate_dao.list_invalid_task_ids(
+                config.template_policy_identity,
+                self.env,
+                self._catalog_revision_hash(refresh_block),
+                task_ids=task_ids,
+            ))
+        except Exception as exc:
+            logger.error(
+                f"[{self.env}] global invalid task read failed: "
+                f"{type(exc).__name__}"
+            )
+            return set()
+
+    async def _retry_pending_non_score_writes(self) -> None:
+        """Retry local integrity tombstones before selecting new work.
+
+        Candidate selection consults ``_pending_invalid_samples`` even when
+        the control plane is unavailable, so a failed marker write cannot
+        redispatch the same task between retries.
+        """
+
+        for key in list(self._pending_invalid_samples):
+            await self._persist_pending_invalid_sample(key)
+        for key in list(self._pending_template_incidents):
+            # Preserve the durable ordering: the subject/task completion is
+            # authoritative for dispatch; family aggregation follows it.
+            if key not in self._pending_invalid_samples:
+                await self._persist_pending_template_incident(key)
+
+    async def _persist_pending_invalid_sample(self, key: tuple) -> bool:
+        payload = self._pending_invalid_samples.get(key)
+        if payload is None:
+            return True
+        if self._behavior_gate_dao is None:
+            return False
+        try:
+            await self._behavior_gate_dao.record_invalid_sample(
+                *payload["args"], **payload["kwargs"],
+            )
+        except Exception as exc:
+            logger.error(
+                f"[{self.env}] invalid sample marker write failed "
+                f"uid={payload['uid']}: {type(exc).__name__}"
+            )
+            return False
+        self._pending_invalid_samples.pop(key, None)
+        return True
+
+    async def _persist_pending_template_incident(self, key: tuple) -> bool:
+        payload = self._pending_template_incidents.get(key)
+        if payload is None:
+            return True
+        if self._behavior_gate_dao is None:
+            return False
+        try:
+            await self._behavior_gate_dao.record_template_incident(
+                *payload["args"], **payload["kwargs"],
+            )
+        except Exception as exc:
+            logger.error(
+                f"[{self.env}] template incident write failed "
+                f"uid={payload['uid']}: {type(exc).__name__}"
+            )
+            return False
+        # An incident can transition a family from suspected to quarantined;
+        # invalidate any cached read before later samples consult it.
+        self._template_health_cache.pop(
+            (str(payload["args"][2]), str(payload["args"][3])),
+            None,
+        )
+        self._pending_template_incidents.pop(key, None)
+        return True
+
+    def _catalog_revision_hash(self, refresh_block: int) -> str:
+        """Transitional immutable-enough catalog identity for policy epoch v2.
+
+        Current environment config has no image digest/dataset revision. Scope
+        quarantine to environment image plus task-pool refresh so a mutable tag
+        can never carry an old template verdict into a later pool implicitly.
+        """
+
+        image = str(getattr(self._env_executor, "docker_image", "") or "")
+        return _stable_runtime_hash({
+            "environment": self.env.casefold(),
+            "image": image,
+            "refresh_block": int(refresh_block),
+        })
+
     async def _behavior_gate_allows(self, record, config) -> bool:
         """Return whether ``record`` may dispatch in this worker's env.
 
-        Shadow and disabled modes are fail-open by definition.  Enforce mode
-        is fail-closed for a configured env: a missing table row, transient DB
-        read error, or non-final verdict keeps expensive tasks at zero rather
-        than recreating the 600-way timeout fan-out.
+        Plain shadow is immediately fail-open. Enforce is fail-closed until a
+        pass. Admission-shadow holds fan-out only until a final observation or
+        the absolute admission deadline, and never turns a failure into loss.
         """
-        if not config.enforces or not config.gates_environment(self.env):
+        if not config.gates_environment(self.env):
             return True
         fingerprint = record_deployment_fingerprint(record, config)
-        pending_failure = self._runtime_gate_quarantine.get(fingerprint)
+        pending_failure = self._model_behavior_quarantine.get(fingerprint)
+        if not config.blocks_admission:
+            # Plain shadow never holds traffic, but it still owes operators a
+            # durable would-fail verdict after a transient write error.
+            if pending_failure is not None:
+                write_outcome = await self._write_model_behavior_failure(
+                    fingerprint, pending_failure,
+                )
+                self._log_behavior_gate_state(
+                    record,
+                    (
+                        "failed"
+                        if write_outcome == "failed"
+                        else write_outcome
+                    ),
+                    (
+                        pending_failure["reason_code"]
+                        if write_outcome == "failed"
+                        else "model_behavior_write_pending"
+                    ),
+                    allowed=True,
+                )
+            return True
+        first_seen = self._admission_first_seen.setdefault(
+            fingerprint, time.monotonic(),
+        )
         if pending_failure is not None:
-            write_outcome = await self._write_runtime_invariant_failure(
+            write_outcome = await self._write_model_behavior_failure(
                 fingerprint,
                 pending_failure,
             )
@@ -616,54 +901,102 @@ class ExecutorWorker:
                 (
                     pending_failure["reason_code"]
                     if write_outcome == "failed"
-                    else "runtime_invariant_write_pending"
+                    else "model_behavior_write_pending"
+                ),
+                allowed=(
+                    config.mode is BehaviorGateMode.ADMISSION_SHADOW
+                    and write_outcome == "failed"
                 ),
             )
-            # A successful retry durably changed the verdict to failed; an
-            # unsuccessful retry remains locally quarantined.  Neither state
-            # may release more benchmark work.
-            return False
+            if config.enforces:
+                return False
+            if write_outcome == "failed":
+                return True
+            # A transient verdict-write failure must not turn admission-shadow
+            # into an unbounded hold.  Continue to the persisted snapshot (or
+            # the local fallback timer) so the absolute admission deadline can
+            # still release fan-out.
         if self._behavior_gate_dao is None:
             status = "dao_unavailable"
-            self._log_behavior_gate_state(record, status, "awaiting_preflight")
-            return False
+            allowed = self._local_admission_expired(first_seen, config)
+            self._log_behavior_gate_state(
+                record, status, "awaiting_preflight", allowed=allowed,
+            )
+            return allowed
         try:
             snapshot = await read_gate_snapshot(
                 self._behavior_gate_dao, record, config,
             )
+            if snapshot.row is None:
+                await self._behavior_gate_dao.ensure_pending(
+                    record.challenger.hotkey,
+                    record.challenger.revision,
+                    config.policy_version,
+                    fingerprint,
+                    admission_deadline_at=(
+                        getattr(
+                            record, "behavior_admission_deadline_at", None,
+                        )
+                        or int(time.time()) + config.admission_hold_seconds
+                    ),
+                )
+                snapshot = await read_gate_snapshot(
+                    self._behavior_gate_dao, record, config,
+                )
         except Exception as exc:
+            allowed = self._local_admission_expired(first_seen, config)
             self._log_behavior_gate_state(
                 record,
                 "read_error",
                 type(exc).__name__,
+                allowed=allowed,
             )
-            return False
-        self._log_behavior_gate_state(
-            record, snapshot.status.value, snapshot.reason,
-        )
+            return allowed
         if snapshot.row and snapshot.row.get("promotion_sealed_at") is not None:
             self._log_behavior_gate_state(
-                record, "sealed", "promotion_sealed",
+                record, "sealed", "promotion_sealed", allowed=False,
             )
             return False
-        return snapshot.passed
+        if config.enforces:
+            allowed = snapshot.passed
+        else:
+            allowed = (
+                snapshot.passed
+                or snapshot.failed
+                or snapshot.admission_expired
+                or self._local_admission_expired(first_seen, config)
+            )
+        self._log_behavior_gate_state(
+            record, snapshot.status.value, snapshot.reason, allowed=allowed,
+        )
+        if snapshot.passed or snapshot.failed:
+            self._admission_first_seen.pop(fingerprint, None)
+        return allowed
+
+    @staticmethod
+    def _local_admission_expired(first_seen: float, config) -> bool:
+        return (
+            config.mode is BehaviorGateMode.ADMISSION_SHADOW
+            and time.monotonic() - first_seen >= config.admission_hold_seconds
+        )
 
     def _log_behavior_gate_state(
-        self, record, status: str, reason: str,
+        self, record, status: str, reason: str, *, allowed: Optional[bool] = None,
     ) -> None:
         key = (
             f"{record.challenger.hotkey}:{record.challenger.revision}:"
             f"{record.deployment_id}"
         )
-        marker = f"{status}:{reason}"
+        dispatch_allowed = status == "passed" if allowed is None else allowed
+        marker = f"{status}:{reason}:{dispatch_allowed}"
         if self._last_behavior_gate_log.get(key) == marker:
             return
         self._last_behavior_gate_log[key] = marker
-        log = logger.info if status == "passed" else logger.warning
+        log = logger.info if dispatch_allowed else logger.warning
         log(
             f"[{self.env}] behavior gate uid={record.challenger.uid} "
             f"status={status} reason={reason}; "
-            f"dispatch={'allowed' if status == 'passed' else 'blocked'}"
+            f"dispatch={'allowed' if dispatch_allowed else 'blocked'}"
         )
 
     def _cancel_dispatches_for_deployments(self, deployment_ids: set[str]) -> None:
@@ -716,24 +1049,17 @@ class ExecutorWorker:
         tagged with the task-id pool's ``refresh_block`` so the scheduler
         only counts current-refresh samples.
 
-        Failure handling distinguishes three cases (pre-refactor parity,
-        see PR #439):
+        Failure handling distinguishes three cases:
 
-          - **Miner-capability error** — the exception chain matches
-            ``_ZERO_SCORE_ERROR_PATTERNS`` (context-length overflow).
-            That's a property of the model and won't change on retry,
-            so persist score=0.
-          - **All other exceptions** (transport, parse, HTTP status,
-            env crash mid-flight, env returning ``status=failed`` for
-            non-capability reasons): never the miner's fault to know.
-            **Don't persist** — let the next ``_tick`` re-attempt this
-            task_id. The shuffle keeps us from always blocking on the
-            same flaky task. The 10% buffer absorbs permanent infra-only
-            failures; beyond that operators step in.
+          - **Typed harness deadline** — write a non-scoring invalid-sample
+            tombstone immediately.  Other unstructured exceptions receive the
+            same durable treatment on their first occurrence.  Neither path
+            is attributed to the model or allowed to retry forever.
           - ``Result.success=False`` / ``error`` from a non-raising
             evaluate: the env returned a structured invalid attempt.
-            **Don't persist** — rows with ``extra.error`` are not valid
-            samples and must not count toward completion or comparison.
+            Write a non-scoring invalid-sample tombstone unless trusted,
+            structured evidence explicitly attributes the failure to the
+            model on a healthy endpoint and template.
         """
         miner_obj = _Miner(
             hotkey=miner.hotkey, model=miner.model, revision=miner.revision,
@@ -964,12 +1290,12 @@ class ExecutorWorker:
                 return record
         return None
 
-    async def _write_runtime_invariant_failure(
+    async def _write_model_behavior_failure(
         self,
         fingerprint: str,
         failure: Dict[str, Any],
     ) -> str:
-        """Commit a runtime failure or resolve a promotion-seal race.
+        """Commit a model-owned failure or resolve a promotion-seal race.
 
         Returns ``failed`` when the terminal failure is durable, ``sealed``
         when promotion's atomic cutoff won, and ``pending`` when neither
@@ -978,14 +1304,17 @@ class ExecutorWorker:
         try:
             if self._behavior_gate_dao is None:
                 raise RuntimeError("behavior gate DAO unavailable")
-            committed = await self._behavior_gate_dao.fail_runtime_invariant(
+            committed = await self._behavior_gate_dao.fail_model_behavior(
                 failure["hotkey"],
                 failure["revision"],
                 failure["policy_version"],
                 fingerprint,
+                classification=failure["classification"],
                 reason_code=failure["reason_code"],
+                attribution=failure["attribution"],
                 evidence=failure["evidence"],
                 counts=failure["counts"],
+                minimum_distinct_templates=failure["minimum_distinct_templates"],
             )
             if not committed:
                 verdict = await self._behavior_gate_dao.get_verdict(
@@ -999,45 +1328,169 @@ class ExecutorWorker:
                     and verdict.get("status") == "passed"
                     and verdict.get("promotion_sealed_at") is not None
                 ):
-                    self._runtime_gate_quarantine.pop(fingerprint, None)
+                    self._model_behavior_quarantine.pop(fingerprint, None)
                     logger.info(
-                        f"[{self.env}] runtime invariant cutoff already sealed "
+                        f"[{self.env}] model behavior cutoff already sealed "
                         f"uid={failure['uid']}"
                     )
                     return "sealed"
                 raise RuntimeError("runtime invariant write was not confirmed")
         except Exception as exc:
-            self._runtime_gate_quarantine[fingerprint] = failure
+            self._model_behavior_quarantine[fingerprint] = failure
             # Evidence and exception text can contain model-controlled data;
             # expose only stable identifiers and the exception class.
             logger.error(
-                f"[{self.env}] runtime invariant gate write failed "
+                f"[{self.env}] model behavior gate write failed "
                 f"uid={failure['uid']}: {type(exc).__name__}"
             )
             return "pending"
 
-        self._runtime_gate_quarantine.pop(fingerprint, None)
+        self._model_behavior_quarantine.pop(fingerprint, None)
         return "failed"
 
-    async def _runtime_invariant_blocks_persist(
+    async def _record_invalid_sample(
         self,
         *,
         miner: MinerSnapshot,
         task_id: int,
+        refresh_block: int,
         expected_deployment_id: Optional[str],
         score: float,
         extra: Dict[str, Any],
     ) -> bool:
-        """Record a UID208-style impossible positive result.
+        """Persist sample-integrity evidence without creating a score/verdict."""
 
-        Missing or non-numeric telemetry is unknown rather than zero.  Every
-        anomaly is recorded as a distinct-task observation; only a repeated
-        identical signature closes the gate.  Shadow mode preserves the
-        sample, while enforce mode suppresses invalid evidence immediately.
-        """
         evidence = _sample_outcome_evidence(score=score, extra=extra)
-        classification = classify_sample_invariant(evidence)
-        if classification is None:
+        reason = classify_sample_invariant(evidence)
+        if reason is None:
+            return False
+
+        return await self._record_invalid_sample_reason(
+            miner=miner,
+            task_id=task_id,
+            refresh_block=refresh_block,
+            expected_deployment_id=expected_deployment_id,
+            reason=reason,
+            evidence=evidence,
+            extra=extra,
+        )
+
+    async def _record_invalid_sample_reason(
+        self,
+        *,
+        miner: MinerSnapshot,
+        task_id: int,
+        refresh_block: int,
+        expected_deployment_id: Optional[str],
+        reason: InvalidSampleReason,
+        evidence: SampleOutcomeEvidence,
+        extra: Dict[str, Any],
+    ) -> bool:
+        """Write one non-scoring completion and its optional template signal."""
+
+        owner = _failure_owner(extra.get("failure_owner"))
+        template_key_hash = _template_key_hash(self.env, extra)
+        audit_evidence = {
+            "environment": self.env,
+            "commands_executed": evidence.commands_executed,
+            "llm_call_count": evidence.llm_call_count,
+            "total_tokens": evidence.total_tokens,
+            "output_bytes": evidence.output_bytes,
+            "failure_owner": owner.value,
+            "request_dispatched": _request_dispatched(extra),
+            "request_reached_model": _strict_bool_or_none(
+                extra.get("request_reached_model")
+            ),
+            "template_family_id": _safe_identifier(
+                extra.get("template_family_id")
+            ),
+            "template_id": _safe_identifier(extra.get("template_id")),
+            "template_revision": _safe_identifier(
+                extra.get("template_revision")
+            ),
+        }
+        key = (
+            str(miner.hotkey),
+            str(miner.revision),
+            self.env,
+            int(refresh_block),
+            int(task_id),
+        )
+        self._pending_invalid_samples[key] = {
+            "uid": miner.uid,
+            "args": (
+                miner.hotkey,
+                miner.revision,
+                self.env,
+                int(refresh_block),
+                int(task_id),
+            ),
+            "kwargs": {
+                "reason_code": reason.value,
+                "template_key_hash": template_key_hash,
+                "evidence": audit_evidence,
+            },
+        }
+        if template_key_hash is not None and (
+            owner is FailureOwner.TEMPLATE
+            or reason is InvalidSampleReason.TEMPLATE_FAMILY_QUARANTINED
+        ):
+            try:
+                config = await self._behavior_gate_config()
+                self._pending_template_incidents[key] = {
+                    "uid": miner.uid,
+                    "args": (
+                        config.template_policy_identity,
+                        self.env,
+                        self._catalog_revision_hash(refresh_block),
+                        template_key_hash,
+                    ),
+                    "kwargs": {
+                        "subject_hash": _stable_runtime_hash({
+                            "hotkey": miner.hotkey,
+                            "revision": miner.revision,
+                        }),
+                        "deployment_hash": _stable_runtime_hash({
+                            "deployment_id": expected_deployment_id or "",
+                        }),
+                        "task_instance_hash": _runtime_task_hash(
+                            environment=self.env,
+                            task_id=task_id,
+                            refresh_block=refresh_block,
+                        ),
+                        "task_id": int(task_id),
+                        "reason_code": reason.value,
+                        "evidence": audit_evidence,
+                    },
+                }
+            except Exception as exc:
+                logger.error(
+                    f"[{self.env}] template incident preparation failed "
+                    f"uid={miner.uid}: {type(exc).__name__}"
+                )
+
+        marker_durable = await self._persist_pending_invalid_sample(key)
+        if marker_durable and key in self._pending_template_incidents:
+            await self._persist_pending_template_incident(key)
+        logger.warning(
+            f"[{self.env}] invalid sample uid={miner.uid} task_id={task_id} "
+            f"reason={reason.value}; score_persisted=false model_strike=false"
+        )
+        return True
+
+    async def _model_behavior_blocks_persist(
+        self,
+        *,
+        miner: MinerSnapshot,
+        task_id: int,
+        refresh_block: int,
+        expected_deployment_id: Optional[str],
+        extra: Dict[str, Any],
+    ) -> bool:
+        """Record only fully attributed model evidence across template families."""
+
+        evidence = _model_behavior_evidence(extra)
+        if evidence is None or not evidence.eligible_for_model_strike:
             return False
 
         config = await self._behavior_gate_config()
@@ -1049,95 +1502,151 @@ class ExecutorWorker:
         )
         if record is None:
             return False
+        template_key_hash = evidence.template_key_hash(self.env)
+        if template_key_hash is None:
+            return False
 
         fingerprint = record_deployment_fingerprint(record, config)
-        observation_evidence = {
-            "environment": self.env,
-            "score": score,
-            "commands_executed": evidence.commands_executed,
-            "llm_call_count": evidence.llm_call_count,
-            "total_tokens": evidence.total_tokens,
-            "output_bytes": evidence.output_bytes,
-        }
-        signature_hash = _runtime_signature_hash(
-            environment=self.env,
-            evidence=evidence,
-            classification=classification.value,
-        )
-        task_hash = _runtime_task_hash(
-            environment=self.env,
-            task_id=task_id,
-        )
         threshold = config.runtime_violations_to_fail
+        audit_evidence = evidence.audit_evidence()
         try:
             if self._behavior_gate_dao is None:
                 raise RuntimeError("behavior gate DAO unavailable")
             observation_count = int(
-                await self._behavior_gate_dao.record_runtime_invariant_observation(
+                await self._behavior_gate_dao.record_model_observation(
                     miner.hotkey,
                     miner.revision,
                     config.policy_version,
                     fingerprint,
-                    signature_hash=signature_hash,
-                    task_hash=task_hash,
-                    classification=classification.value,
-                    evidence=observation_evidence,
+                    classification=evidence.classification.value,
+                    template_key_hash=template_key_hash,
+                    task_hash=_runtime_task_hash(
+                        environment=self.env,
+                        task_id=task_id,
+                        refresh_block=refresh_block,
+                    ),
+                    attribution=evidence.attribution(),
+                    evidence=audit_evidence,
                     threshold=threshold,
                 )
             )
         except Exception as exc:
-            # The invalid sample still cannot become benchmark evidence in
-            # enforce mode, but one uncertain observation is not sufficient
-            # to quarantine or terminally fail the deployment.
             logger.error(
-                f"[{self.env}] runtime invariant observation write failed "
+                f"[{self.env}] model observation write failed "
                 f"uid={miner.uid}: {type(exc).__name__}"
             )
-            return config.enforces
+            # An unavailable control plane cannot prove that the cross-template
+            # threshold was reached.  Let this attributable task persist (a
+            # structured error becomes score=0 below) so it cannot loop forever.
+            return False
 
-        reason = "runtime_positive_score_zero_activity"
         if observation_count < threshold:
-            logger.warning(
-                f"[{self.env}] runtime invariant uid={miner.uid} "
-                f"task_id={task_id} reason={reason} "
-                f"observations={observation_count}/{threshold}; "
-                f"mode={config.mode.value}; "
-                f"persist={'blocked' if config.enforces else 'shadow-allowed'}"
-            )
-            return config.enforces
+            # One attributable failure is useful evidence, but it is not yet a
+            # breaker verdict.  Persist the task normally so candidate
+            # selection converges while waiting for an independent family.
+            return False
 
+        reason_code = f"runtime_{evidence.classification.value}"
         failure = {
             "uid": miner.uid,
             "hotkey": miner.hotkey,
             "revision": miner.revision,
             "policy_version": config.policy_version,
-            "reason_code": reason,
-            # Keep the retry payload to the same compact, allowlisted scalar
-            # evidence accepted by BehaviorGateDAO.  Raw output, errors,
-            # prompts, and tool arguments never enter the quarantine.
-            "evidence": observation_evidence,
+            "classification": evidence.classification.value,
+            "reason_code": reason_code,
+            "attribution": evidence.attribution(),
+            "evidence": audit_evidence,
             "counts": {
                 "total": observation_count,
                 "strikes": observation_count,
-                classification.value: observation_count,
+                evidence.classification.value: observation_count,
             },
+            "minimum_distinct_templates": threshold,
         }
-        await self._write_runtime_invariant_failure(fingerprint, failure)
-
+        await self._write_model_behavior_failure(fingerprint, failure)
         logger.warning(
-            f"[{self.env}] runtime invariant uid={miner.uid} "
-            f"task_id={task_id} reason={reason} "
-            f"observations={observation_count}/{threshold}; "
-            f"mode={config.mode.value}; "
-            f"persist={'blocked' if config.enforces else 'shadow-allowed'}"
+            f"[{self.env}] model behavior uid={miner.uid} task_id={task_id} "
+            f"classification={evidence.classification.value} "
+            f"templates={observation_count}/{threshold} mode={config.mode.value}"
         )
         return config.enforces
+
+    async def _record_quarantined_template_sample(
+        self,
+        *,
+        miner: MinerSnapshot,
+        task_id: int,
+        refresh_block: int,
+        expected_deployment_id: Optional[str],
+        score: float,
+        extra: Dict[str, Any],
+    ) -> bool:
+        """Consume a family breaker as a non-scoring sample completion.
+
+        Task-to-family metadata is emitted by the environment with the result,
+        so a previously unseen task cannot be skipped before its first run.
+        Once observed, however, it is attached to the durable quarantined
+        family and becomes globally skippable for all later subjects.
+        """
+
+        template_key_hash = _template_key_hash(self.env, extra)
+        if template_key_hash is None or self._behavior_gate_dao is None:
+            return False
+        try:
+            config = await self._behavior_gate_config()
+            catalog_hash = self._catalog_revision_hash(refresh_block)
+            cache_key = (catalog_hash, template_key_hash)
+            cached = self._template_health_cache.get(cache_key)
+            if cached is not None and cached[0] > time.monotonic():
+                health_status = cached[1]
+            else:
+                lock = self._template_health_locks.setdefault(
+                    cache_key, asyncio.Lock(),
+                )
+                async with lock:
+                    cached = self._template_health_cache.get(cache_key)
+                    if cached is not None and cached[0] > time.monotonic():
+                        health_status = cached[1]
+                    else:
+                        health = await self._behavior_gate_dao.get_template_health(
+                            config.template_policy_identity,
+                            self.env,
+                            catalog_hash,
+                            template_key_hash,
+                        )
+                        health_status = str(
+                            (health or {}).get("status") or ""
+                        )
+                        self._template_health_cache[cache_key] = (
+                            time.monotonic() + 60.0,
+                            health_status,
+                        )
+        except Exception as exc:
+            logger.error(
+                f"[{self.env}] template health read failed "
+                f"uid={miner.uid}: {type(exc).__name__}"
+            )
+            return False
+        if health_status != "quarantined":
+            return False
+
+        return await self._record_invalid_sample_reason(
+            miner=miner,
+            task_id=task_id,
+            refresh_block=refresh_block,
+            expected_deployment_id=expected_deployment_id,
+            reason=InvalidSampleReason.TEMPLATE_FAMILY_QUARANTINED,
+            evidence=_sample_outcome_evidence(score=score, extra=extra),
+            extra=extra,
+        )
 
     async def _evaluate_and_persist_gated(
         self, *, miner: MinerSnapshot, task_id: int, base_url: str,
         refresh_block: int, miner_obj: "_Miner",
         expected_deployment_id: Optional[str] = None,
     ) -> None:
+        from affine.core.environments import EvaluationDeadlineExceeded
+
         acquired_host = await self._acquire_dispatch_slot(
             expected_deployment_id=expected_deployment_id,
         )
@@ -1147,41 +1656,78 @@ class ExecutorWorker:
                 result = await self._env_executor.evaluate(
                     miner=miner_obj, task_id=task_id,
                 )
+            except EvaluationDeadlineExceeded:
+                latency_ms = int((time.monotonic() - started) * 1000)
+                logger.warning(
+                    f"[TIMEOUT] U{miner.uid:<4} │ {self.env:<20} │ "
+                    f"INVALID │ task_id={task_id:<8} │ "
+                    f"{latency_ms / 1000.0:6.3f}s │ typed_harness_deadline"
+                )
+                if not await self._validate_or_drop(
+                    miner=miner,
+                    task_id=task_id,
+                    expected_deployment_id=expected_deployment_id,
+                    latency_ms=latency_ms,
+                ):
+                    return
+                await self._record_invalid_sample_reason(
+                    miner=miner,
+                    task_id=task_id,
+                    refresh_block=refresh_block,
+                    expected_deployment_id=expected_deployment_id,
+                    reason=InvalidSampleReason.HARNESS_DEADLINE_EXCEEDED,
+                    evidence=SampleOutcomeEvidence(
+                        score=None,
+                        commands_executed=None,
+                        llm_call_count=None,
+                        total_tokens=None,
+                        output_bytes=None,
+                        terminated_reason="harness_deadline_exceeded",
+                    ),
+                    extra={
+                        "failure_owner": FailureOwner.HARNESS.value,
+                        "request_dispatched": True,
+                        "request_reached_model": None,
+                    },
+                )
+                self.metrics.record_invalid(latency_ms=latency_ms)
+                return
             except Exception as e:
                 latency_s = time.monotonic() - started
                 latency_ms = int(latency_s * 1000)
                 error_brief = str(e).replace("\n", " ").replace("\r", " ")[:200]
-                zero_score = _is_zero_score_error(e)
-                tag = "ZERO" if zero_score else "FAILED"
                 logger.info(
-                    f"[{tag}] U{miner.uid:<4} │ {self.env:<20} │     FAILED │ "
+                    f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
                     f"task_id={task_id:<8} │ {latency_s:6.3f}s │ {type(e).__name__}: {error_brief}"
                 )
-                if zero_score:
-                    # Miner-capability limit (context overflow). Persist as
-                    # score=0 — retrying would yield the same error.
-                    if not await self._validate_or_drop(
-                        miner=miner, task_id=task_id,
-                        expected_deployment_id=expected_deployment_id,
-                        latency_ms=latency_ms,
-                    ):
-                        return
-                    await self._samples.persist(
-                        miner_hotkey=miner.hotkey,
-                        model_revision=miner.revision,
-                        model=miner.model,
-                        env=self.env,
-                        task_id=task_id,
-                        score=0.0,
-                        latency_ms=latency_ms,
-                        extra={
-                            "error": error_brief,
-                            "zero_score_reason": "context_overflow",
-                        },
-                        block_number=0,
-                        refresh_block=refresh_block,
-                    )
-                self.metrics.record_completion(success=False, latency_ms=latency_ms)
+                if not await self._validate_or_drop(
+                    miner=miner,
+                    task_id=task_id,
+                    expected_deployment_id=expected_deployment_id,
+                    latency_ms=latency_ms,
+                ):
+                    return
+                await self._record_invalid_sample_reason(
+                    miner=miner,
+                    task_id=task_id,
+                    refresh_block=refresh_block,
+                    expected_deployment_id=expected_deployment_id,
+                    reason=InvalidSampleReason.HARNESS_EXCEPTION,
+                    evidence=SampleOutcomeEvidence(
+                        score=None,
+                        commands_executed=None,
+                        llm_call_count=None,
+                        total_tokens=None,
+                        output_bytes=None,
+                        terminated_reason="harness_exception",
+                    ),
+                    extra={
+                        "failure_owner": FailureOwner.HARNESS.value,
+                        "request_dispatched": True,
+                        "request_reached_model": None,
+                    },
+                )
+                self.metrics.record_invalid(latency_ms=latency_ms)
                 return
         finally:
             self._decrement_env_slot()
@@ -1200,18 +1746,46 @@ class ExecutorWorker:
             latency_ms=latency_ms,
         ):
             return
-        if await self._runtime_invariant_blocks_persist(
+        if await self._record_invalid_sample(
             miner=miner,
             task_id=task_id,
+            refresh_block=refresh_block,
             expected_deployment_id=expected_deployment_id,
             score=score,
+            extra=extra,
+        ):
+            self.metrics.record_invalid(latency_ms=latency_ms)
+            return
+        if await self._record_quarantined_template_sample(
+            miner=miner,
+            task_id=task_id,
+            refresh_block=refresh_block,
+            expected_deployment_id=expected_deployment_id,
+            score=score,
+            extra=extra,
+        ):
+            self.metrics.record_invalid(latency_ms=latency_ms)
+            return
+        if await self._model_behavior_blocks_persist(
+            miner=miner,
+            task_id=task_id,
+            refresh_block=refresh_block,
+            expected_deployment_id=expected_deployment_id,
             extra=extra,
         ):
             self.metrics.record_completion(success=False, latency_ms=latency_ms)
             return
         if error or extra.get("error"):
             error_brief = str(error or extra.get("error")).replace("\n", " ").replace("\r", " ")[:200]
-            if _is_zero_score_error(Exception(error_brief)):
+            model_evidence = _model_behavior_evidence(extra)
+            if (
+                model_evidence is not None
+                and model_evidence.eligible_for_model_strike
+            ):
+                # The trusted producer has explicitly attributed this failed
+                # task to the model on a healthy endpoint/template.  Persist a
+                # structured zero instead of retrying a deterministic failure;
+                # raw error text remains outside the score row.
                 await self._samples.persist(
                     miner_hotkey=miner.hotkey,
                     model_revision=miner.revision,
@@ -1221,19 +1795,41 @@ class ExecutorWorker:
                     score=0.0,
                     latency_ms=latency_ms,
                     extra={
-                        "error": error_brief,
-                        "zero_score_reason": "context_overflow",
+                        "zero_score_reason": "structured_model_behavior",
+                        "classification": model_evidence.classification.value,
+                        **model_evidence.attribution(),
+                        "template_family_id": model_evidence.template_family_id,
+                        "template_id": model_evidence.template_id,
+                        "template_revision": model_evidence.template_revision,
                     },
                     block_number=0,
                     refresh_block=refresh_block,
                 )
-                self.metrics.record_completion(success=False, latency_ms=latency_ms)
+                self.metrics.record_completion(
+                    success=False, latency_ms=latency_ms,
+                )
                 return
             logger.info(
                 f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
                 f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {error_brief}"
             )
-            self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            await self._record_invalid_sample_reason(
+                miner=miner,
+                task_id=task_id,
+                refresh_block=refresh_block,
+                expected_deployment_id=expected_deployment_id,
+                reason=InvalidSampleReason.HARNESS_RESULT_ERROR,
+                evidence=_sample_outcome_evidence(score=score, extra=extra),
+                extra={
+                    **extra,
+                    "failure_owner": (
+                        extra.get("failure_owner")
+                        or FailureOwner.HARNESS.value
+                    ),
+                    "request_dispatched": _request_dispatched(extra),
+                },
+            )
+            self.metrics.record_invalid(latency_ms=latency_ms)
             return
         await self._samples.persist(
             miner_hotkey=miner.hotkey,
@@ -1339,38 +1935,62 @@ def _sample_outcome_evidence(
     )
 
 
-def _runtime_signature_hash(
-    *,
-    environment: str,
-    evidence: SampleOutcomeEvidence,
-    classification: str,
+def _model_behavior_evidence(
+    extra: Dict[str, Any],
+) -> ModelBehaviorEvidence | None:
+    raw = extra.get("model_behavior")
+    structured = raw if isinstance(raw, dict) else extra
+    return ModelBehaviorEvidence.from_mapping(structured)
+
+
+def _runtime_task_hash(
+    *, environment: str, task_id: int, refresh_block: int,
 ) -> str:
-    """Hash the complete invariant signature without retaining raw fields."""
+    """Hash task identity separately so retries dedupe without raw IDs."""
     return _stable_runtime_hash({
-        "kind": "runtime-invariant-signature-v1",
+        "kind": "runtime-task-instance-v2",
         "environment": environment,
-        "score": evidence.score,
-        "terminated_reason": (
-            str(evidence.terminated_reason)
-            .replace("\n", " ")
-            .replace("\r", " ")[:256]
-            if evidence.terminated_reason is not None
-            else None
-        ),
-        "commands_executed": evidence.commands_executed,
-        "llm_call_count": evidence.llm_call_count,
-        "total_tokens": evidence.total_tokens,
-        "output_bytes": evidence.output_bytes,
-        "classification": classification,
+        "task_id": int(task_id),
+        "refresh_block": int(refresh_block),
     })
 
 
-def _runtime_task_hash(*, environment: str, task_id: int) -> str:
-    """Hash task identity separately so retries dedupe without raw IDs."""
+def _failure_owner(value: Any) -> FailureOwner:
+    try:
+        return FailureOwner(str(value))
+    except ValueError:
+        return FailureOwner.UNKNOWN
+
+
+def _strict_bool_or_none(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _request_dispatched(extra: Dict[str, Any]) -> bool | None:
+    canonical = _strict_bool_or_none(extra.get("request_dispatched"))
+    if canonical is not None:
+        return canonical
+    return _strict_bool_or_none(extra.get("request_attempted"))
+
+
+def _safe_identifier(value: Any) -> str | None:
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    return text[:256] if text else None
+
+
+def _template_key_hash(environment: str, extra: Dict[str, Any]) -> str | None:
+    template_key = (
+        _safe_identifier(extra.get("template_family_id"))
+        or _safe_identifier(extra.get("template_id"))
+    )
+    if template_key is None:
+        return None
     return _stable_runtime_hash({
-        "kind": "runtime-invariant-task-v1",
-        "environment": environment,
-        "task_id": int(task_id),
+        "kind": "behavior-template-family-v1",
+        "environment": str(environment),
+        "template_key": template_key,
     })
 
 
@@ -1407,38 +2027,3 @@ def _resolve_deployment_id(
         if d.base_url == base_url:
             return d.deployment_id
     return legacy_id
-
-
-# Pre-refactor parity (see PR #439): only errors that point at a miner
-# capability limit get persisted as a real zero-score sample. Everything
-# else is transport / env-side flake and gets retried on the next tick.
-#
-# This is conservative on purpose. Random ``status=failed`` from the env,
-# Targon 5xx, dropped connections — none of those are the miner's fault,
-# and persisting them as 0 would let one flaky env round permanently
-# disqualify a miner. The only sanctioned zero-score-on-error class is
-# "the miner's response/prompt blew past the model context window",
-# which is a model property and won't change on retry.
-_ZERO_SCORE_ERROR_PATTERNS = (
-    "context lengths of up to",
-    "is longer than the model",
-    "exceeds the maximum allowed length",
-    "exceeds the maximum context length",
-)
-
-
-def _is_zero_score_error(exc: BaseException) -> bool:
-    """Walk the cause chain and check each layer's message for a known
-    miner-capability-limit pattern. We walk the chain because affinetes
-    wraps the original error several times (ExecutionError → BackendError
-    → EnvironmentError) and the substring of interest can live on any
-    layer."""
-    seen: List[BaseException] = []
-    cur: Optional[BaseException] = exc
-    while cur is not None and cur not in seen:
-        msg = str(cur).lower()
-        if any(p in msg for p in _ZERO_SCORE_ERROR_PATTERNS):
-            return True
-        seen.append(cur)
-        cur = cur.__cause__ or cur.__context__
-    return False

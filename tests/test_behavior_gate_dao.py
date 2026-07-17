@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
@@ -36,7 +37,21 @@ class _FakeDynamoClient:
         self.put_calls.append(kwargs)
         key = self._item_key(kwargs["Item"])
         if kwargs.get("ConditionExpression") and key in self.items:
-            raise _conditional_error()
+            existing = self.items[key]
+            values = kwargs.get("ExpressionAttributeValues", {})
+            write_now = int(values.get(":write_now", {}).get("N", "-1"))
+            existing_ttl = (
+                int(existing["ttl"]["N"]) if "ttl" in existing else None
+            )
+            permits_expired = "#ttl <= :write_now" in kwargs[
+                "ConditionExpression"
+            ]
+            if (
+                not permits_expired
+                or existing_ttl is None
+                or existing_ttl > write_now
+            ):
+                raise _conditional_error()
         self.items[key] = kwargs["Item"]
         return {}
 
@@ -50,7 +65,45 @@ class _FakeDynamoClient:
         if self.update_errors:
             raise self.update_errors.pop(0)
         update_expression = kwargs.get("UpdateExpression", "")
-        if "promotion_sealed_at" in update_expression:
+        if "admission_expired_at" in update_expression:
+            key = (
+                kwargs["Key"]["pk"]["S"],
+                kwargs["Key"]["sk"]["S"],
+            )
+            existing = self.items.get(key, {})
+            values = kwargs["ExpressionAttributeValues"]
+            status = existing.get("status", {}).get("S")
+            deadline = int(
+                existing.get("admission_deadline_at", {}).get("N", "0")
+            )
+            now = int(values[":now"]["N"])
+            if status in {"passed", "failed", "expired"} or deadline > now:
+                raise _conditional_error()
+            row = dict(existing)
+            row.update({
+                "status": values[":expired"],
+                "reason_code": values[":reason"],
+                "admission_expired_at": values[":now"],
+                "updated_at": values[":now"],
+            })
+            row.setdefault("decided_at", values[":now"])
+            row.pop("lease_owner", None)
+            row.pop("lease_expires_at", None)
+            self.items[key] = row
+        elif "admission_deadline_at" in update_expression:
+            key = (
+                kwargs["Key"]["pk"]["S"],
+                kwargs["Key"]["sk"]["S"],
+            )
+            existing = self.items.get(key, {})
+            if "admission_deadline_at" in existing:
+                raise _conditional_error()
+            row = dict(existing)
+            row["admission_deadline_at"] = kwargs[
+                "ExpressionAttributeValues"
+            ][":deadline"]
+            self.items[key] = row
+        elif "promotion_sealed_at" in update_expression:
             key = (
                 kwargs["Key"]["pk"]["S"],
                 kwargs["Key"]["sk"]["S"],
@@ -62,6 +115,40 @@ class _FakeDynamoClient:
             row = dict(existing)
             row.setdefault("promotion_sealed_at", values[":now"])
             row["updated_at"] = values[":now"]
+            self.items[key] = row
+        elif kwargs["Key"]["sk"]["S"] == "STATE":
+            key = (
+                kwargs["Key"]["pk"]["S"],
+                kwargs["Key"]["sk"]["S"],
+            )
+            existing = self.items.get(key, {})
+            values = kwargs["ExpressionAttributeValues"]
+            incoming = values[":status"]["S"]
+            if (
+                kwargs.get("ConditionExpression")
+                and existing.get("status", {}).get("S") == "quarantined"
+                and incoming != "quarantined"
+                and int(existing.get("ttl", {}).get("N", "0"))
+                > int(values.get(":wall_now", {}).get("N", "-1"))
+            ):
+                raise _conditional_error()
+            row = dict(existing)
+            row.update({
+                "pk": kwargs["Key"]["pk"],
+                "sk": kwargs["Key"]["sk"],
+                "status": values[":status"],
+                "incident_count": values[":incidents"],
+                "distinct_subjects": values[":subjects"],
+                "distinct_task_instances": values[":tasks"],
+                "subject_threshold": values[":subject_threshold"],
+                "task_threshold": values[":task_threshold"],
+                "template_key_hash": values[":template"],
+                "updated_at": values[":now"],
+                "ttl": values[":ttl"],
+            })
+            row.setdefault("created_at", values[":now"])
+            if incoming == "quarantined":
+                row.setdefault("quarantined_at", values[":now"])
             self.items[key] = row
         elif "failure_source = :source" in update_expression:
             key = (
@@ -86,8 +173,9 @@ class _FakeDynamoClient:
                 "evidence": values[":evidence"],
                 "updated_at": values[":now"],
                 "decided_at": values[":now"],
-                "runtime_failed_at": values[":now"],
             })
+            if "model_failed_at" in update_expression:
+                row["model_failed_at"] = values[":now"]
             for field in (
                 "hotkey",
                 "revision",
@@ -164,6 +252,13 @@ def test_partition_key_is_scoped_to_policy_and_deployment():
     assert "#POLICY#v1#DEPLOY#deployment-a" in first
 
 
+def test_policy_v2_exposes_no_harness_invalid_to_failed_backdoor():
+    dao = BehaviorGateDAO()
+
+    assert not hasattr(dao, "record_runtime_invariant_observation")
+    assert not hasattr(dao, "fail_runtime_invariant")
+
+
 @pytest.mark.asyncio
 async def test_ensure_pending_is_conditional_and_preserves_existing(fake_client):
     dao = BehaviorGateDAO()
@@ -176,6 +271,83 @@ async def test_ensure_pending_is_conditional_and_preserves_existing(fake_client)
     assert fake_client.put_calls[0]["ConditionExpression"] == (
         "attribute_not_exists(pk) AND attribute_not_exists(sk)"
     )
+
+
+@pytest.mark.asyncio
+async def test_ensure_pending_anchors_and_backfills_deadline_without_extension(
+    fake_client,
+):
+    dao = BehaviorGateDAO()
+    created = await dao.ensure_pending(
+        "hk", "rev", "v1", "new", now=100, admission_deadline_at=400,
+    )
+    repeated = await dao.ensure_pending(
+        "hk", "rev", "v1", "new", now=200, admission_deadline_at=900,
+    )
+    assert created["admission_deadline_at"] == 400
+    assert repeated["admission_deadline_at"] == 400
+
+    # Simulate a row written by v1, then let v2 atomically backfill it.  A
+    # subsequent coordinator cannot move the deadline farther into the future.
+    legacy = await dao.ensure_pending("hk", "rev", "v1", "legacy", now=100)
+    assert "admission_deadline_at" not in legacy
+    backfilled = await dao.ensure_pending(
+        "hk", "rev", "v1", "legacy", now=200, admission_deadline_at=500,
+    )
+    not_extended = await dao.ensure_pending(
+        "hk", "rev", "v1", "legacy", now=300, admission_deadline_at=800,
+    )
+    assert backfilled["admission_deadline_at"] == 500
+    assert not_extended["admission_deadline_at"] == 500
+    deadline_updates = [
+        call for call in fake_client.update_calls
+        if "admission_deadline_at" in call.get("UpdateExpression", "")
+    ]
+    assert all(
+        "if_not_exists(admission_deadline_at, :deadline)"
+        in call["UpdateExpression"]
+        for call in deadline_updates
+    )
+    assert all(
+        call["ConditionExpression"]
+        == "attribute_not_exists(admission_deadline_at)"
+        for call in deadline_updates
+    )
+
+
+@pytest.mark.asyncio
+async def test_admission_expiry_is_single_claim_control_final(fake_client):
+    dao = BehaviorGateDAO()
+    await dao.ensure_pending(
+        "hk", "rev", "v2", "dep",
+        now=100,
+        admission_deadline_at=400,
+    )
+
+    assert not await dao.claim_expired_admission(
+        "hk", "rev", "v2", "dep", now=399,
+    )
+    claims = await asyncio.gather(*(
+        dao.claim_expired_admission(
+            "hk", "rev", "v2", "dep", now=400,
+        )
+        for _ in range(2)
+    ))
+    assert claims.count(True) == 1
+    assert claims.count(False) == 1
+
+    verdict = await dao.get_verdict("hk", "rev", "v2", "dep")
+    assert verdict["status"] == "expired"
+    assert verdict["reason_code"] == "deployment_admission_deadline_exceeded"
+    assert verdict["admission_expired_at"] == 400
+    assert "lease_owner" not in verdict
+    assert not await dao.claim_expired_admission(
+        "hk", "rev", "v2", "dep", now=500,
+    )
+
+    assert ":expired" in fake_client.update_calls[-1][
+        "ExpressionAttributeValues"
+    ]
 
 
 @pytest.mark.asyncio
@@ -225,81 +397,41 @@ async def test_attempt_write_is_idempotent_and_drops_raw_evidence(fake_client):
 
 
 @pytest.mark.asyncio
-async def test_runtime_observations_count_distinct_tasks_per_signature(fake_client):
+async def test_expired_ttl_row_can_be_atomically_replaced(
+    fake_client,
+    monkeypatch,
+):
+    monkeypatch.setattr(behavior_gate_mod.time, "time", lambda: 100)
     dao = BehaviorGateDAO()
-    signature = "a" * 64
-    first_task = "b" * 64
-    second_task = "c" * 64
 
-    first = await dao.record_runtime_invariant_observation(
-        "hk", "rev", "v1", "dep",
-        signature_hash=signature,
-        task_hash=first_task,
-        classification="harness_invalid",
-        evidence={"task_id": 101, "terminated_reason": "error_exit_3"},
-        threshold=2,
+    assert await dao.record_attempt(
+        "hk", "rev", "v2", "dep",
+        probe_id="probe-1",
+        classification="clean",
+        created_at=100,
+        ttl_days=1,
     )
-    duplicate = await dao.record_runtime_invariant_observation(
-        "hk", "rev", "v1", "dep",
-        signature_hash=signature,
-        task_hash=first_task,
-        classification="harness_invalid",
-        evidence={"task_id": 101, "terminated_reason": "error_exit_3"},
-        threshold=2,
+    key = next(
+        key for key in fake_client.items
+        if key[1] == "ATTEMPT#probe-1"
     )
-    second = await dao.record_runtime_invariant_observation(
-        "hk", "rev", "v1", "dep",
-        signature_hash=signature,
-        task_hash=second_task,
-        classification="harness_invalid",
-        evidence={"task_id": 102, "terminated_reason": "error_exit_3"},
-        threshold=2,
-    )
+    fake_client.items[key]["ttl"] = {"N": "99"}
 
-    assert (first, duplicate, second) == (1, 1, 2)
-    assert len(fake_client.put_calls) == 3
-    assert len(fake_client.items) == 2
-    count_query = fake_client.query_calls[-1]
-    assert count_query["ConsistentRead"] is True
-    assert count_query["Select"] == "COUNT"
-    assert count_query["Limit"] == 2
-
-
-@pytest.mark.asyncio
-async def test_promotion_seal_wins_atomic_race_against_runtime_failure(fake_client):
-    dao = BehaviorGateDAO()
-    key = dao._key("hk", "rev", "v1", "dep", "VERDICT")
-    item_key = key["pk"]["S"], key["sk"]["S"]
-    fake_client.items[item_key] = dao._serialize({
-        "pk": item_key[0],
-        "sk": item_key[1],
-        "status": "passed",
-        "reason_code": "preflight_passed",
-    })
-
-    assert await dao.seal_for_promotion(
-        "hk", "rev", "v1", "dep", now=450,
+    assert await dao.record_attempt(
+        "hk", "rev", "v2", "dep",
+        probe_id="probe-1",
+        classification="model_no_progress",
+        created_at=101,
+        ttl_days=1,
     )
-    assert await dao.seal_for_promotion(
-        "hk", "rev", "v1", "dep", now=451,
-    )
-    assert not await dao.fail_runtime_invariant(
-        "hk",
-        "rev",
-        "v1",
-        "dep",
-        reason_code="too_late",
-        evidence={"task_id": 1},
-        now=500,
-    )
+    replaced = dao._deserialize(fake_client.items[key])
+    assert replaced["classification"] == "model_no_progress"
+    assert replaced["created_at"] == 101
 
-    verdict = await dao.get_verdict("hk", "rev", "v1", "dep")
-    assert verdict["status"] == "passed"
-    assert verdict["promotion_sealed_at"] == 450
-    runtime_update = fake_client.update_calls[-1]
-    assert "attribute_not_exists(promotion_sealed_at)" in (
-        runtime_update["ConditionExpression"]
-    )
+    put = fake_client.put_calls[-1]
+    assert "#ttl <= :write_now" in put["ConditionExpression"]
+    assert put["ExpressionAttributeNames"] == {"#ttl": "ttl"}
+    assert put["ExpressionAttributeValues"][":write_now"] == {"N": "100"}
 
 
 @pytest.mark.asyncio
@@ -412,143 +544,295 @@ async def test_final_verdict_is_frozen_and_same_result_is_idempotent(fake_client
 
 
 @pytest.mark.asyncio
-async def test_runtime_invariant_atomically_overrides_pass_and_clears_lease(
+async def test_invalid_sample_completion_survives_deployment_and_policy_rotation(
     fake_client,
 ):
     dao = BehaviorGateDAO()
-    key = dao._key("hk", "rev", "v1", "dep", "VERDICT")
+    template = "a" * 64
+
+    assert await dao.record_invalid_sample(
+        "hk",
+        "rev",
+        "TERMINAL",
+        900,
+        101,
+        reason_code="positive_score_zero_activity",
+        template_key_hash=template,
+        evidence={
+            "score": 1.0,
+            "llm_call_count": 0,
+            "content": "must not be persisted",
+        },
+        created_at=100,
+    )
+    assert not await dao.record_invalid_sample(
+        "hk",
+        "rev",
+        "TERMINAL",
+        900,
+        101,
+        reason_code="duplicate",
+        template_key_hash=template,
+        created_at=200,
+    )
+    assert await dao.record_invalid_sample(
+        "hk",
+        "rev",
+        "TERMINAL",
+        900,
+        102,
+        reason_code="positive_score_zero_activity",
+        created_at=100,
+    )
+
+    assert await dao.list_invalid_sample_task_ids(
+        "hk", "rev", "TERMINAL", 900,
+    ) == {101, 102}
+    assert await dao.list_invalid_sample_task_ids(
+        "hk", "rev", "TERMINAL", 900, task_ids=[102, 999],
+    ) == {102}
+    assert await dao.list_invalid_sample_task_ids(
+        "hk", "rev", "TERMINAL", 901,
+    ) == set()
+
+    rows = [
+        dao._deserialize(item)
+        for item in fake_client.items.values()
+        if item["sk"]["S"].startswith("INVALID_SAMPLE#")
+    ]
+    assert len(rows) == 2
+    assert all("POLICY#" not in row["pk"] for row in rows)
+    assert all("DEPLOY#" not in row["pk"] for row in rows)
+    assert rows[0]["sample_status"] == "invalid"
+    assert "score" not in rows[0]
+    assert "content" not in rows[0]["evidence"]
+
+
+@pytest.mark.asyncio
+async def test_template_breaker_requires_cross_subject_evidence_for_global_task(
+    fake_client,
+):
+    dao = BehaviorGateDAO()
+    catalog = "1" * 64
+    family = "2" * 64
+
+    first = await dao.record_template_incident(
+        "policy-v2",
+        "TERMINAL",
+        catalog,
+        family,
+        subject_hash="3" * 64,
+        deployment_hash="4" * 64,
+        task_instance_hash="5" * 64,
+        task_id=101,
+        reason_code="positive_score_zero_activity",
+        created_at=100,
+    )
+    assert first["status"] == "suspected"
+    assert first["distinct_subjects"] == 1
+    assert first["distinct_task_instances"] == 1
+    # One subject proves only that subject's sample was invalid; a transient
+    # telemetry failure must not suppress the task for every UID.
+    assert await dao.list_invalid_task_ids(
+        "policy-v2", "TERMINAL", catalog,
+    ) == set()
+
+    same_subject_new_task = await dao.record_template_incident(
+        "policy-v2",
+        "TERMINAL",
+        catalog,
+        family,
+        subject_hash="3" * 64,
+        deployment_hash="6" * 64,
+        task_instance_hash="7" * 64,
+        task_id=102,
+        reason_code="positive_score_zero_activity",
+        created_at=101,
+    )
+    assert same_subject_new_task["status"] == "suspected"
+    assert same_subject_new_task["distinct_subjects"] == 1
+    assert same_subject_new_task["distinct_task_instances"] == 2
+    assert await dao.list_invalid_task_ids(
+        "policy-v2", "TERMINAL", catalog,
+    ) == set()
+
+    second_subject = await dao.record_template_incident(
+        "policy-v2",
+        "TERMINAL",
+        catalog,
+        family,
+        subject_hash="8" * 64,
+        deployment_hash="9" * 64,
+        task_instance_hash="7" * 64,
+        task_id=102,
+        reason_code="positive_score_zero_activity",
+        created_at=102,
+    )
+    assert second_subject["status"] == "quarantined"
+    assert second_subject["distinct_subjects"] == 2
+    assert second_subject["distinct_task_instances"] == 2
+    assert await dao.list_invalid_task_ids(
+        "policy-v2", "TERMINAL", catalog,
+    ) == {101, 102}
+    assert await dao.list_invalid_task_ids(
+        "policy-v2", "TERMINAL", catalog, task_ids=[102, 999],
+    ) == {102}
+
+    health = await dao.get_template_health(
+        "policy-v2", "TERMINAL", catalog, family,
+    )
+    assert health is not None
+    assert health["status"] == "quarantined"
+    assert health["distinct_subjects"] == 2
+    assert health["distinct_task_instances"] == 2
+    assert health["quarantined_at"] == 102
+
+    state_updates = [
+        call for call in fake_client.update_calls
+        if call["Key"]["sk"]["S"] == "STATE"
+    ]
+    assert state_updates
+    assert all("#ttl = :ttl" in call["UpdateExpression"] for call in state_updates)
+    assert all(
+        call["ExpressionAttributeNames"]["#ttl"] == "ttl"
+        for call in state_updates
+    )
+
+    # Catalog revision is part of both task and family scope, so a fixed image
+    # does not inherit stale quarantine state from the previous window.
+    other_catalog = "a" * 64
+    assert await dao.list_invalid_task_ids(
+        "policy-v2", "TERMINAL", other_catalog,
+    ) == set()
+    assert await dao.get_template_health(
+        "policy-v2", "TERMINAL", other_catalog, family,
+    ) is None
+
+
+def _model_attribution(**overrides):
+    value = {
+        "failure_owner": "model",
+        "request_dispatched": True,
+        "request_reached_model": True,
+        "endpoint_healthy": True,
+        "template_healthy": True,
+    }
+    value.update(overrides)
+    return value
+
+
+@pytest.mark.asyncio
+async def test_model_observations_require_structured_ownership_and_distinct_families(
+    fake_client,
+):
+    dao = BehaviorGateDAO()
+
+    with pytest.raises(ValueError, match="classification must be model-owned"):
+        await dao.record_model_observation(
+            "hk", "rev", "v2", "dep",
+            classification="harness_invalid",
+            template_key_hash="1" * 64,
+            task_hash="2" * 64,
+            attribution=_model_attribution(),
+        )
+    with pytest.raises(ValueError, match="request_reached_model"):
+        await dao.record_model_observation(
+            "hk", "rev", "v2", "dep",
+            classification="model_no_progress",
+            template_key_hash="1" * 64,
+            task_hash="2" * 64,
+            attribution=_model_attribution(request_reached_model=False),
+        )
+
+    first = await dao.record_model_observation(
+        "hk", "rev", "v2", "dep",
+        classification="model_no_progress",
+        template_key_hash="1" * 64,
+        task_hash="2" * 64,
+        attribution=_model_attribution(),
+        evidence={
+            "deadline_exceeded": True,
+            "progress_deadline_ms": 90_000,
+            "message": "raw model text",
+        },
+    )
+    duplicate_family = await dao.record_model_observation(
+        "hk", "rev", "v2", "dep",
+        classification="model_protocol_failure",
+        template_key_hash="1" * 64,
+        task_hash="3" * 64,
+        attribution=_model_attribution(),
+    )
+    assert (first, duplicate_family) == (1, 1)
+    assert not await dao.fail_model_behavior(
+        "hk", "rev", "v2", "dep",
+        classification="model_no_progress",
+        reason_code="model_progress_deadline",
+        attribution=_model_attribution(),
+    )
+
+    second = await dao.record_model_observation(
+        "hk", "rev", "v2", "dep",
+        classification="model_protocol_failure",
+        template_key_hash="4" * 64,
+        task_hash="5" * 64,
+        attribution=_model_attribution(
+            endpoint_healthy=None,
+            endpoint_health="healthy",
+            template_healthy=None,
+            template_health="healthy",
+        ),
+    )
+    assert second == 2
+    assert await dao.fail_model_behavior(
+        "hk", "rev", "v2", "dep",
+        classification="model_no_progress",
+        reason_code="model_progress_deadline",
+        attribution=_model_attribution(),
+        evidence={"message": "must not persist"},
+        now=500,
+    )
+
+    verdict = await dao.get_verdict("hk", "rev", "v2", "dep")
+    assert verdict["status"] == "failed"
+    assert verdict["failure_source"] == "model_behavior"
+    assert verdict["model_failed_at"] == 500
+    assert verdict["counts"]["distinct_template_families"] == 2
+    assert verdict["counts"]["strikes"] == 2
+    assert verdict["evidence"]["failure_owner"] == "model"
+    assert verdict["evidence"]["request_reached_model"] is True
+    assert "message" not in verdict["evidence"]
+
+
+@pytest.mark.asyncio
+async def test_model_failure_cannot_cross_promotion_seal(fake_client):
+    dao = BehaviorGateDAO()
+    for index, template in enumerate(("a" * 64, "b" * 64)):
+        await dao.record_model_observation(
+            "hk", "rev", "v2", "dep",
+            classification="model_no_progress",
+            template_key_hash=template,
+            task_hash=str(index + 1) * 64,
+            attribution=_model_attribution(),
+        )
+
+    key = dao._key("hk", "rev", "v2", "dep", "VERDICT")
     item_key = key["pk"]["S"], key["sk"]["S"]
     fake_client.items[item_key] = dao._serialize({
         "pk": item_key[0],
         "sk": item_key[1],
         "status": "passed",
-        "reason_code": "preflight_passed",
-        "evidence": {"stream_completed": True},
-        "lease_owner": "stale-worker",
-        "lease_expires_at": 999,
-        "decided_at": 100,
+        "promotion_sealed_at": 400,
     })
+    fake_client.update_errors.append(_conditional_error())
 
-    assert await dao.fail_runtime_invariant(
-        "hk",
-        "rev",
-        "v1",
-        "dep",
-        reason_code="positive_score_zero_activity",
-        evidence={
-            "invariant_name": "uid208_zero_activity",
-            "score": 1.0,
-            "commands_executed": 0,
-            "llm_call_count": 0,
-            "total_tokens": 0,
-            "output_bytes": 0,
-            "terminated_reason": "error_exit_3",
-            "content": "raw model output must be dropped",
-            "tool_arguments": {"secret": True},
-        },
-        counts={"runtime_invariant_failures": 1},
+    assert not await dao.fail_model_behavior(
+        "hk", "rev", "v2", "dep",
+        classification="model_no_progress",
+        reason_code="too_late",
+        attribution=_model_attribution(),
         now=500,
     )
-
-    verdict = await dao.get_verdict("hk", "rev", "v1", "dep")
-    assert verdict["status"] == "failed"
-    assert verdict["failure_source"] == "runtime_invariant"
-    assert verdict["reason_code"] == "positive_score_zero_activity"
-    assert verdict["decided_at"] == 500
-    assert verdict["runtime_failed_at"] == 500
-    assert "lease_owner" not in verdict
-    assert "lease_expires_at" not in verdict
-    assert verdict["counts"] == {"runtime_invariant_failures": 1}
-    assert verdict["evidence"] == {
-        "invariant_name": "uid208_zero_activity",
-        "score": 1.0,
-        "commands_executed": 0,
-        "llm_call_count": 0,
-        "total_tokens": 0,
-        "output_bytes": 0,
-        "terminated_reason": "error_exit_3",
-    }
-    update = fake_client.update_calls[-1]
-    assert update["ConditionExpression"] == (
-        "(attribute_not_exists(#status) OR #status <> :failed) "
-        "AND attribute_not_exists(promotion_sealed_at)"
-    )
-    assert "REMOVE lease_owner, lease_expires_at" in update["UpdateExpression"]
-
-
-@pytest.mark.asyncio
-async def test_runtime_invariant_missing_row_creates_failed_verdict(fake_client):
-    dao = BehaviorGateDAO()
-
-    assert await dao.fail_runtime_invariant(
-        "hk",
-        "rev",
-        "v1",
-        "dep",
-        reason_code="runtime invariant",
-        evidence={"sample_invariant": "zero activity"},
-        now=600,
-    )
-
-    verdict = await dao.get_verdict("hk", "rev", "v1", "dep")
-    assert verdict["status"] == "failed"
-    assert verdict["reason_code"] == "runtime_invariant"
-    assert verdict["evidence"] == {"sample_invariant": "zero_activity"}
-    assert verdict["created_at"] == 600
-
-
-@pytest.mark.asyncio
-async def test_runtime_invariant_concurrent_and_already_failed_are_idempotent(
-    fake_client,
-):
-    import asyncio
-
-    dao = BehaviorGateDAO()
-    results = await asyncio.gather(*(
-        dao.fail_runtime_invariant(
-            "hk",
-            "rev",
-            "v1",
-            "dep",
-            reason_code=f"race_{index}",
-            evidence={"task_id": index},
-            now=700 + index,
-        )
-        for index in range(2)
-    ))
-
-    assert results == [True, True]
-    verdict = await dao.get_verdict("hk", "rev", "v1", "dep")
-    assert verdict["status"] == "failed"
-    first_reason = verdict["reason_code"]
-    first_decided_at = verdict["decided_at"]
-
-    # A later duplicate observes FAILED and reports success without mutating
-    # the winning call's reason, evidence, or timestamps.
-    assert await dao.fail_runtime_invariant(
-        "hk",
-        "rev",
-        "v1",
-        "dep",
-        reason_code="late_duplicate",
-        evidence={"task_id": 999},
-        now=999,
-    )
-    frozen = await dao.get_verdict("hk", "rev", "v1", "dep")
-    assert frozen["reason_code"] == first_reason
-    assert frozen["decided_at"] == first_decided_at
-
-    # Ordinary preflight writers can never resurrect a runtime-failed row.
-    fake_client.update_errors.append(_conditional_error())
-    assert not await dao.set_verdict(
-        "hk",
-        "rev",
-        "v1",
-        "dep",
-        status="passed",
-        reason_code="must_not_resurrect",
-        now=1_000,
-    )
-    still_failed = await dao.get_verdict("hk", "rev", "v1", "dep")
-    assert still_failed["status"] == "failed"
-    assert still_failed["reason_code"] == first_reason
+    verdict = await dao.get_verdict("hk", "rev", "v2", "dep")
+    assert verdict["status"] == "passed"
+    assert verdict["promotion_sealed_at"] == 400
