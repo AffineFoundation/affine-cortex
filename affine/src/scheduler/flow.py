@@ -151,6 +151,20 @@ def _is_system_miner(miner: MinerSnapshot) -> bool:
     )
 
 
+def _runtime_record_miner(
+    record: ChampionRecord | BattleRecord,
+) -> MinerSnapshot:
+    if isinstance(record, BattleRecord):
+        return record.challenger
+    return MinerSnapshot(
+        uid=record.uid,
+        hotkey=record.hotkey,
+        revision=record.revision,
+        model=record.model,
+        model_type=record.model_type,
+    )
+
+
 def _format_cause_chain(exc: BaseException, *, max_depth: int = 8) -> str:
     """Render ``exc``'s ``__cause__`` chain as a `` -> Type: msg`` suffix so
     the real underlying error (docker stderr, sglang argv reject, HF auth,
@@ -268,18 +282,26 @@ seconds. Used by the orphan reaper to tell whether an ``in_progress`` claim
 belongs to an older endpoint generation. Optional for providers without
 endpoint lifecycle metadata."""
 
+RuntimeDeploymentRecord = ChampionRecord | BattleRecord
+
 DeploymentHealthFn = Callable[
-    [ChampionRecord], Awaitable[bool | DeploymentHealthResult]
+    [RuntimeDeploymentRecord], Awaitable[bool | DeploymentHealthResult]
 ]
-"""Classify whether a persisted champion deployment is still serving the
-saved champion identity. Boolean callbacks remain supported for providers
+"""Classify whether the active champion or challenger runtime still serves
+the saved miner identity. Boolean callbacks remain supported for providers
 using the legacy contract."""
 
 DeploymentTransportRepairFn = Callable[
-    [ChampionRecord, DeploymentHealthResult], Awaitable[bool]
+    [RuntimeDeploymentRecord, DeploymentHealthResult], Awaitable[bool]
 ]
 """Request repair of the transport in front of a healthy model runtime.
 Return whether the transport is managed and a repair is pending."""
+
+DeploymentEndpointRepairFn = Callable[
+    [RuntimeDeploymentRecord, DeploymentHealthResult], Awaitable[bool]
+]
+"""Request replacement of an endpoint whose control plane and public path
+remain unavailable. Return whether a fenced replacement is pending."""
 
 
 @dataclass
@@ -299,6 +321,8 @@ class FlowConfig:
     """
     deployment_health_failure_threshold: int = 3
     """Consecutive inconclusive readiness failures required before repair."""
+    deployment_unknown_failure_threshold: int = 5
+    """Consecutive control-plane failures required before endpoint replacement."""
 
     def __post_init__(self) -> None:
         if self.task_pool_refresh_blocks is None:
@@ -312,6 +336,10 @@ class FlowConfig:
         self.deployment_health_failure_threshold = _positive_int_config(
             self.deployment_health_failure_threshold,
             source="FlowConfig.deployment_health_failure_threshold",
+        )
+        self.deployment_unknown_failure_threshold = _positive_int_config(
+            self.deployment_unknown_failure_threshold,
+            source="FlowConfig.deployment_unknown_failure_threshold",
         )
 
 
@@ -339,6 +367,9 @@ class FlowScheduler:
         deployment_transport_repair_fn: Optional[
             DeploymentTransportRepairFn
         ] = None,
+        deployment_endpoint_repair_fn: Optional[
+            DeploymentEndpointRepairFn
+        ] = None,
         sample_metrics_reader: Optional[SampleMetricsReader] = None,
         behavior_gate_dao: Any = None,
         transition_deployment_role_fn: Optional[
@@ -364,8 +395,9 @@ class FlowScheduler:
         )
         self._deployment_health = deployment_health_fn
         self._deployment_transport_repair = deployment_transport_repair_fn
+        self._deployment_endpoint_repair = deployment_endpoint_repair_fn
         self._deployment_health_failure: Optional[
-            Tuple[str, str, DeploymentHealthState, int]
+            Tuple[str, str, str, DeploymentHealthState, int]
         ] = None
         self._behavior_gate_dao = behavior_gate_dao
         self._transition_deployment_role = transition_deployment_role_fn
@@ -489,6 +521,14 @@ class FlowScheduler:
                 await self._decide_invalidation_lost(champion, battle)
                 return
 
+        # Reconcile whichever model is actually running. During a battle the
+        # challenger owns the single-instance endpoint, so checking only the
+        # champion would leave a broken tunnel or exited challenger unnoticed.
+        runtime_record: RuntimeDeploymentRecord = battle or champion
+        if not await self._recover_unhealthy_runtime_deployment(runtime_record):
+            return
+
+        if battle is not None:
             gate_snapshot = await self._active_behavior_gate_snapshot(
                 battle, envs,
             )
@@ -502,15 +542,6 @@ class FlowScheduler:
                     # pending/running/suspected/deferred all keep the model's
                     # lifecycle intact while benchmark fan-out remains zero.
                     return
-
-        # Runtime health reconciliation. The deployment_id/base_url pair
-        # says what the scheduler last *successfully* started, but not
-        # whether that process is still alive. Only check while no battle
-        # is in flight: on single-model SSH endpoints the champion runtime is
-        # intentionally released once the challenger becomes active.
-        if battle is None:
-            if not await self._recover_unhealthy_champion_deployment(champion):
-                return
 
         # 5. Champion needs inference. During a single-model-endpoint battle the
         # champion may intentionally have no live deployment because its
@@ -771,22 +802,21 @@ class FlowScheduler:
             f"FlowScheduler: champion uid={champion.uid} deployed at {result.base_url}"
         )
 
-    async def _recover_unhealthy_champion_deployment(
-        self, champion: ChampionRecord,
+    async def _recover_unhealthy_runtime_deployment(
+        self,
+        record: RuntimeDeploymentRecord,
     ) -> bool:
-        """Reconcile a persisted champion runtime without overreacting.
-
-        Returns ``True`` when the caller can continue the normal flow, or
-        ``False`` when this tick performed/attempted a recovery deployment
-        and should stop just like the ordinary champion deploy path.
-        """
+        """Reconcile the champion or challenger runtime currently in use."""
         if self._deployment_health is None:
             return True
-        if not champion.deployment_id or not champion.base_url:
+        if not record.deployment_id or not record.base_url:
             return True
 
+        miner = _runtime_record_miner(record)
+        role = "challenger" if isinstance(record, BattleRecord) else "champion"
+
         try:
-            raw_health = await self._deployment_health(champion)
+            raw_health = await self._deployment_health(record)
             if isinstance(raw_health, bool):
                 health = DeploymentHealthResult(
                     DeploymentHealthState.HEALTHY
@@ -803,98 +833,211 @@ class FlowScheduler:
                 )
         except Exception as e:
             logger.warning(
-                f"FlowScheduler: champion deployment health check raised "
-                f"for uid={champion.uid} deployment_id="
-                f"{champion.deployment_id!r}; leaving state unchanged "
+                f"FlowScheduler: {role} deployment health check raised "
+                f"for uid={miner.uid} deployment_id="
+                f"{record.deployment_id!r}; leaving state unchanged "
                 f"this tick: {type(e).__name__}: {e}"
             )
             return True
 
-        deployment_id = champion.deployment_id
+        deployment_id = record.deployment_id
         if health.state is DeploymentHealthState.HEALTHY:
             self._deployment_health_failure = None
-            return True
-
-        if health.state is DeploymentHealthState.UNKNOWN:
-            self._deployment_health_failure = None
-            logger.warning(
-                f"FlowScheduler: champion uid={champion.uid} deployment "
-                f"{deployment_id!r} health is unknown "
-                f"(reason={health.reason or '-'}); preserving runtime state"
+            await self._sync_runtime_base_url(
+                record,
+                health.canonical_base_url,
             )
             return True
 
         if health.state is DeploymentHealthState.UNHEALTHY:
             self._deployment_health_failure = None
-            return await self._redeploy_unhealthy_champion(
-                champion, reason=health.reason,
+            return await self._recover_confirmed_runtime_failure(
+                record,
+                reason=health.reason,
             )
 
         previous = self._deployment_health_failure
-        marker = (deployment_id, health.identity, health.state)
+        subject = f"{role}:{miner.uid}:{miner.hotkey}:{miner.revision}"
+        marker = (subject, deployment_id, health.identity, health.state)
         failure_count = (
-            previous[3] + 1
-            if previous is not None and previous[:3] == marker
+            previous[4] + 1
+            if previous is not None and previous[:4] == marker
             else 1
         )
-        self._deployment_health_failure = (
-            deployment_id,
-            health.identity,
-            health.state,
-            failure_count,
+        self._deployment_health_failure = (*marker, failure_count)
+        threshold = (
+            self.cfg.deployment_unknown_failure_threshold
+            if health.state is DeploymentHealthState.UNKNOWN
+            else self.cfg.deployment_health_failure_threshold
         )
-        threshold = self.cfg.deployment_health_failure_threshold
         if failure_count < threshold:
             logger.warning(
-                f"FlowScheduler: champion uid={champion.uid} deployment "
+                f"FlowScheduler: {role} uid={miner.uid} deployment "
                 f"{deployment_id!r} health suspected "
                 f"({failure_count}/{threshold}, state={health.state.value}, "
                 f"reason={health.reason or '-'}); preserving runtime state"
             )
             return True
 
-        self._deployment_health_failure = None
+        if health.state is DeploymentHealthState.UNKNOWN:
+            if self._deployment_endpoint_repair is None:
+                logger.error(
+                    f"FlowScheduler: {role} uid={miner.uid} deployment "
+                    f"{deployment_id!r} control plane remains unavailable "
+                    "but no endpoint replacement callback is configured"
+                )
+                return True
+            try:
+                repair_pending = await self._deployment_endpoint_repair(
+                    record,
+                    health,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"FlowScheduler: endpoint replacement request failed for "
+                    f"{role} uid={miner.uid} deployment_id={deployment_id!r}; "
+                    f"preserving runtime state: {type(e).__name__}: {e}"
+                )
+                return True
+            if not repair_pending:
+                logger.error(
+                    f"FlowScheduler: endpoint replacement was not queued for "
+                    f"{role} uid={miner.uid} deployment_id={deployment_id!r}; "
+                    "preserving runtime state and rechecking next tick"
+                )
+                return True
+            self._deployment_health_failure = None
+            logger.warning(
+                f"FlowScheduler: requested fenced endpoint replacement for "
+                f"{role} uid={miner.uid} deployment_id={deployment_id!r} "
+                f"after {failure_count} consecutive control-plane failures"
+            )
+            return True
+
         if health.state is DeploymentHealthState.TRANSPORT_UNHEALTHY:
             if self._deployment_transport_repair is None:
                 logger.error(
-                    f"FlowScheduler: champion uid={champion.uid} deployment "
+                    f"FlowScheduler: {role} uid={miner.uid} deployment "
                     f"{deployment_id!r} transport is unhealthy but no repair "
                     "callback is configured; preserving the SGLang runtime"
                 )
                 return True
             try:
                 repair_pending = await self._deployment_transport_repair(
-                    champion,
+                    record,
                     health,
                 )
             except Exception as e:
                 logger.warning(
                     f"FlowScheduler: transport repair request failed for "
-                    f"uid={champion.uid} deployment_id={deployment_id!r}; "
+                    f"{role} uid={miner.uid} deployment_id={deployment_id!r}; "
                     f"preserving runtime state: {type(e).__name__}: {e}"
                 )
                 return True
             if not repair_pending:
                 logger.error(
-                    f"FlowScheduler: champion uid={champion.uid} deployment "
+                    f"FlowScheduler: {role} uid={miner.uid} deployment "
                     f"{deployment_id!r} transport repair was not queued; "
                     "preserving the SGLang runtime and rechecking next tick"
                 )
                 return True
+            self._deployment_health_failure = None
             logger.warning(
-                f"FlowScheduler: requested transport repair for champion "
-                f"uid={champion.uid} deployment_id={deployment_id!r} after "
-                f"{threshold} consecutive failures; preserving SGLang state"
+                f"FlowScheduler: requested transport repair for {role} "
+                f"uid={miner.uid} deployment_id={deployment_id!r} after "
+                f"{failure_count} consecutive failures; preserving SGLang state"
             )
             return True
 
-        return await self._redeploy_unhealthy_champion(
-            champion,
+        self._deployment_health_failure = None
+        return await self._recover_confirmed_runtime_failure(
+            record,
             reason=(
                 f"{health.reason or health.state.value}; "
                 f"confirmed_after={threshold}"
             ),
         )
+
+    async def _sync_runtime_base_url(
+        self,
+        record: RuntimeDeploymentRecord,
+        canonical_base_url: str,
+    ) -> None:
+        """Publish a verified endpoint URL to the state executors consume."""
+        if not canonical_base_url:
+            return
+
+        # The autoscaler may drain this deployment while the network probe is
+        # in flight. Re-read state before writing so a late health result
+        # cannot resurrect a deployment or battle that has already cleared.
+        if isinstance(record, BattleRecord):
+            current = await self.state.get_battle()
+        else:
+            current = await self.state.get_champion()
+        if current is None or type(current) is not type(record):
+            return
+        expected_miner = _runtime_record_miner(record)
+        current_miner = _runtime_record_miner(current)
+        if (
+            current.deployment_id != record.deployment_id
+            or current_miner.uid != expected_miner.uid
+            or current_miner.hotkey != expected_miner.hotkey
+            or current_miner.revision != expected_miner.revision
+        ):
+            return
+
+        deployments = list(current.deployments or [])
+        changed = current.base_url != canonical_base_url
+        for deployment in deployments:
+            if (
+                deployment.deployment_id == current.deployment_id
+                or len(deployments) == 1
+            ) and deployment.base_url != canonical_base_url:
+                deployment.base_url = canonical_base_url
+                changed = True
+        if not changed:
+            return
+        current.base_url = canonical_base_url
+        current.deployments = deployments
+        if isinstance(current, BattleRecord):
+            await self.state.set_battle(current)
+        else:
+            await self.state.set_champion(current)
+        miner = _runtime_record_miner(current)
+        logger.info(
+            f"FlowScheduler: synchronized runtime URL for uid={miner.uid} "
+            f"deployment_id={current.deployment_id!r} to {canonical_base_url!r}"
+        )
+
+    async def _recover_confirmed_runtime_failure(
+        self,
+        record: RuntimeDeploymentRecord,
+        *,
+        reason: str,
+    ) -> bool:
+        if isinstance(record, ChampionRecord):
+            return await self._redeploy_unhealthy_champion(record, reason=reason)
+
+        try:
+            await self._teardown_record(record)
+        except Exception as e:
+            logger.warning(
+                f"FlowScheduler: challenger uid={record.challenger.uid} "
+                f"runtime teardown failed during infra retry: "
+                f"{type(e).__name__}: {e}"
+            )
+        released = await self.queue.release_claim(
+            record.challenger.uid,
+            hotkey=record.challenger.hotkey,
+            revision=record.challenger.revision,
+        )
+        await self.state.clear_battle()
+        logger.warning(
+            f"FlowScheduler: challenger uid={record.challenger.uid} runtime "
+            f"is unhealthy; released it for an infra retry "
+            f"(claim_released={released}, reason={reason or '-'})"
+        )
+        return False
 
     async def _redeploy_unhealthy_champion(
         self,

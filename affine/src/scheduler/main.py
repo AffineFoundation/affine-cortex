@@ -58,6 +58,7 @@ from .flow import (
     NoEndpointCapacity,
     TransientDeployError,
 )
+from .gpu_autoscaler import enqueue_health_endpoint_replacement_request
 from .health import (
     DeploymentHealthResult,
     DeploymentHealthState,
@@ -113,6 +114,10 @@ def _endpoint_matches_target(endpoint, target) -> bool:
 
 def _is_scoring_endpoint(endpoint) -> bool:
     return (getattr(endpoint, "role", None) or "scoring") == "scoring"
+
+
+def _runtime_record_target(record):
+    return record.challenger if isinstance(record, BattleRecord) else record
 
 
 async def _resolve_live_ssh_config(
@@ -610,48 +615,49 @@ async def _run() -> None:
                 role,
             )
 
-        async def deployment_health_fn(champion):
-            if not champion.deployment_id:
+        async def deployment_health_fn(record):
+            if not record.deployment_id:
                 return DeploymentHealthResult(
                     DeploymentHealthState.UNHEALTHY,
                     reason="missing_deployment_id",
                 )
-            _name, cfg = await _resolve_ssh_cfg(champion.deployment_id)
+            _name, cfg = await _resolve_ssh_cfg(record.deployment_id)
             if cfg is None:
                 logger.warning(
-                    f"scheduler: no ssh endpoint owns champion "
-                    f"deployment_id={champion.deployment_id!r}; "
+                    f"scheduler: no ssh endpoint owns runtime "
+                    f"deployment_id={record.deployment_id!r}; "
                     f"treating deployment as unhealthy"
                 )
                 return DeploymentHealthResult(
                     DeploymentHealthState.UNHEALTHY,
                     reason="endpoint_inactive_or_removed",
                 )
+            target_record = _runtime_record_target(record)
             target = targon_lifecycle.DeployTarget(
-                uid=champion.uid,
-                hotkey=champion.hotkey,
-                model=champion.model,
-                revision=champion.revision,
-                model_type=champion.model_type,
+                uid=target_record.uid,
+                hotkey=target_record.hotkey,
+                model=target_record.model,
+                revision=target_record.revision,
+                model_type=target_record.model_type,
             )
             return await ssh_lifecycle.deployment_health(
-                cfg, target, base_url=champion.base_url,
+                cfg, target, base_url=cfg.inference_url(),
             )
 
-        async def deployment_transport_repair_fn(champion, health):
-            if not champion.deployment_id:
+        async def deployment_transport_repair_fn(record, health):
+            if not record.deployment_id:
                 return False
-            name, cfg = await _resolve_ssh_cfg(champion.deployment_id)
+            name, cfg = await _resolve_ssh_cfg(record.deployment_id)
             if cfg is None:
                 logger.warning(
                     f"scheduler: cannot request tunnel repair for deployment "
-                    f"{champion.deployment_id!r}; endpoint is no longer active"
+                    f"{record.deployment_id!r}; endpoint is no longer active"
                 )
                 return False
             queued = await _queue_ssh_tunnel_repair(
                 kv_adapter,
                 cfg,
-                deployment_id=champion.deployment_id,
+                deployment_id=record.deployment_id,
                 reason=health.reason,
                 expected_identity=health.identity,
             )
@@ -675,6 +681,33 @@ async def _run() -> None:
                     )
                 return health.identity == cfg.health_identity()
             return True
+
+        async def deployment_endpoint_repair_fn(record, health):
+            if not record.deployment_id:
+                return False
+            name, cfg = await _resolve_ssh_cfg(record.deployment_id)
+            if cfg is None:
+                return False
+            if not cfg.autoscale_managed or not cfg.autoscale_instance_id:
+                logger.error(
+                    f"scheduler: endpoint={name!r} control plane is unavailable, "
+                    "but the endpoint is not autoscaler-managed"
+                )
+                return False
+            if health.identity != cfg.health_identity():
+                logger.info(
+                    f"scheduler: skipped stale endpoint replacement for "
+                    f"endpoint={name!r}; endpoint generation changed"
+                )
+                return False
+            return await enqueue_health_endpoint_replacement_request(
+                kv_adapter,
+                endpoint_name=name,
+                instance_id=cfg.autoscale_instance_id,
+                endpoint_generation=cfg.endpoint_generation,
+                reason=health.reason,
+                now=int(time.time()),
+            )
 
         async def list_active_ssh_endpoint_names():
             return {
@@ -722,6 +755,7 @@ async def _run() -> None:
 
         deployment_health_fn = None
         deployment_transport_repair_fn = None
+        deployment_endpoint_repair_fn = None
         transition_deployment_role_fn = None
         list_active_ssh_endpoint_names = None
         list_active_ssh_endpoint_activations = None
@@ -750,6 +784,7 @@ async def _run() -> None:
         ),
         deployment_health_fn=deployment_health_fn,
         deployment_transport_repair_fn=deployment_transport_repair_fn,
+        deployment_endpoint_repair_fn=deployment_endpoint_repair_fn,
         transition_deployment_role_fn=transition_deployment_role_fn,
         sample_metrics_reader=sample_metrics_reader,
         behavior_gate_dao=BehaviorGateDAO(),

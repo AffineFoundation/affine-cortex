@@ -23,6 +23,7 @@ class DeploymentHealthResult:
     state: DeploymentHealthState
     reason: str = ""
     identity: str = ""
+    canonical_base_url: str = ""
 
 
 def tunnel_repair_request_key(endpoint_name: str) -> str:
