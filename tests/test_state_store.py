@@ -278,3 +278,28 @@ async def test_kv_adapter_signature_matches_dao():
     assert captured["set"]["param_value"] == {"uid": 1}
     assert captured["set"]["param_type"] == "dict"
     assert captured["set"]["updated_by"] == "t"
+
+
+@pytest.mark.asyncio
+async def test_kv_adapter_can_preserve_config_description():
+    from affine.src.scorer.window_state import SystemConfigKVAdapter
+
+    captured = {}
+
+    class StubDAO:
+        async def get_param(self, key):
+            assert key == "gpu_autoscaler"
+            return {"description": "GPU endpoint capacity policy"}
+
+        async def set_param(self, **kwargs):
+            captured.update(kwargs)
+
+    adapter = SystemConfigKVAdapter(StubDAO(), updated_by="gpu-autoscaler")
+    await adapter.set_preserving_metadata(
+        "gpu_autoscaler",
+        {"enabled": True, "endpoints": []},
+    )
+
+    assert captured["param_type"] == "dict"
+    assert captured["description"] == "GPU endpoint capacity policy"
+    assert captured["updated_by"] == "gpu-autoscaler"

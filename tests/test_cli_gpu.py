@@ -23,7 +23,6 @@ def test_gpu_replace_endpoint_forwards_options(monkeypatch):
             "lium-b200-1",
             "--new-slot",
             "lium-b200-2",
-            "--keep-old",
             "--dry-run",
             "--yes",
         ],
@@ -33,10 +32,56 @@ def test_gpu_replace_endpoint_forwards_options(monkeypatch):
     assert captured == {
         "old_endpoint_name": "lium-b200-1",
         "new_slot_name": "lium-b200-2",
-        "keep_old": True,
         "dry_run": True,
         "yes": True,
     }
+
+
+def test_gpu_add_endpoint_forwards_options(monkeypatch):
+    captured = {}
+
+    async def fake_add_endpoint_command(**kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.gpu_autoscaler.add_endpoint_command",
+        fake_add_endpoint_command,
+    )
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "gpu",
+            "add-endpoint",
+            "--slot",
+            "lium-b200-2",
+            "--dry-run",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert captured == {
+        "slot_name": "lium-b200-2",
+        "dry_run": True,
+        "yes": True,
+    }
+
+
+def test_gpu_replace_endpoint_rejects_removed_keep_old_option():
+    result = CliRunner().invoke(
+        cli,
+        [
+            "gpu",
+            "replace-endpoint",
+            "--old",
+            "lium-b200-1",
+            "--keep-old",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "No such option: --keep-old" in result.output
 
 
 def test_gpu_remove_endpoint_forwards_options(monkeypatch):

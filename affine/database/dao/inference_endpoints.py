@@ -16,8 +16,8 @@ dataclass below for the typed view.
 from __future__ import annotations
 
 import time
-from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import asdict, dataclass, field, replace
+from typing import Any, Dict, List, Optional, Sequence
 
 from botocore.exceptions import ClientError
 
@@ -145,6 +145,12 @@ _ASSIGNMENT_FIELDS = (
 )
 
 
+_STATIC_ENDPOINT_CONFIG_FIELDS = (
+    *_ENDPOINT_RUNTIME_IDENTITY_FIELDS,
+    "notes",
+)
+
+
 class InferenceEndpointsDAO(BaseDAO):
     """CRUD over the ``inference_endpoints`` table."""
 
@@ -174,6 +180,113 @@ class InferenceEndpointsDAO(BaseDAO):
         payload["updated_at"] = now
         payload["updated_by"] = updated_by
         return await self.put(payload)
+
+    async def stage_static_endpoint(
+        self,
+        endpoint: Endpoint,
+        *,
+        updated_by: str = "operator",
+    ) -> None:
+        """Store static endpoint config as inactive without touching assignment.
+
+        Autoscaler-managed rows have a separate owner and must only be changed
+        through the autoscaler lifecycle. The conditional update closes the
+        race between the preceding read and this write.
+        """
+        if endpoint.autoscale_managed:
+            raise ValueError("static endpoint config cannot be autoscaler-managed")
+
+        previous = await self.get(endpoint.name)
+        if previous is not None and previous.autoscale_managed:
+            raise ValueError(
+                f"endpoint {endpoint.name!r} is autoscaler-managed; use "
+                "`af gpu replace-endpoint`"
+            )
+
+        now = int(time.time())
+        config_values = {
+            field: getattr(endpoint, field)
+            for field in _STATIC_ENDPOINT_CONFIG_FIELDS
+        }
+        updated = await self._update_endpoint_fields(
+            endpoint.name,
+            set_values={
+                **config_values,
+                "active": False,
+                "autoscale_managed": False,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            condition_expression=(
+                "attribute_not_exists(#cond_managed) OR "
+                "#cond_managed = :cond_false"
+            ),
+            condition_names={"#cond_managed": "autoscale_managed"},
+            condition_values={":cond_false": False},
+            return_false_on_condition_failure=True,
+        )
+        if not updated:
+            raise ValueError(
+                f"endpoint {endpoint.name!r} became autoscaler-managed; "
+                "refusing static update"
+            )
+
+    async def activate_static_endpoint(
+        self,
+        name: str,
+        *,
+        expected_updated_by: str,
+        updated_by: str = "operator",
+    ) -> None:
+        """Activate the caller's staged config while preserving assignment."""
+        previous = await self.get(name)
+        if previous is None:
+            raise ValueError(f"endpoint {name!r} does not exist")
+        if previous.autoscale_managed:
+            raise ValueError(
+                f"endpoint {name!r} is autoscaler-managed; use "
+                "`af gpu replace-endpoint`"
+            )
+
+        now = int(time.time())
+        active_endpoint = replace(previous, active=True)
+        generation = int(previous.generation or 0)
+        activated_at = int(previous.activated_at or 0)
+        if self._activation_bump_required(previous, active_endpoint):
+            generation += 1
+            activated_at = now
+
+        updated = await self._update_endpoint_fields(
+            name,
+            set_values={
+                "active": True,
+                "generation": generation,
+                "activated_at": activated_at,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            condition_expression=(
+                "attribute_exists(#cond_pk) AND "
+                "(attribute_not_exists(#cond_managed) OR "
+                "#cond_managed = :cond_false) AND "
+                "#cond_updated_by = :cond_updated_by"
+            ),
+            condition_names={
+                "#cond_pk": "pk",
+                "#cond_managed": "autoscale_managed",
+                "#cond_updated_by": "updated_by",
+            },
+            condition_values={
+                ":cond_false": False,
+                ":cond_updated_by": expected_updated_by,
+            },
+            return_false_on_condition_failure=True,
+        )
+        if not updated:
+            raise ValueError(
+                f"endpoint {name!r} changed after its health check, became "
+                "autoscaler-managed, or was deleted; refusing static activation"
+            )
 
     @staticmethod
     def _activation_bump_required(
@@ -275,16 +388,16 @@ class InferenceEndpointsDAO(BaseDAO):
             "#cond_model": endpoint.assigned_model,
             "#cond_revision": endpoint.assigned_revision,
         }
-        for idx, (field, value) in enumerate(expected_identity.items()):
+        for idx, (field_name, value) in enumerate(expected_identity.items()):
             if value is None:
                 condition_values[":null_type"] = "NULL"
                 conditions.append(
-                    f"(attribute_not_exists({field}) OR "
-                    f"attribute_type({field}, :null_type))"
+                    f"(attribute_not_exists({field_name}) OR "
+                    f"attribute_type({field_name}, :null_type))"
                 )
                 continue
             value_key = f":expected_identity_{idx}"
-            conditions.append(f"{field} = {value_key}")
+            conditions.append(f"{field_name} = {value_key}")
             condition_values[value_key] = value
 
         return await self._update_endpoint_fields(
@@ -341,6 +454,72 @@ class InferenceEndpointsDAO(BaseDAO):
                 ":token": token,
                 ":deploying": "deploying",
             },
+            return_false_on_condition_failure=True,
+        )
+
+    async def promote_assignment(
+        self,
+        name: str,
+        *,
+        uid: int,
+        hotkey: str,
+        model: str,
+        revision: str,
+        deployment_id: str,
+        role: str = "challenger",
+        expected_roles: Sequence[str] = ("pre_challenger",),
+        updated_by: str = "scheduler",
+    ) -> bool:
+        """Atomically change a ready deployment's runtime role.
+
+        The full model identity and deployment id fence the update so an old
+        state record cannot relabel a newer owner of the same endpoint. The
+        expected predecessor roles and target role are accepted, making the
+        transition idempotent without accepting unrelated runtime roles.
+        """
+        now = int(time.time())
+        accepted_roles = tuple(dict.fromkeys((*expected_roles, role)))
+        role_conditions = []
+        condition_values: Dict[str, Any] = {
+            ":active": True,
+            ":uid": uid,
+            ":hotkey": hotkey,
+            ":model": model,
+            ":revision": revision,
+            ":deployment": deployment_id,
+            ":ready": "ready",
+        }
+        for index, accepted_role in enumerate(accepted_roles):
+            value_key = f":accepted_role_{index}"
+            role_conditions.append(f"#cond_role = {value_key}")
+            condition_values[value_key] = accepted_role
+
+        return await self._update_endpoint_fields(
+            name,
+            set_values={
+                "assignment_role": role,
+                "updated_at": now,
+                "updated_by": updated_by,
+            },
+            condition_expression=(
+                "(attribute_not_exists(#cond_active) OR "
+                "#cond_active = :active) AND "
+                "#cond_uid = :uid AND #cond_hotkey = :hotkey AND "
+                "#cond_model = :model AND #cond_revision = :revision AND "
+                "#cond_deployment = :deployment AND #cond_status = :ready "
+                f"AND ({' OR '.join(role_conditions)})"
+            ),
+            condition_names={
+                "#cond_active": "active",
+                "#cond_uid": "assigned_uid",
+                "#cond_hotkey": "assigned_hotkey",
+                "#cond_model": "assigned_model",
+                "#cond_revision": "assigned_revision",
+                "#cond_deployment": "deployment_id",
+                "#cond_status": "assignment_status",
+                "#cond_role": "assignment_role",
+            },
+            condition_values=condition_values,
             return_false_on_condition_failure=True,
         )
 
@@ -409,8 +588,8 @@ class InferenceEndpointsDAO(BaseDAO):
 
         payload = asdict(endpoint)
         payload.pop("name", None)
-        for field in _ASSIGNMENT_FIELDS:
-            payload.pop(field, None)
+        for field_name in _ASSIGNMENT_FIELDS:
+            payload.pop(field_name, None)
         payload.update({
             "active": True,
             "generation": generation,
@@ -521,17 +700,17 @@ class InferenceEndpointsDAO(BaseDAO):
         names: Dict[str, str] = {}
         values: Dict[str, Dict[str, Any]] = {}
         set_parts = []
-        for idx, (field, value) in enumerate(set_values.items()):
+        for idx, (field_name, value) in enumerate(set_values.items()):
             name_key = f"#s{idx}"
             value_key = f":v{idx}"
-            names[name_key] = field
+            names[name_key] = field_name
             values[value_key] = self._serialize({"value": value})["value"]
             set_parts.append(f"{name_key} = {value_key}")
 
         remove_parts = []
-        for idx, field in enumerate(remove_fields):
+        for idx, field_name in enumerate(remove_fields):
             name_key = f"#r{idx}"
-            names[name_key] = field
+            names[name_key] = field_name
             remove_parts.append(name_key)
 
         names.update(condition_names or {})

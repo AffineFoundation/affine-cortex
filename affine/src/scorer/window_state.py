@@ -24,7 +24,7 @@ gone. State machine "transitions" are now implicit in the read state:
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, List, Optional, Protocol
+from typing import Any, Dict, List, Mapping, Optional, Protocol
 
 
 # ---- dataclasses ----------------------------------------------------------
@@ -52,8 +52,12 @@ class DeploymentRecord:
 
 @dataclass
 class ChampionRecord:
-    """The current champion. Targon workload is owned for the champion's
-    full reign — only torn down when a challenger wins."""
+    """The current champion and, when needed, its serving deployment.
+
+    Multi-instance providers may keep this workload for the full reign.
+    Single-model SSH endpoints release it once a battle starts because the
+    completed baseline remains in ``sample_results``.
+    """
     uid: int
     hotkey: str
     revision: str
@@ -72,16 +76,15 @@ class BattleRecord:
     Two lifecycle states share this shape:
 
     * **Active battle** (``current_battle``) — the challenger the
-      comparator is currently deciding on. Deployed on the primary
-      endpoint under single-instance semantics. ``previous_champion``
-      is set so crash recovery can still terminate the displaced
-      champion and re-emit weights if a tick crashes between
-      ``set_champion(new)`` and ``clear_battle()``.
+      comparator is currently deciding on. ``previous_champion`` is set so
+      crash recovery can still terminate the displaced champion and re-emit
+      weights if a tick crashes between ``set_champion(new)`` and
+      ``clear_battle()``.
     * **Pre-deployed** (``predeployed_challengers``) — a queued miner
-      deployed onto a spare non-primary endpoint so it can accumulate
-      baseline samples in parallel with the active battle. Promotion
-      to active battle is a teardown-then-deploy on the primary;
-      sample_results survives because rows are keyed by
+      deployed onto any free endpoint so it can accumulate samples in
+      parallel with the active battle. Promotion changes its runtime role in
+      place; no model reload is required. ``sample_results`` survives role
+      changes because rows are keyed by
       ``(hotkey, revision, env, task_id, refresh_block)``, not by host
       or deployment id. ``previous_champion`` is ``None`` for these.
 
@@ -237,10 +240,10 @@ class StateStore:
     # -- pre-deployed challengers ------------------------------------------
 
     async def get_predeployed_challengers(self) -> List[BattleRecord]:
-        """Pre-deployed challengers — queued miners loaded onto spare ssh
-        endpoints so they accumulate baseline samples in parallel with
-        the active battle. Empty list when no spare endpoints exist
-        (single-machine) or no eligible queued miners remain. Uses the
+        """Pre-deployed challengers — queued miners loaded onto free ssh
+        endpoints so they accumulate samples in parallel with the active
+        battle. Empty when no endpoint is free or no eligible queued miners
+        remain. Uses the
         same :class:`BattleRecord` shape as ``current_battle`` —
         ``previous_champion`` is ``None`` for these entries (it only
         becomes meaningful at promotion)."""
@@ -430,26 +433,44 @@ class SystemConfigKVAdapter:
     async def get(self, key: str, default: Any = None) -> Any:
         return await self._dao.get_param_value(key, default=default)
 
+    @staticmethod
+    def _param_type(value: Any) -> str:
+        if isinstance(value, bool):
+            return "bool"
+        if isinstance(value, int):
+            return "int"
+        if isinstance(value, float):
+            return "float"
+        if isinstance(value, str):
+            return "str"
+        if isinstance(value, list):
+            return "list"
+        return "dict"
+
     async def set(self, key: str, value: Any) -> None:
         # Infer ``param_type`` from the value so callers don't have to.
         # SystemConfigDAO uses this column as metadata only (no validation),
         # but it's still required positional.
-        if isinstance(value, bool):
-            ptype = "bool"
-        elif isinstance(value, int):
-            ptype = "int"
-        elif isinstance(value, float):
-            ptype = "float"
-        elif isinstance(value, str):
-            ptype = "str"
-        elif isinstance(value, list):
-            ptype = "list"
-        else:
-            ptype = "dict"
         await self._dao.set_param(
             param_name=key,
             param_value=value,
-            param_type=ptype,
+            param_type=self._param_type(value),
+            updated_by=self._updated_by,
+        )
+
+    async def set_preserving_metadata(self, key: str, value: Any) -> None:
+        """Update a value without clearing the existing description."""
+        existing = await self._dao.get_param(key)
+        description = (
+            str(existing.get("description") or "")
+            if isinstance(existing, Mapping)
+            else ""
+        )
+        await self._dao.set_param(
+            param_name=key,
+            param_value=value,
+            param_type=self._param_type(value),
+            description=description,
             updated_by=self._updated_by,
         )
 
@@ -464,22 +485,10 @@ class SystemConfigKVAdapter:
         expires_at_field: str,
         now: int,
     ) -> bool:
-        if isinstance(value, bool):
-            ptype = "bool"
-        elif isinstance(value, int):
-            ptype = "int"
-        elif isinstance(value, float):
-            ptype = "float"
-        elif isinstance(value, str):
-            ptype = "str"
-        elif isinstance(value, list):
-            ptype = "list"
-        else:
-            ptype = "dict"
         return await self._dao.set_param_if_absent_or_expired(
             param_name=key,
             param_value=value,
-            param_type=ptype,
+            param_type=self._param_type(value),
             expires_at_field=expires_at_field,
             now=now,
             updated_by=self._updated_by,
@@ -534,7 +543,9 @@ def _deployment_list(raw: Dict[str, Any]) -> List[DeploymentRecord]:
     return deployments
 
 
-def _primary_deployment(deployments: List[DeploymentRecord]) -> tuple[Optional[str], Optional[str]]:
+def _representative_deployment(
+    deployments: List[DeploymentRecord],
+) -> tuple[Optional[str], Optional[str]]:
     if not deployments:
         return None, None
     first = deployments[0]
@@ -546,7 +557,7 @@ def _champion_from_dict(raw: Dict[str, Any]) -> ChampionRecord:
     deployment_id = raw.get("deployment_id")
     base_url = raw.get("base_url")
     if deployments and (not deployment_id or not base_url):
-        deployment_id, base_url = _primary_deployment(deployments)
+        deployment_id, base_url = _representative_deployment(deployments)
     return ChampionRecord(
         uid=int(raw["uid"]),
         hotkey=str(raw["hotkey"]),
@@ -581,9 +592,11 @@ def _battle_from_dict(raw: Dict[str, Any]) -> BattleRecord:
     deployment_id = str(raw.get("deployment_id") or "")
     base_url = str(raw.get("base_url") or "")
     if deployments and (not deployment_id or not base_url):
-        primary_id, primary_url = _primary_deployment(deployments)
-        deployment_id = primary_id or ""
-        base_url = primary_url or ""
+        representative_id, representative_url = _representative_deployment(
+            deployments
+        )
+        deployment_id = representative_id or ""
+        base_url = representative_url or ""
     prev_raw = raw.get("previous_champion") or {}
     previous_champion: Optional[MinerSnapshot] = None
     if isinstance(prev_raw, dict) and prev_raw.get("hotkey"):

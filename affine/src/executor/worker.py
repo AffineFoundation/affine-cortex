@@ -564,7 +564,7 @@ class ExecutorWorker:
                     )
 
         # Pre-deployed challengers: same gating as ``battle.challenger``,
-        # each on its own non-primary endpoint.
+        # each on its currently assigned endpoint.
         for record in allowed_predeployed:
             pre_urls = _base_urls(
                 record.deployments, record.base_url,
@@ -642,7 +642,15 @@ class ExecutorWorker:
         # Launch each candidate as a free-standing task. The wrapper
         # removes the key from ``in_flight_keys`` on completion so a
         # failed-but-not-persisted task can be retried next poll.
+        launched = 0
         for key, miner, task_id, base_url, dep_id in candidates:
+            # In-place promotion persists current_battle before pruning the
+            # pre-deployed list. A scheduler crash can therefore expose the
+            # same subject through both collections for one poll. Candidate
+            # construction is intentionally simple; fence duplicates at the
+            # point where ownership of the in-flight key becomes authoritative.
+            if key in in_flight_keys:
+                continue
             in_flight_keys.add(key)
             t = asyncio.create_task(
                 self._dispatch_one(
@@ -655,7 +663,8 @@ class ExecutorWorker:
             in_flight_tasks.add(t)
             if dep_id:
                 self._tasks_by_deployment.setdefault(dep_id, set()).add(t)
-        return len(candidates)
+            launched += 1
+        return launched
 
     async def _request_invalid_capacity_rotation(
         self,

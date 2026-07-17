@@ -21,6 +21,7 @@ import asyncio
 import json
 import os
 import sys
+import uuid
 from typing import Optional
 
 import click
@@ -729,15 +730,46 @@ async def _cmd_list_endpoints() -> None:
         await close_client()
 
 
-async def _cmd_set_endpoint(
+async def _probe_static_endpoint(endpoint) -> str:
+    if endpoint.kind == "ssh":
+        from affine.src.scheduler.ssh import SSHConfig, probe_host
+
+        gpu_count = await probe_host(SSHConfig.from_endpoint(endpoint))
+        required_gpus = max(1, int(endpoint.sglang_dp))
+        if gpu_count < required_gpus:
+            raise RuntimeError(
+                f"static endpoint exposes {gpu_count} NVIDIA GPU(s), but "
+                f"sglang_dp={required_gpus} requires at least {required_gpus}"
+            )
+        return f"SSH, Docker, and {gpu_count} NVIDIA GPU(s) ready"
+
+    if endpoint.kind == "targon":
+        from affine.core.providers.targon_client import TargonClient
+
+        if not endpoint.targon_api_url:
+            raise ValueError("--targon-api-url is required when --kind=targon")
+        client = TargonClient(api_url=endpoint.targon_api_url)
+        if not client.configured:
+            raise ValueError(
+                "TARGON_API_KEY is required to verify a static Targon endpoint"
+            )
+        if await client.list_workloads(limit=1) is None:
+            raise RuntimeError("Targon API health check failed")
+        return "Targon API reachable"
+
+    raise ValueError(f"unsupported static endpoint kind: {endpoint.kind!r}")
+
+
+async def _cmd_register_static_endpoint(
     name: str, kind: str, ssh_url: Optional[str], ssh_key_path: Optional[str],
-    public_inference_url: Optional[str], sglang_port: int, sglang_dp: int,
+    public_inference_url: Optional[str], targon_api_url: Optional[str],
+    role: str, sglang_port: int, sglang_dp: int,
     sglang_load_balance_method: str,
     sglang_image: str, sglang_cache_dir: str, sglang_context_len: int,
     sglang_mem_fraction: float, sglang_chunked_prefill: int,
     sglang_tool_call_parser: str, sglang_docker_arg: tuple[str, ...],
     ready_timeout_sec: int,
-    poll_interval_sec: float, active: bool, notes: Optional[str],
+    poll_interval_sec: float, activate: bool, notes: Optional[str],
 ) -> None:
     await init_client()
     try:
@@ -745,9 +777,10 @@ async def _cmd_set_endpoint(
             Endpoint, InferenceEndpointsDAO,
         )
         ep = Endpoint(
-            name=name, kind=kind, active=active,
+            name=name, kind=kind, active=False, role=role,
             ssh_url=ssh_url, ssh_key_path=ssh_key_path,
             public_inference_url=public_inference_url,
+            targon_api_url=targon_api_url,
             sglang_port=sglang_port, sglang_dp=sglang_dp,
             sglang_load_balance_method=sglang_load_balance_method,
             sglang_image=sglang_image, sglang_cache_dir=sglang_cache_dir,
@@ -760,8 +793,37 @@ async def _cmd_set_endpoint(
             poll_interval_sec=poll_interval_sec,
             notes=notes,
         )
-        await InferenceEndpointsDAO().upsert(ep, updated_by="cli:set-endpoint")
-        print(f"✓ wrote endpoint {name!r}")
+        dao = InferenceEndpointsDAO()
+        registration_owner = f"cli:register-static-endpoint:{uuid.uuid4().hex}"
+        try:
+            await dao.stage_static_endpoint(
+                ep,
+                updated_by=registration_owner,
+            )
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+        print(f"✓ registered static endpoint {name!r} as inactive")
+
+        if not activate:
+            return
+
+        try:
+            health = await _probe_static_endpoint(ep)
+        except Exception as e:
+            raise click.ClickException(
+                f"endpoint {name!r} remains inactive: {e}"
+            ) from e
+        print(f"✓ health check passed: {health}")
+
+        try:
+            await dao.activate_static_endpoint(
+                name,
+                expected_updated_by=registration_owner,
+                updated_by=registration_owner,
+            )
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
+        print(f"✓ activated static endpoint {name!r}")
     finally:
         await close_client()
 
@@ -772,7 +834,7 @@ def list_endpoints():
     asyncio.run(_cmd_list_endpoints())
 
 
-@db.command("set-endpoint")
+@db.command("register-static-endpoint")
 @click.option("--name", required=True, help="Unique label, e.g. 'ssh_b300'")
 @click.option("--kind", required=True, type=click.Choice(["ssh", "targon"]))
 @click.option("--ssh-url", default=None, help="ssh://user@host[:port] — required for kind=ssh")
@@ -780,8 +842,12 @@ def list_endpoints():
 @click.option("--public-inference-url", default=None,
               help="Override URL env containers connect to. Leave unset to "
                    "use http://<host>:<sglang_port>/v1.")
+@click.option("--targon-api-url", default=None,
+              help="Targon API URL — required for kind=targon")
+@click.option("--role", type=click.Choice(["scoring", "anticopy"]),
+              default="scoring", show_default=True)
 @click.option("--sglang-port", type=int, default=10001)
-@click.option("--sglang-dp", type=int, default=8)
+@click.option("--sglang-dp", type=click.IntRange(min=1), default=8)
 @click.option(
     "--sglang-load-balance-method",
     type=click.Choice([
@@ -801,22 +867,35 @@ def list_endpoints():
               help="Extra docker-run argument. Repeat for multiple args.")
 @click.option("--ready-timeout-sec", type=int, default=1800)
 @click.option("--poll-interval-sec", type=float, default=15.0)
-@click.option("--active/--inactive", default=True)
+@click.option(
+    "--activate/--inactive",
+    default=True,
+    show_default=True,
+    help="Run a health check and activate, or leave the registration inactive.",
+)
 @click.option("--notes", default=None)
-def set_endpoint(
-    name, kind, ssh_url, ssh_key_path, public_inference_url,
-    sglang_port, sglang_dp, sglang_load_balance_method, sglang_image,
+def register_static_endpoint(
+    name, kind, ssh_url, ssh_key_path, public_inference_url, targon_api_url,
+    role, sglang_port, sglang_dp, sglang_load_balance_method, sglang_image,
     sglang_cache_dir,
     sglang_context_len, sglang_mem_fraction, sglang_chunked_prefill,
     sglang_tool_call_parser, sglang_docker_arg, ready_timeout_sec,
-    poll_interval_sec, active, notes,
+    poll_interval_sec, activate, notes,
 ):
-    """Register or update an inference endpoint."""
+    """Register or update an operator-managed static inference endpoint.
+
+    The endpoint is stored as inactive first. Unless --inactive is passed,
+    the command verifies its control plane before activating it. Endpoint
+    names owned by the autoscaler are rejected.
+    """
     if kind == "ssh" and not ssh_url:
         raise click.UsageError("--ssh-url is required when --kind=ssh")
-    asyncio.run(_cmd_set_endpoint(
+    if kind == "targon" and not targon_api_url:
+        raise click.UsageError("--targon-api-url is required when --kind=targon")
+    asyncio.run(_cmd_register_static_endpoint(
         name=name, kind=kind, ssh_url=ssh_url, ssh_key_path=ssh_key_path,
         public_inference_url=public_inference_url,
+        targon_api_url=targon_api_url, role=role,
         sglang_port=sglang_port, sglang_dp=sglang_dp,
         sglang_load_balance_method=sglang_load_balance_method,
         sglang_image=sglang_image, sglang_cache_dir=sglang_cache_dir,
@@ -827,7 +906,7 @@ def set_endpoint(
         sglang_docker_arg=sglang_docker_arg,
         ready_timeout_sec=ready_timeout_sec,
         poll_interval_sec=poll_interval_sec,
-        active=active, notes=notes,
+        activate=activate, notes=notes,
     ))
 
 

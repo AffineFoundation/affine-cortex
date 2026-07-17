@@ -43,6 +43,7 @@ from affine.src.scorer.dao_adapters import (
 from affine.src.scorer.sampler import WindowSampler
 from affine.src.scorer.weight_writer import WeightWriter
 from affine.src.scorer.window_state import (
+    BattleRecord,
     StateStore,
     SystemConfigKVAdapter,
 )
@@ -50,10 +51,11 @@ from affine.src.scorer.window_state import (
 from . import ssh as ssh_lifecycle
 from . import targon as targon_lifecycle
 from .flow import (
+    DeploymentRoleTransitionResult,
     DeploymentStateInvalidatedError,
     FlowConfig,
     FlowScheduler,
-    NoSpareEndpoint,
+    NoEndpointCapacity,
     TransientDeployError,
 )
 
@@ -107,6 +109,121 @@ def _is_scoring_endpoint(endpoint) -> bool:
     return (getattr(endpoint, "role", None) or "scoring") == "scoring"
 
 
+def _endpoint_is_available(endpoint) -> bool:
+    """Return whether an endpoint can be atomically reserved now."""
+    unassigned = (
+        getattr(endpoint, "assigned_uid", None) is None
+        and not getattr(endpoint, "assignment_token", None)
+        and not getattr(endpoint, "deployment_id", None)
+        and not getattr(endpoint, "assignment_status", None)
+    )
+    if unassigned:
+        return True
+    return (
+        getattr(endpoint, "assignment_status", None) == "deploying"
+        and int(getattr(endpoint, "assignment_expires_at", 0) or 0)
+        <= int(time.time())
+    )
+
+
+_DEPLOYMENT_ROLE_PREDECESSORS = {
+    "challenger": ("pre_challenger",),
+    # ``active`` is the legacy role used by deployments created before role
+    # tracking was split into champion/challenger assignments.
+    "champion": ("challenger", "active"),
+}
+
+
+async def _transition_ssh_deployment_role(
+    endpoints_dao,
+    ssh_configs: Dict[str, ssh_lifecycle.SSHConfig],
+    record: BattleRecord,
+    role: str,
+) -> DeploymentRoleTransitionResult:
+    """Fence an SSH runtime role change and classify failures for flow."""
+    expected_roles = _DEPLOYMENT_ROLE_PREDECESSORS.get(role)
+    if expected_roles is None:
+        raise ValueError(
+            f"unsupported deployment role transition target: {role!r}"
+        )
+
+    deployment_names: Dict[str, Optional[str]] = {}
+    for deployment in record.deployments or []:
+        if deployment.deployment_id:
+            deployment_names[deployment.deployment_id] = (
+                deployment.endpoint_name or None
+            )
+    if record.deployment_id:
+        deployment_names.setdefault(record.deployment_id, None)
+    if not deployment_names:
+        return DeploymentRoleTransitionResult.STALE
+
+    cached_names = {
+        cfg.deployment_id(): name for name, cfg in ssh_configs.items()
+    }
+    for deployment_id, name in tuple(deployment_names.items()):
+        if name is None:
+            deployment_names[deployment_id] = cached_names.get(deployment_id)
+
+    unresolved = [
+        deployment_id
+        for deployment_id, name in deployment_names.items()
+        if name is None
+    ]
+    if unresolved:
+        try:
+            live = await endpoints_dao.list_active(kind="ssh")
+        except Exception as e:
+            logger.warning(
+                "scheduler: live endpoint lookup failed during role "
+                f"transition uid={record.challenger.uid} role={role}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        live_names: Dict[str, str] = {}
+        try:
+            for endpoint in live:
+                if not _is_scoring_endpoint(endpoint):
+                    continue
+                cfg = ssh_lifecycle.SSHConfig.from_endpoint(endpoint)
+                ssh_configs[endpoint.name] = cfg
+                live_names[cfg.deployment_id()] = endpoint.name
+        except Exception as e:
+            logger.warning(
+                "scheduler: active endpoint config could not be resolved "
+                f"during role transition uid={record.challenger.uid} "
+                f"role={role}: {type(e).__name__}: {e}"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        for deployment_id in unresolved:
+            deployment_names[deployment_id] = live_names.get(deployment_id)
+        if any(name is None for name in deployment_names.values()):
+            return DeploymentRoleTransitionResult.STALE
+
+    for deployment_id, name in deployment_names.items():
+        try:
+            promoted = await endpoints_dao.promote_assignment(
+                name,
+                uid=record.challenger.uid,
+                hotkey=record.challenger.hotkey,
+                model=record.challenger.model,
+                revision=record.challenger.revision,
+                deployment_id=deployment_id,
+                role=role,
+                expected_roles=expected_roles,
+            )
+        except Exception as e:
+            logger.warning(
+                "scheduler: provider assignment update failed during role "
+                f"transition uid={record.challenger.uid} role={role} "
+                f"endpoint={name!r}: {type(e).__name__}: {e}"
+            )
+            return DeploymentRoleTransitionResult.RETRYABLE
+        if not promoted:
+            return DeploymentRoleTransitionResult.STALE
+    return DeploymentRoleTransitionResult.UPDATED
+
+
 def _resolve_provider_kind(
     active: List[object],
     *,
@@ -126,7 +243,8 @@ def _resolve_provider_kind(
     if not active:
         raise RuntimeError(
             "no active inference endpoints registered; configure one with "
-            "`af db set-endpoint --kind ssh --ssh-url ssh://user@host[:port] ...` "
+            "`af db register-static-endpoint --kind ssh "
+            "--ssh-url ssh://user@host[:port] ...` "
             "or `--kind targon --targon-api-url https://...`"
         )
     ssh_active = [ep for ep in active if ep.kind == "ssh"]
@@ -146,29 +264,36 @@ def _resolve_provider_kind(
 
 
 def _select_ssh_endpoints(endpoints: List[object], target, *, role: str) -> List[object]:
-    """``endpoints[0]`` is the primary — champion + current challenger
-    time-share it. ``pre_challenger`` claims a free non-primary endpoint
-    or raises :exc:`NoSpareEndpoint`. Existing assignment for the same
-    miner is reused."""
+    """Choose an endpoint by runtime ownership rather than slot position.
+
+    An existing assignment for the same model identity is stable. Otherwise
+    every role may use the first free endpoint. A direct challenger deploy
+    may replace the champion only when no free endpoint exists, preserving
+    single-endpoint operation without allowing it to evict another queued or
+    active challenger.
+    """
     if not endpoints:
         raise RuntimeError("no active ssh endpoints")
     matching = [ep for ep in endpoints if _endpoint_matches_target(ep, target)]
     if matching:
         return matching
 
-    primary = endpoints[0]
-    if role == "pre_challenger":
-        candidates = [
-            ep for ep in endpoints[1:] if ep.assigned_uid is None
-        ]
-        if not candidates:
-            raise NoSpareEndpoint(
-                f"no free non-primary ssh endpoint for pre_challenger "
-                f"target_uid={target.uid}"
-            )
-        return [candidates[0]]
+    free = [ep for ep in endpoints if _endpoint_is_available(ep)]
+    if free:
+        return [free[0]]
 
-    return [primary]
+    if role == "challenger":
+        champions = [
+            ep for ep in endpoints
+            if getattr(ep, "assignment_role", None) in ("champion", "active")
+        ]
+        if champions:
+            return [champions[0]]
+
+    message = f"no free ssh endpoint for role={role} target_uid={target.uid}"
+    if role == "pre_challenger":
+        raise NoEndpointCapacity(message)
+    raise EndpointReservationConflict(message)
 
 
 async def _deploy_ssh_target(
@@ -213,7 +338,7 @@ async def _deploy_ssh_target(
                 f"before role={role!r} target_uid={target.uid} could claim it"
             )
             if role == "pre_challenger":
-                raise NoSpareEndpoint(message)
+                raise NoEndpointCapacity(message)
             raise EndpointReservationConflict(message)
         try:
             result = await ssh_lifecycle.deploy(cfg, target)
@@ -258,10 +383,10 @@ async def _deploy_ssh_target(
                 base_url=result.base_url,
             )
         )
-    primary = deployments[0]
+    representative = deployments[0]
     return targon_lifecycle.DeployResult(
-        deployment_id=primary.deployment_id,
-        base_url=primary.base_url,
+        deployment_id=representative.deployment_id,
+        base_url=representative.base_url,
         deployments=deployments,
     )
 
@@ -427,6 +552,14 @@ async def _run() -> None:
             finally:
                 await endpoints_dao.clear_assignment(name)
 
+        async def transition_deployment_role_fn(record, role):
+            return await _transition_ssh_deployment_role(
+                endpoints_dao,
+                ssh_configs,
+                record,
+                role,
+            )
+
         async def deployment_health_fn(champion):
             if not champion.deployment_id:
                 return False
@@ -462,8 +595,8 @@ async def _run() -> None:
                 if _is_scoring_endpoint(ep)
             }
 
-        # SSH primary always time-shares champion + current challenger,
-        # so the flag is True regardless of endpoint count.
+        # Each SSH endpoint hosts one sglang model at a time. Runtime roles
+        # move between otherwise-equivalent active endpoints.
         flow_config = FlowConfig(single_instance_provider=True)
         targon_client = None
         logger.info(
@@ -494,6 +627,7 @@ async def _run() -> None:
             await targon_lifecycle.teardown(targon_client, deployment_id)
 
         deployment_health_fn = None
+        transition_deployment_role_fn = None
         list_active_ssh_endpoint_names = None
         list_active_ssh_endpoint_activations = None
         flow_config = FlowConfig()
@@ -520,6 +654,7 @@ async def _run() -> None:
             list_active_ssh_endpoint_activations
         ),
         deployment_health_fn=deployment_health_fn,
+        transition_deployment_role_fn=transition_deployment_role_fn,
         sample_metrics_reader=sample_metrics_reader,
         behavior_gate_dao=BehaviorGateDAO(),
     )

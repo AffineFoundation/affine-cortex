@@ -292,7 +292,8 @@ MINER_STATS_SCHEMA = {
 #   assigned_revision
 #   deployment_id          provider-specific live deployment id
 #   base_url               URL executor should use for this assignment
-#   assignment_role        "champion" | "challenger" | "active"
+#   assignment_role        "champion" | "challenger" | "pre_challenger"
+#                          (legacy rows may contain "active")
 #   assigned_at            assignment timestamp
 #
 #   # ssh-kind extras
