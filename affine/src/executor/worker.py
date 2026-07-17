@@ -1174,6 +1174,15 @@ class ExecutorWorker:
             latency_ms=latency_ms,
         ):
             return
+        if await self._runtime_invariant_blocks_persist(
+            miner=miner,
+            task_id=task_id,
+            expected_deployment_id=expected_deployment_id,
+            score=score,
+            extra=extra,
+        ):
+            self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            return
         if valid_for_scoring is False or malformed_disposition:
             detail = extra.get("failure_detail") or error or extra.get("error")
             error_brief = str(detail or "environment marked attempt invalid").replace(
@@ -1199,15 +1208,6 @@ class ExecutorWorker:
                 f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
                 f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {error_brief}"
             )
-            self.metrics.record_completion(success=False, latency_ms=latency_ms)
-            return
-        if await self._runtime_invariant_blocks_persist(
-            miner=miner,
-            task_id=task_id,
-            expected_deployment_id=expected_deployment_id,
-            score=score,
-            extra=extra,
-        ):
             self.metrics.record_completion(success=False, latency_ms=latency_ms)
             return
         await self._samples.persist(

@@ -349,7 +349,7 @@ def test_executor_does_not_persist_explicitly_invalid_attempt():
     assert _persist_calls_for_result(result) == []
 
 
-def test_executor_skips_behavior_checks_for_invalid_attempt():
+def test_executor_checks_runtime_invariants_before_invalid_disposition_drop():
     from affine.core.models import Result
 
     result = Result(
@@ -361,16 +361,20 @@ def test_executor_skips_behavior_checks_for_invalid_attempt():
         extra={"valid_for_scoring": False},
     )
 
-    async def fail_if_called(**_kwargs):
-        raise AssertionError("invalid attempt reached runtime invariant checks")
+    invariant_calls = []
+
+    async def observe_invariant(**kwargs):
+        invariant_calls.append(kwargs)
+        return False
 
     def configure(worker):
-        worker._runtime_invariant_blocks_persist = fail_if_called
+        worker._runtime_invariant_blocks_persist = observe_invariant
 
     assert _persist_calls_for_result(result, configure_worker=configure) == []
+    assert len(invariant_calls) == 1
 
 
-def test_executor_skips_behavior_checks_for_unclassified_error_result():
+def test_executor_checks_runtime_invariants_before_unclassified_error_drop():
     from affine.core.models import Result
 
     result = Result(
@@ -382,17 +386,21 @@ def test_executor_skips_behavior_checks_for_unclassified_error_result():
         task_id=123,
     )
 
-    async def fail_if_called(**_kwargs):
-        raise AssertionError("error result reached runtime invariant checks")
+    invariant_calls = []
+
+    async def observe_invariant(**kwargs):
+        invariant_calls.append(kwargs)
+        return False
 
     def configure(worker):
-        worker._runtime_invariant_blocks_persist = fail_if_called
+        worker._runtime_invariant_blocks_persist = observe_invariant
 
     assert _persist_calls_for_result(
         result,
         env="DISTILL-V2",
         configure_worker=configure,
     ) == []
+    assert len(invariant_calls) == 1
 
 
 def test_executor_rejects_malformed_scoring_disposition():
