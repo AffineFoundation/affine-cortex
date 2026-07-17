@@ -818,6 +818,7 @@ async def deployment_health(
             state,
             reason=reason,
             identity=config.health_identity(),
+            canonical_base_url=config.inference_url(),
         )
 
     try:
@@ -831,12 +832,18 @@ async def deployment_health(
     except Exception as e:
         logger.warning(
             f"ssh-provider: docker inspect health check unavailable on "
-            f"{config.host}; preserving deployment state: "
+            f"{config.host}; checking the public inference path before "
+            f"preserving deployment state: "
             f"{type(e).__name__}: {e}"
         )
+        if await _probe_ready(probe_url):
+            return result(
+                DeploymentHealthState.HEALTHY,
+                reason="container_inspect_unavailable_public_ready",
+            )
         return result(
             DeploymentHealthState.UNKNOWN,
-            reason="container_inspect_unavailable",
+            reason="container_inspect_and_public_probe_unavailable",
         )
 
     state = info.get("State") if isinstance(info.get("State"), dict) else {}

@@ -826,7 +826,14 @@ async def test_deployment_health_treats_ssh_inspect_failure_as_unknown(monkeypat
     async def failing_ssh_exec(config, command):
         raise RuntimeError("ssh unavailable")
 
+    async def failed_public_probe(base_url, *, timeout_sec=5.0):
+        return False
+
     monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", failing_ssh_exec)
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._probe_ready",
+        failed_public_probe,
+    )
 
     result = await deployment_health(
         _config(endpoint_name="ssh_b300"),
@@ -834,7 +841,38 @@ async def test_deployment_health_treats_ssh_inspect_failure_as_unknown(monkeypat
     )
 
     assert result.state is DeploymentHealthState.UNKNOWN
-    assert result.reason == "container_inspect_unavailable"
+    assert result.reason == "container_inspect_and_public_probe_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_deployment_health_keeps_runtime_when_ssh_fails_but_public_ready(
+    monkeypatch,
+):
+    async def failing_ssh_exec(config, command):
+        raise RuntimeError("ssh unavailable")
+
+    probed_urls = []
+
+    async def successful_public_probe(base_url, *, timeout_sec=5.0):
+        probed_urls.append(base_url)
+        return True
+
+    cfg = _config(
+        endpoint_name="ssh_b300",
+        public_inference_url="https://inference.example/v1",
+    )
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", failing_ssh_exec)
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._probe_ready",
+        successful_public_probe,
+    )
+
+    result = await deployment_health(cfg, _target())
+
+    assert result.state is DeploymentHealthState.HEALTHY
+    assert result.reason == "container_inspect_unavailable_public_ready"
+    assert result.canonical_base_url == "https://inference.example/v1"
+    assert probed_urls == ["https://inference.example/v1"]
 
 
 @pytest.mark.asyncio

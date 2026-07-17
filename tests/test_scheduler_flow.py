@@ -37,6 +37,7 @@ from affine.src.scorer.comparator import WindowComparator
 from affine.src.scorer.sampler import WindowSampler
 from affine.src.scorer.window_state import (
     BattleRecord,
+    DeploymentRecord,
     InMemoryConfigStore,
     MinerSnapshot,
     StateStore,
@@ -345,6 +346,7 @@ def _build_scheduler(
     *, kv, miner_store, deployer, samples, weight_writer=None,
     window_blocks=WINDOW_BLOCKS, deployment_health_fn=None,
     deployment_transport_repair_fn=None,
+    deployment_endpoint_repair_fn=None,
     list_active_endpoint_names_fn=None,
     list_active_endpoint_activations_fn=None,
     task_pool_refresh_blocks=None, config=None, behavior_gate_dao=None,
@@ -384,6 +386,7 @@ def _build_scheduler(
         ),
         deployment_health_fn=deployment_health_fn,
         deployment_transport_repair_fn=deployment_transport_repair_fn,
+        deployment_endpoint_repair_fn=deployment_endpoint_repair_fn,
         behavior_gate_dao=behavior_gate_dao,
         transition_deployment_role_fn=(
             transition_deployment_role_fn or deployer.transition_role
@@ -1243,6 +1246,297 @@ async def test_transport_failure_repairs_tunnel_without_clearing_deployment():
     champion = await state.get_champion()
     assert champion.deployment_id == "wrk-live"
     assert champion.base_url == "https://t/live"
+
+
+@pytest.mark.asyncio
+async def test_active_challenger_transport_failure_repairs_without_losing_battle():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+        _make_miner(
+            2,
+            "chal_hk",
+            200,
+            status=STATUS_IN_PROGRESS,
+            revision="chal_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    health_checks = []
+    repairs = []
+
+    async def deployment_health_fn(record):
+        health_checks.append(record.challenger.uid)
+        return DeploymentHealthResult(
+            DeploymentHealthState.TRANSPORT_UNHEALTHY,
+            reason="public_probe_failed_local_ready",
+            identity="endpoint-1:instance-1:generation=1",
+        )
+
+    async def repair_fn(record, health):
+        repairs.append((record.challenger.uid, health.identity))
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        deployment_health_fn=deployment_health_fn,
+        deployment_transport_repair_fn=repair_fn,
+    )
+    await state.set_battle(BattleRecord(
+        challenger=MinerSnapshot(
+            uid=2,
+            hotkey="chal_hk",
+            revision="chal_rev",
+            model="org/challenger",
+        ),
+        deployment_id="wrk-challenger",
+        base_url="https://t/challenger",
+        started_at_block=50,
+    ))
+
+    await scheduler.tick(current_block=51)
+    await scheduler.tick(current_block=52)
+    await scheduler.tick(current_block=53)
+
+    assert health_checks == [2, 2, 2]
+    assert repairs == [(2, "endpoint-1:instance-1:generation=1")]
+    battle = await state.get_battle()
+    assert battle is not None
+    assert battle.challenger.uid == 2
+    assert battle.deployment_id == "wrk-challenger"
+    assert miner_store.rows[2]["challenge_status"] == STATUS_IN_PROGRESS
+    assert deployer.teardowns == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_runtime_health_queues_fenced_endpoint_replacement():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"].update({
+        "deployment_id": "wrk-live",
+        "base_url": "https://t/live",
+    })
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    replacements = []
+
+    async def deployment_health_fn(record):
+        return DeploymentHealthResult(
+            DeploymentHealthState.UNKNOWN,
+            reason="container_inspect_and_public_probe_unavailable",
+            identity="endpoint-1:instance-1:generation=4",
+        )
+
+    async def endpoint_repair_fn(record, health):
+        replacements.append((record.deployment_id, health.identity))
+        return True
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        deployment_health_fn=deployment_health_fn,
+        deployment_endpoint_repair_fn=endpoint_repair_fn,
+    )
+
+    for block in range(51, 56):
+        await scheduler.tick(current_block=block)
+
+    assert replacements == [
+        ("wrk-live", "endpoint-1:instance-1:generation=4")
+    ]
+    champion = await state.get_champion()
+    assert champion.deployment_id == "wrk-live"
+    assert champion.base_url == "https://t/live"
+    assert deployer.deploys == []
+    assert deployer.teardowns == []
+
+
+@pytest.mark.asyncio
+async def test_healthy_runtime_synchronizes_canonical_endpoint_url():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"].update({
+        "deployment_id": "wrk-live",
+        "base_url": "http://old-tunnel:8101/v1",
+        "deployments": [
+            {
+                "endpoint_name": "endpoint-1",
+                "deployment_id": "wrk-live",
+                "base_url": "http://old-tunnel:8101/v1",
+            }
+        ],
+    })
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+    ])
+
+    async def deployment_health_fn(record):
+        return DeploymentHealthResult(
+            DeploymentHealthState.HEALTHY,
+            identity="endpoint-1:instance-2:generation=2",
+            canonical_base_url="http://new-tunnel:8102/v1",
+        )
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=_DeployTracker(),
+        samples=_SamplesFake(),
+        deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    champion = await state.get_champion()
+    assert champion.base_url == "http://new-tunnel:8102/v1"
+    assert champion.deployments == [
+        DeploymentRecord(
+            endpoint_name="endpoint-1",
+            deployment_id="wrk-live",
+            base_url="http://new-tunnel:8102/v1",
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_healthy_challenger_synchronizes_executor_endpoint_url():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+        _make_miner(
+            2,
+            "chal_hk",
+            200,
+            status=STATUS_IN_PROGRESS,
+            revision="chal_rev",
+        ),
+    ])
+
+    async def deployment_health_fn(record):
+        return DeploymentHealthResult(
+            DeploymentHealthState.HEALTHY,
+            identity="endpoint-1:instance-2:generation=2",
+            canonical_base_url="http://new-tunnel:8102/v1",
+        )
+
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=_DeployTracker(),
+        samples=_SamplesFake(),
+        deployment_health_fn=deployment_health_fn,
+    )
+    await state.set_battle(BattleRecord(
+        challenger=MinerSnapshot(
+            uid=2,
+            hotkey="chal_hk",
+            revision="chal_rev",
+            model="org/challenger",
+        ),
+        deployment_id="wrk-challenger",
+        base_url="http://old-tunnel:8101/v1",
+        deployments=[DeploymentRecord(
+            endpoint_name="endpoint-1",
+            deployment_id="wrk-challenger",
+            base_url="http://old-tunnel:8101/v1",
+        )],
+        started_at_block=50,
+    ))
+
+    await scheduler.tick(current_block=51)
+
+    battle = await state.get_battle()
+    assert battle is not None
+    assert battle.base_url == "http://new-tunnel:8102/v1"
+    assert battle.deployments[0].base_url == "http://new-tunnel:8102/v1"
+
+
+@pytest.mark.asyncio
+async def test_late_health_result_does_not_restore_drained_runtime_state():
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"].update({
+        "deployment_id": "wrk-drained",
+        "base_url": "http://old-tunnel:8101/v1",
+    })
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+    ])
+    state = StateStore(kv)
+
+    async def deployment_health_fn(record):
+        await state.clear_champion()
+        return DeploymentHealthResult(
+            DeploymentHealthState.HEALTHY,
+            identity="endpoint-1:instance-2:generation=2",
+            canonical_base_url="http://new-tunnel:8102/v1",
+        )
+
+    scheduler, _, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=_DeployTracker(),
+        samples=_SamplesFake(),
+        deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+
+    assert await state.get_champion() is None
 
 
 @pytest.mark.asyncio

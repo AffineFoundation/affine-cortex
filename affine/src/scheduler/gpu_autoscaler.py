@@ -579,9 +579,20 @@ class GPUAutoscaler:
             snapshot,
             now,
         )
-        force_start = self._should_force_start_after_restart(snapshot)
-        desired = config.desired_instances(
+        champion_recovery_needed = (
+            snapshot.active_capacity_count == 0
+            and not snapshot.champion_samples_complete
+        )
+        force_start = (
+            self._should_force_start_after_restart(snapshot)
+            or champion_recovery_needed
+        )
+        demand_count = max(
             snapshot.pending_count,
+            1 if champion_recovery_needed else 0,
+        )
+        desired = config.desired_instances(
+            demand_count,
             gpu_down_for_sec=gpu_down_for_sec,
             force_start=force_start,
         )
@@ -787,12 +798,52 @@ class GPUAutoscaler:
                     updated_by=str(request.get("updated_by") or "gpu-autoscaler"),
                 )
             elif operation == MANUAL_ENDPOINT_OPERATION_REPLACE:
-                operation_result = await self.replace_endpoint(
-                    config,
-                    old_endpoint_name=str(request["old_endpoint_name"]),
-                    new_slot_name=str(request["new_slot_name"]),
-                    updated_by=str(request.get("updated_by") or "gpu-autoscaler"),
+                old_endpoint_name = str(request["old_endpoint_name"])
+                new_slot_name = str(request["new_slot_name"])
+                expected_instance_id = str(
+                    request.get("expected_instance_id") or ""
                 )
+                expected_generation = request.get("expected_generation")
+                current_endpoint = (
+                    await self._endpoints.get(old_endpoint_name)
+                    if expected_instance_id
+                    else None
+                )
+                stale_health_request = expected_instance_id and (
+                    current_endpoint is None
+                    or str(current_endpoint.autoscale_instance_id or "")
+                    != expected_instance_id
+                    or int(current_endpoint.generation or 0)
+                    != int(expected_generation or 0)
+                )
+                if stale_health_request:
+                    logger.warning(
+                        "gpu-autoscaler: skipped stale health replacement "
+                        "endpoint=%s expected_instance=%s expected_generation=%s",
+                        old_endpoint_name,
+                        expected_instance_id,
+                        expected_generation,
+                    )
+                    operation_result = EndpointReplaceResult(
+                        old_endpoint_name=old_endpoint_name,
+                        new_endpoint_name=new_slot_name,
+                        new_slot_name=new_slot_name,
+                        old_instance_id=(
+                            str(current_endpoint.autoscale_instance_id or "")
+                            if current_endpoint is not None
+                            else ""
+                        ),
+                        same_endpoint=old_endpoint_name == new_slot_name,
+                    )
+                else:
+                    operation_result = await self.replace_endpoint(
+                        config,
+                        old_endpoint_name=old_endpoint_name,
+                        new_slot_name=new_slot_name,
+                        updated_by=str(
+                            request.get("updated_by") or "gpu-autoscaler"
+                        ),
+                    )
             else:
                 operation_result = await self.remove_endpoint(
                     config,
@@ -2408,6 +2459,9 @@ async def _enqueue_manual_endpoint_request(
     old_endpoint_name: str = "",
     keep_slot: bool = False,
     ttl_seconds: int = DEFAULT_MANUAL_REPLACEMENT_TTL_SECONDS,
+    expected_instance_id: str = "",
+    expected_generation: Optional[int] = None,
+    reason: str = "",
 ) -> Dict[str, Any]:
     if operation not in {
         MANUAL_ENDPOINT_OPERATION_ADD,
@@ -2440,6 +2494,12 @@ async def _enqueue_manual_endpoint_request(
     }
     if operation == MANUAL_ENDPOINT_OPERATION_REMOVE:
         request["keep_slot"] = bool(keep_slot)
+    if expected_instance_id:
+        request["expected_instance_id"] = expected_instance_id
+    if expected_generation is not None:
+        request["expected_generation"] = int(expected_generation)
+    if reason:
+        request["reason"] = reason
     acquired = await kv.set_if_absent_or_expired(
         MANUAL_REPLACEMENT_LOCK_KEY,
         request,
@@ -2458,6 +2518,44 @@ async def _enqueue_manual_endpoint_request(
         f"new_slot={existing.get('new_slot_name')!r}; retry after "
         f"expires_at={existing.get('expires_at')}"
     )
+
+
+async def enqueue_health_endpoint_replacement_request(
+    kv,
+    *,
+    endpoint_name: str,
+    instance_id: str,
+    endpoint_generation: int,
+    reason: str,
+    now: int,
+) -> bool:
+    """Queue a same-slot replacement fenced to the observed machine."""
+    try:
+        await _enqueue_manual_endpoint_request(
+            kv,
+            operation=MANUAL_ENDPOINT_OPERATION_REPLACE,
+            old_endpoint_name=endpoint_name,
+            new_slot_name=endpoint_name,
+            updated_by="scheduler:deployment-health",
+            now=now,
+            expected_instance_id=instance_id,
+            expected_generation=endpoint_generation,
+            reason=reason,
+        )
+        return True
+    except RuntimeError:
+        existing = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+        if not isinstance(existing, Mapping):
+            return False
+        return (
+            _active_manual_replacement_value(existing, int(now)) is not None
+            and existing.get("operation") == MANUAL_ENDPOINT_OPERATION_REPLACE
+            and existing.get("old_endpoint_name") == endpoint_name
+            and existing.get("new_slot_name") == endpoint_name
+            and str(existing.get("expected_instance_id") or "") == instance_id
+            and int(existing.get("expected_generation") or 0)
+            == int(endpoint_generation)
+        )
 
 
 async def _enqueue_manual_replacement_request(

@@ -32,6 +32,7 @@ from affine.src.scheduler.gpu_autoscaler import (
     _enqueue_manual_replacement_request,
     _manual_endpoint_result_key,
     _wait_for_manual_endpoint_result,
+    enqueue_health_endpoint_replacement_request,
     load_config,
 )
 from affine.src.scheduler.health import tunnel_repair_request_key
@@ -884,6 +885,85 @@ async def test_enqueue_manual_replacement_only_writes_request():
 
 
 @pytest.mark.asyncio
+async def test_enqueue_health_replacement_is_fenced_and_idempotent():
+    kv = InMemoryConfigStore()
+
+    queued = await enqueue_health_endpoint_replacement_request(
+        kv,
+        endpoint_name="lium-b200-1",
+        instance_id="inst-old",
+        endpoint_generation=7,
+        reason="ssh_and_public_unavailable",
+        now=1000,
+    )
+    duplicate = await enqueue_health_endpoint_replacement_request(
+        kv,
+        endpoint_name="lium-b200-1",
+        instance_id="inst-old",
+        endpoint_generation=7,
+        reason="ssh_and_public_unavailable",
+        now=1001,
+    )
+    conflicting = await enqueue_health_endpoint_replacement_request(
+        kv,
+        endpoint_name="lium-b200-2",
+        instance_id="inst-other",
+        endpoint_generation=1,
+        reason="ssh_and_public_unavailable",
+        now=1001,
+    )
+
+    assert queued is True
+    assert duplicate is True
+    assert conflicting is False
+    stored = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
+    assert stored["operation"] == MANUAL_ENDPOINT_OPERATION_REPLACE
+    assert stored["old_endpoint_name"] == "lium-b200-1"
+    assert stored["new_slot_name"] == "lium-b200-1"
+    assert stored["expected_instance_id"] == "inst-old"
+    assert stored["expected_generation"] == 7
+    assert stored["reason"] == "ssh_and_public_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_daemon_skips_health_replacement_after_endpoint_generation_changes():
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="inst-new",
+        autoscale_purpose="eval",
+        generation=8,
+    )
+    endpoints = _Endpoints([endpoint])
+    autoscaler = _autoscaler(_Queue(), endpoints, kv, now=1000)
+    queued = await enqueue_health_endpoint_replacement_request(
+        kv,
+        endpoint_name="lium-b200-1",
+        instance_id="inst-old",
+        endpoint_generation=7,
+        reason="ssh_and_public_unavailable",
+        now=1000,
+    )
+
+    result = await autoscaler.tick(_config())
+
+    assert queued is True
+    assert result.action == "manual-replacement:completed"
+    assert _Client.events == []
+    assert _Client.create_calls == []
+    assert _Client.deleted == []
+    current = endpoints.endpoints["lium-b200-1"]
+    assert current.active is True
+    assert current.autoscale_instance_id == "inst-new"
+    assert current.generation == 8
+    assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
+
+
+@pytest.mark.asyncio
 async def test_enqueue_manual_add_only_writes_request():
     kv = InMemoryConfigStore()
     request = await _enqueue_manual_add_request(
@@ -1136,16 +1216,19 @@ async def test_daemon_executes_replacement_without_scaling_fallback_slot():
             ManagedEndpointSlot(name="lium-b300-fallback", provider="lium"),
         ],
     )
-    request = await _enqueue_manual_replacement_request(
+    queued = await enqueue_health_endpoint_replacement_request(
         kv,
-        old_endpoint_name="lium-b200-1",
-        new_slot_name="lium-b200-1",
-        updated_by="test",
+        endpoint_name="lium-b200-1",
+        instance_id="old-inst",
+        endpoint_generation=0,
+        reason="ssh_and_public_unavailable",
         now=1000,
     )
+    request = await kv.get(MANUAL_REPLACEMENT_LOCK_KEY)
 
     result = await autoscaler.tick(cfg)
 
+    assert queued is True
     assert result.action == "manual-replacement:completed"
     assert _Client.events == [
         ("drain", "lium-b200-1", "old-inst"),
@@ -1791,6 +1874,51 @@ async def test_restart_without_pending_does_not_scale_up():
     assert result.action == "none"
     assert result.desired_instances == 0
     assert endpoints.endpoints == {}
+
+
+@pytest.mark.asyncio
+async def test_missing_capacity_recovers_incomplete_champion_without_pending():
+    kv = InMemoryConfigStore()
+    state = StateStore(kv)
+    await state.set_champion(ChampionRecord(
+        uid=7,
+        hotkey="hk7",
+        revision="rev7",
+        model="repo/model",
+    ))
+    await kv.set(
+        "current_task_ids",
+        {"task_ids": {"MEMORY": [1, 2, 3]}, "refreshed_at_block": 100},
+    )
+    await kv.set(
+        "environments",
+        {
+            "MEMORY": {
+                "enabled_for_sampling": True,
+                "enabled_for_scoring": True,
+                "sampling": {
+                    "sampling_count": 3,
+                    "dataset_range": [[1, 3]],
+                },
+            }
+        },
+    )
+    endpoints = _Endpoints()
+    autoscaler = _autoscaler(
+        _Queue(pending=0),
+        endpoints,
+        kv,
+        now=1000,
+        samples=_Samples(count=0),
+    )
+
+    result = await autoscaler.tick(
+        _config(threshold=5, max_gpu_down_wait_seconds=12 * 60 * 60)
+    )
+
+    assert result.action == "scale-up:1"
+    assert result.desired_instances == 1
+    assert sorted(endpoints.endpoints) == ["lium-b200-1"]
 
 
 @pytest.mark.asyncio
