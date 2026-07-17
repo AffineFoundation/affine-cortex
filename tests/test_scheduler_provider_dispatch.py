@@ -24,14 +24,18 @@ from affine.src.scheduler.main import (
     EndpointReservationConflict,
     _deploy_ssh_target,
     _gpu_autoscaler_empty_provider_kind,
+    _queue_ssh_tunnel_repair,
+    _resolve_live_ssh_config,
     _resolve_provider_kind,
     _transition_ssh_deployment_role,
 )
 from affine.src.scheduler.ssh import SSHConfig
+from affine.src.scheduler.health import tunnel_repair_request_key
 from affine.src.scheduler.targon import DeployResult, DeployTarget
 from affine.src.scorer.window_state import (
     BattleRecord,
     DeploymentRecord,
+    InMemoryConfigStore,
     MinerSnapshot,
 )
 
@@ -541,6 +545,9 @@ class _EndpointsDAOFake:
             if ep.active and (kind is None or ep.kind == kind)
         ]
 
+    async def get(self, name):
+        return next((ep for ep in self.endpoints if ep.name == name), None)
+
     async def clear_assignment(self, name):
         self.cleared.append(name)
 
@@ -645,6 +652,126 @@ class _StaleReadEndpointsDAOFake(_EndpointsDAOFake):
         actual.assignment_token = kwargs["token"]
         actual.assignment_status = "deploying"
         return True
+
+
+@pytest.mark.asyncio
+async def test_ssh_config_resolution_refreshes_replaced_endpoint():
+    endpoint = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=True,
+        ssh_url="ssh://root@new.example.com:40299",
+        ssh_key_path="/keys/new",
+    )
+    dao = _EndpointsDAOFake([endpoint])
+    cached = {
+        "b300": SSHConfig(
+            host="old.example.com",
+            endpoint_name="b300",
+            port=40298,
+            key_path="/keys/old",
+        )
+    }
+
+    name, config = await _resolve_live_ssh_config(
+        dao,
+        cached,
+        "ssh:b300:affine-sglang-current",
+    )
+
+    assert name == "b300"
+    assert config.host == "new.example.com"
+    assert config.port == 40299
+    assert config.key_path == "/keys/new"
+    assert cached["b300"] == config
+
+
+@pytest.mark.asyncio
+async def test_ssh_config_resolution_drops_inactive_cached_endpoint():
+    endpoint = Endpoint(
+        name="b300",
+        kind="ssh",
+        active=False,
+        ssh_url="ssh://root@old.example.com:40298",
+    )
+    dao = _EndpointsDAOFake([endpoint])
+    cached = {
+        "b300": SSHConfig(
+            host="old.example.com",
+            endpoint_name="b300",
+            port=40298,
+        )
+    }
+
+    resolved = await _resolve_live_ssh_config(
+        dao,
+        cached,
+        "ssh:b300:affine-sglang-current",
+    )
+
+    assert resolved == (None, None)
+    assert cached == {}
+
+
+@pytest.mark.asyncio
+async def test_ssh_config_resolution_does_not_fallback_on_database_error():
+    class _FailingDAO(_EndpointsDAOFake):
+        async def list_active(self, kind=None):
+            raise RuntimeError("database unavailable")
+
+    cached = {
+        "b300": SSHConfig(
+            host="old.example.com",
+            endpoint_name="b300",
+            port=40298,
+        )
+    }
+
+    with pytest.raises(RuntimeError, match="database unavailable"):
+        await _resolve_live_ssh_config(
+            _FailingDAO([]),
+            cached,
+            "ssh:b300:affine-sglang-current",
+        )
+
+    assert cached["b300"].host == "old.example.com"
+
+
+@pytest.mark.asyncio
+async def test_tunnel_repair_request_is_scoped_to_current_instance():
+    kv = InMemoryConfigStore()
+    config = SSHConfig(
+        host="gpu.example.com",
+        endpoint_name="b300",
+        autoscale_managed=True,
+        autoscale_instance_id="instance-2",
+        endpoint_generation=9,
+    )
+
+    queued = await _queue_ssh_tunnel_repair(
+        kv,
+        config,
+        deployment_id=config.deployment_id(),
+        reason="public_probe_failed_local_ready",
+    )
+
+    assert queued is True
+    request = await kv.get(tunnel_repair_request_key("b300"))
+    assert request["instance_id"] == "instance-2"
+    assert request["endpoint_generation"] == 9
+    assert request["deployment_id"] == config.deployment_id()
+    assert request["expires_at"] > request["requested_at"]
+
+    stale_kv = InMemoryConfigStore()
+    queued_stale = await _queue_ssh_tunnel_repair(
+        stale_kv,
+        config,
+        deployment_id=config.deployment_id(),
+        reason="public_probe_failed_local_ready",
+        expected_identity="b300:old-instance:generation=8",
+    )
+    assert queued_stale is False
+    assert await stale_kv.get(tunnel_repair_request_key("b300")) is None
 
 
 def _target():

@@ -53,6 +53,7 @@ from affine.core.providers.targon_client import (
 from affine.core.setup import logger
 
 from .flow import TransientDeployError
+from .health import DeploymentHealthResult, DeploymentHealthState
 from .targon import DeployResult, DeployTarget, MachineDeployment  # reuse the dataclasses
 
 
@@ -141,6 +142,9 @@ class SSHConfig:
     poll_interval_sec: float = DEFAULT_POLL_INTERVAL_SEC
     connect_timeout: int = 30
     exec_timeout: int = 120
+    autoscale_managed: bool = False
+    autoscale_instance_id: Optional[str] = None
+    endpoint_generation: int = 0
 
     @staticmethod
     def _parse_ssh_url(url: str) -> Tuple[str, str, int]:
@@ -193,6 +197,13 @@ class SSHConfig:
             ),
             ready_timeout_sec=endpoint.ready_timeout_sec,
             poll_interval_sec=endpoint.poll_interval_sec,
+            autoscale_managed=bool(
+                getattr(endpoint, "autoscale_managed", False)
+            ),
+            autoscale_instance_id=getattr(
+                endpoint, "autoscale_instance_id", None
+            ),
+            endpoint_generation=int(getattr(endpoint, "generation", 0) or 0),
         )
 
     def inference_url(self) -> str:
@@ -207,6 +218,13 @@ class SSHConfig:
         """
         endpoint = self.endpoint_name or self.host
         return f"ssh:{endpoint}:{CONTAINER_NAME}"
+
+    def health_identity(self) -> str:
+        runtime = self.autoscale_instance_id or f"{self.host}:{self.port}"
+        return (
+            f"{self.endpoint_name or self.host}:{runtime}:"
+            f"generation={self.endpoint_generation}"
+        )
 
 
 def _coerce_docker_args(value: Any) -> Tuple[str, ...]:
@@ -698,26 +716,92 @@ def _parse_container_inspect_json(output: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-async def _container_inspect(config: "SSHConfig") -> Optional[Dict[str, Any]]:
+class _ContainerNotFoundError(RuntimeError):
+    pass
+
+
+class _ContainerInspectUnavailableError(RuntimeError):
+    pass
+
+
+def _docker_object_not_found(*outputs: str) -> bool:
+    text = "\n".join(outputs).lower()
+    return "no such object" in text or "no such container" in text
+
+
+async def _container_inspect(config: "SSHConfig") -> Dict[str, Any]:
     fmt = "{{json .}}"
     cmd = f"docker inspect --format {shlex.quote(fmt)} {CONTAINER_NAME}"
     rc, out, err = await _ssh_exec(config, cmd)
     if rc != 0:
+        message = (
+            f"docker inspect {CONTAINER_NAME!r} failed on {config.host}: "
+            f"rc={rc} stderr={err!r}"
+        )
+        if _docker_object_not_found(out, err):
+            raise _ContainerNotFoundError(message)
+        raise _ContainerInspectUnavailableError(message)
+    info = _parse_container_inspect_json(out)
+    if info is None:
+        raise _ContainerInspectUnavailableError(
+            f"docker inspect {CONTAINER_NAME!r} on {config.host} returned "
+            "no parseable JSON"
+        )
+    return info
+
+
+async def _probe_remote_ready(
+    config: "SSHConfig",
+    *,
+    timeout_sec: float = 5.0,
+) -> Optional[bool]:
+    """Probe SGLang from inside its host-networked container.
+
+    ``None`` means the SSH/docker probe itself could not be executed, so the
+    caller must not infer that SGLang is down from this observation.
+    """
+    url = f"http://127.0.0.1:{config.sglang_port}/v1/models"
+    script = (
+        "import json, urllib.request\n"
+        "try:\n"
+        f"    response = urllib.request.urlopen({url!r}, timeout={timeout_sec!r})\n"
+        "    payload = json.load(response)\n"
+        "    ready = response.status == 200 and isinstance(payload, dict) "
+        "and isinstance(payload.get('data'), list) and bool(payload['data'])\n"
+        "except Exception:\n"
+        "    ready = False\n"
+        "raise SystemExit(0 if ready else 1)\n"
+    )
+    cmd = (
+        f"docker exec {shlex.quote(CONTAINER_NAME)} "
+        f"python -c {shlex.quote(script)}"
+    )
+    try:
+        rc, _out, err = await _ssh_exec(config, cmd)
+    except Exception as e:
         logger.warning(
-            f"ssh-provider: docker inspect {CONTAINER_NAME!r} failed "
-            f"on {config.host}: rc={rc} stderr={err!r}"
+            f"ssh-provider: local readiness probe could not run on "
+            f"{config.host}: {type(e).__name__}: {e}"
         )
         return None
-    return _parse_container_inspect_json(out)
+    if rc == 0:
+        return True
+    if rc == 1:
+        return False
+    logger.warning(
+        f"ssh-provider: local readiness probe could not run on {config.host}: "
+        f"rc={rc} stderr={err!r}"
+    )
+    return None
 
 
-async def deployment_healthy(
+async def deployment_health(
     config: "SSHConfig",
     target: DeployTarget,
     *,
     base_url: Optional[str] = None,
-) -> bool:
-    """Return whether the remote container is still serving ``target``.
+) -> DeploymentHealthResult:
+    """Classify whether the remote container is still serving ``target``.
 
     This is a runtime reconcile check for the flow scheduler. ``/v1/models``
     alone is not enough on a single-instance host because the stable URL may
@@ -725,27 +809,38 @@ async def deployment_healthy(
     require both Docker labels and the OpenAI readiness probe to match.
     """
     probe_url = base_url or config.inference_url()
+
+    def result(
+        state: DeploymentHealthState,
+        reason: str = "",
+    ) -> DeploymentHealthResult:
+        return DeploymentHealthResult(
+            state,
+            reason=reason,
+            identity=config.health_identity(),
+        )
+
     try:
         info = await _container_inspect(config)
+    except _ContainerNotFoundError as e:
+        logger.warning(f"ssh-provider: {e}")
+        return result(
+            DeploymentHealthState.UNHEALTHY,
+            reason="container_missing",
+        )
     except Exception as e:
         logger.warning(
-            f"ssh-provider: docker inspect health check raised on "
-            f"{config.host}; falling back to /v1/models only: "
+            f"ssh-provider: docker inspect health check unavailable on "
+            f"{config.host}; preserving deployment state: "
             f"{type(e).__name__}: {e}"
         )
-        return await _probe_ready(probe_url)
-    if info is None:
-        return False
+        return result(
+            DeploymentHealthState.UNKNOWN,
+            reason="container_inspect_unavailable",
+        )
 
     state = info.get("State") if isinstance(info.get("State"), dict) else {}
     status = str(state.get("Status") or "")
-    if status != "running":
-        logger.warning(
-            f"ssh-provider: {CONTAINER_NAME} is not running on {config.host} "
-            f"(status={status!r}, exit={state.get('ExitCode')!r})"
-        )
-        return False
-
     container_cfg = (
         info.get("Config") if isinstance(info.get("Config"), dict) else {}
     )
@@ -766,15 +861,72 @@ async def deployment_healthy(
                 f"ssh-provider: {CONTAINER_NAME} label mismatch on "
                 f"{config.host}: {key}={actual!r}, expected={expected!r}"
             )
-            return False
+            return result(
+                DeploymentHealthState.UNHEALTHY,
+                reason=f"container_label_mismatch:{key}",
+            )
 
-    if not await _probe_ready(probe_url):
+    if status in {"exited", "dead"}:
         logger.warning(
-            f"ssh-provider: {CONTAINER_NAME} labels match uid={target.uid} "
-            f"but {probe_url}/models is not ready"
+            f"ssh-provider: {CONTAINER_NAME} exited on {config.host} "
+            f"(status={status!r}, exit={state.get('ExitCode')!r})"
         )
-        return False
-    return True
+        return result(
+            DeploymentHealthState.UNHEALTHY,
+            reason=f"container_status:{status}",
+        )
+    if status in {"created", "restarting", "removing", "paused"}:
+        logger.warning(
+            f"ssh-provider: {CONTAINER_NAME} is in a transitional state on "
+            f"{config.host} (status={status!r})"
+        )
+        return result(
+            DeploymentHealthState.SUSPECTED,
+            reason=f"container_status:{status or 'unknown'}",
+        )
+    if status != "running":
+        return result(
+            DeploymentHealthState.UNKNOWN,
+            reason=f"container_status:{status or 'unknown'}",
+        )
+
+    if await _probe_ready(probe_url):
+        return result(DeploymentHealthState.HEALTHY)
+
+    local_ready = await _probe_remote_ready(config)
+    if local_ready is True:
+        logger.warning(
+            f"ssh-provider: {CONTAINER_NAME} is ready on GPU-local port "
+            f"{config.sglang_port}, but public probe {probe_url}/models failed"
+        )
+        return result(
+            DeploymentHealthState.TRANSPORT_UNHEALTHY,
+            reason="public_probe_failed_local_ready",
+        )
+    if local_ready is False:
+        logger.warning(
+            f"ssh-provider: {CONTAINER_NAME} labels match uid={target.uid}, "
+            "but both public and GPU-local readiness probes failed"
+        )
+        return result(
+            DeploymentHealthState.SUSPECTED,
+            reason="public_and_local_probes_failed",
+        )
+    return result(
+        DeploymentHealthState.UNKNOWN,
+        reason="public_probe_failed_local_probe_unavailable",
+    )
+
+
+async def deployment_healthy(
+    config: "SSHConfig",
+    target: DeployTarget,
+    *,
+    base_url: Optional[str] = None,
+) -> bool:
+    """Compatibility wrapper for callers using the previous bool contract."""
+    health = await deployment_health(config, target, base_url=base_url)
+    return health.state is DeploymentHealthState.HEALTHY
 
 
 async def _wait_ready(

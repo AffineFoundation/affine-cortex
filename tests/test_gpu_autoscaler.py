@@ -34,6 +34,7 @@ from affine.src.scheduler.gpu_autoscaler import (
     _wait_for_manual_endpoint_result,
     load_config,
 )
+from affine.src.scheduler.health import tunnel_repair_request_key
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
@@ -179,6 +180,7 @@ class _Tunnels:
     def __init__(self, *, fail=False):
         self.fail = fail
         self.ensured = []
+        self.restarted = []
         self.stopped = []
 
     async def ensure(self, spec):
@@ -188,6 +190,12 @@ class _Tunnels:
 
     async def stop(self, endpoint_name):
         self.stopped.append(endpoint_name)
+
+    async def restart(self, spec):
+        self.restarted.append(spec)
+        self.ensured.append(spec)
+        if self.fail:
+            raise RuntimeError("simulated tunnel failure")
 
     async def stop_all(self):
         self.stopped.append("*")
@@ -667,6 +675,115 @@ async def test_tick_reconciles_active_tunneled_endpoint_url():
     assert spec.endpoint_name == "lium-b200-1"
     assert spec.instance_id == "inst-lium-b200-1"
     assert spec.local_port == 8102
+
+
+@pytest.mark.asyncio
+async def test_tick_restarts_tunnel_requested_by_scheduler():
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        role="scoring",
+        ssh_key_path="/root/.ssh/affine_validator_server",
+        ssh_url="ssh://root@lium-b200-1.example.com:22",
+        public_inference_url="http://validator.example.com:8102/v1",
+        sglang_port=10001,
+        autoscale_managed=True,
+        autoscale_provider="lium",
+        autoscale_instance_id="inst-lium-b200-1",
+        autoscale_purpose="eval",
+        generation=7,
+    )
+    endpoints = _Endpoints([endpoint])
+    tunnels = _Tunnels()
+    autoscaler = _autoscaler(
+        _Queue(pending=0),
+        endpoints,
+        kv,
+        tunnels=tunnels,
+    )
+    cfg = GPUAutoscalerConfig(
+        enabled=True,
+        idle_seconds=3600,
+        pending_threshold_per_instance=1,
+        min_instances=0,
+        max_instances=1,
+        providers={
+            "lium": InstanceAPIConfig(
+                provider="lium",
+                api_url="https://lium.example.com",
+                create_path="/instances",
+                delete_path="/instances/{instance_id}",
+            )
+        },
+        slots=[
+            ManagedEndpointSlot(
+                name="lium-b200-1",
+                provider="lium",
+                endpoint={
+                    "ssh_key_path": "/root/.ssh/affine_validator_server",
+                    "public_inference_url": "http://validator.example.com:8102/v1",
+                },
+                tunnel={"enabled": True},
+            )
+        ],
+    )
+    request_key = tunnel_repair_request_key("lium-b200-1")
+    await kv.set(
+        request_key,
+        {
+            "request_version": 1,
+            "token": "repair-1",
+            "endpoint_name": "lium-b200-1",
+            "instance_id": "inst-lium-b200-1",
+            "endpoint_generation": 7,
+            "requested_at": 900,
+            "expires_at": 1100,
+        },
+    )
+
+    result = await autoscaler.tick(cfg)
+
+    assert result.action == "none"
+    assert len(tunnels.restarted) == 1
+    assert tunnels.restarted[0].instance_id == "inst-lium-b200-1"
+    assert await kv.get(request_key) is None
+
+
+@pytest.mark.asyncio
+async def test_tunnel_repair_request_cannot_cross_endpoint_generation():
+    kv = InMemoryConfigStore()
+    endpoint = Endpoint(
+        name="lium-b200-1",
+        kind="ssh",
+        active=True,
+        autoscale_managed=True,
+        autoscale_instance_id="new-instance",
+        generation=8,
+    )
+    autoscaler = _autoscaler(
+        _Queue(pending=0),
+        _Endpoints([endpoint]),
+        kv,
+    )
+    request_key = tunnel_repair_request_key(endpoint.name)
+    await kv.set(
+        request_key,
+        {
+            "request_version": 1,
+            "token": "repair-old-generation",
+            "endpoint_name": endpoint.name,
+            "instance_id": "old-instance",
+            "endpoint_generation": 7,
+            "expires_at": 1100,
+        },
+    )
+
+    request = await autoscaler._pending_tunnel_repair_request(endpoint)
+
+    assert request is None
+    assert await kv.get(request_key) is None
 
 
 @pytest.mark.asyncio

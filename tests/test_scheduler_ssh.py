@@ -15,6 +15,10 @@ import pytest
 
 from affine.database.dao.inference_endpoints import Endpoint
 from affine.src.scheduler.main import _select_ssh_endpoints
+from affine.src.scheduler.health import (
+    DeploymentHealthResult,
+    DeploymentHealthState,
+)
 from affine.src.scheduler.ssh import (
     ACTIVE_HF_INCOMPLETE_CACHE_MAX_AGE_SECONDS,
     CONTAINER_NAME,
@@ -34,6 +38,7 @@ from affine.src.scheduler.ssh import (
     _parse_container_exit_status,
     _parse_container_inspect_json,
     _should_disable_hf_xet,
+    deployment_health,
     deployment_healthy,
     deploy,
 )
@@ -678,10 +683,24 @@ async def test_deployment_healthy_requires_matching_running_container(monkeypatc
     monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
     monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
 
-    assert await deployment_healthy(
+    result = await deployment_health(
         cfg, target, base_url="http://edge.example/v1",
     )
+    assert result.state is DeploymentHealthState.HEALTHY
     assert probed == ["http://edge.example/v1"]
+
+
+@pytest.mark.asyncio
+async def test_deployment_healthy_preserves_boolean_contract(monkeypatch):
+    async def fake_deployment_health(config, target, *, base_url=None):
+        return DeploymentHealthResult(DeploymentHealthState.HEALTHY)
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh.deployment_health",
+        fake_deployment_health,
+    )
+
+    assert await deployment_healthy(_config(), _target()) is True
 
 
 @pytest.mark.asyncio
@@ -710,7 +729,171 @@ async def test_deployment_healthy_rejects_wrong_model_label(monkeypatch):
     monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", fake_ssh_exec)
     monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
 
-    assert not await deployment_healthy(cfg, target)
+    result = await deployment_health(cfg, target)
+    assert result.state is DeploymentHealthState.UNHEALTHY
+    assert result.reason.startswith("container_label_mismatch:")
+
+
+@pytest.mark.asyncio
+async def test_deployment_health_classifies_public_only_failure_as_transport(
+    monkeypatch,
+):
+    target = _target()
+    cfg = _config(endpoint_name="ssh_b300")
+    inspect_payload = {
+        "State": {"Status": "running", "ExitCode": 0},
+        "Config": {
+            "Labels": {
+                "io.affine.endpoint": "ssh_b300",
+                "io.affine.uid": str(target.uid),
+                "io.affine.hotkey": target.hotkey,
+                "io.affine.model": target.model,
+                "io.affine.revision": target.revision,
+            }
+        },
+    }
+
+    async def fake_container_inspect(config):
+        return inspect_payload
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        return False
+
+    async def fake_remote_probe(config, *, timeout_sec=5.0):
+        return True
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._container_inspect",
+        fake_container_inspect,
+    )
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._probe_remote_ready",
+        fake_remote_probe,
+    )
+
+    result = await deployment_health(cfg, target)
+
+    assert result.state is DeploymentHealthState.TRANSPORT_UNHEALTHY
+    assert result.reason == "public_probe_failed_local_ready"
+
+
+@pytest.mark.asyncio
+async def test_deployment_health_requires_confirmation_when_both_probes_fail(
+    monkeypatch,
+):
+    target = _target()
+    cfg = _config(endpoint_name="ssh_b300")
+    inspect_payload = {
+        "State": {"Status": "running", "ExitCode": 0},
+        "Config": {
+            "Labels": {
+                "io.affine.endpoint": "ssh_b300",
+                "io.affine.uid": str(target.uid),
+                "io.affine.hotkey": target.hotkey,
+                "io.affine.model": target.model,
+                "io.affine.revision": target.revision,
+            }
+        },
+    }
+
+    async def fake_container_inspect(config):
+        return inspect_payload
+
+    async def fake_probe_ready(base_url, *, timeout_sec=5.0):
+        return False
+
+    async def fake_remote_probe(config, *, timeout_sec=5.0):
+        return False
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._container_inspect",
+        fake_container_inspect,
+    )
+    monkeypatch.setattr("affine.src.scheduler.ssh._probe_ready", fake_probe_ready)
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._probe_remote_ready",
+        fake_remote_probe,
+    )
+
+    result = await deployment_health(cfg, target)
+
+    assert result.state is DeploymentHealthState.SUSPECTED
+
+
+@pytest.mark.asyncio
+async def test_deployment_health_treats_ssh_inspect_failure_as_unknown(monkeypatch):
+    async def failing_ssh_exec(config, command):
+        raise RuntimeError("ssh unavailable")
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", failing_ssh_exec)
+
+    result = await deployment_health(
+        _config(endpoint_name="ssh_b300"),
+        _target(),
+    )
+
+    assert result.state is DeploymentHealthState.UNKNOWN
+    assert result.reason == "container_inspect_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_deployment_health_treats_missing_container_as_unhealthy(monkeypatch):
+    async def missing_container(config, command):
+        return 1, "", "Error: No such object: affine-sglang-current"
+
+    monkeypatch.setattr("affine.src.scheduler.ssh._ssh_exec", missing_container)
+
+    result = await deployment_health(
+        _config(endpoint_name="ssh_b300"),
+        _target(),
+    )
+
+    assert result.state is DeploymentHealthState.UNHEALTHY
+    assert result.reason == "container_missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("container_status", "expected_health"),
+    [
+        ("exited", DeploymentHealthState.UNHEALTHY),
+        ("restarting", DeploymentHealthState.SUSPECTED),
+    ],
+)
+async def test_deployment_health_classifies_container_status(
+    monkeypatch,
+    container_status,
+    expected_health,
+):
+    target = _target()
+    inspect_payload = {
+        "State": {"Status": container_status, "ExitCode": 1},
+        "Config": {
+            "Labels": {
+                "io.affine.endpoint": "ssh_b300",
+                "io.affine.uid": str(target.uid),
+                "io.affine.hotkey": target.hotkey,
+                "io.affine.model": target.model,
+                "io.affine.revision": target.revision,
+            }
+        },
+    }
+
+    async def fake_container_inspect(config):
+        return inspect_payload
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.ssh._container_inspect",
+        fake_container_inspect,
+    )
+
+    result = await deployment_health(
+        _config(endpoint_name="ssh_b300"),
+        target,
+    )
+
+    assert result.state is expected_health
 
 
 def test_tool_call_parser_none_omits_flag():

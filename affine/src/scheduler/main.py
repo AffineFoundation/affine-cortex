@@ -58,6 +58,12 @@ from .flow import (
     NoEndpointCapacity,
     TransientDeployError,
 )
+from .health import (
+    DeploymentHealthResult,
+    DeploymentHealthState,
+    TUNNEL_REPAIR_REQUEST_TTL_SECONDS,
+    tunnel_repair_request_key,
+)
 
 
 NETUID = int(os.getenv("NETUID", "120"))
@@ -107,6 +113,84 @@ def _endpoint_matches_target(endpoint, target) -> bool:
 
 def _is_scoring_endpoint(endpoint) -> bool:
     return (getattr(endpoint, "role", None) or "scoring") == "scoring"
+
+
+async def _resolve_live_ssh_config(
+    endpoints_dao,
+    ssh_configs: Dict[str, ssh_lifecycle.SSHConfig],
+    deployment_id: str,
+):
+    """Resolve an SSH deployment only from the current active endpoint row.
+
+    The cache is an index, not an authority. Reusing it after an endpoint was
+    replaced, deactivated, or had its key changed can connect the scheduler to
+    the previous machine generation.
+    """
+    cached_name = next(
+        (
+            name
+            for name, cfg in ssh_configs.items()
+            if cfg.deployment_id() == deployment_id
+        ),
+        None,
+    )
+    active = await endpoints_dao.list_active(kind="ssh")
+    if cached_name is not None:
+        endpoint = next(
+            (item for item in active if item.name == cached_name),
+            None,
+        )
+        if endpoint is None or not _is_scoring_endpoint(endpoint):
+            ssh_configs.pop(cached_name, None)
+            return None, None
+        cfg = ssh_lifecycle.SSHConfig.from_endpoint(endpoint)
+        if cfg.deployment_id() != deployment_id:
+            ssh_configs.pop(cached_name, None)
+            return None, None
+        ssh_configs[cached_name] = cfg
+        return cached_name, cfg
+
+    for endpoint in active:
+        if not _is_scoring_endpoint(endpoint):
+            continue
+        cfg = ssh_lifecycle.SSHConfig.from_endpoint(endpoint)
+        if cfg.deployment_id() == deployment_id:
+            ssh_configs[endpoint.name] = cfg
+            return endpoint.name, cfg
+    return None, None
+
+
+async def _queue_ssh_tunnel_repair(
+    kv_adapter,
+    cfg: ssh_lifecycle.SSHConfig,
+    *,
+    deployment_id: str,
+    reason: str,
+    expected_identity: str = "",
+) -> bool:
+    """Ask the autoscaler process to restart a tunnel it owns."""
+    if not cfg.autoscale_managed or not cfg.autoscale_instance_id:
+        return False
+    if expected_identity and cfg.health_identity() != expected_identity:
+        return False
+    now = int(time.time())
+    request = {
+        "request_version": 1,
+        "token": uuid.uuid4().hex,
+        "endpoint_name": cfg.endpoint_name,
+        "instance_id": cfg.autoscale_instance_id,
+        "endpoint_generation": cfg.endpoint_generation,
+        "deployment_id": deployment_id,
+        "reason": reason,
+        "requested_at": now,
+        "expires_at": now + TUNNEL_REPAIR_REQUEST_TTL_SECONDS,
+    }
+    return await kv_adapter.set_if_absent_or_expired(
+        tunnel_repair_request_key(cfg.endpoint_name),
+        request,
+        expires_at_field="expires_at",
+        now=now,
+    )
 
 
 def _endpoint_is_available(endpoint) -> bool:
@@ -483,45 +567,11 @@ async def _run() -> None:
             )
 
         async def _resolve_ssh_cfg(deployment_id):
-            """Find the (name, cfg) that owns ``deployment_id``.
-            ``ssh_configs`` is a startup snapshot; an endpoint added at
-            runtime (or one whose row was edited after start) won't be
-            there. Fall back to a live ``list_active`` so teardown can
-            still find a cfg to docker-rm + clear_assignment on."""
-            for name, cfg in ssh_configs.items():
-                if deployment_id == cfg.deployment_id():
-                    try:
-                        endpoint = await endpoints_dao.get(name)
-                        if (
-                            endpoint is not None
-                            and endpoint.active
-                            and endpoint.kind == "ssh"
-                            and _is_scoring_endpoint(endpoint)
-                        ):
-                            cfg = ssh_lifecycle.SSHConfig.from_endpoint(endpoint)
-                            ssh_configs[name] = cfg
-                    except Exception as e:
-                        logger.warning(
-                            f"scheduler: live endpoint refresh failed during "
-                            f"teardown_fn for endpoint={name!r}: "
-                            f"{type(e).__name__}: {e}; using cached cfg"
-                        )
-                    return name, cfg
-            try:
-                live = await endpoints_dao.list_active(kind="ssh")
-            except Exception as e:
-                logger.warning(
-                    f"scheduler: live endpoint lookup failed during "
-                    f"teardown_fn for deployment_id={deployment_id!r}: "
-                    f"{type(e).__name__}: {e}"
-                )
-                return None, None
-            for ep in live:
-                cfg = ssh_lifecycle.SSHConfig.from_endpoint(ep)
-                if deployment_id == cfg.deployment_id():
-                    ssh_configs[ep.name] = cfg  # cache for next time
-                    return ep.name, cfg
-            return None, None
+            return await _resolve_live_ssh_config(
+                endpoints_dao,
+                ssh_configs,
+                deployment_id,
+            )
 
         async def teardown_fn(deployment_id):
             if not deployment_id:
@@ -562,7 +612,10 @@ async def _run() -> None:
 
         async def deployment_health_fn(champion):
             if not champion.deployment_id:
-                return False
+                return DeploymentHealthResult(
+                    DeploymentHealthState.UNHEALTHY,
+                    reason="missing_deployment_id",
+                )
             _name, cfg = await _resolve_ssh_cfg(champion.deployment_id)
             if cfg is None:
                 logger.warning(
@@ -570,7 +623,10 @@ async def _run() -> None:
                     f"deployment_id={champion.deployment_id!r}; "
                     f"treating deployment as unhealthy"
                 )
-                return False
+                return DeploymentHealthResult(
+                    DeploymentHealthState.UNHEALTHY,
+                    reason="endpoint_inactive_or_removed",
+                )
             target = targon_lifecycle.DeployTarget(
                 uid=champion.uid,
                 hotkey=champion.hotkey,
@@ -578,9 +634,47 @@ async def _run() -> None:
                 revision=champion.revision,
                 model_type=champion.model_type,
             )
-            return await ssh_lifecycle.deployment_healthy(
+            return await ssh_lifecycle.deployment_health(
                 cfg, target, base_url=champion.base_url,
             )
+
+        async def deployment_transport_repair_fn(champion, health):
+            if not champion.deployment_id:
+                return False
+            name, cfg = await _resolve_ssh_cfg(champion.deployment_id)
+            if cfg is None:
+                logger.warning(
+                    f"scheduler: cannot request tunnel repair for deployment "
+                    f"{champion.deployment_id!r}; endpoint is no longer active"
+                )
+                return False
+            queued = await _queue_ssh_tunnel_repair(
+                kv_adapter,
+                cfg,
+                deployment_id=champion.deployment_id,
+                reason=health.reason,
+                expected_identity=health.identity,
+            )
+            if not cfg.autoscale_managed or not cfg.autoscale_instance_id:
+                logger.error(
+                    f"scheduler: endpoint={name!r} transport is unhealthy, "
+                    "but its tunnel is not autoscaler-managed"
+                )
+                return False
+            elif not queued:
+                if health.identity != cfg.health_identity():
+                    logger.info(
+                        f"scheduler: skipped stale tunnel repair for "
+                        f"endpoint={name!r}; endpoint generation changed"
+                    )
+                else:
+                    logger.info(
+                        f"scheduler: tunnel repair already pending for "
+                        f"endpoint={name!r} "
+                        f"instance={cfg.autoscale_instance_id!r}"
+                    )
+                return health.identity == cfg.health_identity()
+            return True
 
         async def list_active_ssh_endpoint_names():
             return {
@@ -627,6 +721,7 @@ async def _run() -> None:
             await targon_lifecycle.teardown(targon_client, deployment_id)
 
         deployment_health_fn = None
+        deployment_transport_repair_fn = None
         transition_deployment_role_fn = None
         list_active_ssh_endpoint_names = None
         list_active_ssh_endpoint_activations = None
@@ -654,6 +749,7 @@ async def _run() -> None:
             list_active_ssh_endpoint_activations
         ),
         deployment_health_fn=deployment_health_fn,
+        deployment_transport_repair_fn=deployment_transport_repair_fn,
         transition_deployment_role_fn=transition_deployment_role_fn,
         sample_metrics_reader=sample_metrics_reader,
         behavior_gate_dao=BehaviorGateDAO(),

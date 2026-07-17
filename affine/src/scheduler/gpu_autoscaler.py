@@ -43,6 +43,7 @@ from affine.src.scorer.challenger_queue import ChallengerQueue
 from affine.src.scorer.dao_adapters import MinersQueueAdapter, SampleResultsAdapter
 from affine.src.scorer.sampling_thresholds import champion_completion_threshold
 from affine.src.scorer.window_state import StateStore, SystemConfigKVAdapter
+from affine.src.scheduler.health import tunnel_repair_request_key
 
 
 CONFIG_KEY = "gpu_autoscaler"
@@ -437,6 +438,10 @@ class SSHTunnelManager:
             current.spec.instance_id,
             current.spec.local_port,
         )
+
+    async def restart(self, spec: TunnelSpec) -> None:
+        await self.stop(spec.endpoint_name)
+        await self.ensure(spec)
 
     async def stop_all(self) -> None:
         for endpoint_name in list(self._tunnels):
@@ -996,8 +1001,17 @@ class GPUAutoscaler:
             if slot is None or not _tunnel_enabled(slot):
                 continue
             reconciled = _endpoint_with_slot_tunnel_overrides(endpoint, slot)
+            repair_request = await self._pending_tunnel_repair_request(endpoint)
             try:
-                await self._ensure_endpoint_tunnel(slot, reconciled)
+                if repair_request is None:
+                    await self._ensure_endpoint_tunnel(slot, reconciled)
+                else:
+                    spec = _tunnel_spec_for_endpoint(slot, reconciled)
+                    if spec is None:
+                        raise RuntimeError(
+                            f"endpoint {endpoint.name!r} has no tunnel spec"
+                        )
+                    await self._tunnels.restart(spec)
             except Exception as e:
                 failures += 1
                 logger.error(
@@ -1009,6 +1023,28 @@ class GPUAutoscaler:
                     e,
                 )
                 continue
+            if repair_request is not None:
+                try:
+                    cleared = await self._kv.delete_if_token(
+                        tunnel_repair_request_key(endpoint.name),
+                        str(repair_request["token"]),
+                    )
+                except Exception as e:
+                    cleared = False
+                    logger.warning(
+                        "gpu-autoscaler: tunnel repaired but request cleanup "
+                        "failed endpoint=%s: %s: %s",
+                        endpoint.name,
+                        type(e).__name__,
+                        e,
+                    )
+                logger.warning(
+                    "gpu-autoscaler: tunnel repair completed endpoint=%s "
+                    "instance=%s request_cleared=%s",
+                    endpoint.name,
+                    endpoint.autoscale_instance_id,
+                    cleared,
+                )
             if reconciled != endpoint:
                 try:
                     await self._endpoints.activate_autoscaled_endpoint(
@@ -1026,6 +1062,68 @@ class GPUAutoscaler:
                     )
                     continue
         return failures
+
+    async def _pending_tunnel_repair_request(
+        self,
+        endpoint: Endpoint,
+    ) -> Optional[Dict[str, Any]]:
+        key = tunnel_repair_request_key(endpoint.name)
+        try:
+            raw = await self._kv.get(key)
+        except Exception as e:
+            logger.warning(
+                "gpu-autoscaler: failed to read tunnel repair request for "
+                "endpoint=%s: %s: %s",
+                endpoint.name,
+                type(e).__name__,
+                e,
+            )
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+
+        token = str(raw.get("token") or "")
+        now = int(self._now())
+        try:
+            request_version = int(raw.get("request_version") or 0)
+            request_generation = int(raw.get("endpoint_generation") or 0)
+            expires_at = int(raw.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            request_version = -1
+            request_generation = -1
+            expires_at = 0
+        valid = (
+            request_version == 1
+            and bool(token)
+            and str(raw.get("endpoint_name") or "") == endpoint.name
+            and str(raw.get("instance_id") or "")
+            == str(endpoint.autoscale_instance_id or "")
+            and request_generation == int(endpoint.generation or 0)
+            and expires_at > now
+        )
+        if valid:
+            return dict(raw)
+
+        try:
+            if token:
+                await self._kv.delete_if_token(key, token)
+            else:
+                await self._kv.delete(key)
+        except Exception as e:
+            logger.warning(
+                "gpu-autoscaler: failed to discard stale tunnel repair "
+                "request endpoint=%s: %s: %s",
+                endpoint.name,
+                type(e).__name__,
+                e,
+            )
+        logger.warning(
+            "gpu-autoscaler: discarded stale tunnel repair request "
+            "endpoint=%s instance=%s",
+            endpoint.name,
+            endpoint.autoscale_instance_id,
+        )
+        return None
 
     def _should_force_start_after_restart(
         self,
