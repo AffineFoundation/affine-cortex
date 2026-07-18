@@ -261,7 +261,7 @@ def test_status_returns_normalized_pod_state():
             "ssh_url": "ssh://root@203.0.113.10:2222",
             "ports": [
                 {
-                    "port": 10001,
+                    "port": 40000,
                     "url": "https://pod-1.example.com",
                 }
             ],
@@ -276,7 +276,74 @@ def test_status_returns_normalized_pod_state():
     assert result["status"] == "running"
     assert result["ssh_url"] == "ssh://root@203.0.113.10:2222"
     assert result["public_inference_url"] == "https://pod-1.example.com/v1"
+    assert result["sglang_port"] == 40000
     assert result["raw"]["user_public_key"] == "<redacted>"
+
+
+def test_status_keeps_internal_and_public_service_ports_separate():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+
+    def request(method, path, **kwargs):
+        assert (method, path) == ("GET", "/pods/pod-1")
+        return {
+            "uid": "pod-1",
+            "status": "RUNNING",
+            "ssh_connect_cmd": "ssh root@203.0.113.10 -p 40299",
+            "ports_mapping": {"22": 40299, "40000": 45123},
+        }
+
+    client.request = request
+
+    result = client.status("pod-1")
+
+    assert result["ssh_url"] == "ssh://root@203.0.113.10:40299"
+    assert result["public_inference_url"] == "http://203.0.113.10:45123/v1"
+    assert result["sglang_port"] == 40000
+
+
+def test_status_does_not_invent_unmapped_service_port():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+
+    def request(method, path, **kwargs):
+        return {
+            "uid": "pod-1",
+            "status": "RUNNING",
+            "ssh_connect_cmd": "ssh root@203.0.113.10 -p 40299",
+            "ports_mapping": {"22": 40299},
+            "urls": [{"url": "https://ambiguous.example.com"}],
+        }
+
+    client.request = request
+
+    result = client.status("pod-1")
+
+    assert result["public_inference_url"] == ""
+    assert result["sglang_port"] == 0
+
+
+def test_resolve_template_requires_configured_internal_service_port():
+    lium = _load_wrapper()
+    client = lium.LiumClient.__new__(lium.LiumClient)
+    client.request = lambda method, path: [
+        {
+            "id": "template-10001",
+            "name": "Pytorch DinD",
+            "status": "VERIFY_SUCCESS",
+            "supports_docker": True,
+            "internal_ports": [22, 10001],
+        },
+        {
+            "id": "template-40000",
+            "name": "Pytorch DinD",
+            "status": "VERIFY_SUCCESS",
+            "supports_docker": True,
+            "internal_ports": [22, 40000],
+        },
+    ]
+
+    assert client.resolve_template_id() == "template-40000"
 
 
 def test_error_payloads_distinguish_wrapper_and_provider_not_found():

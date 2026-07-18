@@ -23,9 +23,7 @@ from affine.src.scheduler.gpu_autoscaler import (
     MANUAL_REPLACEMENT_REQUEST_VERSION,
     MANUAL_REPLACEMENT_STATE_KEY,
     ManagedEndpointSlot,
-    SSHTunnelManager,
     STATE_KEY,
-    TunnelSpec,
     _config_without_endpoint_slot,
     _enqueue_manual_add_request,
     _enqueue_manual_remove_request,
@@ -35,7 +33,6 @@ from affine.src.scheduler.gpu_autoscaler import (
     enqueue_health_endpoint_replacement_request,
     load_config,
 )
-from affine.src.scheduler.health import tunnel_repair_request_key
 from affine.src.scorer.window_state import (
     BattleRecord,
     ChampionRecord,
@@ -177,31 +174,6 @@ class _Samples:
         return self.count
 
 
-class _Tunnels:
-    def __init__(self, *, fail=False):
-        self.fail = fail
-        self.ensured = []
-        self.restarted = []
-        self.stopped = []
-
-    async def ensure(self, spec):
-        self.ensured.append(spec)
-        if self.fail:
-            raise RuntimeError("simulated tunnel failure")
-
-    async def stop(self, endpoint_name):
-        self.stopped.append(endpoint_name)
-
-    async def restart(self, spec):
-        self.restarted.append(spec)
-        self.ensured.append(spec)
-        if self.fail:
-            raise RuntimeError("simulated tunnel failure")
-
-    async def stop_all(self):
-        self.stopped.append("*")
-
-
 class _Client:
     deleted = []
     delete_calls = []
@@ -210,6 +182,8 @@ class _Client:
     renewed = []
     status_calls = []
     create_lease_expires_at = 1500
+    create_public_inference_url = None
+    create_sglang_port = 10001
     renew_expires_at = 0
     create_returns_none_for_names = set()
     delete_returns_false_for_ids = set()
@@ -231,7 +205,12 @@ class _Client:
             provider=self.config.provider,
             instance_id=f"inst-{name}",
             ssh_url=f"ssh://root@{name}.example.com:22",
-            public_inference_url=f"http://{name}.example.com:10001/v1",
+            public_inference_url=(
+                self.create_public_inference_url
+                if self.create_public_inference_url is not None
+                else f"http://{name}.example.com:{self.create_sglang_port}/v1"
+            ),
+            sglang_port=self.create_sglang_port,
             lease_expires_at=self.create_lease_expires_at,
         )
 
@@ -283,6 +262,8 @@ def _reset_client_state():
     _Client.renewed = []
     _Client.status_calls = []
     _Client.create_lease_expires_at = 1500
+    _Client.create_public_inference_url = None
+    _Client.create_sglang_port = 10001
     _Client.renew_expires_at = 0
     _Client.create_returns_none_for_names = set()
     _Client.delete_returns_false_for_ids = set()
@@ -358,7 +339,7 @@ def _config_payload():
     }
 
 
-def _autoscaler(queue, endpoints, kv, *, now=1000, samples=None, tunnels=None):
+def _autoscaler(queue, endpoints, kv, *, now=1000, samples=None):
     if hasattr(endpoints, "now"):
         endpoints.now = now
     return GPUAutoscaler(
@@ -368,7 +349,6 @@ def _autoscaler(queue, endpoints, kv, *, now=1000, samples=None, tunnels=None):
         kv_store=kv,
         samples_adapter=samples or _Samples(count=0),
         client_factory=_Client,
-        tunnel_manager=tunnels or _Tunnels(),
         now_fn=lambda: now,
     )
 
@@ -440,7 +420,7 @@ def test_managed_endpoint_slot_accepts_autoscale_purpose():
     assert slot.purpose == "bench-pool"
 
 
-def test_managed_endpoint_slot_accepts_tunnel_config():
+def test_managed_endpoint_slot_ignores_legacy_tunnel_config():
     slot = ManagedEndpointSlot.from_mapping({
         "name": "lium-b200-1",
         "provider": "lium",
@@ -452,14 +432,8 @@ def test_managed_endpoint_slot_accepts_tunnel_config():
         },
     })
 
-    assert slot.endpoint["public_inference_url"] == (
-        "http://validator.example.com:8102/v1"
-    )
-    assert slot.tunnel == {
-        "enabled": True,
-        "bind_host": "0.0.0.0",
-        "target_port": 10001,
-    }
+    assert "public_inference_url" not in slot.endpoint
+    assert not hasattr(slot, "tunnel")
 
 
 def test_config_without_endpoint_slot_removes_only_requested_slot():
@@ -483,34 +457,6 @@ def test_config_without_endpoint_slot_removes_only_requested_slot():
         "targon-b200-3",
     ]
     assert payload["endpoints"][1]["name"] == "lium-b200-temp-2"
-
-
-@pytest.mark.asyncio
-async def test_tunnel_manager_refuses_port_owned_by_unmanaged_process(
-    monkeypatch,
-):
-    async def port_is_open(host, port):
-        return True
-
-    async def unexpected_subprocess(*args, **kwargs):
-        raise AssertionError("ssh process must not start on an occupied port")
-
-    monkeypatch.setattr(
-        "affine.src.scheduler.gpu_autoscaler._local_port_is_open",
-        port_is_open,
-    )
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", unexpected_subprocess)
-    manager = SSHTunnelManager()
-    spec = TunnelSpec(
-        endpoint_name="lium-b200-1",
-        instance_id="new-inst",
-        ssh_url="ssh://root@new.example.com:22",
-        ssh_key_path="/root/.ssh/id_ed25519",
-        public_url="http://validator.example.com:8102/v1",
-    )
-
-    with pytest.raises(RuntimeError, match="unmanaged process"):
-        await manager.ensure(spec)
 
 
 def test_instance_api_url_falls_back_to_provider_api_url(monkeypatch):
@@ -557,16 +503,12 @@ async def test_scales_up_when_pending_exceeds_threshold():
 
 
 @pytest.mark.asyncio
-async def test_scale_up_keeps_slot_public_url_over_provider_direct_url():
+async def test_scale_up_uses_provider_direct_url_and_port():
+    _Client.create_public_inference_url = "http://203.0.113.10:45123/v1"
+    _Client.create_sglang_port = 40000
     kv = InMemoryConfigStore()
     endpoints = _Endpoints()
-    tunnels = _Tunnels()
-    autoscaler = _autoscaler(
-        _Queue(pending=1),
-        endpoints,
-        kv,
-        tunnels=tunnels,
-    )
+    autoscaler = _autoscaler(_Queue(pending=1), endpoints, kv)
     cfg = GPUAutoscalerConfig(
         enabled=True,
         pending_threshold_per_instance=1,
@@ -587,8 +529,8 @@ async def test_scale_up_keeps_slot_public_url_over_provider_direct_url():
                 endpoint={
                     "ssh_key_path": "/root/.ssh/affine_validator_server",
                     "public_inference_url": "http://validator.example.com:8102/v1",
+                    "sglang_port": 10001,
                 },
-                tunnel={"enabled": True},
             )
         ],
     )
@@ -596,17 +538,10 @@ async def test_scale_up_keeps_slot_public_url_over_provider_direct_url():
     result = await autoscaler.tick(cfg)
 
     assert result.action == "scale-up:1"
-    ep = endpoints.endpoints["lium-b200-1"]
-    assert ep.ssh_url == "ssh://root@lium-b200-1.example.com:22"
-    assert ep.public_inference_url == "http://validator.example.com:8102/v1"
-    assert len(tunnels.ensured) == 1
-    spec = tunnels.ensured[0]
-    assert spec.endpoint_name == "lium-b200-1"
-    assert spec.instance_id == "inst-lium-b200-1"
-    assert spec.local_port == 8102
-    assert spec.target_host == "127.0.0.1"
-    assert spec.target_port == 10001
-    assert spec.ssh_key_path == "/root/.ssh/affine_validator_server"
+    endpoint = endpoints.endpoints["lium-b200-1"]
+    assert endpoint.ssh_url == "ssh://root@lium-b200-1.example.com:22"
+    assert endpoint.public_inference_url == "http://203.0.113.10:45123/v1"
+    assert endpoint.sglang_port == 40000
     assert _Client.events == [
         ("create", "lium-b200-1"),
         ("activate", "lium-b200-1"),
@@ -614,225 +549,36 @@ async def test_scale_up_keeps_slot_public_url_over_provider_direct_url():
 
 
 @pytest.mark.asyncio
-async def test_tick_reconciles_active_tunneled_endpoint_url():
-    kv = InMemoryConfigStore()
-    endpoint = Endpoint(
-        name="lium-b200-1",
-        kind="ssh",
-        active=True,
-        role="scoring",
-        ssh_key_path="/root/.ssh/affine_validator_server",
-        ssh_url="ssh://root@lium-b200-1.example.com:22",
-        public_inference_url="http://lium-b200-1.example.com:10001/v1",
-        sglang_port=10001,
-        autoscale_managed=True,
-        autoscale_provider="lium",
-        autoscale_instance_id="inst-lium-b200-1",
-        autoscale_purpose="eval",
-    )
-    endpoints = _Endpoints([endpoint])
-    tunnels = _Tunnels()
-    autoscaler = _autoscaler(
-        _Queue(pending=0),
-        endpoints,
-        kv,
-        tunnels=tunnels,
-    )
-    cfg = GPUAutoscalerConfig(
-        enabled=True,
-        idle_seconds=3600,
-        pending_threshold_per_instance=1,
-        min_instances=0,
-        max_instances=1,
-        providers={
-            "lium": InstanceAPIConfig(
-                provider="lium",
-                api_url="https://lium.example.com",
-                create_path="/instances",
-                delete_path="/instances/{instance_id}",
-            )
-        },
-        slots=[
-            ManagedEndpointSlot(
-                name="lium-b200-1",
-                provider="lium",
-                endpoint={
-                    "ssh_key_path": "/root/.ssh/affine_validator_server",
-                    "public_inference_url": "http://validator.example.com:8102/v1",
-                },
-                tunnel={"enabled": True},
-            )
-        ],
-    )
-
-    result = await autoscaler.tick(cfg)
-
-    assert result.action == "none"
-    ep = endpoints.endpoints["lium-b200-1"]
-    assert ep.public_inference_url == "http://validator.example.com:8102/v1"
-    assert _Client.events == [("activate", "lium-b200-1")]
-    assert len(tunnels.ensured) == 1
-    spec = tunnels.ensured[0]
-    assert spec.endpoint_name == "lium-b200-1"
-    assert spec.instance_id == "inst-lium-b200-1"
-    assert spec.local_port == 8102
-
-
-@pytest.mark.asyncio
-async def test_tick_restarts_tunnel_requested_by_scheduler():
-    kv = InMemoryConfigStore()
-    endpoint = Endpoint(
-        name="lium-b200-1",
-        kind="ssh",
-        active=True,
-        role="scoring",
-        ssh_key_path="/root/.ssh/affine_validator_server",
-        ssh_url="ssh://root@lium-b200-1.example.com:22",
-        public_inference_url="http://validator.example.com:8102/v1",
-        sglang_port=10001,
-        autoscale_managed=True,
-        autoscale_provider="lium",
-        autoscale_instance_id="inst-lium-b200-1",
-        autoscale_purpose="eval",
-        generation=7,
-    )
-    endpoints = _Endpoints([endpoint])
-    tunnels = _Tunnels()
-    autoscaler = _autoscaler(
-        _Queue(pending=0),
-        endpoints,
-        kv,
-        tunnels=tunnels,
-    )
-    cfg = GPUAutoscalerConfig(
-        enabled=True,
-        idle_seconds=3600,
-        pending_threshold_per_instance=1,
-        min_instances=0,
-        max_instances=1,
-        providers={
-            "lium": InstanceAPIConfig(
-                provider="lium",
-                api_url="https://lium.example.com",
-                create_path="/instances",
-                delete_path="/instances/{instance_id}",
-            )
-        },
-        slots=[
-            ManagedEndpointSlot(
-                name="lium-b200-1",
-                provider="lium",
-                endpoint={
-                    "ssh_key_path": "/root/.ssh/affine_validator_server",
-                    "public_inference_url": "http://validator.example.com:8102/v1",
-                },
-                tunnel={"enabled": True},
-            )
-        ],
-    )
-    request_key = tunnel_repair_request_key("lium-b200-1")
-    await kv.set(
-        request_key,
-        {
-            "request_version": 1,
-            "token": "repair-1",
-            "endpoint_name": "lium-b200-1",
-            "instance_id": "inst-lium-b200-1",
-            "endpoint_generation": 7,
-            "requested_at": 900,
-            "expires_at": 1100,
-        },
-    )
-
-    result = await autoscaler.tick(cfg)
-
-    assert result.action == "none"
-    assert len(tunnels.restarted) == 1
-    assert tunnels.restarted[0].instance_id == "inst-lium-b200-1"
-    assert await kv.get(request_key) is None
-
-
-@pytest.mark.asyncio
-async def test_tunnel_repair_request_cannot_cross_endpoint_generation():
-    kv = InMemoryConfigStore()
-    endpoint = Endpoint(
-        name="lium-b200-1",
-        kind="ssh",
-        active=True,
-        autoscale_managed=True,
-        autoscale_instance_id="new-instance",
-        generation=8,
-    )
-    autoscaler = _autoscaler(
-        _Queue(pending=0),
-        _Endpoints([endpoint]),
-        kv,
-    )
-    request_key = tunnel_repair_request_key(endpoint.name)
-    await kv.set(
-        request_key,
-        {
-            "request_version": 1,
-            "token": "repair-old-generation",
-            "endpoint_name": endpoint.name,
-            "instance_id": "old-instance",
-            "endpoint_generation": 7,
-            "expires_at": 1100,
-        },
-    )
-
-    request = await autoscaler._pending_tunnel_repair_request(endpoint)
-
-    assert request is None
-    assert await kv.get(request_key) is None
-
-
-@pytest.mark.asyncio
-async def test_scale_up_deletes_instance_when_tunnel_setup_fails():
+@pytest.mark.parametrize(
+    ("public_url", "sglang_port"),
+    [
+        ("", 40000),
+        ("http://203.0.113.10/v1", 40000),
+        ("http://203.0.113.10:45123/models", 40000),
+        ("http://203.0.113.10:45123/v1", 0),
+    ],
+)
+async def test_scale_up_deletes_instance_without_usable_direct_endpoint(
+    public_url,
+    sglang_port,
+):
+    _Client.create_public_inference_url = public_url
+    _Client.create_sglang_port = sglang_port
     kv = InMemoryConfigStore()
     endpoints = _Endpoints()
-    tunnels = _Tunnels(fail=True)
-    autoscaler = _autoscaler(
-        _Queue(pending=1),
-        endpoints,
-        kv,
-        tunnels=tunnels,
-    )
-    cfg = GPUAutoscalerConfig(
-        enabled=True,
-        pending_threshold_per_instance=1,
-        min_instances=0,
-        max_instances=1,
-        providers={
-            "lium": InstanceAPIConfig(
-                provider="lium",
-                api_url="https://lium.example.com",
-                create_path="/instances",
-                delete_path="/instances/{instance_id}",
-            )
-        },
-        slots=[
-            ManagedEndpointSlot(
-                name="lium-b200-1",
-                provider="lium",
-                endpoint={
-                    "public_inference_url": "http://validator.example.com:8102/v1",
-                },
-                tunnel={"enabled": True},
-            )
-        ],
-    )
+    autoscaler = _autoscaler(_Queue(pending=1), endpoints, kv)
 
-    result = await autoscaler.tick(cfg)
+    result = await autoscaler.tick(_config(threshold=1))
 
     assert result.action == "none"
     assert endpoints.endpoints == {}
-    assert _Client.deleted == ["inst-lium-b200-1"]
+    assert _Client.deleted == ["inst-lium-b200-1", "inst-lium-b200-2"]
     assert _Client.events == [
         ("create", "lium-b200-1"),
         ("delete", "inst-lium-b200-1"),
+        ("create", "lium-b200-2"),
+        ("delete", "inst-lium-b200-2"),
     ]
-    assert tunnels.stopped == ["lium-b200-1"]
 
 
 @pytest.mark.asyncio
@@ -1182,13 +928,11 @@ async def test_daemon_executes_replacement_without_scaling_fallback_slot():
         autoscale_purpose="eval",
     )
     endpoints = _Endpoints([old])
-    tunnels = _Tunnels()
     autoscaler = _autoscaler(
         _Queue(pending=10),
         endpoints,
         kv,
         now=1000,
-        tunnels=tunnels,
     )
     cfg = GPUAutoscalerConfig(
         enabled=True,
@@ -1208,10 +952,6 @@ async def test_daemon_executes_replacement_without_scaling_fallback_slot():
             ManagedEndpointSlot(
                 name="lium-b200-1",
                 provider="lium",
-                endpoint={
-                    "public_inference_url": ("http://validator.example.com:8102/v1"),
-                },
-                tunnel={"enabled": True},
             ),
             ManagedEndpointSlot(name="lium-b300-fallback", provider="lium"),
         ],
@@ -1238,8 +978,6 @@ async def test_daemon_executes_replacement_without_scaling_fallback_slot():
         ("activate", "lium-b200-1"),
     ]
     assert all(event != ("create", "lium-b300-fallback") for event in _Client.events)
-    assert tunnels.stopped == ["lium-b200-1"]
-    assert [spec.instance_id for spec in tunnels.ensured] == ["inst-lium-b200-1"]
     assert await kv.get(MANUAL_REPLACEMENT_LOCK_KEY) is None
     replacement = await kv.get(_manual_endpoint_result_key(request["token"]))
     assert replacement["status"] == "completed"
@@ -1958,13 +1696,11 @@ async def test_scales_down_idle_managed_endpoint_and_clears_champion_deployment(
         autoscale_lease_expires_at=1500,
     )
     endpoints = _Endpoints([endpoint])
-    tunnels = _Tunnels()
     autoscaler = _autoscaler(
         _Queue(pending=0),
         endpoints,
         kv,
         now=1000,
-        tunnels=tunnels,
     )
 
     result = await autoscaler.tick(_config(idle_seconds=60))
@@ -1987,7 +1723,6 @@ async def test_scales_down_idle_managed_endpoint_and_clears_champion_deployment(
     assert ep.autoscale_instance_id is None
     assert ep.autoscale_purpose is None
     assert ep.autoscale_lease_expires_at == 0
-    assert tunnels.stopped == ["lium-b200-1"]
     champion = await state.get_champion()
     assert champion.deployment_id is None
     assert champion.base_url is None

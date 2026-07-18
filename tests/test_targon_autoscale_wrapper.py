@@ -73,6 +73,7 @@ def test_create_registers_deploys_and_returns_provider_handle(monkeypatch):
     assert result["instance_id"] == "wrk-test"
     assert result["ssh_url"] == "ssh://wrk-test@ssh.deployments.targon.com:22"
     assert result["public_inference_url"] == "https://wrk-test-10001.caas.targon.com/v1"
+    assert result["sglang_port"] == 10001
     assert calls[:3] == [
         ("GET", "/workloads", None),
         ("POST", "/workloads", calls[1][2]),
@@ -155,6 +156,7 @@ def test_status_returns_normalized_workload_state(monkeypatch):
     assert result["status"] == "running"
     assert result["ssh_url"] == "ssh://wrk-test@ssh.deployments.targon.com:22"
     assert result["public_inference_url"] == "https://wrk-test-10001.caas.targon.com/v1"
+    assert result["sglang_port"] == 10001
     assert calls == [
         ("GET", "/workloads/wrk-test"),
         ("GET", "/workloads/wrk-test/state"),

@@ -62,8 +62,6 @@ from .gpu_autoscaler import enqueue_health_endpoint_replacement_request
 from .health import (
     DeploymentHealthResult,
     DeploymentHealthState,
-    TUNNEL_REPAIR_REQUEST_TTL_SECONDS,
-    tunnel_repair_request_key,
 )
 
 
@@ -165,36 +163,25 @@ async def _resolve_live_ssh_config(
     return None, None
 
 
-async def _queue_ssh_tunnel_repair(
+async def _queue_ssh_endpoint_replacement(
     kv_adapter,
     cfg: ssh_lifecycle.SSHConfig,
     *,
-    deployment_id: str,
     reason: str,
     expected_identity: str = "",
 ) -> bool:
-    """Ask the autoscaler process to restart a tunnel it owns."""
+    """Request a fenced replacement for an unhealthy direct endpoint."""
     if not cfg.autoscale_managed or not cfg.autoscale_instance_id:
         return False
     if expected_identity and cfg.health_identity() != expected_identity:
         return False
-    now = int(time.time())
-    request = {
-        "request_version": 1,
-        "token": uuid.uuid4().hex,
-        "endpoint_name": cfg.endpoint_name,
-        "instance_id": cfg.autoscale_instance_id,
-        "endpoint_generation": cfg.endpoint_generation,
-        "deployment_id": deployment_id,
-        "reason": reason,
-        "requested_at": now,
-        "expires_at": now + TUNNEL_REPAIR_REQUEST_TTL_SECONDS,
-    }
-    return await kv_adapter.set_if_absent_or_expired(
-        tunnel_repair_request_key(cfg.endpoint_name),
-        request,
-        expires_at_field="expires_at",
-        now=now,
+    return await enqueue_health_endpoint_replacement_request(
+        kv_adapter,
+        endpoint_name=cfg.endpoint_name,
+        instance_id=cfg.autoscale_instance_id,
+        endpoint_generation=cfg.endpoint_generation,
+        reason=reason,
+        now=int(time.time()),
     )
 
 
@@ -644,44 +631,6 @@ async def _run() -> None:
                 cfg, target, base_url=cfg.inference_url(),
             )
 
-        async def deployment_transport_repair_fn(record, health):
-            if not record.deployment_id:
-                return False
-            name, cfg = await _resolve_ssh_cfg(record.deployment_id)
-            if cfg is None:
-                logger.warning(
-                    f"scheduler: cannot request tunnel repair for deployment "
-                    f"{record.deployment_id!r}; endpoint is no longer active"
-                )
-                return False
-            queued = await _queue_ssh_tunnel_repair(
-                kv_adapter,
-                cfg,
-                deployment_id=record.deployment_id,
-                reason=health.reason,
-                expected_identity=health.identity,
-            )
-            if not cfg.autoscale_managed or not cfg.autoscale_instance_id:
-                logger.error(
-                    f"scheduler: endpoint={name!r} transport is unhealthy, "
-                    "but its tunnel is not autoscaler-managed"
-                )
-                return False
-            elif not queued:
-                if health.identity != cfg.health_identity():
-                    logger.info(
-                        f"scheduler: skipped stale tunnel repair for "
-                        f"endpoint={name!r}; endpoint generation changed"
-                    )
-                else:
-                    logger.info(
-                        f"scheduler: tunnel repair already pending for "
-                        f"endpoint={name!r} "
-                        f"instance={cfg.autoscale_instance_id!r}"
-                    )
-                return health.identity == cfg.health_identity()
-            return True
-
         async def deployment_endpoint_repair_fn(record, health):
             if not record.deployment_id:
                 return False
@@ -700,14 +649,19 @@ async def _run() -> None:
                     f"endpoint={name!r}; endpoint generation changed"
                 )
                 return False
-            return await enqueue_health_endpoint_replacement_request(
+            return await _queue_ssh_endpoint_replacement(
                 kv_adapter,
-                endpoint_name=name,
-                instance_id=cfg.autoscale_instance_id,
-                endpoint_generation=cfg.endpoint_generation,
+                cfg,
                 reason=health.reason,
-                now=int(time.time()),
+                expected_identity=health.identity,
             )
+
+        async def deployment_transport_repair_fn(record, health):
+            logger.warning(
+                "scheduler: direct inference transport failed; requesting "
+                "a fenced same-slot endpoint replacement"
+            )
+            return await deployment_endpoint_repair_fn(record, health)
 
         async def list_active_ssh_endpoint_names():
             return {

@@ -13,7 +13,6 @@ scheduler needs: SSH URL, public inference URL, and instance id.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 import math
 import os
@@ -21,7 +20,6 @@ import signal
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
-from asyncio.subprocess import Process
 from typing import Any, Callable, Dict, List, Mapping, Optional
 from urllib.parse import urlparse
 
@@ -43,7 +41,6 @@ from affine.src.scorer.challenger_queue import ChallengerQueue
 from affine.src.scorer.dao_adapters import MinersQueueAdapter, SampleResultsAdapter
 from affine.src.scorer.sampling_thresholds import champion_completion_threshold
 from affine.src.scorer.window_state import StateStore, SystemConfigKVAdapter
-from affine.src.scheduler.health import tunnel_repair_request_key
 
 
 CONFIG_KEY = "gpu_autoscaler"
@@ -73,9 +70,6 @@ MAX_PENDING_PEEK = 10_000
 
 _ENDPOINT_OVERRIDE_FIELDS = {
     "ssh_key_path",
-    "public_inference_url",
-    "ssh_url",
-    "sglang_port",
     "sglang_dp",
     "sglang_load_balance_method",
     "sglang_image",
@@ -99,7 +93,6 @@ class ManagedEndpointSlot:
     purpose: str = "eval"
     endpoint: Dict[str, Any] = field(default_factory=dict)
     create_payload: Dict[str, Any] = field(default_factory=dict)
-    tunnel: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_mapping(cls, payload: Mapping[str, Any]) -> "ManagedEndpointSlot":
@@ -107,11 +100,6 @@ class ManagedEndpointSlot:
         for field_name in _ENDPOINT_OVERRIDE_FIELDS:
             if field_name in payload and field_name not in endpoint:
                 endpoint[field_name] = payload[field_name]
-        tunnel = (
-            dict(payload.get("tunnel"))
-            if isinstance(payload.get("tunnel"), Mapping)
-            else {}
-        )
         return cls(
             name=str(payload.get("name") or ""),
             provider=str(payload.get("provider") or "").lower(),
@@ -123,7 +111,6 @@ class ManagedEndpointSlot:
                 if isinstance(payload.get("create_payload"), Mapping)
                 else {}
             ),
-            tunnel=tunnel,
         )
 
 
@@ -333,122 +320,6 @@ class GPUAutoscalerConfig:
 
 
 @dataclass(frozen=True)
-class TunnelSpec:
-    endpoint_name: str
-    instance_id: str
-    ssh_url: str
-    ssh_key_path: str
-    public_url: str
-    bind_host: str = "0.0.0.0"
-    target_host: str = "127.0.0.1"
-    target_port: int = 10001
-    connect_timeout_sec: float = 10.0
-
-    @property
-    def local_port(self) -> int:
-        parsed = urlparse(self.public_url or "")
-        if not parsed.port:
-            raise ValueError(
-                f"public_inference_url for endpoint {self.endpoint_name!r} "
-                "must include an explicit port when tunnel is enabled"
-            )
-        return int(parsed.port)
-
-
-@dataclass
-class _TunnelProcess:
-    spec: TunnelSpec
-    process: Process
-
-
-class SSHTunnelManager:
-    def __init__(self):
-        self._tunnels: Dict[str, _TunnelProcess] = {}
-
-    async def ensure(self, spec: TunnelSpec) -> None:
-        current = self._tunnels.get(spec.endpoint_name)
-        if (
-            current is not None
-            and current.spec == spec
-            and current.process.returncode is None
-        ):
-            return
-
-        await self.stop(spec.endpoint_name)
-        if await _local_port_is_open("127.0.0.1", spec.local_port):
-            raise RuntimeError(
-                f"local tunnel port 127.0.0.1:{spec.local_port} is already "
-                "owned by an unmanaged process"
-            )
-        user, host, port = _parse_ssh_url(spec.ssh_url)
-        forward = (
-            f"{spec.bind_host}:{spec.local_port}:"
-            f"{spec.target_host}:{spec.target_port}"
-        )
-        cmd = [
-            "ssh",
-            "-N",
-            "-o", "ExitOnForwardFailure=yes",
-            "-o", "ServerAliveInterval=30",
-            "-o", "ServerAliveCountMax=3",
-            "-o", "StrictHostKeyChecking=no",
-        ]
-        if spec.ssh_key_path:
-            cmd.extend(["-i", spec.ssh_key_path])
-        cmd.extend(["-p", str(port), "-L", forward, f"{user}@{host}"])
-        process = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        try:
-            await _wait_for_tunnel_process(
-                process,
-                "127.0.0.1",
-                spec.local_port,
-                timeout_sec=spec.connect_timeout_sec,
-            )
-        except Exception:
-            await _stop_process(process, timeout_sec=2.0)
-            raise
-        self._tunnels[spec.endpoint_name] = _TunnelProcess(
-            spec=spec,
-            process=process,
-        )
-        logger.info(
-            "gpu-autoscaler: tunnel ready endpoint=%s instance=%s "
-            "local_port=%s target=%s:%s",
-            spec.endpoint_name,
-            spec.instance_id,
-            spec.local_port,
-            spec.target_host,
-            spec.target_port,
-        )
-
-    async def stop(self, endpoint_name: str) -> None:
-        current = self._tunnels.pop(endpoint_name, None)
-        if current is None:
-            return
-        await _stop_process(current.process, timeout_sec=5.0)
-        logger.info(
-            "gpu-autoscaler: tunnel stopped endpoint=%s instance=%s "
-            "local_port=%s",
-            endpoint_name,
-            current.spec.instance_id,
-            current.spec.local_port,
-        )
-
-    async def restart(self, spec: TunnelSpec) -> None:
-        await self.stop(spec.endpoint_name)
-        await self.ensure(spec)
-
-    async def stop_all(self) -> None:
-        for endpoint_name in list(self._tunnels):
-            await self.stop(endpoint_name)
-
-
-@dataclass(frozen=True)
 class AutoscalerSnapshot:
     pending_count: int
     in_progress_count: int
@@ -531,7 +402,6 @@ class GPUAutoscaler:
         kv_store,
         samples_adapter: SampleResultsAdapter,
         client_factory: Optional[Callable[[InstanceAPIConfig], InstanceAPIClient]] = None,
-        tunnel_manager: Optional[SSHTunnelManager] = None,
         now_fn: Optional[Callable[[], float]] = None,
     ):
         self._queue = queue
@@ -540,12 +410,11 @@ class GPUAutoscaler:
         self._kv = kv_store
         self._samples = samples_adapter
         self._client_factory = client_factory or InstanceAPIClient
-        self._tunnels = tunnel_manager or SSHTunnelManager()
         self._now = now_fn or time.time
         self._force_start_after_restart = True
 
     async def close(self) -> None:
-        await self._tunnels.stop_all()
+        pass
 
     async def tick(self, config: GPUAutoscalerConfig) -> AutoscalerTickResult:
         state = await self._load_state()
@@ -565,10 +434,6 @@ class GPUAutoscaler:
             return AutoscalerTickResult(action="no-slots")
 
         snapshot = await self._snapshot()
-        tunnel_reconcile_failures = await self._reconcile_active_endpoint_tunnels(
-            config,
-            snapshot,
-        )
         if snapshot.idle:
             state.setdefault("last_busy_at", now)
         else:
@@ -597,11 +462,7 @@ class GPUAutoscaler:
             force_start=force_start,
         )
         idle_for = now - int(state.get("last_busy_at", now) or now)
-        action = (
-            f"tunnel-reconcile-failed:{tunnel_reconcile_failures}"
-            if tunnel_reconcile_failures
-            else "none"
-        )
+        action = "none"
         health_result = await self._check_active_endpoint_health(
             config,
             snapshot,
@@ -674,7 +535,6 @@ class GPUAutoscaler:
                 "last_lease_reclaimed_count": lease_result.reclaimed_count,
                 "last_endpoint_health_checked_count": health_result.checked_count,
                 "last_endpoint_health_reclaimed_count": health_result.reclaimed_count,
-                "last_tunnel_reconcile_failures": tunnel_reconcile_failures,
             }
         )
         await self._kv.set(STATE_KEY, state)
@@ -682,7 +542,7 @@ class GPUAutoscaler:
             "gpu-autoscaler: action=%s pending=%s active_capacity=%s desired=%s "
             "idle=%s idle_for=%ss gpu_down_for=%ss force_start=%s "
             "lease_reclaimed=%s health_checked=%s "
-            "health_reclaimed=%s tunnel_reconcile_failures=%s",
+            "health_reclaimed=%s",
             action,
             snapshot.pending_count,
             effective_active_capacity_count,
@@ -694,7 +554,6 @@ class GPUAutoscaler:
             lease_result.reclaimed_count,
             health_result.checked_count,
             health_result.reclaimed_count,
-            tunnel_reconcile_failures,
         )
         return AutoscalerTickResult(
             action=action,
@@ -1041,141 +900,6 @@ class GPUAutoscaler:
         )
         await self._kv.set(STATE_KEY, state)
 
-    async def _reconcile_active_endpoint_tunnels(
-        self,
-        config: GPUAutoscalerConfig,
-        snapshot: AutoscalerSnapshot,
-    ) -> int:
-        failures = 0
-        for endpoint in snapshot.active_managed:
-            slot = _find_slot(config, endpoint.name)
-            if slot is None or not _tunnel_enabled(slot):
-                continue
-            reconciled = _endpoint_with_slot_tunnel_overrides(endpoint, slot)
-            repair_request = await self._pending_tunnel_repair_request(endpoint)
-            try:
-                if repair_request is None:
-                    await self._ensure_endpoint_tunnel(slot, reconciled)
-                else:
-                    spec = _tunnel_spec_for_endpoint(slot, reconciled)
-                    if spec is None:
-                        raise RuntimeError(
-                            f"endpoint {endpoint.name!r} has no tunnel spec"
-                        )
-                    await self._tunnels.restart(spec)
-            except Exception as e:
-                failures += 1
-                logger.error(
-                    "gpu-autoscaler: failed to reconcile tunnel for "
-                    "endpoint=%s instance=%s: %s: %s",
-                    endpoint.name,
-                    endpoint.autoscale_instance_id,
-                    type(e).__name__,
-                    e,
-                )
-                continue
-            if repair_request is not None:
-                try:
-                    cleared = await self._kv.delete_if_token(
-                        tunnel_repair_request_key(endpoint.name),
-                        str(repair_request["token"]),
-                    )
-                except Exception as e:
-                    cleared = False
-                    logger.warning(
-                        "gpu-autoscaler: tunnel repaired but request cleanup "
-                        "failed endpoint=%s: %s: %s",
-                        endpoint.name,
-                        type(e).__name__,
-                        e,
-                    )
-                logger.warning(
-                    "gpu-autoscaler: tunnel repair completed endpoint=%s "
-                    "instance=%s request_cleared=%s",
-                    endpoint.name,
-                    endpoint.autoscale_instance_id,
-                    cleared,
-                )
-            if reconciled != endpoint:
-                try:
-                    await self._endpoints.activate_autoscaled_endpoint(
-                        reconciled,
-                        updated_by="gpu-autoscaler",
-                    )
-                except Exception as e:
-                    failures += 1
-                    logger.error(
-                        "gpu-autoscaler: failed to reconcile endpoint=%s "
-                        "before tunnel setup: %s: %s",
-                        endpoint.name,
-                        type(e).__name__,
-                        e,
-                    )
-                    continue
-        return failures
-
-    async def _pending_tunnel_repair_request(
-        self,
-        endpoint: Endpoint,
-    ) -> Optional[Dict[str, Any]]:
-        key = tunnel_repair_request_key(endpoint.name)
-        try:
-            raw = await self._kv.get(key)
-        except Exception as e:
-            logger.warning(
-                "gpu-autoscaler: failed to read tunnel repair request for "
-                "endpoint=%s: %s: %s",
-                endpoint.name,
-                type(e).__name__,
-                e,
-            )
-            return None
-        if not isinstance(raw, Mapping):
-            return None
-
-        token = str(raw.get("token") or "")
-        now = int(self._now())
-        try:
-            request_version = int(raw.get("request_version") or 0)
-            request_generation = int(raw.get("endpoint_generation") or 0)
-            expires_at = int(raw.get("expires_at") or 0)
-        except (TypeError, ValueError):
-            request_version = -1
-            request_generation = -1
-            expires_at = 0
-        valid = (
-            request_version == 1
-            and bool(token)
-            and str(raw.get("endpoint_name") or "") == endpoint.name
-            and str(raw.get("instance_id") or "")
-            == str(endpoint.autoscale_instance_id or "")
-            and request_generation == int(endpoint.generation or 0)
-            and expires_at > now
-        )
-        if valid:
-            return dict(raw)
-
-        try:
-            if token:
-                await self._kv.delete_if_token(key, token)
-            else:
-                await self._kv.delete(key)
-        except Exception as e:
-            logger.warning(
-                "gpu-autoscaler: failed to discard stale tunnel repair "
-                "request endpoint=%s: %s: %s",
-                endpoint.name,
-                type(e).__name__,
-                e,
-            )
-        logger.warning(
-            "gpu-autoscaler: discarded stale tunnel repair request "
-            "endpoint=%s instance=%s",
-            endpoint.name,
-            endpoint.autoscale_instance_id,
-        )
-        return None
-
     def _should_force_start_after_restart(
         self,
         snapshot: AutoscalerSnapshot,
@@ -1361,7 +1085,18 @@ class GPUAutoscaler:
         )
         if handle is None:
             return False
-        endpoint = await self._endpoint_for_handle(slot, handle)
+        try:
+            endpoint = await self._endpoint_for_handle(slot, handle)
+        except ValueError as e:
+            logger.error(
+                "gpu-autoscaler: provider=%s instance=%s did not return a "
+                "usable direct inference endpoint; deleting instance: %s",
+                slot.provider,
+                handle.instance_id,
+                e,
+            )
+            await client.delete(handle.instance_id, variables=variables)
+            return False
         if not endpoint.ssh_url:
             logger.warning(
                 "gpu-autoscaler: provider=%s instance=%s did not return ssh_url",
@@ -1369,28 +1104,6 @@ class GPUAutoscaler:
                 handle.instance_id,
             )
             await client.delete(handle.instance_id, variables=variables)
-            return False
-        try:
-            await self._ensure_endpoint_tunnel(slot, endpoint)
-        except Exception as e:
-            logger.error(
-                "gpu-autoscaler: tunnel setup failed after create "
-                "endpoint=%s provider=%s instance=%s; deleting instance: "
-                "%s: %s",
-                endpoint.name,
-                slot.provider,
-                handle.instance_id,
-                type(e).__name__,
-                e,
-            )
-            await self._tunnels.stop(endpoint.name)
-            deleted = await client.delete(handle.instance_id, variables=variables)
-            if not deleted:
-                logger.error(
-                    "gpu-autoscaler: failed to delete instance=%s after "
-                    "tunnel setup failure; manual cleanup may be required",
-                    handle.instance_id,
-                )
             return False
         try:
             await self._endpoints.activate_autoscaled_endpoint(
@@ -1408,7 +1121,6 @@ class GPUAutoscaler:
                 type(e).__name__,
                 e,
             )
-            await self._tunnels.stop(endpoint.name)
             deleted = await client.delete(handle.instance_id, variables=variables)
             if not deleted:
                 logger.error(
@@ -1454,13 +1166,13 @@ class GPUAutoscaler:
         for field_name, value in (slot.endpoint or {}).items():
             if field_name in _ENDPOINT_OVERRIDE_FIELDS and value is not None:
                 setattr(endpoint, field_name, value)
-        endpoint.ssh_url = handle.ssh_url or endpoint.ssh_url
-        slot_public_url = (slot.endpoint or {}).get("public_inference_url")
-        endpoint.public_inference_url = (
-            slot_public_url
-            or handle.public_inference_url
-            or endpoint.public_inference_url
+        endpoint.ssh_url = handle.ssh_url
+        endpoint.public_inference_url = _normalize_direct_inference_url(
+            handle.public_inference_url
         )
+        endpoint.sglang_port = int(handle.sglang_port or 0)
+        if not 0 < endpoint.sglang_port <= 65535:
+            raise ValueError("invalid or missing sglang_port")
         if not endpoint.notes:
             endpoint.notes = f"autoscaled via {slot.provider}"
         return endpoint
@@ -1565,16 +1277,6 @@ class GPUAutoscaler:
         if status is None:
             return "failed"
         return "healthy"
-
-    async def _ensure_endpoint_tunnel(
-        self,
-        slot: ManagedEndpointSlot,
-        endpoint: Endpoint,
-    ) -> None:
-        spec = _tunnel_spec_for_endpoint(slot, endpoint)
-        if spec is None:
-            return
-        await self._tunnels.ensure(spec)
 
     async def _renew_busy_expiring_leases(
         self,
@@ -1967,7 +1669,6 @@ class GPUAutoscaler:
             return False
         if clear_refs:
             await self._clear_deployment_refs(endpoint)
-        await self._tunnels.stop(endpoint.name)
         logger.info(
             "gpu-autoscaler: deactivated endpoint=%s provider=%s instance=%s",
             endpoint.name,
@@ -2107,7 +1808,7 @@ class GPUAutoscaler:
         """Execute one replacement inside the daemon's serialized tick.
 
         External callers must enqueue through ``af gpu replace-endpoint`` so
-        provider and tunnel mutations stay owned by the daemon process.
+        provider lifecycle mutations stay owned by the daemon process.
         """
         new_slot_name = new_slot_name or old_endpoint_name
         slot = _find_slot(config, new_slot_name)
@@ -2331,118 +2032,24 @@ def _manual_endpoint_action_prefix(operation: str) -> str:
     }[operation]
 
 
-def _tunnel_enabled(slot: ManagedEndpointSlot) -> bool:
-    return _bool_value((slot.tunnel or {}).get("enabled"), default=False)
-
-
-def _endpoint_with_slot_tunnel_overrides(
-    endpoint: Endpoint,
-    slot: ManagedEndpointSlot,
-) -> Endpoint:
-    slot_public_url = (slot.endpoint or {}).get("public_inference_url")
-    if slot_public_url and endpoint.public_inference_url != slot_public_url:
-        return replace(endpoint, public_inference_url=str(slot_public_url))
-    return endpoint
-
-
-def _tunnel_spec_for_endpoint(
-    slot: ManagedEndpointSlot,
-    endpoint: Endpoint,
-) -> Optional[TunnelSpec]:
-    if not _tunnel_enabled(slot):
-        return None
-    instance_id = endpoint.autoscale_instance_id or ""
-    ssh_url = endpoint.ssh_url or ""
-    public_url = endpoint.public_inference_url or ""
-    if not instance_id or not ssh_url or not public_url:
-        raise ValueError(
-            f"endpoint {endpoint.name!r} tunnel requires instance_id, "
-            "ssh_url, and public_inference_url"
-        )
-    tunnel = slot.tunnel or {}
-    target_port = int(
-        tunnel.get("target_port")
-        or tunnel.get("remote_port")
-        or endpoint.sglang_port
-        or 10001
-    )
-    return TunnelSpec(
-        endpoint_name=endpoint.name,
-        instance_id=instance_id,
-        ssh_url=ssh_url,
-        ssh_key_path=str(tunnel.get("ssh_key_path") or endpoint.ssh_key_path or ""),
-        public_url=public_url,
-        bind_host=str(tunnel.get("bind_host") or "0.0.0.0"),
-        target_host=str(tunnel.get("target_host") or "127.0.0.1"),
-        target_port=target_port,
-        connect_timeout_sec=float(tunnel.get("connect_timeout_sec") or 10.0),
-    )
-
-
-def _parse_ssh_url(url: str) -> tuple[str, str, int]:
-    parsed = urlparse(url or "")
-    if parsed.scheme != "ssh" or not parsed.hostname:
-        raise ValueError(f"invalid ssh_url: {url!r}")
-    return parsed.username or "root", parsed.hostname, int(parsed.port or 22)
-
-
-async def _wait_for_tunnel_process(
-    process: Process,
-    host: str,
-    port: int,
-    *,
-    timeout_sec: float,
-) -> None:
-    deadline = time.monotonic() + max(0.1, timeout_sec)
-    last_error: Optional[Exception] = None
-    while time.monotonic() < deadline:
-        if process.returncode is not None:
-            raise RuntimeError(
-                f"ssh tunnel process exited with code {process.returncode}"
-            )
-        try:
-            _, writer = await asyncio.open_connection(host, port)
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-            # An old listener can make the port probe pass while this ssh
-            # process is still failing to bind. ExitOnForwardFailure makes
-            # that process exit promptly, so require it to remain alive for
-            # a short stabilization interval before accepting the tunnel.
-            await asyncio.sleep(0.5)
-            if process.returncode is None:
-                return
-            raise RuntimeError(
-                f"ssh tunnel process exited with code {process.returncode}"
-            )
-        except Exception as e:
-            last_error = e
-            await asyncio.sleep(0.2)
-    raise TimeoutError(
-        f"local tunnel port {host}:{port} did not become ready"
-    ) from last_error
-
-
-async def _local_port_is_open(host: str, port: int) -> bool:
+def _normalize_direct_inference_url(url: str) -> str:
+    value = str(url or "").strip().rstrip("/")
+    if not value:
+        raise ValueError("missing public_inference_url")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError(f"invalid public_inference_url: {url!r}")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(f"invalid public_inference_url: {url!r}")
     try:
-        _, writer = await asyncio.open_connection(host, port)
-    except Exception:
-        return False
-    writer.close()
-    with contextlib.suppress(Exception):
-        await writer.wait_closed()
-    return True
-
-
-async def _stop_process(process: Process, *, timeout_sec: float) -> None:
-    if process.returncode is not None:
-        return
-    process.terminate()
-    try:
-        await asyncio.wait_for(process.wait(), timeout=timeout_sec)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+        explicit_port = parsed.port
+    except ValueError as e:
+        raise ValueError(f"invalid public_inference_url: {url!r}") from e
+    if parsed.scheme == "http" and explicit_port is None:
+        raise ValueError("http public_inference_url must include a port")
+    if parsed.path.rstrip("/") != "/v1":
+        raise ValueError("public_inference_url must end with /v1")
+    return value
 
 
 def _manual_endpoint_result_key(token: str) -> str:
@@ -3012,7 +2619,7 @@ async def remove_endpoint_command(
     dry_run: bool = False,
     yes: bool = False,
 ) -> EndpointRemoveResult:
-    """Queue removal so provider and tunnel mutations stay daemon-owned."""
+    """Queue removal so provider lifecycle mutations stay daemon-owned."""
     await init_client()
     try:
         config_dao = SystemConfigDAO()

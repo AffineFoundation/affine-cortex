@@ -58,6 +58,7 @@ class InstanceHandle:
     instance_id: str
     ssh_url: str = ""
     public_inference_url: str = ""
+    sglang_port: int = 0
     lease_expires_at: int = 0
     raw: Dict[str, Any] = field(default_factory=dict)
 
@@ -158,6 +159,7 @@ class InstanceAPIClient:
             "public_url",
             "data.public_inference_url",
         ),
+        "sglang_port": ("sglang_port", "inference_port", "data.sglang_port"),
         "lease_expires_at": (
             "lease_expires_at",
             "expires_at",
@@ -221,6 +223,7 @@ class InstanceAPIClient:
             instance_id=instance_id,
             ssh_url=self._extract(result, "ssh_url") or "",
             public_inference_url=(self._extract(result, "public_inference_url") or ""),
+            sglang_port=_int_value(self._extract(result, "sglang_port")),
             lease_expires_at=_int_value(self._extract(result, "lease_expires_at")),
             raw=dict(result),
         )
@@ -337,6 +340,7 @@ class InstanceAPIClient:
             instance_id=self._extract(result, "instance_id") or instance_id,
             ssh_url=self._extract(result, "ssh_url") or "",
             public_inference_url=(self._extract(result, "public_inference_url") or ""),
+            sglang_port=_int_value(self._extract(result, "sglang_port")),
             lease_expires_at=_int_value(self._extract(result, "lease_expires_at")),
             raw=dict(result),
         )

@@ -480,6 +480,7 @@ class TargonAutoscaleClient:
                             _openai_endpoint(PUBLIC_INFERENCE_URL)
                             or _public_url(merged, uid, PORT)
                         ),
+                        "sglang_port": PORT,
                         "lease_expires_at": _lease_expires_at(merged),
                         "status": status,
                         "raw": _redacted(merged),
@@ -520,6 +521,7 @@ class TargonAutoscaleClient:
                 _openai_endpoint(PUBLIC_INFERENCE_URL)
                 or _public_url(merged, uid, PORT)
             ),
+            "sglang_port": PORT,
             "raw": _redacted(merged),
         }
 

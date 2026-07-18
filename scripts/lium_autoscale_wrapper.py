@@ -43,7 +43,7 @@ SSH_USER = _env("LIUM_SSH_USER", "root")
 SSH_KEY_PATH = _env("LIUM_SSH_KEY_PATH", "/root/.ssh/id_ed25519")
 TEMPLATE_ID = _env("LIUM_TEMPLATE_ID")
 TERMINATION_HOURS = int(_env("LIUM_TERMINATION_HOURS", "8") or "8")
-PORT = int(_env("LIUM_SGLANG_PORT", "10001") or "10001")
+PORT = int(_env("LIUM_SGLANG_PORT", "40000") or "40000")
 WAIT_TIMEOUT = int(_env("LIUM_CREATE_WAIT_TIMEOUT_SEC", "900") or "900")
 POLL_SECONDS = int(_env("LIUM_CREATE_POLL_SECONDS", "15") or "15")
 DELETE_VERIFY_ATTEMPTS = int(
@@ -53,7 +53,6 @@ DELETE_VERIFY_INTERVAL_SECONDS = float(
     _env("LIUM_DELETE_VERIFY_INTERVAL_SECONDS", "2") or "2"
 )
 ENDPOINT_SCHEME = _env("LIUM_ENDPOINT_SCHEME", "http").rstrip(":/") or "http"
-PUBLIC_INFERENCE_URL = _env("LIUM_PUBLIC_INFERENCE_URL")
 NAME_PREFIX = _env("LIUM_POD_NAME_PREFIX", "affine-autoscale")
 
 
@@ -234,6 +233,14 @@ class LiumClient:
                 "No Lium templates available",
                 code="provider_configuration_error",
             )
+        templates = [
+            template for template in templates if PORT in _service_ports(template)
+        ]
+        if not templates:
+            raise LiumProviderError(
+                f"No Lium template exposes internal service port {PORT}",
+                code="provider_configuration_error",
+            )
 
         def score(template: Mapping[str, Any]) -> tuple:
             status = str(template.get("status") or "")
@@ -353,13 +360,13 @@ class LiumClient:
                     http_status=502,
                 )
             ssh_url = _ssh_url(pod)
-            if ssh_url and self._ssh_ready(ssh_url):
+            public_url, sglang_port = _inference_endpoint(pod, PORT)
+            if ssh_url and public_url and self._ssh_ready(ssh_url):
                 return {
                     "instance_id": uid,
                     "ssh_url": ssh_url,
-                    "public_inference_url": (
-                        _openai_endpoint(PUBLIC_INFERENCE_URL) or _public_url(pod, PORT)
-                    ),
+                    "public_inference_url": public_url,
+                    "sglang_port": sglang_port,
                     "lease_expires_at": (
                         _lease_expires_at(pod) or _default_lease_expires_at()
                     ),
@@ -368,7 +375,8 @@ class LiumClient:
                 }
             time.sleep(POLL_SECONDS)
         raise LiumProviderError(
-            f"Pod {uid} did not become SSH-ready in {WAIT_TIMEOUT}s; "
+            f"Pod {uid} did not expose SSH and internal port {PORT} "
+            f"within {WAIT_TIMEOUT}s; "
             f"last={str(_redacted_pod(last or {}))[:800]}",
             code="provider_instance_not_ready",
             http_status=504,
@@ -392,14 +400,14 @@ class LiumClient:
         pod = self.get_pod(uid)
         if pod is None:
             raise LiumHTTPError("GET", f"/pods/{uid}", 404, "not found")
+        public_url, sglang_port = _inference_endpoint(pod, PORT)
         return {
             "instance_id": uid,
             "lease_expires_at": _lease_expires_at(pod),
             "status": _status(pod),
             "ssh_url": _ssh_url(pod),
-            "public_inference_url": (
-                _openai_endpoint(PUBLIC_INFERENCE_URL) or _public_url(pod, PORT)
-            ),
+            "public_inference_url": public_url,
+            "sglang_port": sglang_port,
             "raw": _redacted_pod(pod),
         }
 
@@ -632,6 +640,18 @@ def _port_items(data: Mapping[str, Any]) -> List[dict]:
     return items
 
 
+def _service_ports(data: Mapping[str, Any]) -> set[int]:
+    ports = set()
+    for value in data.get("internal_ports") or []:
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            continue
+        if port > 0 and port != 22:
+            ports.add(port)
+    return ports
+
+
 def _ssh_url(data: Mapping[str, Any]) -> str:
     direct = str(data.get("ssh_url") or "").strip()
     if direct:
@@ -672,26 +692,35 @@ def _ssh_url(data: Mapping[str, Any]) -> str:
     return f"ssh://{user}@{host}:{int(port or 22)}"
 
 
-def _public_url(data: Mapping[str, Any], port: int) -> str:
-    for url in _urls(data, port):
-        return _openai_endpoint(url)
-    parsed = _parse_ssh_cmd(data)
-    host = parsed.get("host") or _parse_host_from_ssh_url(_ssh_url(data))
-    return f"{ENDPOINT_SCHEME}://{host}:{port}/v1" if host else ""
+def _inference_endpoint(
+    data: Mapping[str, Any],
+    internal_port: int,
+) -> tuple[str, int]:
+    for url in _urls(data, internal_port):
+        return _openai_endpoint(url), internal_port
+    return "", 0
 
 
 def _urls(data: Mapping[str, Any], port: int) -> Iterable[str]:
     for value in data.get("urls") or []:
-        if isinstance(value, dict) and int(value.get("port") or port) == port:
-            url = value.get("url")
-            if url:
-                yield str(url)
+        if not isinstance(value, dict):
+            continue
+        try:
+            mapped_port = int(value.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mapped_port == port and value.get("url"):
+            yield str(value["url"])
     state = data.get("state") if isinstance(data.get("state"), dict) else {}
     for value in state.get("urls") or []:
-        if isinstance(value, dict) and int(value.get("port") or port) == port:
-            url = value.get("url")
-            if url:
-                yield str(url)
+        if not isinstance(value, dict):
+            continue
+        try:
+            mapped_port = int(value.get("port") or 0)
+        except (TypeError, ValueError):
+            continue
+        if mapped_port == port and value.get("url"):
+            yield str(value["url"])
     for item in _port_items(data):
         internal = (
             item.get("port") or item.get("target_port") or item.get("container_port")

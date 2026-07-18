@@ -45,6 +45,33 @@ def test_instance_api_does_not_default_status_path_for_raw_provider_api():
 
 
 @pytest.mark.asyncio
+async def test_create_extracts_direct_inference_port(monkeypatch):
+    client = InstanceAPIClient(
+        InstanceAPIConfig(
+            provider="lium",
+            api_url="https://lium.example.com",
+            create_path="/instances",
+        )
+    )
+
+    async def fake_request(*args, **kwargs):
+        return {
+            "instance_id": "pod-1",
+            "ssh_url": "ssh://root@203.0.113.10:40299",
+            "public_inference_url": "http://203.0.113.10:40000/v1",
+            "sglang_port": "40000",
+        }
+
+    monkeypatch.setattr(client, "_request", fake_request)
+
+    handle = await client.create()
+
+    assert handle is not None
+    assert handle.public_inference_url == "http://203.0.113.10:40000/v1"
+    assert handle.sglang_port == 40000
+
+
+@pytest.mark.asyncio
 async def test_delete_treats_provider_404_as_success(monkeypatch):
     client = InstanceAPIClient(
         InstanceAPIConfig(

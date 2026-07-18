@@ -1198,7 +1198,7 @@ async def test_health_failure_count_resets_for_new_endpoint_generation():
 
 
 @pytest.mark.asyncio
-async def test_transport_failure_repairs_tunnel_without_clearing_deployment():
+async def test_transport_failure_requests_replacement_without_clearing_deployment():
     kv = _seed_state()
     kv.data["current_task_ids"] = {
         "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
@@ -1249,7 +1249,7 @@ async def test_transport_failure_repairs_tunnel_without_clearing_deployment():
 
 
 @pytest.mark.asyncio
-async def test_active_challenger_transport_failure_repairs_without_losing_battle():
+async def test_active_challenger_transport_failure_replaces_without_losing_battle():
     kv = _seed_state()
     kv.data["current_task_ids"] = {
         "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},

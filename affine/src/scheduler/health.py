@@ -6,10 +6,6 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-TUNNEL_REPAIR_REQUEST_KEY_PREFIX = "gpu_autoscaler_tunnel_repair:"
-TUNNEL_REPAIR_REQUEST_TTL_SECONDS = 5 * 60
-
-
 class DeploymentHealthState(str, Enum):
     HEALTHY = "healthy"
     SUSPECTED = "suspected"
@@ -24,7 +20,3 @@ class DeploymentHealthResult:
     reason: str = ""
     identity: str = ""
     canonical_base_url: str = ""
-
-
-def tunnel_repair_request_key(endpoint_name: str) -> str:
-    return f"{TUNNEL_REPAIR_REQUEST_KEY_PREFIX}{endpoint_name}"
