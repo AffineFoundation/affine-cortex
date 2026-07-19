@@ -533,16 +533,16 @@ class ForwardWorker:
                 f"{len(per_rollout)}/{len(rollouts)} rollouts in {time.time()-t0:.1f}s"
             )
 
-            # 4) Sparsify and persist. ``ceac.score/v3`` carries only
+            # 4) Sparsify and persist. ``ceac.score/v4`` carries only
             # decision positions (where self.lp < CUTOFF) — ~5% of the
-            # original token count. This is the only data the verdict
-            # math reads, so dropping the rest shrinks the on-disk blob
+            # original token count — plus ``decision_top1`` (the argmax
+            # token id at each decision position), which feeds the top-1
+            # agreement gate. The full per-position ``resp_lp`` /
+            # ``resp_top`` arrays are dropped, shrinking the on-disk blob
             # and the backfill service's in-memory peer cache ~20×.
-            # resp_top is dropped entirely; it only fed the diagnostic
-            # ``top1_match`` field which no longer exists.
             per_rollout = [sparsify_rollout(r) for r in per_rollout]
             score_payload = {
-                "schema": "ceac.score/v3",
+                "schema": "ceac.score/v4",
                 "hotkey": hotkey,
                 "revision": revision,
                 "model": model,
