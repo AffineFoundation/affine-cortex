@@ -14,7 +14,11 @@ import asyncio
 import pytest
 from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 
-from affine.src.monitor.miners_monitor import HFRepoUnavailable, MinersMonitor
+from affine.src.monitor.miners_monitor import (
+    HF_UNAVAILABLE_GRACE_SECONDS,
+    HFRepoUnavailable,
+    MinersMonitor,
+)
 
 
 def _monitor():
@@ -62,12 +66,14 @@ def test_network_error_is_swallowed(monkeypatch):
 # monitor must defer (not permanently terminate) until the grace window lapses.
 # --------------------------------------------------------------------------- #
 
-from affine.src.monitor.miners_monitor import HF_UNAVAILABLE_GRACE_SECONDS
-
-
 def _grace_monitor():
+    class _StatsDAO:
+        async def get_permanent_invalid_reason(self, _hotkey, _revision):
+            return None
+
     m = MinersMonitor.__new__(MinersMonitor)
     m._repo_unavailable_since = {}
+    m.stats_dao = _StatsDAO()
     return m
 
 

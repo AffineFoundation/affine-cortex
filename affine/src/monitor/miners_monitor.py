@@ -202,6 +202,10 @@ class HFRepoUnavailable(Exception):
         self.reason = reason
 
 
+class PermanentInvalidHistoryUnavailable(RuntimeError):
+    """Raised when a refresh cannot safely check durable invalid verdicts."""
+
+
 class MinersMonitor:
     """Refreshes current miner snapshot and historical miner metadata."""
 
@@ -373,6 +377,11 @@ class MinersMonitor:
                         terminate_stats=True,
                     )
                 miners.append(info)
+            except PermanentInvalidHistoryUnavailable:
+                # Do not rewrite a previously invalid snapshot as valid when
+                # its durable verdict cannot be read. Abort this refresh and
+                # leave the last complete snapshot untouched.
+                raise
             except json.JSONDecodeError:
                 m = MinerInfo(uid=uid, hotkey=hotkey, model="", revision="")
                 m.mark_invalid("invalid_json_commit", permanent=True)
@@ -435,6 +444,26 @@ class MinersMonitor:
                 info.template_check_result = existing.get("template_check_result")
         except Exception:
             pass
+
+        if uid != 0:
+            try:
+                permanent_reason = (
+                    await self.stats_dao.get_permanent_invalid_reason(
+                        hotkey, revision,
+                    )
+                )
+            except Exception as e:
+                raise PermanentInvalidHistoryUnavailable(
+                    "failed to load permanent invalid verdict for "
+                    f"{hotkey[:10]}@{revision[:8]}"
+                ) from e
+            if permanent_reason:
+                info.mark_invalid(
+                    permanent_reason,
+                    permanent=True,
+                    terminate_stats=True,
+                )
+                return info
 
         def _preserve_prior_valid(reason: str) -> bool:
             if not (
@@ -1003,7 +1032,9 @@ class MinersMonitor:
             origin = group[0]
             for later in group[1:]:
                 later.mark_invalid(
-                    f"plagiarism:duplicate_of_uid={origin.uid}", permanent=True,
+                    f"plagiarism:duplicate_of_uid={origin.uid}",
+                    permanent=True,
+                    terminate_stats=True,
                 )
                 logger.info(
                     f"[MinersMonitor] plagiarism uid={later.uid} duplicates "
@@ -1038,6 +1069,31 @@ class MinersMonitor:
         client = get_client()
 
         for miner in miners:
+            if miner.hotkey and miner.revision:
+                stats_update = {
+                    "hotkey": miner.hotkey,
+                    "revision": miner.revision,
+                    "model": miner.model,
+                    "uid": miner.uid,
+                    "first_block": miner.block,
+                    "block_number": current_block,
+                    "is_valid": miner.is_valid,
+                    "invalid_reason": miner.invalid_reason,
+                    "model_hash": miner.model_hash,
+                    "model_type": miner.model_type,
+                    "is_online": True,
+                }
+                if (
+                    miner.permanent_invalid
+                    and miner.terminate_stats
+                    and miner.invalid_reason
+                ):
+                    stats_update.update(
+                        permanent_invalid=True,
+                        permanent_invalid_reason=miner.invalid_reason,
+                    )
+                await self.stats_dao.update_miner_info(**stats_update)
+                await self._maybe_terminate_stats(miner)
             await self.dao.save_miner(
                 uid=miner.uid,
                 hotkey=miner.hotkey,
@@ -1052,21 +1108,6 @@ class MinersMonitor:
                 reg_block=miner.reg_block,
                 reg_hotkey=miner.reg_hotkey,
             )
-            if miner.hotkey and miner.revision:
-                await self.stats_dao.update_miner_info(
-                    hotkey=miner.hotkey,
-                    revision=miner.revision,
-                    model=miner.model,
-                    uid=miner.uid,
-                    first_block=miner.block,
-                    block_number=current_block,
-                    is_valid=miner.is_valid,
-                    invalid_reason=miner.invalid_reason,
-                    model_hash=miner.model_hash,
-                    model_type=miner.model_type,
-                    is_online=True,
-                )
-                await self._maybe_terminate_stats(miner)
             # template_check_result is a non-key attr we still want to keep
             # cached on the row — write it separately so the DAO signature
             # stays free of optional bric-à-brac.

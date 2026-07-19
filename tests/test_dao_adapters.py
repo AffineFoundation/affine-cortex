@@ -9,7 +9,11 @@ import pytest
 import affine.database.client as db_client
 from affine.database.dao.miners import MinersDAO
 from affine.database.dao.miner_stats import MinerStatsDAO
-from affine.src.monitor.miners_monitor import MinerInfo, MinersMonitor
+from affine.src.monitor.miners_monitor import (
+    MinerInfo,
+    MinersMonitor,
+    PermanentInvalidHistoryUnavailable,
+)
 from affine.src.scorer.dao_adapters import SampleResultsAdapter
 
 
@@ -294,6 +298,61 @@ async def test_update_miner_info_writes_nonempty_identity_metadata(monkeypatch):
     assert values[":model"] == {"S": "org/model"}
     assert values[":model_hash"] == {"S": "hash"}
     assert values[":model_type"] == {"S": "qwen3_5_moe"}
+
+
+@pytest.mark.asyncio
+async def test_update_miner_info_writes_monotonic_permanent_verdict(monkeypatch):
+    client = _UpdateRecordingClient()
+    monkeypatch.setattr(
+        "affine.database.client.get_client",
+        lambda: client,
+    )
+
+    dao = MinerStatsDAO()
+    await dao.update_miner_info(
+        hotkey="hk",
+        revision="rev",
+        model="org/model",
+        is_valid=False,
+        invalid_reason="plagiarism:duplicate_of_uid=168",
+        permanent_invalid=True,
+        permanent_invalid_reason="plagiarism:duplicate_of_uid=168",
+    )
+
+    call = client.update_calls[0]
+    clauses = _set_clauses(call["UpdateExpression"])
+    values = call["ExpressionAttributeValues"]
+    assert "permanent_invalid = :permanent_invalid" in clauses
+    assert (
+        "permanent_invalid_reason = if_not_exists("
+        "permanent_invalid_reason, :permanent_invalid_reason)"
+    ) in clauses
+    assert values[":permanent_invalid"] == {"BOOL": True}
+    assert values[":permanent_invalid_reason"] == {
+        "S": "plagiarism:duplicate_of_uid=168",
+    }
+
+
+@pytest.mark.asyncio
+async def test_get_permanent_invalid_reason_requires_structured_flag(monkeypatch):
+    dao = MinerStatsDAO()
+
+    async def _row_without_flag(_hotkey, _revision):
+        return {"invalid_reason": "plagiarism:duplicate_of_uid=168"}
+
+    monkeypatch.setattr(dao, "get_miner_stats", _row_without_flag)
+    assert await dao.get_permanent_invalid_reason("hk", "rev") is None
+
+    async def _permanent_row(_hotkey, _revision):
+        return {
+            "permanent_invalid": True,
+            "permanent_invalid_reason": "plagiarism:duplicate_of_uid=168",
+        }
+
+    monkeypatch.setattr(dao, "get_miner_stats", _permanent_row)
+    assert await dao.get_permanent_invalid_reason("hk", "rev") == (
+        "plagiarism:duplicate_of_uid=168"
+    )
 
 
 class _GetPutRecordingClient:
@@ -728,9 +787,23 @@ class _FakeMinersDAO:
 class _FakeMinerStatsDAO:
     def __init__(self):
         self.updated = []
+        self.permanent_reasons = {}
+        self.terminated = []
 
     async def update_miner_info(self, **kwargs):
         self.updated.append(kwargs)
+        if kwargs.get("permanent_invalid"):
+            key = (kwargs["hotkey"], kwargs["revision"])
+            self.permanent_reasons.setdefault(
+                key, kwargs["permanent_invalid_reason"],
+            )
+
+    async def get_permanent_invalid_reason(self, hotkey, revision):
+        return self.permanent_reasons.get((hotkey, revision))
+
+    async def terminate_if_sampling(self, **kwargs):
+        self.terminated.append(kwargs)
+        return True
 
 
 @pytest.mark.asyncio
@@ -774,3 +847,109 @@ async def test_monitor_persists_current_metadata_to_miner_stats(monkeypatch):
             "is_online": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_monitor_does_not_persist_externally_reversible_invalid(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = MinersMonitor()
+    monitor.dao = _FakeMinersDAO()
+    monitor.stats_dao = _FakeMinerStatsDAO()
+
+    await monitor._persist_miners(
+        [
+            MinerInfo(
+                uid=7,
+                hotkey="hk",
+                model="org/model",
+                revision="rev",
+                is_valid=False,
+                invalid_reason="tokenizer_sig_mismatch:cand=abc",
+                permanent_invalid=True,
+                terminate_stats=False,
+            ),
+        ],
+        current_block=200,
+    )
+
+    update = monitor.stats_dao.updated[0]
+    assert "permanent_invalid" not in update
+    assert "permanent_invalid_reason" not in update
+    assert monitor.stats_dao.terminated == []
+
+
+@pytest.mark.asyncio
+async def test_plagiarism_verdict_survives_origin_disappearing(monkeypatch):
+    monkeypatch.setattr(db_client, "get_client", lambda: _FakeDynamoClient())
+    monitor = MinersMonitor()
+    monitor.dao = _FakeMinersDAO()
+    monitor.stats_dao = _FakeMinerStatsDAO()
+
+    origin = MinerInfo(
+        uid=168,
+        hotkey="origin-hk",
+        model="org/affine-origin-hk",
+        revision="origin-rev",
+        block=100,
+        is_valid=True,
+        model_hash="same-hash",
+    )
+    copied = MinerInfo(
+        uid=167,
+        hotkey="copy-hk",
+        model="org/affine-copy-hk",
+        revision="copy-rev",
+        block=200,
+        is_valid=True,
+        model_hash="same-hash",
+    )
+
+    monitor._detect_plagiarism([origin, copied])
+    assert copied.permanent_invalid is True
+    assert copied.terminate_stats is True
+
+    await monitor._persist_miners([origin, copied], current_block=300)
+    assert monitor.stats_dao.terminated == [{
+        "hotkey": "copy-hk",
+        "revision": "copy-rev",
+        "reason": "plagiarism:duplicate_of_uid=168",
+    }]
+
+    async def _unexpected_hf_lookup(*_args, **_kwargs):
+        raise AssertionError("durable plagiarism verdict must bypass HF lookup")
+
+    monitor._get_model_info = _unexpected_hf_lookup
+    restored = await monitor._validate_miner(
+        uid=167,
+        hotkey="copy-hk",
+        model="org/affine-copy-hk",
+        revision="copy-rev",
+        block=200,
+        commit_count=1,
+    )
+
+    assert restored.is_valid is False
+    assert restored.invalid_reason == "plagiarism:duplicate_of_uid=168"
+    assert restored.permanent_invalid is True
+    assert restored.terminate_stats is True
+
+
+@pytest.mark.asyncio
+async def test_permanent_verdict_read_failure_aborts_validation():
+    class _UnavailableStatsDAO:
+        async def get_permanent_invalid_reason(self, _hotkey, _revision):
+            raise RuntimeError("ddb unavailable")
+
+    monitor = MinersMonitor()
+    monitor.dao = _FakeMinersDAO()
+    monitor.stats_dao = _UnavailableStatsDAO()
+
+    with pytest.raises(PermanentInvalidHistoryUnavailable):
+        await monitor._validate_miner(
+            uid=167,
+            hotkey="copy-hk",
+            model="org/affine-copy-hk",
+            revision="copy-rev",
+            block=200,
+            commit_count=1,
+        )
