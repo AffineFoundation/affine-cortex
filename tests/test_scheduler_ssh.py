@@ -449,7 +449,7 @@ def test_docker_cmd_passes_gpus_all_and_mounts_cache():
     assert "--gpus all" in cmd
     assert f"--restart {RESTART_POLICY}" in cmd
     assert "-v /data:/data" in cmd
-    assert "lmsysorg/sglang:latest" in cmd
+    assert "lmsysorg/sglang:v0.5.14" in cmd
     assert "python -m sglang.launch_server" in cmd
 
 
