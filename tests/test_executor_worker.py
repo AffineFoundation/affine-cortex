@@ -4,6 +4,7 @@ import logging
 import pytest
 
 import affine.src.executor.main as executor_main
+from affine.src.executor.config import _positive_int_env
 from affine.src.executor.worker import (
     _base_urls,
     _pick_url,
@@ -15,6 +16,26 @@ from affine.src.scorer.window_state import DeploymentRecord
 
 def _in_flight_probe(v):
     v.value = 42
+
+
+def test_positive_int_env_uses_default_when_unset(monkeypatch):
+    monkeypatch.delenv("TEST_DISPATCH_BUDGET", raising=False)
+
+    assert _positive_int_env("TEST_DISPATCH_BUDGET", 400) == 400
+
+
+def test_positive_int_env_accepts_override(monkeypatch):
+    monkeypatch.setenv("TEST_DISPATCH_BUDGET", "250")
+
+    assert _positive_int_env("TEST_DISPATCH_BUDGET", 400) == 250
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "invalid"])
+def test_positive_int_env_rejects_invalid_values(monkeypatch, value):
+    monkeypatch.setenv("TEST_DISPATCH_BUDGET", value)
+
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        _positive_int_env("TEST_DISPATCH_BUDGET", 400)
 
 
 def test_executor_manager_ipc_handles_survive_spawn():
@@ -1209,7 +1230,10 @@ def test_status_target_uses_challenger_sampling_count_not_buffered_pool():
     assert manager._last_done[(228, "ENV_A")] == 400
     # No work remaining → planner falls back to initial fair share (the
     # whole budget when there's exactly one env).
-    assert manager.env_cap_values["ENV_A"].value == 600
+    assert (
+        manager.env_cap_values["ENV_A"].value
+        == executor_main.PER_HOST_DISPATCH_BUDGET
+    )
 
 
 def test_status_label_includes_uid_for_each_subject(caplog):

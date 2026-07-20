@@ -415,6 +415,7 @@ _ENV_CONFIGS_CANONICAL = {
         env_type="terminal",
         mem_limit="8g",
         env_vars={"UVICORN_WORKERS": "4"},
+        optional_env_vars=["TERMINEL_SGLANG_DP_SIZE"],
         volumes={
             "/var/run/docker.sock": {
                 "bind": "/var/run/docker.sock",

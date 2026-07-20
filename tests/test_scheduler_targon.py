@@ -178,3 +178,11 @@ async def test_create_deployment_dense_qwen3_keeps_legacy(monkeypatch):
     assert "--reasoning-parser" not in args
     assert "--context-length" not in args
     assert args[args.index("--tool-call-parser") + 1] == "qwen"
+
+
+@pytest.mark.asyncio
+async def test_create_deployment_uses_shared_sglang_runtime_flags(monkeypatch):
+    args = await _capture_create_deployment_args(monkeypatch, model_type="qwen3")
+
+    assert args[args.index("--num-continuous-decode-steps") + 1] == "4"
+    assert "--enable-mixed-chunk" in args
