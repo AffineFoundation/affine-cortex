@@ -16,13 +16,17 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from affine.core.sglang_runtime import (
+    DEFAULT_SGLANG_IMAGE,
+    DEFAULT_SGLANG_SERVER_ARGS,
+)
 from affine.core.setup import logger
 
 
 DEFAULT_API_URL = "https://api.targon.com/tha/v2"
 DEFAULT_ENGINE = "sglang"
 DEFAULT_IMAGE_BY_ENGINE = {
-    "sglang": "lmsysorg/sglang:latest",
+    "sglang": DEFAULT_SGLANG_IMAGE,
     "vllm": "vllm/vllm-openai:latest",
 }
 DEFAULT_RESOURCE_NAME = "h100-small"
@@ -345,6 +349,7 @@ class TargonClient:
                 "--trust-remote-code",
                 "--mem-fraction-static", mem_fraction,
                 "--chunked-prefill-size", chunked_prefill_size,
+                *DEFAULT_SGLANG_SERVER_ARGS,
             ]
             # Qwen3.6 (qwen3_5_moe) needs a reasoning parser and the qwen3_coder
             # tool-call schema, or it serves unparsed <think> blocks and broken

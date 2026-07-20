@@ -588,7 +588,7 @@ class ExecutorWorker:
         Shadow and disabled modes are fail-open by definition.  Enforce mode
         is fail-closed for a configured env: a missing table row, transient DB
         read error, or non-final verdict keeps expensive tasks at zero rather
-        than recreating the 600-way timeout fan-out.
+        than recreating a full-budget timeout fan-out.
         """
         if not config.enforces or not config.gates_environment(self.env):
             return True

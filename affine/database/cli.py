@@ -27,6 +27,7 @@ from typing import Optional
 import click
 
 from affine.cli.types import UID
+from affine.core.sglang_runtime import DEFAULT_SGLANG_IMAGE
 from affine.database import close_client, init_client, init_tables
 from affine.database.dao import MinerStatsDAO, MinersDAO, SampleResultsDAO, SystemConfigDAO
 from affine.database.tables import delete_table, list_tables, reset_tables
@@ -856,7 +857,7 @@ def list_endpoints():
     default="total_tokens",
     show_default=True,
 )
-@click.option("--sglang-image", default="lmsysorg/sglang:latest")
+@click.option("--sglang-image", default=DEFAULT_SGLANG_IMAGE)
 @click.option("--sglang-cache-dir", default="/data")
 @click.option("--sglang-context-len", type=int, default=65536)
 @click.option("--sglang-mem-fraction", type=float, default=0.85)

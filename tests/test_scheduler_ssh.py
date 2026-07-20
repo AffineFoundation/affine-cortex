@@ -336,6 +336,7 @@ def test_sglang_args_include_required_perf_flags():
         ("--port", "10001"),
         ("--mem-fraction-static", "0.85"),
         ("--chunked-prefill-size", "4096"),
+        ("--num-continuous-decode-steps", "4"),
         ("--tool-call-parser", "qwen"),
         ("--dp", "8"),
         ("--load-balance-method", "total_tokens"),
@@ -347,6 +348,7 @@ def test_sglang_args_include_required_perf_flags():
         )
     # --trust-remote-code is a flag without a value
     assert "--trust-remote-code" in args
+    assert "--enable-mixed-chunk" in args
 
 
 def test_hf_cache_dir_name_flattens_org_separator():
@@ -449,7 +451,7 @@ def test_docker_cmd_passes_gpus_all_and_mounts_cache():
     assert "--gpus all" in cmd
     assert f"--restart {RESTART_POLICY}" in cmd
     assert "-v /data:/data" in cmd
-    assert "lmsysorg/sglang:latest" in cmd
+    assert "lmsysorg/sglang:v0.5.14" in cmd
     assert "python -m sglang.launch_server" in cmd
 
 

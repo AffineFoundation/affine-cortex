@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from botocore.exceptions import ClientError
 
+from affine.core.sglang_runtime import DEFAULT_SGLANG_IMAGE
 from affine.database.base_dao import BaseDAO
 from affine.database.schema import get_table_name
 
@@ -64,7 +65,7 @@ class Endpoint:
     sglang_port: int = 10001
     sglang_dp: int = 8
     sglang_load_balance_method: str = "total_tokens"
-    sglang_image: str = "lmsysorg/sglang:latest"
+    sglang_image: str = DEFAULT_SGLANG_IMAGE
     sglang_cache_dir: str = "/data"
     sglang_context_len: int = 65536
     sglang_mem_fraction: float = 0.85
