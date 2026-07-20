@@ -60,6 +60,7 @@ MANUAL_ENDPOINT_OPERATION_REPLACE = "replace"
 DEFAULT_POLL_INTERVAL_SEC = 60
 DEFAULT_IDLE_SECONDS = 30 * 60
 DEFAULT_PENDING_THRESHOLD = 5
+DEFAULT_MAX_INSTANCES = 1
 DEFAULT_MAX_GPU_DOWN_WAIT_SECONDS = 12 * 60 * 60
 DEFAULT_LEASE_RENEW_MARGIN_SECONDS = 60 * 60
 DEFAULT_LEASE_RENEW_COOLDOWN_SECONDS = 5 * 60
@@ -141,7 +142,7 @@ class GPUAutoscalerConfig:
         DEFAULT_ENDPOINT_HEALTH_CHECK_INTERVAL_SECONDS
     )
     min_instances: int = 0
-    max_instances: int = 1
+    max_instances: int = DEFAULT_MAX_INSTANCES
     dry_run: bool = False
     providers: Dict[str, InstanceAPIConfig] = field(default_factory=dict)
     slots: List[ManagedEndpointSlot] = field(default_factory=list)
@@ -166,7 +167,9 @@ class GPUAutoscalerConfig:
             if isinstance(item, Mapping)
         ]
         slots = [slot for slot in slots if slot.name and slot.provider]
-        max_instances = int(data.get("max_instances") or len(slots) or 1)
+        max_instances = int(
+            data.get("max_instances") or DEFAULT_MAX_INSTANCES
+        )
         cfg = cls(
             enabled=_bool_value(data.get("enabled"), default=False),
             poll_interval_sec=int(

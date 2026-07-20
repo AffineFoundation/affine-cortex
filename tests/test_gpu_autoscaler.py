@@ -378,6 +378,21 @@ def test_default_gpu_down_wait_is_twelve_hours():
     assert cfg.max_gpu_down_wait_seconds == 12 * 60 * 60
 
 
+def test_autoscaler_defaults_to_five_pending_and_one_automatic_instance():
+    cfg = GPUAutoscalerConfig.from_mapping({
+        "endpoints": [
+            {"name": "lium-b200-1", "provider": "lium"},
+            {"name": "lium-b200-2", "provider": "lium"},
+        ],
+    })
+
+    assert cfg.pending_threshold_per_instance == 5
+    assert cfg.max_instances == 1
+    assert cfg.desired_instances(4) == 0
+    assert cfg.desired_instances(5) == 1
+    assert cfg.desired_instances(100) == 1
+
+
 @pytest.mark.asyncio
 async def test_load_config_prefers_system_config_over_autoscaler_env(monkeypatch):
     monkeypatch.setenv("AFFINE_GPU_AUTOSCALER_ENABLED", "false")
