@@ -424,9 +424,9 @@ _ENV_CONFIGS_CANONICAL = {
         },
         eval_params={
             "temperature": 0.0,
-            "timeout": 3600,
+            "timeout": 7200,
         },
-        proxy_timeout=3720,
+        proxy_timeout=7320,
     ),
 
     # NavWorld Travel Planning environment (anti-hack hardened scoring)

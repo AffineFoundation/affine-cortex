@@ -117,6 +117,15 @@ def test_terminal_omits_sglang_dp_size_when_unconfigured():
     assert "TERMINEL_SGLANG_DP_SIZE" not in env_vars
 
 
+def test_terminal_allows_two_hour_evaluations():
+    from affine.core.environments import ENV_CONFIGS
+
+    terminal = ENV_CONFIGS["terminal"]
+
+    assert terminal.eval_params["timeout"] == 7200
+    assert terminal.proxy_timeout == 7320
+
+
 def test_sglang_dp_size_is_not_forwarded_to_other_environments():
     env_vars = _get_env_vars_with(
         {"TERMINEL_SGLANG_DP_SIZE": "8"},
