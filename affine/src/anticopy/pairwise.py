@@ -437,6 +437,14 @@ class CopyDecision:
     # peer carried aligned top-1 data. Persisted for operator triage —
     # tells apart a top-1-gated verdict from a |Δlogp|-gated one.
     top1_agreement: float = -1.0
+    # Highest top-1 agreement seen across ALL scanned peers (not just
+    # the closest-by-median one), with the peer that produced it. The
+    # enabled gate fires on ANY peer crossing the threshold, so this —
+    # not ``top1_agreement`` — is the number a candidate threshold
+    # must be measured against. ``-1.0`` / ``""`` when no scanned pair
+    # carried aligned top-1 data.
+    top1_max: float = -1.0
+    top1_max_peer: str = ""
 
 
 def _per_env_decision_medians(pair: PairResult) -> Dict[str, float]:
