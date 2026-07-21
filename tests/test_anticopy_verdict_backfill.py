@@ -25,16 +25,21 @@ from affine.src.anticopy.verdict import (
 # ---------- helpers --------------------------------------------------
 
 
-def _blob(hk: str, rev: str, first_block: int, lps, *, model=None) -> Dict[str, Any]:
+def _blob(
+    hk: str, rev: str, first_block: int, lps, *, model=None, top_ids=None,
+) -> Dict[str, Any]:
+    rollout = {
+        "rollout_key": "champ#CDE#1", "env": "CDE",
+        "resp_lp": list(lps),
+    }
+    if top_ids is not None:
+        rollout["resp_top"] = [[[lp, tid]] for lp, tid in zip(lps, top_ids)]
     return {
         "schema": "ceac.score/v2",
         "hotkey": hk, "revision": rev,
         "model": model or f"org/m-{hk}",
         "first_block": first_block,
-        "per_rollout": [{
-            "rollout_key": "champ#CDE#1", "env": "CDE",
-            "resp_lp": list(lps),
-        }],
+        "per_rollout": [rollout],
     }
 
 
@@ -118,6 +123,38 @@ def test_pick_origin_independent_records_closest():
     assert dec.copy_of_hotkey == ""
     # closest = whichever peer had smallest dec_med
     assert dec.closest_peer_model.startswith("org/m-")
+
+
+def test_pick_origin_top1_max_scans_all_peers():
+    """``top1_max`` must reflect the highest agreement across ALL
+    scanned peers, not just the closest-by-median one — the enabled
+    gate fires on any peer, so calibration reads this field. Peers
+    below ``top1_min_overlap`` must not set it."""
+    cfg = AntiCopyConfig(
+        enabled=True, nll_threshold=0.005, min_overlap=10,
+        agreement_ratio=0.5, verdict_lookback_days=0,
+        top1_threshold=2.0, top1_min_overlap=10,
+    )
+    ids = list(range(60))
+    ref = _blob("Z", "rz", 1000, [-0.7] * 60, top_ids=ids)
+    peers = {
+        # Closest by median (|d|=0.1) but zero argmax agreement.
+        ("A", "ra"): _blob("A", "ra", 200, [-0.8] * 60,
+                           top_ids=[i + 1000 for i in ids]),
+        # Farther by median (|d|=0.8) but perfect argmax agreement.
+        ("B", "rb"): _blob("B", "rb", 500, [-1.5] * 60, top_ids=ids),
+        # Perfect agreement too, but only 5 decision positions —
+        # below top1_min_overlap, must not win top1_max.
+        ("C", "rc"): _blob("C", "rc", 800,
+                           [-0.7] * 5 + [-0.001] * 55, top_ids=ids),
+    }
+    dec = _pick_origin(
+        cfg=cfg, ref_score=ref, ref_first_block=1000, peer_cache=peers,
+    )
+    assert dec.copy_of_hotkey == ""              # gate disabled (2.0)
+    assert dec.top1_agreement == 0.0             # closest peer is A
+    assert dec.top1_max == 1.0                   # best peer is B
+    assert dec.top1_max_peer == "org/m-B"
 
 
 def test_pick_origin_lookback_excludes_ancient():

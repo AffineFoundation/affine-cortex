@@ -124,6 +124,8 @@ def _pick_origin(
     closest_per_env: Dict[str, float] = {}
     closest_peer_model: str = ""
     closest_top1: float = -1.0
+    top1_max = -1.0
+    top1_max_peer: str = ""
     winning_pair: Optional[PairResult] = None
     winning_hk: str = ""
     winning_model: str = ""
@@ -149,6 +151,15 @@ def _pick_origin(
             closest_per_env = _per_env_decision_medians(pair)
             closest_peer_model = peer_model
             closest_top1 = float(pair.top1_agree_combined)
+        # The enabled gate fires on ANY peer, so threshold calibration
+        # needs the max over the whole scan, not the closest pair only.
+        # Same overlap floor as the gate to keep out thin-sample noise.
+        if (
+            pair.top1_agree_combined > top1_max
+            and pair.top1_n >= cfg.top1_min_overlap
+        ):
+            top1_max = float(pair.top1_agree_combined)
+            top1_max_peer = peer_model
         if (
             pair.n_overlap_tokens >= cfg.min_overlap
             and is_copy_verdict(
@@ -167,6 +178,8 @@ def _pick_origin(
             break
 
     decision = CopyDecision()
+    decision.top1_max = top1_max
+    decision.top1_max_peer = top1_max_peer
     if winning_pair is not None:
         decision.copy_of_hotkey = winning_hk
         decision.decision_median = float(winning_pair.decision_median_combined)
@@ -307,6 +320,8 @@ class VerdictBackfillService:
                     decision_per_env=dict(decision.decision_per_env),
                     closest_peer_model=decision.closest_peer_model,
                     top1_agreement=decision.top1_agreement,
+                    top1_max=decision.top1_max,
+                    top1_max_peer=decision.top1_max_peer,
                 )
             except Exception as e:
                 logger.warning(
@@ -326,5 +341,6 @@ class VerdictBackfillService:
                     f"[anticopy.verdict] {hk[:10]} verdict independent "
                     f"dec_med={decision.decision_median:.4f} "
                     f"top1={decision.top1_agreement:.4f} "
+                    f"top1_max={decision.top1_max:.4f} "
                     f"closest={(decision.closest_peer_model or '-')[:40]}"
                 )
