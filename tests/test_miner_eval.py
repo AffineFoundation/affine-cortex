@@ -12,6 +12,18 @@ from click.testing import CliRunner
 from affine.src.miner import eval as eval_mod
 
 
+_INSTRUCTION_GYM_JUDGE_ENV = {
+    "INSTRUCTION_GYM_JUDGE_BASE_URL": "https://judge.example/v1",
+    "INSTRUCTION_GYM_JUDGE_API_KEY": "judge-secret",
+    "INSTRUCTION_GYM_JUDGE_ENSEMBLE_JSON": (
+        '{"aggregation_mode":"min","members":['
+        '{"model_id":"judge-a","model_revision":"revision-a"},'
+        '{"model_id":"judge-b","model_revision":"revision-b"}]}'
+    ),
+    "INSTRUCTION_GYM_APPROVED_SEMANTIC_JUDGE_ENSEMBLE_MANIFEST_SHA256": "a" * 64,
+}
+
+
 class _FakeRemoteEnvironment:
     def __init__(self, result=None):
         self.result = result or {"score": 1.0, "success": True}
@@ -79,6 +91,8 @@ def test_load_environment_uses_override_without_pull_and_host_network(
     monkeypatch.setenv("API_KEY", "global-secret")
     monkeypatch.setenv("CHUTES_API_KEY", "chutes-secret")
     monkeypatch.setenv("OPENAI_API_KEY", "openai-secret")
+    for key, value in _INSTRUCTION_GYM_JUDGE_ENV.items():
+        monkeypatch.setenv(key, value)
 
     wrapped = eval_mod._load_environment(
         "instruction-gym",
@@ -91,7 +105,10 @@ def test_load_environment_uses_override_without_pull_and_host_network(
     assert captured["pull"] is False
     assert captured["host_network"] is True
     assert "network_mode" not in captured
-    assert captured["env_vars"] == {"UVICORN_WORKERS": "1"}
+    assert captured["env_vars"] == {
+        **_INSTRUCTION_GYM_JUDGE_ENV,
+        "UVICORN_WORKERS": "1",
+    }
 
     asyncio.run(
         wrapped.evaluate(
@@ -103,11 +120,37 @@ def test_load_environment_uses_override_without_pull_and_host_network(
         )
     )
     request = remote.evaluate_calls[0]
-    assert request["_timeout"] == 660
+    assert request["_timeout"] == 810
     assert request["protocol_version"] == "1.0"
     assert request["suite_id"] == "instruction_gym_ifeval_template_tasks_v1"
     assert request["universe_id"].startswith("ifeval_template_tasks_v1:")
     assert request["api_key"] == "per-call-secret"
+
+
+def test_load_environment_requires_complete_instruction_gym_judge_environment(
+    monkeypatch,
+):
+    load_calls = []
+    missing = "INSTRUCTION_GYM_JUDGE_API_KEY"
+    monkeypatch.delenv(missing, raising=False)
+    for key, value in _INSTRUCTION_GYM_JUDGE_ENV.items():
+        if key != missing:
+            monkeypatch.setenv(key, value)
+    monkeypatch.setitem(
+        sys.modules,
+        "affinetes",
+        SimpleNamespace(load_env=lambda **kwargs: load_calls.append(kwargs)),
+    )
+
+    with pytest.raises(eval_mod.click.ClickException, match=missing):
+        eval_mod._load_environment(
+            "instruction-gym",
+            network_host=False,
+            basilica=False,
+            image_override="instruction-gym:dev",
+        )
+
+    assert load_calls == []
 
 
 def test_load_environment_rejects_untrusted_basilica_before_affinetes_load(

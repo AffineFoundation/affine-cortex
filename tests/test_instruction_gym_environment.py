@@ -66,6 +66,13 @@ def test_instruction_gym_canonical_config_and_aliases():
     assert config.forward_api_key is False
     assert config.supports_teacher_rollouts is False
     assert config.trusted_execution_modes == ("docker",)
+    assert config.required_env_vars == [
+        "INSTRUCTION_GYM_JUDGE_BASE_URL",
+        "INSTRUCTION_GYM_JUDGE_API_KEY",
+        "INSTRUCTION_GYM_JUDGE_ENSEMBLE_JSON",
+        "INSTRUCTION_GYM_APPROVED_SEMANTIC_JUDGE_ENSEMBLE_MANIFEST_SHA256",
+    ]
+    assert config.optional_env_vars == []
     assert config.eval_params == {
         "protocol_version": "1.0",
         "universe_id": (
@@ -78,7 +85,7 @@ def test_instruction_gym_canonical_config_and_aliases():
     }
     assert config.eval_params["universe_id"] == INSTRUCTION_GYM_UNIVERSE_ID
     assert config.eval_params["suite_id"] == INSTRUCTION_GYM_SUITE_ID
-    assert config.proxy_timeout > config.eval_params["timeout"] + 10
+    assert config.proxy_timeout >= config.eval_params["timeout"] + 180.75 + 10
 
     for alias in (
         "INSTRUCTION-GYM",

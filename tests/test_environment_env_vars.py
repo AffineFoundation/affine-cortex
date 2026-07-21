@@ -21,6 +21,18 @@ from unittest.mock import patch
 import pytest
 
 
+_INSTRUCTION_GYM_JUDGE_ENV = {
+    "INSTRUCTION_GYM_JUDGE_BASE_URL": "https://judge.example/v1",
+    "INSTRUCTION_GYM_JUDGE_API_KEY": "judge-secret",
+    "INSTRUCTION_GYM_JUDGE_ENSEMBLE_JSON": (
+        '{"aggregation_mode":"min","members":['
+        '{"model_id":"judge-a","model_revision":"revision-a"},'
+        '{"model_id":"judge-b","model_revision":"revision-b"}]}'
+    ),
+    "INSTRUCTION_GYM_APPROVED_SEMANTIC_JUDGE_ENSEMBLE_MANIFEST_SHA256": "a" * 64,
+}
+
+
 def _get_env_vars_with(env_lookup: dict, env_name: str = "affine:ded-v2"):
     """Run ``SDKEnvironment._get_env_vars`` for a known env, substituting
     ``os.getenv`` with a lookup against ``env_lookup``. Bypasses
@@ -66,17 +78,36 @@ def test_no_api_key_set_no_aliases_emitted():
     assert "OPENAI_API_KEY" not in env_vars
 
 
-def test_instruction_gym_never_forwards_global_api_credentials():
+def test_instruction_gym_only_forwards_whitelisted_judge_credentials():
     env_vars = _get_env_vars_with(
         {
+            **_INSTRUCTION_GYM_JUDGE_ENV,
             "API_KEY": "global-secret",
             "CHUTES_API_KEY": "chutes-secret",
             "OPENAI_API_KEY": "openai-secret",
+            "INSTRUCTION_GYM_JUDGE_MODEL": "legacy-model",
+            "INSTRUCTION_GYM_JUDGE_MODEL_REVISION": "legacy-revision",
+            "INSTRUCTION_GYM_APPROVED_SEMANTIC_JUDGE_MANIFEST_SHA256": "b" * 64,
         },
         env_name="instruction-gym",
     )
 
-    assert env_vars == {"UVICORN_WORKERS": "1"}
+    assert env_vars == {
+        **_INSTRUCTION_GYM_JUDGE_ENV,
+        "UVICORN_WORKERS": "1",
+    }
+
+
+@pytest.mark.parametrize("missing", tuple(_INSTRUCTION_GYM_JUDGE_ENV))
+def test_instruction_gym_requires_complete_judge_ensemble_environment(missing):
+    supplied = {
+        key: value
+        for key, value in _INSTRUCTION_GYM_JUDGE_ENV.items()
+        if key != missing
+    }
+
+    with pytest.raises(ValueError, match=missing):
+        _get_env_vars_with(supplied, env_name="instruction-gym")
 
 
 def test_liveweb_requires_dashscope_api_key_and_validator_base_url():

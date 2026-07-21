@@ -471,6 +471,16 @@ _ENV_CONFIGS_CANONICAL = {
         # qualify one worker. Keep production registration on that proven
         # topology until a separate multi-worker concurrency/memory gate lands.
         env_vars={"UVICORN_WORKERS": "1"},
+        # Semantic cases fail closed unless Cortex supplies the complete,
+        # independently authenticated ensemble identity. Keep these names
+        # environment-specific: global candidate endpoint credentials must
+        # never be reused by the judge.
+        required_env_vars=[
+            "INSTRUCTION_GYM_JUDGE_BASE_URL",
+            "INSTRUCTION_GYM_JUDGE_API_KEY",
+            "INSTRUCTION_GYM_JUDGE_ENSEMBLE_JSON",
+            "INSTRUCTION_GYM_APPROVED_SEMANTIC_JUDGE_ENSEMBLE_MANIFEST_SHA256",
+        ],
         forward_api_key=False,
         supports_teacher_rollouts=False,
         trusted_execution_modes=("docker",),
@@ -482,7 +492,9 @@ _ENV_CONFIGS_CANONICAL = {
             "temperature": 0.0,
             "timeout": 600,
         },
-        proxy_timeout=660,
+        # The wrapper reserves up to 180.75s for a concurrent semantic-judge
+        # ensemble after the 600s candidate budget, plus transport grace.
+        proxy_timeout=810,
     ),
     "terminal": EnvConfig(
         name="terminal",
