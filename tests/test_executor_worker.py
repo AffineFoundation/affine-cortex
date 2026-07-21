@@ -1,5 +1,6 @@
 from affine.src.executor.worker import (
     _base_urls,
+    _is_invalid_sample_result,
     _is_zero_score_error,
     _pick_url,
     _resolve_deployment_id,
@@ -226,6 +227,135 @@ def test_executor_persists_structured_context_overflow_as_zero():
     persisted = samples.persist_calls[0]
     assert persisted["score"] == 0.0
     assert persisted["extra"]["zero_score_reason"] == "context_overflow"
+
+
+def test_executor_does_not_persist_terminal_llm_stream_idle_timeout():
+    import asyncio as _asyncio
+    from affine.core.models import Result
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import MinerSnapshot
+
+    worker = ExecutorWorker(worker_id=0, env="TERMINAL")
+
+    class _EnvStub:
+        async def evaluate(self, *, miner, task_id):
+            return Result(
+                env="TERMINAL",
+                score=0.0,
+                latency_seconds=1.0,
+                success=False,
+                error="",
+                task_id=task_id,
+                extra={
+                    "agent_runtime_failure": True,
+                    "agent_runtime_failure_kind": "llm_timeout",
+                    "terminated_reason": "runtime_error:llm_timeout",
+                    "agent_runtime_diagnostics": [{
+                        "event_type": "error",
+                        "failure_kind": "llm_timeout",
+                        "message": "llm_stream stream idle timeout",
+                    }],
+                    "harness_status": "VALID",
+                    "harness_failure": False,
+                    "valid_for_scoring": True,
+                },
+            )
+
+    class _SamplesStub:
+        def __init__(self):
+            self.persist_calls = []
+
+        async def persist(self, **kwargs):
+            self.persist_calls.append(kwargs)
+
+    samples = _SamplesStub()
+    worker._env_executor = _EnvStub()
+    worker._samples = samples
+
+    async def _drive():
+        await worker._evaluate_and_persist_gated(
+            miner=MinerSnapshot(
+                uid=96,
+                hotkey="hk",
+                revision="rev",
+                model="org/model",
+            ),
+            task_id=123,
+            base_url="https://example/v1",
+            refresh_block=10,
+            miner_obj=object(),
+        )
+
+    _asyncio.run(_drive())
+
+    assert samples.persist_calls == []
+    assert worker.metrics.tasks_failed == 1
+
+
+def test_executor_does_not_persist_terminal_invalid_scoring_flag():
+    import asyncio as _asyncio
+    from affine.core.models import Result
+    from affine.src.executor.worker import ExecutorWorker
+    from affine.src.scorer.window_state import MinerSnapshot
+
+    worker = ExecutorWorker(worker_id=0, env="TERMINAL")
+
+    class _EnvStub:
+        async def evaluate(self, *, miner, task_id):
+            return Result(
+                env="TERMINAL",
+                score=0.0,
+                latency_seconds=1.0,
+                success=False,
+                error="",
+                task_id=task_id,
+                extra={
+                    "harness_status": "INVALID",
+                    "harness_failure": True,
+                    "valid_for_scoring": False,
+                },
+            )
+
+    class _SamplesStub:
+        def __init__(self):
+            self.persist_calls = []
+
+        async def persist(self, **kwargs):
+            self.persist_calls.append(kwargs)
+
+    samples = _SamplesStub()
+    worker._env_executor = _EnvStub()
+    worker._samples = samples
+
+    async def _drive():
+        await worker._evaluate_and_persist_gated(
+            miner=MinerSnapshot(
+                uid=96,
+                hotkey="hk",
+                revision="rev",
+                model="org/model",
+            ),
+            task_id=456,
+            base_url="https://example/v1",
+            refresh_block=10,
+            miner_obj=object(),
+        )
+
+    _asyncio.run(_drive())
+
+    assert samples.persist_calls == []
+    assert worker.metrics.tasks_failed == 1
+
+
+def test_invalid_sample_result_detects_stream_idle_timeout_text():
+    assert _is_invalid_sample_result(
+        error=None,
+        extra={
+            "agent_runtime_failure": True,
+            "agent_runtime_failure_kind": None,
+            "terminated_reason": "runtime_error:llm_stream stream idle timeout",
+        },
+    )
 
 
 def test_global_slot_acquire_release_round_trip():

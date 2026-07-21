@@ -827,6 +827,14 @@ class ExecutorWorker:
         error = getattr(result, "error", None)
         extra = dict(getattr(result, "extra", {}) or {})
         latency_ms = int((time.monotonic() - started) * 1000)
+        if _is_invalid_sample_result(error=error, extra=extra):
+            diagnostic = _invalid_sample_diagnostic(error=error, extra=extra)
+            logger.info(
+                f"[FAILED] U{miner.uid:<4} │ {self.env:<20} │     INVALID │ "
+                f"task_id={task_id:<8} │ {latency_ms / 1000.0:6.3f}s │ {diagnostic}"
+            )
+            self.metrics.record_completion(success=False, latency_ms=latency_ms)
+            return
         if error or extra.get("error"):
             error_brief = str(error or extra.get("error")).replace("\n", " ").replace("\r", " ")[:200]
             if _is_zero_score_error(Exception(error_brief)):
@@ -974,6 +982,65 @@ _ZERO_SCORE_ERROR_PATTERNS = (
     "exceeds the maximum allowed length",
     "exceeds the maximum context length",
 )
+
+_INVALID_SAMPLE_FAILURE_KINDS = {
+    "llm_timeout",
+}
+
+_INVALID_SAMPLE_DIAGNOSTIC_PATTERNS = (
+    "llm_stream stream idle timeout",
+    "stream idle timeout",
+)
+
+
+def _is_invalid_sample_result(*, error: object, extra: Dict[str, Any]) -> bool:
+    """Return True for completed Result payloads that must not be scored.
+
+    Terminal reports provider/transport runtime failures in ``extra`` while
+    keeping top-level ``error`` empty for local self-eval compatibility. In the
+    executor those are invalid samples: no trustworthy model outcome was
+    produced, so persisting score=0 would turn infrastructure flake into miner
+    score.
+    """
+    if extra.get("valid_for_scoring") is False:
+        return True
+    if str(extra.get("harness_status") or "").upper() == "INVALID":
+        return True
+    if extra.get("harness_failure") is True:
+        return True
+    if bool(extra.get("agent_runtime_failure")):
+        kind = str(extra.get("agent_runtime_failure_kind") or "").strip().lower()
+        terminated_reason = str(extra.get("terminated_reason") or "").strip().lower()
+        if kind in _INVALID_SAMPLE_FAILURE_KINDS:
+            return True
+        if any(p in terminated_reason for p in _INVALID_SAMPLE_DIAGNOSTIC_PATTERNS):
+            return True
+        for item in extra.get("agent_runtime_diagnostics") or []:
+            if not isinstance(item, dict):
+                continue
+            item_kind = str(item.get("failure_kind") or "").strip().lower()
+            if item_kind in _INVALID_SAMPLE_FAILURE_KINDS:
+                return True
+            text = " ".join(
+                str(item.get(key) or "")
+                for key in ("message", "stderr", "trace_jsonl", "terminated_reason")
+            ).lower()
+            if any(p in text for p in _INVALID_SAMPLE_DIAGNOSTIC_PATTERNS):
+                return True
+    error_text = str(error or "").strip().lower()
+    if any(p in error_text for p in _INVALID_SAMPLE_DIAGNOSTIC_PATTERNS):
+        return True
+    return False
+
+
+def _invalid_sample_diagnostic(*, error: object, extra: Dict[str, Any]) -> str:
+    if error:
+        return str(error).replace("\n", " ").replace("\r", " ")[:200]
+    for key in ("terminated_reason", "agent_runtime_failure_kind", "harness_status"):
+        value = extra.get(key)
+        if value:
+            return str(value).replace("\n", " ").replace("\r", " ")[:200]
+    return "invalid sample result"
 
 
 def _is_zero_score_error(exc: BaseException) -> bool:
