@@ -86,10 +86,48 @@ _ENDPOINT_OVERRIDE_FIELDS = {
     "sglang_chunked_prefill",
     "sglang_tool_call_parser",
     "sglang_docker_args",
+    "serving_mode",
+    "sglang_pd_prefill_replicas",
+    "sglang_pd_decode_replicas",
+    "sglang_pd_prefill_port_start",
+    "sglang_pd_bootstrap_port_start",
+    "sglang_pd_decode_port_start",
+    "sglang_pd_transfer_backend",
+    "sglang_pd_ib_device",
+    "sglang_pd_gateway_image",
+    "sglang_pd_prefill_policy",
+    "sglang_pd_decode_policy",
     "ready_timeout_sec",
     "poll_interval_sec",
     "notes",
 }
+
+
+def _validate_managed_pd_endpoint(
+    slot_name: str, endpoint_values: Mapping[str, Any],
+) -> None:
+    if endpoint_values.get("serving_mode") != "pd":
+        return
+    # Validate before an instance is rented. The eventual SSH URL comes from
+    # the provider handle, so a loopback placeholder is sufficient for the
+    # deployment-only invariants checked here.
+    from affine.src.scheduler.ssh import SSHConfig
+    from affine.src.scheduler.ssh_pd import validate_config
+
+    values = {
+        key: value
+        for key, value in endpoint_values.items()
+        if key in Endpoint.__dataclass_fields__
+    }
+    values["ssh_url"] = values.get("ssh_url") or "ssh://localhost"
+    endpoint = Endpoint(name=slot_name, kind="ssh", **values)
+    try:
+        validate_config(SSHConfig.from_endpoint(endpoint))
+    except ValueError as error:
+        raise ValueError(
+            f"autoscaler endpoint {slot_name!r} has invalid PD config: "
+            f"{error}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -108,13 +146,15 @@ class ManagedEndpointSlot:
         for field_name in _ENDPOINT_OVERRIDE_FIELDS:
             if field_name in payload and field_name not in endpoint:
                 endpoint[field_name] = payload[field_name]
+        name = str(payload.get("name") or "")
+        _validate_managed_pd_endpoint(name, endpoint)
         tunnel = (
             dict(payload.get("tunnel"))
             if isinstance(payload.get("tunnel"), Mapping)
             else {}
         )
         return cls(
-            name=str(payload.get("name") or ""),
+            name=name,
             provider=str(payload.get("provider") or "").lower(),
             role=str(payload.get("role") or "scoring"),
             purpose=_safe_token(payload.get("purpose") or "eval", default="eval"),

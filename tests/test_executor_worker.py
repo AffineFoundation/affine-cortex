@@ -21,13 +21,13 @@ def _in_flight_probe(v):
 def test_positive_int_env_uses_default_when_unset(monkeypatch):
     monkeypatch.delenv("TEST_DISPATCH_BUDGET", raising=False)
 
-    assert _positive_int_env("TEST_DISPATCH_BUDGET", 400) == 400
+    assert _positive_int_env("TEST_DISPATCH_BUDGET", 300) == 300
 
 
 def test_positive_int_env_accepts_override(monkeypatch):
     monkeypatch.setenv("TEST_DISPATCH_BUDGET", "250")
 
-    assert _positive_int_env("TEST_DISPATCH_BUDGET", 400) == 250
+    assert _positive_int_env("TEST_DISPATCH_BUDGET", 300) == 250
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "invalid"])
@@ -35,7 +35,7 @@ def test_positive_int_env_rejects_invalid_values(monkeypatch, value):
     monkeypatch.setenv("TEST_DISPATCH_BUDGET", value)
 
     with pytest.raises(ValueError, match="must be a positive integer"):
-        _positive_int_env("TEST_DISPATCH_BUDGET", 400)
+        _positive_int_env("TEST_DISPATCH_BUDGET", 300)
 
 
 def test_executor_manager_ipc_handles_survive_spawn():

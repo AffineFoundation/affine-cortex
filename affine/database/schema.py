@@ -309,6 +309,9 @@ MINER_STATS_SCHEMA = {
 #   sglang_chunked_prefill chunked-prefill size passed to sglang
 #   sglang_tool_call_parser tool-call parser name, "none" to omit
 #   sglang_docker_args    extra docker-run args
+#   serving_mode          "unified" | "pd"
+#   sglang_pd_*           single-host 4P4D ports, images, transfer backend,
+#                         and Model Gateway routing policies
 #   ready_timeout_sec      readiness probe timeout
 #   poll_interval_sec      readiness probe interval
 #

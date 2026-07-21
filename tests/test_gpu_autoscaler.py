@@ -434,15 +434,35 @@ async def test_load_config_uses_autoscaler_env_when_system_config_absent(
 
 
 def test_managed_endpoint_slot_accepts_sglang_runtime_overrides():
+    digest = "a" * 64
     slot = ManagedEndpointSlot.from_mapping({
         "name": "targon-b200-autoscale-1",
         "provider": "targon",
         "sglang_load_balance_method": "total_requests",
         "sglang_docker_args": ["--cgroupns=host"],
+        "serving_mode": "pd",
+        "sglang_pd_prefill_replicas": 4,
+        "sglang_pd_decode_replicas": 4,
+        "sglang_image": f"lmsysorg/sglang:v0.5.14@sha256:{digest}",
+        "sglang_pd_gateway_image": (
+            f"lmsysorg/sgl-model-gateway:v0.5.14@sha256:{digest}"
+        ),
     })
 
     assert slot.endpoint["sglang_load_balance_method"] == "total_requests"
     assert slot.endpoint["sglang_docker_args"] == ["--cgroupns=host"]
+    assert slot.endpoint["serving_mode"] == "pd"
+    assert slot.endpoint["sglang_pd_prefill_replicas"] == 4
+    assert slot.endpoint["sglang_pd_decode_replicas"] == 4
+
+
+def test_managed_endpoint_slot_rejects_unpinned_pd_before_renting():
+    with pytest.raises(ValueError, match="invalid PD config.*must be pinned"):
+        ManagedEndpointSlot.from_mapping({
+            "name": "lium-pd",
+            "provider": "lium",
+            "serving_mode": "pd",
+        })
 
 
 def test_managed_endpoint_slot_accepts_autoscale_purpose():

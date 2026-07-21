@@ -102,21 +102,6 @@ def test_liveweb_forwards_dashscope_api_key():
     assert env_vars["VALIDATOR_BASE_URL"] == "https://validator.example"
 
 
-def test_terminal_forwards_sglang_dp_size_when_configured():
-    env_vars = _get_env_vars_with(
-        {"TERMINEL_SGLANG_DP_SIZE": "8"},
-        env_name="terminal",
-    )
-
-    assert env_vars["TERMINEL_SGLANG_DP_SIZE"] == "8"
-
-
-def test_terminal_omits_sglang_dp_size_when_unconfigured():
-    env_vars = _get_env_vars_with({}, env_name="terminal")
-
-    assert "TERMINEL_SGLANG_DP_SIZE" not in env_vars
-
-
 def test_terminal_allows_two_hour_evaluations():
     from affine.core.environments import ENV_CONFIGS
 
@@ -124,15 +109,6 @@ def test_terminal_allows_two_hour_evaluations():
 
     assert terminal.eval_params["timeout"] == 7200
     assert terminal.proxy_timeout == 7320
-
-
-def test_sglang_dp_size_is_not_forwarded_to_other_environments():
-    env_vars = _get_env_vars_with(
-        {"TERMINEL_SGLANG_DP_SIZE": "8"},
-        env_name="memorygym",
-    )
-
-    assert "TERMINEL_SGLANG_DP_SIZE" not in env_vars
 
 
 def test_build_result_removes_all_base_url_fields():

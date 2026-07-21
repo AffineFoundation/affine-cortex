@@ -3,7 +3,7 @@
 The real concurrency gate is a single cross-process
 ``multiprocessing.BoundedSemaphore`` shared by every worker subprocess.
 It is sized to the inference backend's measured saturation point; the
-default is 400 in-flight evaluations per endpoint and can be overridden
+default is 300 in-flight evaluations per endpoint and can be overridden
 for a different GPU profile.
 
 Cross-env priority is adjusted by the manager from live progress:
@@ -39,7 +39,7 @@ def _positive_int_env(name: str, default: int) -> int:
 # every dispatch against the host its sglang lives on.
 PER_HOST_DISPATCH_BUDGET = _positive_int_env(
     "AFFINE_EXECUTOR_PER_HOST_DISPATCH_BUDGET",
-    400,
+    300,
 )
 
 GLOBAL_DISPATCH_BUDGET = PER_HOST_DISPATCH_BUDGET

@@ -129,6 +129,25 @@ def test_deployment_id_includes_endpoint_name():
     assert cfg.deployment_id() == f"ssh:ssh_b300:{CONTAINER_NAME}"
 
 
+def test_pd_config_from_endpoint_uses_gateway_deployment_identity():
+    cfg = SSHConfig.from_endpoint(Endpoint(
+        name="pd-b200",
+        kind="ssh",
+        ssh_url="ssh://b200",
+        serving_mode="pd",
+        sglang_pd_prefill_replicas=4,
+        sglang_pd_decode_replicas=4,
+        sglang_pd_gateway_image=(
+            "lmsysorg/sgl-model-gateway:v0.5.14@sha256:" + "a" * 64
+        ),
+    ))
+
+    assert cfg.serving_mode == "pd"
+    assert cfg.sglang_pd_prefill_replicas == 4
+    assert cfg.sglang_pd_decode_replicas == 4
+    assert cfg.deployment_id() == "ssh:pd-b200:affine-sglang-pd-gateway"
+
+
 # ---- sglang args + docker cmd ---------------------------------------------
 
 
@@ -444,6 +463,9 @@ def test_docker_cmd_rms_existing_container_first():
     run_idx = cmd.find("docker run")
     assert rm_idx >= 0 and run_idx >= 0
     assert rm_idx < run_idx
+    assert "affine-sglang-pd-gateway" in cmd
+    assert "affine-sglang-pd-prefill-3" in cmd
+    assert "affine-sglang-pd-decode-3" in cmd
 
 
 def test_docker_cmd_passes_gpus_all_and_mounts_cache():

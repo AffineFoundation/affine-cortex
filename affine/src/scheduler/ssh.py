@@ -27,6 +27,8 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
   sglang_chunked_prefill  chunked-prefill size (4096)
   sglang_tool_call_parser parser name, "none" to omit (qwen)
   sglang_docker_args      optional extra docker-run args
+  serving_mode            unified (this module) or pd (ssh_pd module)
+  sglang_pd_*             4P4D worker/Gateway configuration
   ready_timeout_sec       seconds to wait for /v1/models (1800)
   poll_interval_sec       seconds between readiness probes (15)
 """
@@ -104,6 +106,11 @@ ACTIVE_HF_INCOMPLETE_CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
 # Single container name — single-instance host means only one ever exists.
 # ``docker rm -f`` is idempotent so start() always kicks off a fresh state.
 CONTAINER_NAME = "affine-sglang-current"
+PD_COMPAT_CONTAINER_NAMES = (
+    "affine-sglang-pd-gateway",
+    *(f"affine-sglang-pd-decode-{index}" for index in range(4)),
+    *(f"affine-sglang-pd-prefill-{index}" for index in range(4)),
+)
 RESTART_POLICY = "unless-stopped"
 
 # HuggingFace snapshot cache layout: model "<owner>/<name>" lives at
@@ -142,6 +149,17 @@ class SSHConfig:
     sglang_chunked_prefill: int = DEFAULT_CHUNKED_PREFILL
     sglang_tool_call_parser: str = DEFAULT_TOOL_CALL_PARSER
     sglang_docker_args: Tuple[str, ...] = ()
+    serving_mode: str = "unified"
+    sglang_pd_prefill_replicas: int = 4
+    sglang_pd_decode_replicas: int = 4
+    sglang_pd_prefill_port_start: int = 11000
+    sglang_pd_bootstrap_port_start: int = 12000
+    sglang_pd_decode_port_start: int = 13000
+    sglang_pd_transfer_backend: str = "mooncake"
+    sglang_pd_ib_device: Optional[str] = None
+    sglang_pd_gateway_image: str = ""
+    sglang_pd_prefill_policy: str = "cache_aware"
+    sglang_pd_decode_policy: str = "power_of_two"
     ready_timeout_sec: int = DEFAULT_READY_TIMEOUT_SEC
     poll_interval_sec: float = DEFAULT_POLL_INTERVAL_SEC
     connect_timeout: int = 30
@@ -199,6 +217,37 @@ class SSHConfig:
             sglang_docker_args=_coerce_docker_args(
                 getattr(endpoint, "sglang_docker_args", None)
             ),
+            serving_mode=getattr(endpoint, "serving_mode", "unified"),
+            sglang_pd_prefill_replicas=getattr(
+                endpoint, "sglang_pd_prefill_replicas", 4,
+            ),
+            sglang_pd_decode_replicas=getattr(
+                endpoint, "sglang_pd_decode_replicas", 4,
+            ),
+            sglang_pd_prefill_port_start=getattr(
+                endpoint, "sglang_pd_prefill_port_start", 11000,
+            ),
+            sglang_pd_bootstrap_port_start=getattr(
+                endpoint, "sglang_pd_bootstrap_port_start", 12000,
+            ),
+            sglang_pd_decode_port_start=getattr(
+                endpoint, "sglang_pd_decode_port_start", 13000,
+            ),
+            sglang_pd_transfer_backend=getattr(
+                endpoint, "sglang_pd_transfer_backend", "mooncake",
+            ),
+            sglang_pd_ib_device=getattr(
+                endpoint, "sglang_pd_ib_device", None,
+            ),
+            sglang_pd_gateway_image=getattr(
+                endpoint, "sglang_pd_gateway_image", "",
+            ),
+            sglang_pd_prefill_policy=getattr(
+                endpoint, "sglang_pd_prefill_policy", "cache_aware",
+            ),
+            sglang_pd_decode_policy=getattr(
+                endpoint, "sglang_pd_decode_policy", "power_of_two",
+            ),
             ready_timeout_sec=endpoint.ready_timeout_sec,
             poll_interval_sec=endpoint.poll_interval_sec,
             autoscale_managed=bool(
@@ -221,7 +270,12 @@ class SSHConfig:
         which machine owns the single-instance container.
         """
         endpoint = self.endpoint_name or self.host
-        return f"ssh:{endpoint}:{CONTAINER_NAME}"
+        container_name = (
+            "affine-sglang-pd-gateway"
+            if self.serving_mode == "pd"
+            else CONTAINER_NAME
+        )
+        return f"ssh:{endpoint}:{container_name}"
 
     def health_identity(self) -> str:
         runtime = self.autoscale_instance_id or f"{self.host}:{self.port}"
@@ -454,8 +508,9 @@ def _build_docker_run_cmd(
     # --security-opt label=disable: matches the working production reference
     #   containers; needed when SELinux relabeling on the bind mount would
     #   prevent the container from reading /data.
+    stale_containers = " ".join((CONTAINER_NAME, *PD_COMPAT_CONTAINER_NAMES))
     return (
-        f"docker rm -f {CONTAINER_NAME} 2>/dev/null; "
+        f"docker rm -f {stale_containers} 2>/dev/null; "
         f"docker run -d --name {CONTAINER_NAME} --gpus all "
         f"--restart {RESTART_POLICY} "
         f"--network host --ipc=host --shm-size=32g "

@@ -973,6 +973,50 @@ async def test_ssh_deploy_refreshes_cached_endpoint_config(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_ssh_pd_endpoint_dispatches_to_4p4d_lifecycle(monkeypatch):
+    endpoint = Endpoint(
+        name="b200-pd",
+        kind="ssh",
+        ssh_url="ssh://root@b200",
+        serving_mode="pd",
+    )
+    dao = _EndpointsDAOFake([endpoint])
+    calls = []
+
+    async def pd_deploy(config, target):
+        calls.append((config.serving_mode, target.uid))
+        return DeployResult(
+            deployment_id=config.deployment_id(),
+            base_url=config.inference_url(),
+        )
+
+    async def unexpected_unified_deploy(_config, _target):
+        raise AssertionError("PD endpoint used unified lifecycle")
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.main.ssh_pd_lifecycle.deploy",
+        pd_deploy,
+    )
+    monkeypatch.setattr(
+        "affine.src.scheduler.main.ssh_lifecycle.deploy",
+        unexpected_unified_deploy,
+    )
+    monkeypatch.setattr("affine.src.scheduler.main.time.time", lambda: 1_000)
+
+    result = await _deploy_ssh_target(
+        dao, {}, _target(), role="challenger",
+    )
+
+    assert calls == [("pd", 42)]
+    assert result.deployment_id == (
+        "ssh:b200-pd:affine-sglang-pd-gateway"
+    )
+    assert len(result.deployments) == 1
+    assert result.deployments[0].base_url == "http://b200:10001/v1"
+    assert dao.reservations[0][1]["expires_at"] == 4_960
+
+
+@pytest.mark.asyncio
 async def test_ssh_deploy_skips_non_scoring_endpoints(monkeypatch):
     anticopy = Endpoint(
         name="ceac",

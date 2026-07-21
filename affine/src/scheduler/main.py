@@ -49,6 +49,7 @@ from affine.src.scorer.window_state import (
 )
 
 from . import ssh as ssh_lifecycle
+from . import ssh_pd as ssh_pd_lifecycle
 from . import targon as targon_lifecycle
 from .flow import (
     DeploymentRoleTransitionResult,
@@ -78,6 +79,18 @@ SSH_RESERVATION_GRACE_SEC = 300
 
 class EndpointReservationConflict(TransientDeployError):
     """The selected SSH endpoint changed before this deploy owned it."""
+
+
+def _ssh_runtime_lifecycle(config: ssh_lifecycle.SSHConfig):
+    """Select the container lifecycle without changing scheduler semantics."""
+    if config.serving_mode == "pd":
+        return ssh_pd_lifecycle
+    if config.serving_mode == "unified":
+        return ssh_lifecycle
+    raise ValueError(
+        f"unsupported SSH serving_mode={config.serving_mode!r}; "
+        "expected 'unified' or 'pd'"
+    )
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -406,9 +419,14 @@ async def _deploy_ssh_target(
         ssh_configs[ep.name] = cfg
         deployment_id = cfg.deployment_id()
         reservation_token = uuid.uuid4().hex
+        deployment_timeout_sec = (
+            ssh_pd_lifecycle.reservation_timeout_sec(cfg)
+            if cfg.serving_mode == "pd"
+            else max(60, int(ep.ready_timeout_sec))
+        )
         reservation_expires_at = (
             int(time.time())
-            + max(60, int(ep.ready_timeout_sec))
+            + deployment_timeout_sec
             + SSH_RESERVATION_GRACE_SEC
         )
         reserved = await endpoints_dao.try_reserve_assignment(
@@ -430,7 +448,7 @@ async def _deploy_ssh_target(
                 raise NoEndpointCapacity(message)
             raise EndpointReservationConflict(message)
         try:
-            result = await ssh_lifecycle.deploy(cfg, target)
+            result = await _ssh_runtime_lifecycle(cfg).deploy(cfg, target)
             finalized = await endpoints_dao.finalize_assignment(
                 ep.name,
                 token=reservation_token,
@@ -603,7 +621,9 @@ async def _run() -> None:
             # (``ssh_lifecycle.deploy`` is idempotent — ``docker rm -f``
             # step at the top).
             try:
-                await ssh_lifecycle.teardown(cfg, deployment_id)
+                await _ssh_runtime_lifecycle(cfg).teardown(
+                    cfg, deployment_id,
+                )
             finally:
                 await endpoints_dao.clear_assignment(name)
 
@@ -640,7 +660,7 @@ async def _run() -> None:
                 revision=target_record.revision,
                 model_type=target_record.model_type,
             )
-            return await ssh_lifecycle.deployment_health(
+            return await _ssh_runtime_lifecycle(cfg).deployment_health(
                 cfg, target, base_url=cfg.inference_url(),
             )
 

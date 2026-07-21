@@ -692,10 +692,25 @@ async def _cmd_list_endpoints() -> None:
             if ep.kind == "ssh":
                 print(
                     "  sglang              : "
-                    f"port={ep.sglang_port} dp={ep.sglang_dp} "
+                    f"mode={ep.serving_mode} port={ep.sglang_port} "
+                    f"dp={ep.sglang_dp} "
                     f"load_balance={ep.sglang_load_balance_method} "
                     f"image={ep.sglang_image}"
                 )
+                if ep.serving_mode == "pd":
+                    print(
+                        "  sglang pd           : "
+                        f"prefill={ep.sglang_pd_prefill_replicas} "
+                        f"decode={ep.sglang_pd_decode_replicas} "
+                        f"transfer={ep.sglang_pd_transfer_backend} "
+                        f"gateway_image={ep.sglang_pd_gateway_image}"
+                    )
+                    print(
+                        "  sglang pd ports     : "
+                        f"prefill={ep.sglang_pd_prefill_port_start}.. "
+                        f"bootstrap={ep.sglang_pd_bootstrap_port_start}.. "
+                        f"decode={ep.sglang_pd_decode_port_start}.."
+                    )
                 print(
                     "  sglang args         : "
                     f"context={ep.sglang_context_len} "
@@ -734,13 +749,25 @@ async def _cmd_list_endpoints() -> None:
 async def _probe_static_endpoint(endpoint) -> str:
     if endpoint.kind == "ssh":
         from affine.src.scheduler.ssh import SSHConfig, probe_host
+        from affine.src.scheduler.ssh_pd import (
+            required_gpu_count,
+            validate_config,
+        )
 
-        gpu_count = await probe_host(SSHConfig.from_endpoint(endpoint))
-        required_gpus = max(1, int(endpoint.sglang_dp))
+        config = SSHConfig.from_endpoint(endpoint)
+        if config.serving_mode == "pd":
+            validate_config(config)
+        gpu_count = await probe_host(config)
+        required_gpus = required_gpu_count(config)
         if gpu_count < required_gpus:
+            requirement = (
+                f"sglang_dp={required_gpus}"
+                if config.serving_mode == "unified"
+                else "serving_mode='pd' 4P4D"
+            )
             raise RuntimeError(
                 f"static endpoint exposes {gpu_count} NVIDIA GPU(s), but "
-                f"sglang_dp={required_gpus} requires at least {required_gpus}"
+                f"{requirement} requires at least {required_gpus}"
             )
         return f"SSH, Docker, and {gpu_count} NVIDIA GPU(s) ready"
 
@@ -769,6 +796,12 @@ async def _cmd_register_static_endpoint(
     sglang_image: str, sglang_cache_dir: str, sglang_context_len: int,
     sglang_mem_fraction: float, sglang_chunked_prefill: int,
     sglang_tool_call_parser: str, sglang_docker_arg: tuple[str, ...],
+    serving_mode: str, sglang_pd_prefill_replicas: int,
+    sglang_pd_decode_replicas: int, sglang_pd_prefill_port_start: int,
+    sglang_pd_bootstrap_port_start: int, sglang_pd_decode_port_start: int,
+    sglang_pd_transfer_backend: str, sglang_pd_ib_device: Optional[str],
+    sglang_pd_gateway_image: str, sglang_pd_prefill_policy: str,
+    sglang_pd_decode_policy: str,
     ready_timeout_sec: int,
     poll_interval_sec: float, activate: bool, notes: Optional[str],
 ) -> None:
@@ -790,10 +823,29 @@ async def _cmd_register_static_endpoint(
             sglang_chunked_prefill=sglang_chunked_prefill,
             sglang_tool_call_parser=sglang_tool_call_parser,
             sglang_docker_args=list(sglang_docker_arg),
+            serving_mode=serving_mode,
+            sglang_pd_prefill_replicas=sglang_pd_prefill_replicas,
+            sglang_pd_decode_replicas=sglang_pd_decode_replicas,
+            sglang_pd_prefill_port_start=sglang_pd_prefill_port_start,
+            sglang_pd_bootstrap_port_start=sglang_pd_bootstrap_port_start,
+            sglang_pd_decode_port_start=sglang_pd_decode_port_start,
+            sglang_pd_transfer_backend=sglang_pd_transfer_backend,
+            sglang_pd_ib_device=sglang_pd_ib_device,
+            sglang_pd_gateway_image=sglang_pd_gateway_image,
+            sglang_pd_prefill_policy=sglang_pd_prefill_policy,
+            sglang_pd_decode_policy=sglang_pd_decode_policy,
             ready_timeout_sec=ready_timeout_sec,
             poll_interval_sec=poll_interval_sec,
             notes=notes,
         )
+        if kind == "ssh" and serving_mode == "pd":
+            from affine.src.scheduler.ssh import SSHConfig
+            from affine.src.scheduler.ssh_pd import validate_config
+
+            try:
+                validate_config(SSHConfig.from_endpoint(ep))
+            except ValueError as e:
+                raise click.ClickException(str(e)) from e
         dao = InferenceEndpointsDAO()
         registration_owner = f"cli:register-static-endpoint:{uuid.uuid4().hex}"
         try:
@@ -850,6 +902,12 @@ def list_endpoints():
 @click.option("--sglang-port", type=int, default=10001)
 @click.option("--sglang-dp", type=click.IntRange(min=1), default=8)
 @click.option(
+    "--serving-mode",
+    type=click.Choice(["unified", "pd"]),
+    default="unified",
+    show_default=True,
+)
+@click.option(
     "--sglang-load-balance-method",
     type=click.Choice([
         "auto", "round_robin", "total_requests", "total_tokens",
@@ -866,6 +924,43 @@ def list_endpoints():
               help='Tool-call parser name; set to "none" to omit')
 @click.option("--sglang-docker-arg", multiple=True,
               help="Extra docker-run argument. Repeat for multiple args.")
+@click.option(
+    "--sglang-pd-prefill-replicas",
+    type=click.IntRange(min=1),
+    default=4,
+    show_default=True,
+)
+@click.option(
+    "--sglang-pd-decode-replicas",
+    type=click.IntRange(min=1),
+    default=4,
+    show_default=True,
+)
+@click.option("--sglang-pd-prefill-port-start", type=int, default=11000)
+@click.option("--sglang-pd-bootstrap-port-start", type=int, default=12000)
+@click.option("--sglang-pd-decode-port-start", type=int, default=13000)
+@click.option(
+    "--sglang-pd-transfer-backend",
+    type=click.Choice(["mooncake", "nixl"]),
+    default="mooncake",
+    show_default=True,
+)
+@click.option("--sglang-pd-ib-device", default=None)
+@click.option(
+    "--sglang-pd-gateway-image",
+    default="",
+    help="Digest-pinned SGLang Model Gateway image; required in PD mode.",
+)
+@click.option(
+    "--sglang-pd-prefill-policy",
+    default="cache_aware",
+    show_default=True,
+)
+@click.option(
+    "--sglang-pd-decode-policy",
+    default="power_of_two",
+    show_default=True,
+)
 @click.option("--ready-timeout-sec", type=int, default=1800)
 @click.option("--poll-interval-sec", type=float, default=15.0)
 @click.option(
@@ -877,10 +972,16 @@ def list_endpoints():
 @click.option("--notes", default=None)
 def register_static_endpoint(
     name, kind, ssh_url, ssh_key_path, public_inference_url, targon_api_url,
-    role, sglang_port, sglang_dp, sglang_load_balance_method, sglang_image,
+    role, sglang_port, sglang_dp, serving_mode,
+    sglang_load_balance_method, sglang_image,
     sglang_cache_dir,
     sglang_context_len, sglang_mem_fraction, sglang_chunked_prefill,
-    sglang_tool_call_parser, sglang_docker_arg, ready_timeout_sec,
+    sglang_tool_call_parser, sglang_docker_arg,
+    sglang_pd_prefill_replicas, sglang_pd_decode_replicas,
+    sglang_pd_prefill_port_start, sglang_pd_bootstrap_port_start,
+    sglang_pd_decode_port_start, sglang_pd_transfer_backend,
+    sglang_pd_ib_device, sglang_pd_gateway_image,
+    sglang_pd_prefill_policy, sglang_pd_decode_policy, ready_timeout_sec,
     poll_interval_sec, activate, notes,
 ):
     """Register or update an operator-managed static inference endpoint.
@@ -898,6 +999,7 @@ def register_static_endpoint(
         public_inference_url=public_inference_url,
         targon_api_url=targon_api_url, role=role,
         sglang_port=sglang_port, sglang_dp=sglang_dp,
+        serving_mode=serving_mode,
         sglang_load_balance_method=sglang_load_balance_method,
         sglang_image=sglang_image, sglang_cache_dir=sglang_cache_dir,
         sglang_context_len=sglang_context_len,
@@ -905,6 +1007,16 @@ def register_static_endpoint(
         sglang_chunked_prefill=sglang_chunked_prefill,
         sglang_tool_call_parser=sglang_tool_call_parser,
         sglang_docker_arg=sglang_docker_arg,
+        sglang_pd_prefill_replicas=sglang_pd_prefill_replicas,
+        sglang_pd_decode_replicas=sglang_pd_decode_replicas,
+        sglang_pd_prefill_port_start=sglang_pd_prefill_port_start,
+        sglang_pd_bootstrap_port_start=sglang_pd_bootstrap_port_start,
+        sglang_pd_decode_port_start=sglang_pd_decode_port_start,
+        sglang_pd_transfer_backend=sglang_pd_transfer_backend,
+        sglang_pd_ib_device=sglang_pd_ib_device,
+        sglang_pd_gateway_image=sglang_pd_gateway_image,
+        sglang_pd_prefill_policy=sglang_pd_prefill_policy,
+        sglang_pd_decode_policy=sglang_pd_decode_policy,
         ready_timeout_sec=ready_timeout_sec,
         poll_interval_sec=poll_interval_sec,
         activate=activate, notes=notes,

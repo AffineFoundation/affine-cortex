@@ -109,6 +109,73 @@ def test_register_static_endpoint_probe_failure_leaves_inactive(monkeypatch):
     assert "remains inactive: docker unavailable" in result.output
 
 
+def test_register_static_endpoint_accepts_digest_pinned_4p4d(monkeypatch):
+    dao = _FakeEndpointsDAO()
+    _patch_cli_dependencies(monkeypatch, dao)
+    probed = []
+    digest = "a" * 64
+
+    async def probe(endpoint):
+        probed.append(endpoint)
+        return "SSH, Docker, and 8 NVIDIA GPU(s) ready"
+
+    monkeypatch.setattr(db_cli, "_probe_static_endpoint", probe)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "db",
+            "register-static-endpoint",
+            "--name",
+            "manual-b200-pd",
+            "--kind",
+            "ssh",
+            "--ssh-url",
+            "ssh://root@gpu.test",
+            "--serving-mode",
+            "pd",
+            "--sglang-image",
+            f"lmsysorg/sglang:v0.5.14@sha256:{digest}",
+            "--sglang-pd-gateway-image",
+            f"lmsysorg/sgl-model-gateway:v0.5.14@sha256:{digest}",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    endpoint = dao.staged[0][0]
+    assert endpoint.serving_mode == "pd"
+    assert endpoint.sglang_pd_prefill_replicas == 4
+    assert endpoint.sglang_pd_decode_replicas == 4
+    assert endpoint.sglang_pd_prefill_policy == "cache_aware"
+    assert endpoint.sglang_pd_decode_policy == "power_of_two"
+    assert probed == [endpoint]
+
+
+def test_register_static_endpoint_rejects_unpinned_pd_images(monkeypatch):
+    dao = _FakeEndpointsDAO()
+    _patch_cli_dependencies(monkeypatch, dao)
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "db",
+            "register-static-endpoint",
+            "--name",
+            "manual-b200-pd",
+            "--kind",
+            "ssh",
+            "--ssh-url",
+            "ssh://root@gpu.test",
+            "--serving-mode",
+            "pd",
+            "--inactive",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "sglang_image must be pinned" in result.output
+    assert dao.staged == []
+
+
 def test_register_static_endpoint_inactive_skips_probe(monkeypatch):
     dao = _FakeEndpointsDAO()
     _patch_cli_dependencies(monkeypatch, dao)

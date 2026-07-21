@@ -72,6 +72,20 @@ class Endpoint:
     sglang_chunked_prefill: int = 4096
     sglang_tool_call_parser: str = "qwen"
     sglang_docker_args: List[str] = field(default_factory=list)
+    # ``unified`` keeps the historical one-container DP deployment. ``pd``
+    # runs four single-GPU prefill workers, four single-GPU decode workers,
+    # and exposes only an SGLang Model Gateway on ``sglang_port``.
+    serving_mode: str = "unified"
+    sglang_pd_prefill_replicas: int = 4
+    sglang_pd_decode_replicas: int = 4
+    sglang_pd_prefill_port_start: int = 11000
+    sglang_pd_bootstrap_port_start: int = 12000
+    sglang_pd_decode_port_start: int = 13000
+    sglang_pd_transfer_backend: str = "mooncake"
+    sglang_pd_ib_device: Optional[str] = None
+    sglang_pd_gateway_image: str = ""
+    sglang_pd_prefill_policy: str = "cache_aware"
+    sglang_pd_decode_policy: str = "power_of_two"
     ready_timeout_sec: int = 1800
     poll_interval_sec: float = 15.0
 
@@ -125,6 +139,17 @@ _ENDPOINT_RUNTIME_IDENTITY_FIELDS = (
     "sglang_chunked_prefill",
     "sglang_tool_call_parser",
     "sglang_docker_args",
+    "serving_mode",
+    "sglang_pd_prefill_replicas",
+    "sglang_pd_decode_replicas",
+    "sglang_pd_prefill_port_start",
+    "sglang_pd_bootstrap_port_start",
+    "sglang_pd_decode_port_start",
+    "sglang_pd_transfer_backend",
+    "sglang_pd_ib_device",
+    "sglang_pd_gateway_image",
+    "sglang_pd_prefill_policy",
+    "sglang_pd_decode_policy",
     "ready_timeout_sec",
     "poll_interval_sec",
     "targon_api_url",
