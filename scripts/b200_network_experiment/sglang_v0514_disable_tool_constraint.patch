@@ -1,0 +1,58 @@
+diff --git a/python/sglang/srt/entrypoints/openai/serving_chat.py b/python/sglang/srt/entrypoints/openai/serving_chat.py
+index 48d4383..232f6dc 100644
+--- a/python/sglang/srt/entrypoints/openai/serving_chat.py
++++ b/python/sglang/srt/entrypoints/openai/serving_chat.py
+@@ -169,6 +169,14 @@ class OpenAIServingChat(OpenAIServingBase):
+         super().__init__(tokenizer_manager)
+         self.template_manager = template_manager
+         self.tool_call_parser = self.tokenizer_manager.server_args.tool_call_parser
++        self.diag_disable_tool_constraint = (
++            envs.SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT.get()
++        )
++        if self.diag_disable_tool_constraint:
++            logger.warning(
++                "DIAGNOSTIC ONLY: tool-call parsing remains enabled, but "
++                "tool-call constrained decoding is disabled."
++            )
+         self.reasoning_parser = self.tokenizer_manager.server_args.reasoning_parser
+         self._reasoning_detector = None
+         if self.reasoning_parser:
+@@ -619,7 +627,7 @@ class OpenAIServingChat(OpenAIServingBase):
+                 ]
+             else:
+                 tools = [item.model_dump() for item in request.tools]
+-            if self.tool_call_parser:
++            if self.tool_call_parser and not self.diag_disable_tool_constraint:
+                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
+                 tool_call_constraint = parser.get_structure_constraint(
+                     request.tool_choice,
+@@ -628,9 +636,13 @@ class OpenAIServingChat(OpenAIServingBase):
+                 )
+             # Fallback: use generic JSON schema for required/named tool choice
+             # only when no parser-specific constraint was set
+-            if tool_call_constraint is None and (
+-                request.tool_choice == "required"
+-                or isinstance(request.tool_choice, ToolChoice)
++            if (
++                not self.diag_disable_tool_constraint
++                and tool_call_constraint is None
++                and (
++                    request.tool_choice == "required"
++                    or isinstance(request.tool_choice, ToolChoice)
++                )
+             ):
+                 json_schema = get_json_schema_constraint(
+                     request.tools,
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index ef5c461..e5b41bd 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -696,6 +696,8 @@ class Envs:
+ 
+     # Tool-Call behavior
+     SGLANG_TOOL_STRICT_LEVEL = EnvInt(ToolStrictLevel.OFF)
++    # Diagnostic-only A/B: keep parser/template/tools but skip decode constraints.
++    SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT = EnvBool(False)
+ 
+     # Think tokens budget: negative means unlimited, >= 0 caps thinking tokens
+     SGLANG_MAX_THINK_TOKENS = EnvInt(-1)

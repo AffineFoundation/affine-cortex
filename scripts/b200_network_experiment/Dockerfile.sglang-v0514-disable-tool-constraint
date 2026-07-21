@@ -1,0 +1,28 @@
+FROM lmsysorg/sglang@sha256:5027e95bf6ec536856b1b52a91d1f35ff5c564ab83e8a94758a169ff09bb8df3
+
+ARG SGLANG_BASE_COMMIT=49e384ce9d304648e9959666ecb8ce8cd98d0deb
+ARG CONSTRAINT_PATCH_SHA256=9676f1e3eb5a25b7191f22d0443039d25a2cea6664972bff803a1111accff7a8
+
+COPY sglang_v0514_disable_tool_constraint.patch /tmp/affine-sglang/
+
+RUN test "$(git -C /sgl-workspace/sglang rev-parse HEAD)" = "${SGLANG_BASE_COMMIT}" \
+    && echo "${CONSTRAINT_PATCH_SHA256}  /tmp/affine-sglang/sglang_v0514_disable_tool_constraint.patch" \
+       | sha256sum --check --strict \
+    && git -C /sgl-workspace/sglang apply --check \
+       /tmp/affine-sglang/sglang_v0514_disable_tool_constraint.patch \
+    && git -C /sgl-workspace/sglang apply \
+       /tmp/affine-sglang/sglang_v0514_disable_tool_constraint.patch \
+    && git -C /sgl-workspace/sglang diff --check \
+    && python -m py_compile \
+       /sgl-workspace/sglang/python/sglang/srt/environ.py \
+       /sgl-workspace/sglang/python/sglang/srt/entrypoints/openai/serving_chat.py \
+    && rm -rf /tmp/affine-sglang
+
+LABEL org.opencontainers.image.title="Affine SGLang v0.5.14 tool-constraint switch" \
+      org.opencontainers.image.description="Pinned SGLang v0.5.14 with the diagnostic-only SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT runtime switch" \
+      org.opencontainers.image.vendor="Affine Foundation" \
+      org.opencontainers.image.version="v0.5.14-disable-tool-constraint-20260721" \
+      affine.sglang.base_commit="49e384ce9d304648e9959666ecb8ce8cd98d0deb" \
+      affine.sglang.base_digest="sha256:5027e95bf6ec536856b1b52a91d1f35ff5c564ab83e8a94758a169ff09bb8df3" \
+      affine.sglang.constraint_patch_sha256="9676f1e3eb5a25b7191f22d0443039d25a2cea6664972bff803a1111accff7a8" \
+      affine.sglang.diagnostic_only="true"

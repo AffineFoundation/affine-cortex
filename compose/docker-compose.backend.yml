@@ -51,6 +51,12 @@ services:
     mem_limit: "4g"
     env_file:
       - .env
+    environment:
+      # Diagnostic A/B: use the patched v0.5.14 image and disable only the
+      # tool-call constrained-decoding mask. Both values are reversible from
+      # compose/.env without rewriting autoscaler-managed endpoint rows.
+      AFFINE_SGLANG_IMAGE_OVERRIDE: "${AFFINE_SGLANG_IMAGE_OVERRIDE:-affinefoundation/sglang:v0.5.14-disable-tool-constraint-20260721@sha256:b1d50a2acf713ebb6103c548cf21a8d93d23eced5e35464e073947d6df1000cb}"
+      SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT: "${SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT:-1}"
     volumes:
       - /var/log/affine/scheduler:/var/log/affine/scheduler
       # SSH key needed by the ssh provider (paramiko) to deploy sglang on

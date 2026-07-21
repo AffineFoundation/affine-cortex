@@ -27,6 +27,8 @@ from affine.src.scheduler.ssh import (
     HF_ORG_SEPARATOR,
     HF_SNAPSHOT_PREFIX,
     RESTART_POLICY,
+    SGLANG_DISABLE_TOOL_CONSTRAINT_ENV,
+    SGLANG_IMAGE_OVERRIDE_ENV,
     SSHConfig,
     _build_cache_cleanup_cmd,
     _build_docker_run_cmd,
@@ -102,6 +104,20 @@ def test_ssh_config_from_endpoint_keeps_extra_docker_args():
         sglang_docker_args=["--cgroupns=host"],
     ))
     assert cfg.sglang_docker_args == ("--cgroupns=host",)
+
+
+def test_ssh_config_from_endpoint_honors_image_override(monkeypatch):
+    image = "affinefoundation/sglang:test@sha256:" + "a" * 64
+    monkeypatch.setenv(SGLANG_IMAGE_OVERRIDE_ENV, image)
+
+    cfg = SSHConfig.from_endpoint(Endpoint(
+        name="b200",
+        kind="ssh",
+        ssh_url="ssh://b200",
+        sglang_image="lmsysorg/sglang:v0.5.14",
+    ))
+
+    assert cfg.sglang_image == image
 
 
 def test_ssh_config_bad_scheme_raises():
@@ -468,6 +484,39 @@ def test_docker_cmd_disables_hf_xet_when_requested():
         _target(), _config(), disable_hf_xet=True,
     )
     assert "-e HF_HUB_DISABLE_XET=1" in cmd
+
+
+def test_docker_cmd_propagates_disable_tool_constraint(monkeypatch):
+    monkeypatch.setenv(SGLANG_DISABLE_TOOL_CONSTRAINT_ENV, "1")
+
+    cmd = _build_docker_run_cmd(_target(), _config())
+
+    assert "-e SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT=1" in cmd
+
+
+def test_docker_cmd_owns_disable_tool_constraint_value(monkeypatch):
+    monkeypatch.setenv(SGLANG_DISABLE_TOOL_CONSTRAINT_ENV, "true")
+    cfg = _config(sglang_docker_args=(
+        "--cgroupns=host",
+        "--env", "SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT=0",
+    ))
+
+    cmd = _build_docker_run_cmd(_target(), cfg)
+
+    assert "--cgroupns=host" in cmd
+    assert "SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT=0" not in cmd
+    assert cmd.count("SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT=1") == 1
+
+
+def test_docker_cmd_keeps_endpoint_constraint_arg_without_policy(monkeypatch):
+    monkeypatch.delenv(SGLANG_DISABLE_TOOL_CONSTRAINT_ENV, raising=False)
+    cfg = _config(sglang_docker_args=(
+        "--env", "SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT=1",
+    ))
+
+    cmd = _build_docker_run_cmd(_target(), cfg)
+
+    assert cmd.count("SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT=1") == 1
 
 
 def test_docker_cmd_dynamic_xet_policy_overrides_endpoint_extra_arg():

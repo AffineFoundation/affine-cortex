@@ -7,9 +7,10 @@ model loaded at a time, so swapping champion ↔ challenger means
 ``docker rm -f`` the old container before starting the new one.
 
 The sglang command-line args mirror what
-``affine.core.providers.targon_client.create_deployment`` sends to Targon
-— same image (``lmsysorg/sglang:v0.5.14`` by default), same flags. Only
-the orchestration layer differs (SSH + docker run, vs HTTP API).
+``affine.core.providers.targon_client.create_deployment`` sends to Targon.
+The orchestration layer differs (SSH + docker run, vs HTTP API). Production
+may temporarily override the DB-configured SSH image with
+``AFFINE_SGLANG_IMAGE_OVERRIDE`` for a controlled fleet-wide experiment.
 
 Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
 
@@ -77,9 +78,14 @@ _SSH_TRANSPORT_EXCEPTIONS = (
 
 
 # All sglang launch defaults match what targon_client.py sends. Endpoint-
-# specific values come from the inference_endpoints table, not environment
-# variables.
+# specific values normally come from the inference_endpoints table. The image
+# override is intentionally narrow: it lets an operator run a controlled
+# image A/B without rewriting every autoscaler-managed endpoint row.
 DEFAULT_DOCKER_IMAGE = DEFAULT_SGLANG_IMAGE
+SGLANG_IMAGE_OVERRIDE_ENV = "AFFINE_SGLANG_IMAGE_OVERRIDE"
+SGLANG_DISABLE_TOOL_CONSTRAINT_ENV = (
+    "SGLANG_DIAG_DISABLE_TOOL_CONSTRAINT"
+)
 DEFAULT_CACHE_DIR = "/data"
 DEFAULT_PORT = 10001
 DEFAULT_DP = 8
@@ -118,6 +124,17 @@ RESTART_POLICY = "unless-stopped"
 HF_SNAPSHOT_PREFIX = "models--"
 HF_ORG_SEPARATOR = "--"
 assert HF_SNAPSHOT_PREFIX, "HF_SNAPSHOT_PREFIX must be non-empty"
+
+
+def _configured_sglang_image(endpoint_image: str) -> str:
+    override = os.getenv(SGLANG_IMAGE_OVERRIDE_ENV, "").strip()
+    return override or endpoint_image or DEFAULT_DOCKER_IMAGE
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 @dataclass(frozen=True)
@@ -190,7 +207,7 @@ class SSHConfig:
                 "sglang_load_balance_method",
                 DEFAULT_LOAD_BALANCE_METHOD,
             ),
-            sglang_image=endpoint.sglang_image,
+            sglang_image=_configured_sglang_image(endpoint.sglang_image),
             sglang_cache_dir=endpoint.sglang_cache_dir,
             sglang_context_len=endpoint.sglang_context_len,
             sglang_mem_fraction=endpoint.sglang_mem_fraction,
@@ -424,9 +441,14 @@ def _build_docker_run_cmd(
         f"--label {shlex.quote(k)}={shlex.quote(v)}"
         for k, v in labels.items()
     )
-    docker_args = _strip_env_from_docker_args(
-        config.sglang_docker_args, "HF_HUB_DISABLE_XET",
-    )
+    docker_args = config.sglang_docker_args
+    managed_envs = ["HF_HUB_DISABLE_XET"]
+    if os.getenv(SGLANG_DISABLE_TOOL_CONSTRAINT_ENV, "").strip():
+        managed_envs.append(SGLANG_DISABLE_TOOL_CONSTRAINT_ENV)
+    for managed_env in managed_envs:
+        docker_args = _strip_env_from_docker_args(
+            docker_args, managed_env,
+        )
     extra_docker_flags = " ".join(
         shlex.quote(str(arg)) for arg in docker_args
     )
@@ -439,6 +461,10 @@ def _build_docker_run_cmd(
     )
     if disable_hf_xet:
         env_flags += "-e HF_HUB_DISABLE_XET=1 "
+    if _env_flag_enabled(SGLANG_DISABLE_TOOL_CONSTRAINT_ENV):
+        env_flags += (
+            f"-e {SGLANG_DISABLE_TOOL_CONSTRAINT_ENV}=1 "
+        )
     hf_token = os.getenv("HF_TOKEN")
     if hf_token:
         q = shlex.quote(hf_token)
