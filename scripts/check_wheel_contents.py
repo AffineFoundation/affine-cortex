@@ -12,9 +12,6 @@ REQUIRED_MEMBERS = frozenset(
     {
         "affine/core/__init__.py",
         "affine/core/environments.py",
-        "affine/core/instruction_gym_sampling.py",
-        "affine/core/data/__init__.py",
-        "affine/core/data/instruction_gym_sampling_manifest_v1.json",
         "affine/src/scheduler/__init__.py",
         "affine/src/scheduler/flow.py",
         "affine/src/miner/__init__.py",
@@ -27,6 +24,13 @@ REQUIRED_MEMBERS = frozenset(
         "affine/database/__init__.py",
         "affine/database/system_config.json",
         "affine/database/dao/__init__.py",
+    }
+)
+REMOVED_MEMBERS = frozenset(
+    {
+        "affine/core/instruction_gym_sampling.py",
+        "affine/core/data/__init__.py",
+        "affine/core/data/instruction_gym_sampling_manifest_v1.json",
     }
 )
 FORBIDDEN_PREFIXES = ("tests/", "scripts/")
@@ -46,6 +50,9 @@ def check_wheel(path: str | Path) -> None:
     missing = sorted(REQUIRED_MEMBERS - members)
     if missing:
         raise ValueError(f"wheel is missing runtime files: {', '.join(missing)}")
+    removed = sorted(REMOVED_MEMBERS & members)
+    if removed:
+        raise ValueError(f"wheel contains removed runtime files: {', '.join(removed)}")
     forbidden = sorted(
         member for member in members if member.startswith(FORBIDDEN_PREFIXES)
     )

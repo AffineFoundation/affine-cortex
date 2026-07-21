@@ -14,7 +14,6 @@ from affine.core.environments import (
     INSTRUCTION_GYM_SUITE_ID,
     INSTRUCTION_GYM_TASK_ID_END,
     INSTRUCTION_GYM_UNIVERSE_ID,
-    INSTRUCTION_GYM_SAMPLING_MANIFEST_SHA256,
     validate_execution_mode,
 )
 
@@ -70,10 +69,10 @@ def test_instruction_gym_canonical_config_and_aliases():
     assert config.eval_params == {
         "protocol_version": "1.0",
         "universe_id": (
-            "ifeval_templates_v4:"
-            "6678152f3da165d389353a00c8b397a3fbf556f66e92e34bc1dcb194d1a6de53"
+            "ifeval_template_tasks_v1:"
+            "49546defab4200cee1e8fb7b75e4a208c4328e77bb3769690269b63dd84a132d"
         ),
-        "suite_id": "instruction_gym_ifeval_templates_v4",
+        "suite_id": "instruction_gym_ifeval_template_tasks_v1",
         "temperature": 0.0,
         "timeout": 600,
     }
@@ -101,15 +100,17 @@ def test_instruction_gym_starts_disabled_with_exact_half_open_range():
     )
     payload = json.loads(config_path.read_text(encoding="utf-8"))
     runtime = payload["environments"]["INSTRUCTION-GYM"]
+    terminal = payload["environments"]["TERMINAL"]
 
     assert runtime["enabled_for_sampling"] is False
     assert runtime["enabled_for_scoring"] is False
     assert runtime["sampling"]["dataset_range"] == [[0, INSTRUCTION_GYM_TASK_ID_END]]
-    assert runtime["sampling"]["sampling_mode"] == "template_stratified_v1"
     assert (
-        runtime["sampling"]["sampling_manifest_sha256"]
-        == INSTRUCTION_GYM_SAMPLING_MANIFEST_SHA256
+        runtime["sampling"]["sampling_mode"]
+        == terminal["sampling"]["sampling_mode"]
+        == "random"
     )
+    assert "sampling_manifest_sha256" not in runtime["sampling"]
 
 
 @pytest.mark.parametrize("source", ["override", "hosts_config"])

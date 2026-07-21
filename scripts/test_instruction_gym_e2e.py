@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import bisect
 import hashlib
 import ipaddress
 import json
@@ -27,17 +26,12 @@ from urllib.parse import urlsplit
 
 from affine.core.environments import (
     ENV_CONFIGS,
-    INSTRUCTION_GYM_SAMPLING_MANIFEST_SHA256,
     INSTRUCTION_GYM_TASK_ID_END,
     _ENV_CACHE,
     SDKEnvironment,
 )
-from affine.core.instruction_gym_sampling import (
-    InstructionGymSamplingManifest,
-    load_sampling_manifest,
-)
 from affine.src.scorer.sampler import (
-    SAMPLING_MODE_TEMPLATE_STRATIFIED_V1,
+    SAMPLING_MODE_RANDOM,
     EnvSamplingConfig,
     WindowSampler,
 )
@@ -48,6 +42,7 @@ _CONTAINER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _ENVIRONMENT_VARIABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _FAILURE_BASE_URL = "http://127.0.0.1:9"
 _OWNER_LABEL = "io.affine.instruction-gym-e2e.owner"
+_MAX_LOCAL_SAMPLING_COUNT = 1_000
 
 
 class IntegrationFailure(RuntimeError):
@@ -125,9 +120,11 @@ def _validate_args(args: argparse.Namespace) -> None:
     if (
         isinstance(args.sampling_count, bool)
         or not isinstance(args.sampling_count, int)
-        or not 2 <= args.sampling_count <= 541
+        or not 2 <= args.sampling_count <= _MAX_LOCAL_SAMPLING_COUNT
     ):
-        raise IntegrationFailure("--sampling-count must be within [2, 541]")
+        raise IntegrationFailure(
+            f"--sampling-count must be within [2, {_MAX_LOCAL_SAMPLING_COUNT}]"
+        )
     if isinstance(args.sampling_seed, bool) or not isinstance(args.sampling_seed, int):
         raise IntegrationFailure("--sampling-seed must be an integer")
     if (
@@ -172,28 +169,13 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise IntegrationFailure("--actor-host-port must be within [1, 65535]")
 
 
-def _template_for_task_id(
-    manifest: InstructionGymSamplingManifest,
-    task_id: int,
-) -> tuple[str, int]:
-    ends = [template.case_id_end for template in manifest.templates]
-    index = bisect.bisect_right(ends, task_id)
-    if index >= len(manifest.templates):
-        raise IntegrationFailure(f"scheduler emitted out-of-range task_id={task_id}")
-    template = manifest.templates[index]
-    if not template.case_id_start <= task_id < template.case_id_end:
-        raise IntegrationFailure(f"scheduler emitted uncovered task_id={task_id}")
-    return template.template_id, template.source_key
-
-
 def deterministic_task_handoff(
     *,
     count: int,
     seed: int,
-) -> tuple[InstructionGymSamplingManifest, list[dict[str, Any]]]:
-    """Run the real manifest-backed WindowSampler and expose direct task IDs."""
+) -> list[dict[str, int]]:
+    """Run Cortex's shared random WindowSampler and expose direct task IDs."""
 
-    manifest = load_sampling_manifest(INSTRUCTION_GYM_SAMPLING_MANIFEST_SHA256)
     sampled = _DeterministicWindowSampler(seed).generate(
         window_id=0,
         block_start=0,
@@ -202,28 +184,16 @@ def deterministic_task_handoff(
                 env="instruction-gym",
                 dataset_range=[[0, INSTRUCTION_GYM_TASK_ID_END]],
                 sampling_count=count,
-                mode=SAMPLING_MODE_TEMPLATE_STRATIFIED_V1,
-                sampling_manifest_sha256=INSTRUCTION_GYM_SAMPLING_MANIFEST_SHA256,
+                mode=SAMPLING_MODE_RANDOM,
             )
         },
     )["instruction-gym"]
-    rows = []
-    for task_id in sampled:
-        template_id, source_key = _template_for_task_id(manifest, task_id)
-        rows.append(
-            {
-                "task_id": task_id,
-                "template_id": template_id,
-                "source_key": source_key,
-            }
-        )
+    rows = [{"task_id": task_id} for task_id in sampled]
     if len({row["task_id"] for row in rows}) != count:
         raise IntegrationFailure("WindowSampler returned duplicate task IDs")
-    if len({row["template_id"] for row in rows}) != count:
-        raise IntegrationFailure(
-            "one balanced sampling round did not cover distinct templates"
-        )
-    return manifest, rows
+    if not all(0 <= row["task_id"] < INSTRUCTION_GYM_TASK_ID_END for row in rows):
+        raise IntegrationFailure("WindowSampler returned an out-of-range task ID")
+    return rows
 
 
 def _prompt_sha256(result: Any) -> str:
@@ -541,7 +511,7 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
     """Execute the real local Docker path and return machine-readable evidence."""
 
     _validate_args(args)
-    manifest, handoff = deterministic_task_handoff(
+    handoff = deterministic_task_handoff(
         count=args.sampling_count,
         seed=args.sampling_seed,
     )
@@ -684,10 +654,6 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
             )
         if failure_evidence[0]["prompt_sha256"] != failure_evidence[1]["prompt_sha256"]:
             raise IntegrationFailure("model seed changed the materialized prompt")
-        if failure_evidence[0]["prompt_sha256"] == failure_evidence[2]["prompt_sha256"]:
-            raise IntegrationFailure(
-                "distinct sampled templates produced the same prompt"
-            )
         if (
             len(
                 {row["catalog_sha256"] for row in (success_evidence, *failure_evidence)}
@@ -737,11 +703,11 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
         ) from operation_error
 
     report = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "passed": True,
         "image": args.image,
         "image_id": image.id,
-        "sampling_manifest_sha256": manifest.manifest_sha256,
+        "sampling_mode": SAMPLING_MODE_RANDOM,
         "sampling_seed_sha256": hashlib.sha256(
             f"instruction-gym-e2e:{args.sampling_seed}".encode()
         ).hexdigest(),
@@ -752,7 +718,7 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
         "container_credential_isolation_verified": True,
         "result_secret_sanitization_verified": True,
         "task_seed_invariance_verified": True,
-        "cross_template_diversity_verified": True,
+        "random_scheduler_handoff_verified": True,
         "direct_task_id_handoff_verified": True,
         "cleanup_verified": True,
     }

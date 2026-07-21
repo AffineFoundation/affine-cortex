@@ -10,14 +10,11 @@ the online configuration store.
 
 - The scheduler passes the sampled global `task_id` directly to the evaluator.
   The model `seed` controls generation only and never selects a question.
-- `template_stratified_v1` loads the vendored 541-template range manifest,
-  requires manifest SHA-256
-  `6814c3037bb198dc80d25596ea689e05f0bf50b4c4833c598a51071d09bf02b3`,
-  and covers the exact half-open range `[0, 102636151)`.
-- Sampling uses balanced template rounds and draws assignments without
-  replacement. The generated task pool is persisted through the existing
-  scheduler state path; public window or block values are not used as an RNG
-  seed.
+- Sampling reuses the same `random` mode as Terminal over the exact half-open
+  range `[0, 541000000)`. Cortex draws unique task IDs from the flat address
+  space; it does not balance templates or deduplicate materialized prompts.
+  The generated task pool is persisted through the existing scheduler state
+  path; public window or block values are not used as an RNG seed.
 - The environment is Docker-only. Basilica is rejected before cache lookup or
   `affinetes.load_env` in SDK, miner-eval, and teacher paths.
 - `UVICORN_WORKERS=1` matches the clean-tag image, SDK, validator and isolated
@@ -44,7 +41,6 @@ OpenAI-compatible response path, classified connection-failure path, prompt
 identity, secret redaction, and cleanup. Unit coverage is in:
 
 - `tests/test_instruction_gym_environment.py`
-- `tests/test_instruction_gym_sampling.py`
 - `tests/test_instruction_gym_e2e_script.py`
 - `tests/test_miner_eval.py`
 - `tests/test_wheel_contents.py`
@@ -62,7 +58,7 @@ Do not enable either runtime flag until all of the following are true:
 3. `EnvConfig.docker_image` is changed from the mutable placeholder to that
    digest.
 4. A clean host pulls the digest and passes Affinetes `afs validate` for at
-   least two valid IDs and the exclusive upper boundary `102636151`.
+   least two valid IDs and the exclusive upper boundary `541000000`.
 5. The same digest passes the affine-cortex end-to-end gate without production
    credentials or online state changes.
 6. The approved model endpoint is confirmed by its owner to be privately

@@ -166,14 +166,11 @@ def validate_execution_mode(config: EnvConfig, mode: Any) -> str:
 # ========================= Environment Configurations =========================
 
 INSTRUCTION_GYM_UNIVERSE_ID = (
-    "ifeval_templates_v4:"
-    "6678152f3da165d389353a00c8b397a3fbf556f66e92e34bc1dcb194d1a6de53"
+    "ifeval_template_tasks_v1:"
+    "49546defab4200cee1e8fb7b75e4a208c4328e77bb3769690269b63dd84a132d"
 )
-INSTRUCTION_GYM_SUITE_ID = "instruction_gym_ifeval_templates_v4"
-INSTRUCTION_GYM_TASK_ID_END = 102_636_151
-INSTRUCTION_GYM_SAMPLING_MANIFEST_SHA256 = (
-    "6814c3037bb198dc80d25596ea689e05f0bf50b4c4833c598a51071d09bf02b3"
-)
+INSTRUCTION_GYM_SUITE_ID = "instruction_gym_ifeval_template_tasks_v1"
+INSTRUCTION_GYM_TASK_ID_END = 541_000_000
 
 
 # Canonical environment configurations
@@ -461,13 +458,12 @@ _ENV_CONFIGS_CANONICAL = {
         },
         proxy_timeout=7260,
     ),
-    # InstructionGym IFEval-template v4. Keep the source contract explicit:
-    # task_id is the sole prompt address, while seed only controls model
-    # sampling. The scheduler's manifest-pinned template_stratified_v1 mode
-    # selects these global IDs without remapping them in the container. The
-    # environment remains disabled in system_config until a provider-bound
-    # image is published; replace the tag with its immutable registry digest
-    # before enabling production sampling.
+    # InstructionGym's task_id is the sole prompt address, while seed only
+    # controls model sampling. Cortex selects these global IDs through the same
+    # flat random sampler used by Terminal and does not remap them in the
+    # container. The environment remains disabled in system_config until a
+    # provider-bound image is published; replace the tag with its immutable
+    # registry digest before enabling production sampling.
     "instruction-gym": EnvConfig(
         name="instruction-gym",
         docker_image="affinefoundation/instruction-gym:latest",

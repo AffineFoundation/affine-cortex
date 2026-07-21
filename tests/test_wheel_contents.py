@@ -31,6 +31,15 @@ def test_wheel_check_accepts_complete_runtime_graph(tmp_path):
     MODULE.check_wheel(wheel)
 
 
+def test_wheel_check_rejects_removed_instruction_gym_runtime_files(tmp_path):
+    wheel = tmp_path / "affine_io-0.1.1-py3-none-any.whl"
+    removed = next(iter(MODULE.REMOVED_MEMBERS))
+    _write_wheel(wheel, MODULE.REQUIRED_MEMBERS | {removed})
+
+    with pytest.raises(ValueError, match="removed runtime files"):
+        MODULE.check_wheel(wheel)
+
+
 def test_wheel_check_reports_missing_runtime_subpackage(tmp_path):
     wheel = tmp_path / "affine_io-0.1.1-py3-none-any.whl"
     members = MODULE.REQUIRED_MEMBERS - {"affine/src/scorer/sampler.py"}

@@ -51,7 +51,7 @@ exclude = ["tests*"]
 namespaces = false
 
 [tool.setuptools.package-data]
-affine = ["core/data/*.json", "database/*.json"]
+affine = ["database/*.json"]
 
 [tool.uv.sources]
 affine = { path = ".", editable = true }

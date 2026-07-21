@@ -105,8 +105,8 @@ def test_load_environment_uses_override_without_pull_and_host_network(
     request = remote.evaluate_calls[0]
     assert request["_timeout"] == 660
     assert request["protocol_version"] == "1.0"
-    assert request["suite_id"] == "instruction_gym_ifeval_templates_v4"
-    assert request["universe_id"].startswith("ifeval_templates_v4:")
+    assert request["suite_id"] == "instruction_gym_ifeval_template_tasks_v1"
+    assert request["universe_id"].startswith("ifeval_template_tasks_v1:")
     assert request["api_key"] == "per-call-secret"
 
 

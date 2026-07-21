@@ -26,15 +26,14 @@ sys.modules[STUB_SPEC.name] = stub
 STUB_SPEC.loader.exec_module(stub)
 
 
-def test_scheduler_handoff_is_reproducible_direct_and_template_balanced() -> None:
-    manifest, first = e2e.deterministic_task_handoff(count=100, seed=20260714)
-    _, second = e2e.deterministic_task_handoff(count=100, seed=20260714)
+def test_scheduler_handoff_reuses_reproducible_direct_random_sampling() -> None:
+    first = e2e.deterministic_task_handoff(count=100, seed=20260714)
+    second = e2e.deterministic_task_handoff(count=100, seed=20260714)
 
     assert first == second
     assert len(first) == 100
     assert len({row["task_id"] for row in first}) == 100
-    assert len({row["template_id"] for row in first}) == 100
-    assert all(0 <= row["task_id"] < manifest.case_id_end for row in first)
+    assert all(0 <= row["task_id"] < e2e.INSTRUCTION_GYM_TASK_ID_END for row in first)
 
 
 def _result(*, task_id: int, request: dict | None = None):
@@ -141,7 +140,7 @@ def test_success_contract_rejects_secret_material_outside_request() -> None:
         )
 
 
-@pytest.mark.parametrize("count", (0, 1, 542))
+@pytest.mark.parametrize("count", (0, 1, 1_001))
 def test_e2e_arguments_bound_sampling_count(count: int) -> None:
     args = e2e._parser().parse_args(
         [
