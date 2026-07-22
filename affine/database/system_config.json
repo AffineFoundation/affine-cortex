@@ -137,8 +137,8 @@
     },
     "MEMORY": {
       "display_name": "MEMORY",
-      "enabled_for_sampling": true,
-      "enabled_for_scoring": true,
+      "enabled_for_sampling": false,
+      "enabled_for_scoring": false,
       "sampling": {
         "sampling_count": 100,
         "priority": 1,
