@@ -49,6 +49,16 @@ class MinerStatsDAO(BaseDAO):
     ) -> Optional[Dict[str, Any]]:
         return await self.get(self._make_pk(hotkey), self._make_sk(revision))
 
+    async def get_permanent_invalid_reason(
+        self, hotkey: str, revision: str,
+    ) -> Optional[str]:
+        """Return the durable non-recoverable verdict for one model identity."""
+        row = await self.get_miner_stats(hotkey, revision)
+        if not row or row.get("permanent_invalid") is not True:
+            return None
+        reason = row.get("permanent_invalid_reason")
+        return str(reason) if reason else "permanent_invalid"
+
     async def get_all_historical_miners(self) -> List[Dict[str, Any]]:
         from affine.database.client import get_client
 
@@ -103,6 +113,8 @@ class MinerStatsDAO(BaseDAO):
         invalid_reason: Optional[str] = None,
         model_hash: str = "",
         model_type: str = "",
+        permanent_invalid: bool = False,
+        permanent_invalid_reason: Optional[str] = None,
         is_online: bool = True,
     ) -> None:
         """Persist current miner metadata without overwriting lifecycle state.
@@ -166,6 +178,22 @@ class MinerStatsDAO(BaseDAO):
             else {"NULL": True}
         )
         update_parts.append("invalid_reason = :invalid_reason")
+        if permanent_invalid:
+            if not permanent_invalid_reason:
+                raise ValueError(
+                    "permanent_invalid_reason is required for a permanent verdict"
+                )
+            values[":permanent_invalid"] = {"BOOL": True}
+            values[":permanent_invalid_reason"] = {
+                "S": str(permanent_invalid_reason),
+            }
+            update_parts.extend([
+                "permanent_invalid = :permanent_invalid",
+                (
+                    "permanent_invalid_reason = if_not_exists("
+                    "permanent_invalid_reason, :permanent_invalid_reason)"
+                ),
+            ])
 
         params = {
             "TableName": self.table_name,

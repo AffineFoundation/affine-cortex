@@ -86,6 +86,11 @@ class _FakeScoresDAO:
         return self.return_row
 
 
+class _FakeMinerStatsDAO:
+    async def get_permanent_invalid_reason(self, _hotkey, _revision):
+        return None
+
+
 class _FakeMinerDAO:
     def __init__(self, row=None):
         self.row = row
@@ -125,6 +130,7 @@ def _build_monitor(
         champion_sig=champion_sig, state=state,
     )
     monitor.anticopy_scores_dao = _FakeScoresDAO(return_row=score_row)
+    monitor.stats_dao = _FakeMinerStatsDAO()
 
     async def _fake_load(_dao):
         return AntiCopyConfig(enabled=cfg_enabled)
