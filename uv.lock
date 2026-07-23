@@ -53,7 +53,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "affinetes", git = "https://github.com/AffineFoundation/affinetes.git" },
+    { name = "affinetes", git = "https://github.com/AffineFoundation/affinetes.git?rev=6cfa4cafcbf1736f07ccf5801a2e7e4ce8983f2b" },
     { name = "aiobotocore", specifier = ">=2.23.0" },
     { name = "aiofiles" },
     { name = "aiohttp", specifier = ">=3.10.11" },
@@ -86,8 +86,8 @@ requires-dist = [
 
 [[package]]
 name = "affinetes"
-version = "0.1.0"
-source = { git = "https://github.com/AffineFoundation/affinetes.git#22d6780a80dc141c35dda4d79ec0a007d485dd3a" }
+version = "0.2.0"
+source = { git = "https://github.com/AffineFoundation/affinetes.git?rev=6cfa4cafcbf1736f07ccf5801a2e7e4ce8983f2b#6cfa4cafcbf1736f07ccf5801a2e7e4ce8983f2b" }
 dependencies = [
     { name = "aiohttp" },
     { name = "docker" },
