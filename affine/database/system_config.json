@@ -151,6 +151,21 @@
         "sampling_mode": "random"
       }
     },
+    "REASONING": {
+      "display_name": "REASONING",
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": false,
+      "sampling": {
+        "sampling_count": 300,
+        "dataset_range": [
+          [
+            0,
+            10600000
+          ]
+        ],
+        "sampling_mode": "random"
+      }
+    },
     "TERMINAL": {
       "display_name": "TERMINAL",
       "enabled_for_sampling": true,
