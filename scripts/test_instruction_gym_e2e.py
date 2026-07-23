@@ -43,6 +43,36 @@ _ENVIRONMENT_VARIABLE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _FAILURE_BASE_URL = "http://127.0.0.1:9"
 _OWNER_LABEL = "io.affine.instruction-gym-e2e.owner"
 _MAX_LOCAL_SAMPLING_COUNT = 1_000
+_JUDGE_BASE_URL_ENV = "INSTRUCTION_GYM_JUDGE_BASE_URL"
+_JUDGE_API_KEY_ENV = "INSTRUCTION_GYM_JUDGE_API_KEY"
+_JUDGE_ENSEMBLE_JSON_ENV = "INSTRUCTION_GYM_JUDGE_ENSEMBLE_JSON"
+_APPROVED_JUDGE_ENSEMBLE_MANIFEST_SHA256_ENV = (
+    "INSTRUCTION_GYM_APPROVED_SEMANTIC_JUDGE_ENSEMBLE_MANIFEST_SHA256"
+)
+_LOCAL_JUDGE_BASE_URL = "http://127.0.0.1:8/v1"
+_LOCAL_JUDGE_API_KEY = "affine-instruction-gym-e2e-local-judge-key"
+_LOCAL_JUDGE_ENSEMBLE_JSON = json.dumps(
+    {
+        "aggregation_mode": "min",
+        "members": [
+            {
+                "model_id": "affine-instruction-gym-e2e-judge-a",
+                "model_revision": "affine-instruction-gym-e2e-judge-a-v1",
+            },
+            {
+                "model_id": "affine-instruction-gym-e2e-judge-b",
+                "model_revision": "affine-instruction-gym-e2e-judge-b-v1",
+            },
+        ],
+    },
+    separators=(",", ":"),
+    sort_keys=True,
+)
+_JUDGE_MANIFEST_PROBE = (
+    "from instruction_gym.semantic import SemanticJudgeEnsembleConfig; "
+    "value = SemanticJudgeEnsembleConfig.from_env().manifest.manifest_sha256; "
+    "assert value is not None; print(value)"
+)
 
 
 class IntegrationFailure(RuntimeError):
@@ -400,6 +430,45 @@ def _validate_local_docker_client(client: Any) -> None:
         )
 
 
+def _local_judge_environment(client: Any, *, image_id: str) -> dict[str, str]:
+    """Bind a non-production Judge identity to the exact local image under test."""
+
+    environment = {
+        _JUDGE_BASE_URL_ENV: _LOCAL_JUDGE_BASE_URL,
+        _JUDGE_API_KEY_ENV: _LOCAL_JUDGE_API_KEY,
+        _JUDGE_ENSEMBLE_JSON_ENV: _LOCAL_JUDGE_ENSEMBLE_JSON,
+    }
+    try:
+        output = client.containers.run(
+            image_id,
+            command=["-c", _JUDGE_MANIFEST_PROBE],
+            entrypoint="python",
+            environment=environment,
+            network_disabled=True,
+            remove=True,
+            stdout=True,
+            stderr=False,
+        )
+    except Exception as exc:
+        raise IntegrationFailure(
+            f"local Judge manifest probe failed with {type(exc).__name__}"
+        ) from exc
+    try:
+        digest = output.decode("ascii").strip()
+    except (AttributeError, UnicodeDecodeError) as exc:
+        raise IntegrationFailure(
+            "local Judge manifest probe returned invalid bytes"
+        ) from exc
+    if _SHA256.fullmatch(digest) is None:
+        raise IntegrationFailure(
+            "local Judge manifest probe returned an invalid digest"
+        )
+    return {
+        **environment,
+        _APPROVED_JUDGE_ENSEMBLE_MANIFEST_SHA256_ENV: digest,
+    }
+
+
 def _owned_container_identity(
     container: Any,
     *,
@@ -481,6 +550,7 @@ def _validate_container_credential_isolation(
     container: Any,
     *,
     secrets: tuple[str, ...],
+    expected_judge_environment: dict[str, str],
 ) -> None:
     try:
         container.reload()
@@ -493,17 +563,27 @@ def _validate_container_credential_isolation(
         isinstance(item, str) for item in entries
     ):
         raise IntegrationFailure("Docker container environment has an invalid shape")
+    observed_environment: dict[str, str] = {}
+    for entry in entries:
+        key, separator, value = entry.partition("=")
+        if not separator or key in observed_environment:
+            raise IntegrationFailure("Docker container environment has duplicate keys")
+        observed_environment[key] = value
     serialized = "\n".join(entries)
     if any(secret and secret in serialized for secret in secrets):
         raise IntegrationFailure(
             "InstructionGym container received endpoint secret material"
         )
-    for entry in entries:
-        key, separator, value = entry.partition("=")
-        normalized = _normalized_field_name(key)
-        if separator and value and normalized.endswith("apikey"):
+    for key, value in expected_judge_environment.items():
+        if observed_environment.get(key) != value:
             raise IntegrationFailure(
-                "InstructionGym container received a non-empty API credential"
+                "InstructionGym container received an unexpected local Judge identity"
+            )
+    for key, value in observed_environment.items():
+        normalized = _normalized_field_name(key)
+        if value and normalized.endswith("apikey") and key != _JUDGE_API_KEY_ENV:
+            raise IntegrationFailure(
+                "InstructionGym container received a non-Judge API credential"
             )
 
 
@@ -537,7 +617,13 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
         docker_client = docker.from_env()
         _validate_local_docker_client(docker_client)
         image = docker_client.images.get(args.image)
+        judge_environment = _local_judge_environment(
+            docker_client,
+            image_id=image.id,
+        )
     except Exception as exc:
+        if isinstance(exc, IntegrationFailure):
+            raise
         raise IntegrationFailure(
             f"local image inspection failed with {type(exc).__name__}"
         ) from exc
@@ -558,6 +644,13 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
     operation_error: BaseException | None = None
     failure_evidence: list[dict[str, Any]] = []
     success_evidence: dict[str, Any] | None = None
+    previous_judge_environment = {key: os.environ.get(key) for key in judge_environment}
+    result_secrets = (
+        *endpoint_secrets,
+        judge_environment[_JUDGE_BASE_URL_ENV],
+        judge_environment[_JUDGE_API_KEY_ENV],
+        judge_environment[_JUDGE_ENSEMBLE_JSON_ENV],
+    )
 
     def local_image_loader(**kwargs: Any) -> Any:
         kwargs.update(
@@ -583,6 +676,7 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
         return original_loader(**kwargs)
 
     try:
+        os.environ.update(judge_environment)
         ENV_CONFIGS["instruction-gym"] = replace(
             original_config,
             docker_image=args.image,
@@ -607,6 +701,7 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
         _validate_container_credential_isolation(
             active_container,
             secrets=endpoint_secrets,
+            expected_judge_environment=judge_environment,
         )
         first_task_id = handoff[0]["task_id"]
         second_task_id = handoff[1]["task_id"]
@@ -625,7 +720,7 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
         success_evidence = _validate_success(
             success_result,
             task_id=first_task_id,
-            secrets=endpoint_secrets,
+            secrets=result_secrets,
         )
 
         for task_id, model_seed in (
@@ -645,7 +740,7 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
                 _validate_endpoint_failure(
                     result,
                     task_id=task_id,
-                    secrets=endpoint_secrets,
+                    secrets=result_secrets,
                 )
             )
         if success_evidence["prompt_sha256"] != failure_evidence[0]["prompt_sha256"]:
@@ -670,6 +765,11 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
     finally:
         affinetes.load_env = original_loader
         ENV_CONFIGS["instruction-gym"] = original_config
+        for key, previous in previous_judge_environment.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
         try:
             if sdk is not None:
                 await sdk._env.cleanup()
@@ -715,6 +815,10 @@ async def run_integration(args: argparse.Namespace) -> dict[str, Any]:
         "successful_evaluation": success_evidence,
         "failure_evaluations": failure_evidence,
         "successful_scoring_verified": True,
+        "local_judge_ensemble_manifest_sha256": judge_environment[
+            _APPROVED_JUDGE_ENSEMBLE_MANIFEST_SHA256_ENV
+        ],
+        "local_judge_configuration_verified": True,
         "container_credential_isolation_verified": True,
         "result_secret_sanitization_verified": True,
         "task_seed_invariance_verified": True,

@@ -216,6 +216,77 @@ def test_e2e_rejects_nonlocal_docker_daemon(
             e2e._validate_local_docker_client(client)
 
 
+def test_local_judge_environment_is_bound_to_the_exact_image() -> None:
+    captured = {}
+
+    class Containers:
+        @staticmethod
+        def run(image_id: str, **kwargs):
+            captured["image_id"] = image_id
+            captured.update(kwargs)
+            return ("a" * 64 + "\n").encode()
+
+    environment = e2e._local_judge_environment(
+        SimpleNamespace(containers=Containers()),
+        image_id="sha256:" + "b" * 64,
+    )
+
+    assert captured["image_id"] == "sha256:" + "b" * 64
+    assert captured["entrypoint"] == "python"
+    assert captured["network_disabled"] is True
+    assert captured["remove"] is True
+    assert environment[e2e._APPROVED_JUDGE_ENSEMBLE_MANIFEST_SHA256_ENV] == "a" * 64
+    assert captured["environment"] == {
+        key: value
+        for key, value in environment.items()
+        if key != e2e._APPROVED_JUDGE_ENSEMBLE_MANIFEST_SHA256_ENV
+    }
+
+
+def test_local_judge_environment_rejects_an_invalid_image_digest_result() -> None:
+    containers = SimpleNamespace(run=lambda *_args, **_kwargs: b"not-a-digest\n")
+
+    with pytest.raises(e2e.IntegrationFailure, match="invalid digest"):
+        e2e._local_judge_environment(
+            SimpleNamespace(containers=containers),
+            image_id="sha256:" + "b" * 64,
+        )
+
+
+def test_container_credential_isolation_allows_only_expected_judge_key() -> None:
+    expected = {
+        e2e._JUDGE_BASE_URL_ENV: e2e._LOCAL_JUDGE_BASE_URL,
+        e2e._JUDGE_API_KEY_ENV: e2e._LOCAL_JUDGE_API_KEY,
+        e2e._JUDGE_ENSEMBLE_JSON_ENV: e2e._LOCAL_JUDGE_ENSEMBLE_JSON,
+        e2e._APPROVED_JUDGE_ENSEMBLE_MANIFEST_SHA256_ENV: "a" * 64,
+    }
+    container = SimpleNamespace(
+        reload=lambda: None,
+        attrs={
+            "Config": {
+                "Env": [
+                    *(f"{key}={value}" for key, value in expected.items()),
+                    "UVICORN_WORKERS=1",
+                ]
+            }
+        },
+    )
+
+    e2e._validate_container_credential_isolation(
+        container,
+        secrets=("candidate-endpoint-secret",),
+        expected_judge_environment=expected,
+    )
+
+    container.attrs["Config"]["Env"].append("API_KEY=candidate-secret")
+    with pytest.raises(e2e.IntegrationFailure, match="non-Judge API credential"):
+        e2e._validate_container_credential_isolation(
+            container,
+            secrets=("candidate-endpoint-secret",),
+            expected_judge_environment=expected,
+        )
+
+
 def test_cleanup_does_not_remove_same_name_replacement() -> None:
     class NotFound(Exception):
         pass
