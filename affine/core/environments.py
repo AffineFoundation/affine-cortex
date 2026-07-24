@@ -409,6 +409,18 @@ _ENV_CONFIGS_CANONICAL = {
         proxy_timeout=7260,
     ),
 
+    "reasoning": EnvConfig(
+        name="reasoning",
+        docker_image="affinefoundation/reasoning:latest",
+        mem_limit="4g",
+        env_vars={"UVICORN_WORKERS": "4"},
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 3600,
+        },
+        proxy_timeout=3660,
+    ),
+
     "terminal": EnvConfig(
         name="terminal",
         docker_image="affinefoundation/terminal:latest",
@@ -502,6 +514,10 @@ _ENV_ALIASES = {
     "Memory": "memory",
     "memorygym": "memory",
     "MemoryGym": "memory",
+
+    # Reasoning aliases
+    "REASONING": "reasoning",
+    "Reasoning": "reasoning",
 
     # NavWorld aliases
     "NAVWORLD": "navworld",
