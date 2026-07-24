@@ -166,6 +166,21 @@
         "sampling_mode": "random"
       }
     },
+    "INSTRUCTION-GYM": {
+      "display_name": "INSTRUCTION-GYM",
+      "enabled_for_sampling": true,
+      "enabled_for_scoring": false,
+      "sampling": {
+        "sampling_count": 300,
+        "dataset_range": [
+          [
+            0,
+            541000000
+          ]
+        ],
+        "sampling_mode": "random"
+      }
+    },
     "TERMINAL": {
       "display_name": "TERMINAL",
       "enabled_for_sampling": true,

@@ -421,6 +421,21 @@ _ENV_CONFIGS_CANONICAL = {
         proxy_timeout=3660,
     ),
 
+    "instruction-gym": EnvConfig(
+        name="instruction-gym",
+        docker_image="affinefoundation/instruction-gym:latest",
+        env_vars={
+            "UVICORN_WORKERS": "1",
+        },
+        optional_env_vars=["DASHSCOPE_API_KEY"],
+        mem_limit="4g",
+        eval_params={
+            "temperature": 0.0,
+            "timeout": 600,
+        },
+        proxy_timeout=810,
+    ),
+
     "terminal": EnvConfig(
         name="terminal",
         docker_image="affinefoundation/terminal:latest",
@@ -518,6 +533,10 @@ _ENV_ALIASES = {
     # Reasoning aliases
     "REASONING": "reasoning",
     "Reasoning": "reasoning",
+
+    # InstructionGym aliases
+    "INSTRUCTION-GYM": "instruction-gym",
+    "InstructionGym": "instruction-gym",
 
     # NavWorld aliases
     "NAVWORLD": "navworld",
