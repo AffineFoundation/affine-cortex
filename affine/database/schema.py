@@ -302,7 +302,7 @@ MINER_STATS_SCHEMA = {
 #   sglang_port            port sglang listens on inside the docker container
 #   sglang_dp              data-parallel size
 #   sglang_load_balance_method DP request routing strategy
-#   sglang_image           docker image (default lmsysorg/sglang:latest)
+#   sglang_image           docker image (default lmsysorg/sglang:v0.5.14)
 #   sglang_cache_dir       host mount for HF cache
 #   sglang_context_len     context length passed to sglang
 #   sglang_mem_fraction    GPU memory fraction passed to sglang

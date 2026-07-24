@@ -8,7 +8,7 @@ model loaded at a time, so swapping champion ↔ challenger means
 
 The sglang command-line args mirror what
 ``affine.core.providers.targon_client.create_deployment`` sends to Targon
-— same image (``lmsysorg/sglang:latest`` by default), same flags. Only
+— same image (``lmsysorg/sglang:v0.5.14`` by default), same flags. Only
 the orchestration layer differs (SSH + docker run, vs HTTP API).
 
 Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
@@ -21,7 +21,7 @@ Endpoint configuration is DB-driven via the ``inference_endpoints`` table:
   sglang_dp               data-parallel size (8)
   sglang_load_balance_method DP request routing strategy (total_tokens)
   sglang_cache_dir        HF cache mount point (/data)
-  sglang_image            (lmsysorg/sglang:latest)
+  sglang_image            (lmsysorg/sglang:v0.5.14)
   sglang_context_len      legacy field; deployment no longer passes --context-length
   sglang_mem_fraction     GPU memory fraction passed to sglang (0.85)
   sglang_chunked_prefill  chunked-prefill size (4096)
@@ -50,6 +50,7 @@ from affine.core.providers.targon_client import (
     QWEN36_TOOL_CALL_PARSER,
     is_qwen36,
 )
+from affine.core.sglang_runtime import DEFAULT_SGLANG_IMAGE
 from affine.core.setup import logger
 
 from .flow import TransientDeployError
@@ -75,7 +76,7 @@ _SSH_TRANSPORT_EXCEPTIONS = (
 # All sglang launch defaults match what targon_client.py sends. Endpoint-
 # specific values come from the inference_endpoints table, not environment
 # variables.
-DEFAULT_DOCKER_IMAGE = "lmsysorg/sglang:latest"
+DEFAULT_DOCKER_IMAGE = DEFAULT_SGLANG_IMAGE
 DEFAULT_CACHE_DIR = "/data"
 DEFAULT_PORT = 10001
 DEFAULT_DP = 8
@@ -979,7 +980,7 @@ async def deploy(config: SSHConfig, target: DeployTarget) -> DeployResult:
       1. SSH in
       2. ``docker rm -f <CONTAINER_NAME>`` (idempotent — handles any stale
          container left from a previous deploy / crashed teardown)
-      3. ``docker run -d --gpus all ... lmsysorg/sglang:latest python -m
+      3. ``docker run -d --gpus all ... lmsysorg/sglang:v0.5.14 python -m
          sglang.launch_server ...``
       4. Poll ``http://<host>:<port>/v1/models`` until ready
 

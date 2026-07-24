@@ -16,13 +16,14 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
+from affine.core.sglang_runtime import DEFAULT_SGLANG_IMAGE
 from affine.core.setup import logger
 
 
 DEFAULT_API_URL = "https://api.targon.com/tha/v2"
 DEFAULT_ENGINE = "sglang"
 DEFAULT_IMAGE_BY_ENGINE = {
-    "sglang": "lmsysorg/sglang:latest",
+    "sglang": DEFAULT_SGLANG_IMAGE,
     "vllm": "vllm/vllm-openai:latest",
 }
 DEFAULT_RESOURCE_NAME = "h100-small"
