@@ -215,6 +215,21 @@ def _positive_int_config(value: object, *, source: str) -> int:
         raise ValueError(f"{source} must be a positive integer, got {value!r}")
     return out
 
+
+def _non_negative_float_config(value: object, *, source: str) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError) as e:
+        raise ValueError(
+            f"{source} must be a non-negative number, got {value!r}"
+        ) from e
+    if not math.isfinite(out) or out < 0:
+        raise ValueError(
+            f"{source} must be a non-negative number, got {value!r}"
+        )
+    return out
+
+
 DEFAULT_MARGIN = 0.03
 """Per-env additive margin the challenger must clear to be ``dominant``."""
 
@@ -319,7 +334,9 @@ class FlowConfig:
     Targon-style multi-instance providers leave this False because sibling
     deployments can coexist independently.
     """
-    deployment_health_failure_threshold: int = 3
+    deployment_health_check_interval_sec: float = 240.0
+    """Minimum time between runtime health checks for the same deployment."""
+    deployment_health_failure_threshold: int = 5
     """Consecutive inconclusive readiness failures required before repair."""
     deployment_unknown_failure_threshold: int = 5
     """Consecutive control-plane failures required before endpoint replacement."""
@@ -336,6 +353,10 @@ class FlowConfig:
         self.deployment_health_failure_threshold = _positive_int_config(
             self.deployment_health_failure_threshold,
             source="FlowConfig.deployment_health_failure_threshold",
+        )
+        self.deployment_health_check_interval_sec = _non_negative_float_config(
+            self.deployment_health_check_interval_sec,
+            source="FlowConfig.deployment_health_check_interval_sec",
         )
         self.deployment_unknown_failure_threshold = _positive_int_config(
             self.deployment_unknown_failure_threshold,
@@ -399,6 +420,10 @@ class FlowScheduler:
         self._deployment_health_failure: Optional[
             Tuple[str, str, str, DeploymentHealthState, int]
         ] = None
+        self._deployment_health_check_key: Optional[
+            Tuple[str, int, str, str, str]
+        ] = None
+        self._last_deployment_health_check_at = float("-inf")
         self._behavior_gate_dao = behavior_gate_dao
         self._transition_deployment_role = transition_deployment_role_fn
         self._last_behavior_gate_log: Dict[str, str] = {}
@@ -814,6 +839,22 @@ class FlowScheduler:
 
         miner = _runtime_record_miner(record)
         role = "challenger" if isinstance(record, BattleRecord) else "champion"
+        health_check_key = (
+            role,
+            miner.uid,
+            miner.hotkey,
+            miner.revision,
+            record.deployment_id,
+        )
+        now = time.monotonic()
+        if (
+            self._deployment_health_check_key == health_check_key
+            and now - self._last_deployment_health_check_at
+            < self.cfg.deployment_health_check_interval_sec
+        ):
+            return True
+        self._deployment_health_check_key = health_check_key
+        self._last_deployment_health_check_at = now
 
         try:
             raw_health = await self._deployment_health(record)

@@ -369,6 +369,7 @@ def _build_scheduler(
         config=config or FlowConfig(
             window_blocks=window_blocks,
             task_pool_refresh_blocks=task_pool_refresh_blocks,
+            deployment_health_check_interval_sec=0,
         ),
         state=state,
         queue=queue,
@@ -404,6 +405,8 @@ def test_flow_config_task_pool_refresh_defaults_to_window_blocks(monkeypatch):
     cfg = FlowConfig(window_blocks=123)
 
     assert cfg.task_pool_refresh_blocks == 123
+    assert cfg.deployment_health_check_interval_sec == 240
+    assert cfg.deployment_health_failure_threshold == 5
 
 
 def test_flow_config_task_pool_refresh_reads_env(monkeypatch):
@@ -1110,7 +1113,7 @@ async def test_healthy_champion_deployment_is_not_redeployed():
 
 
 @pytest.mark.asyncio
-async def test_suspected_champion_requires_three_consecutive_failures():
+async def test_suspected_champion_requires_five_consecutive_failures():
     kv = _seed_state()
     kv.data["current_task_ids"] = {
         "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
@@ -1145,10 +1148,12 @@ async def test_suspected_champion_requires_three_consecutive_failures():
 
     await scheduler.tick(current_block=51)
     await scheduler.tick(current_block=52)
+    await scheduler.tick(current_block=53)
+    await scheduler.tick(current_block=54)
     assert deployer.deploys == []
     assert (await state.get_champion()).deployment_id == "wrk-suspected"
 
-    await scheduler.tick(current_block=53)
+    await scheduler.tick(current_block=55)
     assert [target.uid for target in deployer.deploys] == [1]
     assert (await state.get_champion()).deployment_id == "wrk-001"
 
@@ -1198,6 +1203,63 @@ async def test_health_failure_count_resets_for_new_endpoint_generation():
 
 
 @pytest.mark.asyncio
+async def test_runtime_health_checks_respect_configured_interval(monkeypatch):
+    kv = _seed_state()
+    kv.data["current_task_ids"] = {
+        "task_ids": {"ENV_A": [1, 2, 3, 4], "ENV_B": [5, 6, 7, 8]},
+        "refreshed_at_block": 50,
+    }
+    kv.data["champion"]["deployment_id"] = "wrk-live"
+    kv.data["champion"]["base_url"] = "https://t/live"
+    miner_store = _InMemoryMinerStore([
+        _make_miner(
+            1,
+            "champ_hk",
+            100,
+            status=STATUS_CHAMPION,
+            revision="champ_rev",
+        ),
+    ])
+    deployer = _DeployTracker()
+    health_checks = []
+    now = [100.0]
+
+    async def deployment_health_fn(record):
+        health_checks.append(record.deployment_id)
+        return DeploymentHealthResult(
+            DeploymentHealthState.SUSPECTED,
+            reason="both_probes_failed",
+        )
+
+    monkeypatch.setattr(
+        "affine.src.scheduler.flow.time.monotonic",
+        lambda: now[0],
+    )
+    scheduler, state, _ = _build_scheduler(
+        kv=kv,
+        miner_store=miner_store,
+        deployer=deployer,
+        samples=_SamplesFake(),
+        config=FlowConfig(
+            window_blocks=WINDOW_BLOCKS,
+            deployment_health_check_interval_sec=240,
+        ),
+        deployment_health_fn=deployment_health_fn,
+    )
+
+    await scheduler.tick(current_block=51)
+    now[0] = 339.0
+    await scheduler.tick(current_block=52)
+    assert health_checks == ["wrk-live"]
+
+    now[0] = 340.0
+    await scheduler.tick(current_block=53)
+    assert health_checks == ["wrk-live", "wrk-live"]
+    assert deployer.deploys == []
+    assert (await state.get_champion()).deployment_id == "wrk-live"
+
+
+@pytest.mark.asyncio
 async def test_transport_failure_repairs_tunnel_without_clearing_deployment():
     kv = _seed_state()
     kv.data["current_task_ids"] = {
@@ -1240,6 +1302,8 @@ async def test_transport_failure_repairs_tunnel_without_clearing_deployment():
     await scheduler.tick(current_block=51)
     await scheduler.tick(current_block=52)
     await scheduler.tick(current_block=53)
+    await scheduler.tick(current_block=54)
+    await scheduler.tick(current_block=55)
 
     assert repairs == [("wrk-live", "public_failed_local_ready")]
     assert deployer.deploys == []
@@ -1310,8 +1374,10 @@ async def test_active_challenger_transport_failure_repairs_without_losing_battle
     await scheduler.tick(current_block=51)
     await scheduler.tick(current_block=52)
     await scheduler.tick(current_block=53)
+    await scheduler.tick(current_block=54)
+    await scheduler.tick(current_block=55)
 
-    assert health_checks == [2, 2, 2]
+    assert health_checks == [2, 2, 2, 2, 2]
     assert repairs == [(2, "endpoint-1:instance-1:generation=1")]
     battle = await state.get_battle()
     assert battle is not None
